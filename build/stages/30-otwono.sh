@@ -344,8 +344,10 @@ RequiresMountsFor=/var/lib/otwono
 Before=multi-user.target
 
 [Service]
+# Deliberately not RemainAfterExit: the timer re-runs this so the console carries a
+# current peer count. Piping otwono-netd's own output to the console instead would work
+# for a test and be unusable on a real headless node.
 Type=oneshot
-RemainAfterExit=yes
 ExecStart=/usr/lib/otwono/mesh-check
 StandardOutput=journal+console
 StandardError=journal+console
@@ -359,6 +361,22 @@ LockPersonality=yes
 
 [Install]
 WantedBy=multi-user.target
+UNIT
+
+cat > "$ROOTFS/etc/systemd/system/otwono-mesh-check.timer" <<'UNIT'
+[Unit]
+Description=Periodic OTWONO mesh status on the console
+
+[Timer]
+# Discovery needs a moment after boot, so the first run at multi-user.target always
+# reports zero peers. Repeating gives an operator on a serial console a live count, and
+# gives the two-node test something to wait on.
+OnBootSec=25s
+OnUnitActiveSec=20s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
 UNIT
 
 log "installing the first-boot control-plane check"
@@ -394,9 +412,15 @@ LockPersonality=yes
 WantedBy=multi-user.target
 UNIT
 
-for unit in otwono-permd otwono-hwd otwono-idd otwono-netd otwono-control-plane-check otwono-mesh-check; do
-    chroot "$ROOTFS" systemctl enable "$unit.service" 2>/dev/null \
-        || warn "could not enable $unit.service"
+for unit in otwono-permd otwono-hwd otwono-idd otwono-netd otwono-control-plane-check otwono-mesh-check otwono-mesh-check.timer; do
+    # The list carries a .timer as well as services, so only append .service when the
+    # entry does not already name a unit type.
+    case "$unit" in
+        *.timer) target="$unit" ;;
+        *)       target="$unit.service" ;;
+    esac
+    chroot "$ROOTFS" systemctl enable "$target" 2>/dev/null \
+        || warn "could not enable $target"
 done
 
 log "installing documentation"

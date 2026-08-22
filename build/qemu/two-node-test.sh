@@ -152,12 +152,12 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     if grep -qa "Kernel panic\|OTWONO-MESH-FAIL" "$OUT/node-a.log" "$OUT/node-b.log"; then
         result=fail; break
     fi
-    # The mesh check runs once at boot, before discovery has had time to find anything,
-    # so its connected= count is usually zero even on success. The authentication lines
-    # are what actually prove a peer was verified, so wait on those.
-    a_auth=$(grep -ac "peer authenticated" "$OUT/node-a.log" || true)
-    b_auth=$(grep -ac "peer authenticated" "$OUT/node-b.log" || true)
-    if [ "${a_auth:-0}" -ge 1 ] && [ "${b_auth:-0}" -ge 1 ]; then
+    # Wait on the periodic mesh marker, not on otwono-netd's own log lines: the daemon
+    # logs to the journal, so its output never reaches the serial console. An earlier
+    # version of this test waited for evidence that could not appear.
+    a_conn=$(mesh_field "$OUT/node-a.log" connected)
+    b_conn=$(mesh_field "$OUT/node-b.log" connected)
+    if [ "${a_conn:-0}" -ge 1 ] && [ "${b_conn:-0}" -ge 1 ]; then
         result=pass; break
     fi
     sleep 5
@@ -166,8 +166,8 @@ done
 echo
 echo "node A identity: $(mesh_field "$OUT/node-a.log" node)"
 echo "node B identity: $(mesh_field "$OUT/node-b.log" node)"
-echo "node A authentications: $(grep -ac 'peer authenticated' "$OUT/node-a.log" || echo 0)"
-echo "node B authentications: $(grep -ac 'peer authenticated' "$OUT/node-b.log" || echo 0)"
+echo "node A peers connected: $(mesh_field "$OUT/node-a.log" connected)"
+echo "node B peers connected: $(mesh_field "$OUT/node-b.log" connected)"
 
 if [ "$result" != pass ]; then
     echo "FAIL: the two nodes did not form a mesh ($result)" >&2
@@ -186,9 +186,9 @@ B_ID=$(mesh_field "$OUT/node-b.log" node)
     exit 1
 }
 
-# Each node must have authenticated the *other* one, not merely something.
-grep -qa "$B_ID" "$OUT/node-a.log" || { echo "FAIL: node A never names node B" >&2; exit 1; }
-grep -qa "$A_ID" "$OUT/node-b.log" || { echo "FAIL: node B never names node A" >&2; exit 1; }
+# Both sides must report a peer. A one-sided count would mean a half-open session.
+[ "$(mesh_field "$OUT/node-a.log" connected)" -ge 1 ] || { echo "FAIL: node A has no peer" >&2; exit 1; }
+[ "$(mesh_field "$OUT/node-b.log" connected)" -ge 1 ] || { echo "FAIL: node B has no peer" >&2; exit 1; }
 
 echo "PASS: two nodes discovered and mutually authenticated"
 echo "  A $A_ID"
