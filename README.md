@@ -6,8 +6,8 @@ networking, local AI, distributed services, and offline-first capabilities.
 Runs on **x86_64/AMD64** computers and **ARM64** single-board computers. Same operating
 system, same subsystems, same interfaces — the capabilities scale to the hardware.
 
-> **Project status: Phase 2 complete (amd64).** Both images boot under QEMU, and the
-> **permission broker and hardware daemon now run on the booted system**: at first boot the
+> **Project status: Phase 2 complete.** Both images boot under QEMU, and the
+> **permission broker and hardware daemon now run on both booted systems**: at first boot the
 > guest requests a capability, calls the hardware daemon with it, and the broker writes a
 > hash-chained audit record — all recovered from the image and verified on the host
 > afterwards. Nothing has run on real hardware yet. The node network, AI runtime and

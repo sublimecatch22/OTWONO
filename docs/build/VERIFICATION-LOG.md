@@ -213,9 +213,11 @@ Environment findings that shaped stage 50:
 
 ---
 
-## Phase 2 — the control plane runs on a booted system
+## Phase 2 — the control plane runs on both booted architectures
 
-**`make -C build TARGET=amd64-qemu-ubuntu boot-test` passes with the daemons in the image.**
+**`boot-test` passes with the daemons in the image on `amd64-qemu-ubuntu` and
+`arm64-qemu-ubuntu`.** Both produce the identical trail below; the arm64 daemons are
+cross-compiled on an x86_64 host and run under full emulation.
 
 Both daemons start under the full hardening baseline, and the guest fetches its own
 capability profile *through* the control plane at first boot:
@@ -226,15 +228,15 @@ capability profile *through* the control plane at first boot:
 OTWONO-CONTROL-PLANE-OK tier=T0_MICRO audit_records=3
 ```
 
-Zero `Failed to start .*otwono` lines in the boot log.
+Stage 60 then recovers three artifacts from each image and checks them on the host:
 
-Stage 60 then recovers three artifacts from the image and checks them on the host:
+| Artifact | Source | amd64 | arm64 |
+|---|---|---|---|
+| `capability-profile.json` | data partition, local probe | `T0_MICRO`, `x86_64` | `T0_MICRO`, `aarch64` |
+| `control-plane-profile.json` | data partition, via permd + hwd | `T0_MICRO` — **matches** | `T0_MICRO` — **matches** |
+| `audit.jsonl` | root partition, written by the broker | 3 records, **chain intact** | 3 records, **chain intact** |
 
-| Artifact | Source | Result |
-|---|---|---|
-| `capability-profile.json` | data partition, written by the local probe | tier `T0_MICRO`, arch `x86_64` |
-| `control-plane-profile.json` | data partition, fetched via permd + hwd | tier `T0_MICRO` — **matches the local probe** |
-| `audit.jsonl` | root partition, written by the broker | 3 records, **chain intact** |
+Neither boot log contains a `Failed to start .*otwono` line.
 
 The audit trail the guest wrote, verified on the host with `otwono-permd --verify-audit`:
 
@@ -272,6 +274,13 @@ A quoting error there now fails a fifteen-second job instead of a ten-minute boo
 general rule this produced: **no non-trivial shell inside a systemd unit** — put it in a
 file that the linter can see.
 
+**8. binfmt registration belonged to every chrooting stage, not just the first.** The arm64
+run failed in stage 50 with `Exec format error` from `grub-mkstandalone`. Only stage 10
+registered the aarch64 handler, and that run skipped stage 10 as already complete;
+registration lives in the kernel, so it does not survive a container restart either. Every
+partial rebuild of a foreign-arch target hit this. `ensure_foreign_arch_support()` now
+lives in `build/lib/common.sh` and is called by all five stages that chroot.
+
 **7. The boot harness burned the full timeout on a missing marker.** A guest sitting at a
 login prompt never exits, so a marker that never arrives cost the entire 600s. The harness
 now notes when the login prompt appears — systemd is finished by then — and gives up after
@@ -289,4 +298,6 @@ a 60s grace, naming the missing markers and any failed OTWONO unit.
   whole file can recompute every hash. Anchoring the chain head somewhere the writer cannot
   reach is Phase 3 work.
 - Only one tier (`T0_MICRO`) and one policy shape have been exercised on a booted system.
+  Both QEMU guests classify identically, so the tiering logic itself is still only covered
+  by fixtures.
 

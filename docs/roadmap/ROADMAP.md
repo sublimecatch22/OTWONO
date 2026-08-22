@@ -68,9 +68,9 @@ blocked ⇒ only the Ubuntu recipes are exercised here.
 
 **Exit criterion: met, and then some.** 14 integration tests run both daemons over real
 Unix sockets: an unauthorized caller is refused, an authorized caller succeeds, and the
-hash chain verifies. Beyond the criterion, the same path was exercised on a **booted
-amd64 image** — the guest fetched its profile through permd and hwd at first boot, and the
-audit log it wrote was recovered and verified on the host.
+hash chain verifies. Beyond the criterion, the same path was exercised on **booted
+amd64 and arm64 images** — each guest fetched its profile through permd and hwd at first
+boot, and the audit log it wrote was recovered and verified on the host.
 
 **Carried forward (not done):** both daemons run as root; the dedicated Z2/Z3 users and
 Landlock scoping listed above are outstanding, and need group-aware socket binding. There
