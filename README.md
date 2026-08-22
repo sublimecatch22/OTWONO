@@ -6,11 +6,15 @@ networking, local AI, distributed services, and offline-first capabilities.
 Runs on **x86_64/AMD64** computers and **ARM64** single-board computers. Same operating
 system, same subsystems, same interfaces — the capabilities scale to the hardware.
 
-> **Project status: Phase 0 — foundation.** The architecture, the build skeleton, and
-> hardware detection exist and are tested. There is no bootable image yet. Every document
-> and subsystem carries an explicit status (`SPECIFIED` / `IMPLEMENTED` / `VERIFIED`), and
-> nothing here claims to work that has not been run. See
-> [`docs/roadmap/ROADMAP.md`](docs/roadmap/ROADMAP.md).
+> **Project status: Phase 1.** The **amd64 image boots** — under QEMU it reaches a login
+> prompt and produces a hardware capability profile from inside the VM, recovered from the
+> guest's own disk. arm64 is not yet verified. No OTWONO daemon exists yet; the node
+> network, AI runtime, permission broker and distributed services are design only.
+>
+> Every document and subsystem carries an explicit status (`SPECIFIED` / `IMPLEMENTED` /
+> `VERIFIED`), and nothing here claims to work that has not been run — see
+> [`docs/build/VERIFICATION-LOG.md`](docs/build/VERIFICATION-LOG.md) for the evidence and
+> [`docs/roadmap/ROADMAP.md`](docs/roadmap/ROADMAP.md) for what comes next.
 
 ---
 
@@ -72,11 +76,23 @@ tools/capture-hw-fixture.sh crates/otwono-hal/tests/fixtures/my-board --label "O
 Image builds:
 
 ```bash
+tools/probe-env.sh                                 # can this host build an image at all?
 make -C build list-targets
-make -C build TARGET=amd64-qemu-ubuntu rootfs      # stages 05..30 (works today)
-make -C build TARGET=arm64-qemu-ubuntu rootfs      # cross-bootstrap via binfmt + qemu-user
-make -C build TARGET=amd64-qemu image              # stages 40..50 — Phase 1, not implemented
+
+# Build and boot an amd64 image. Verified: reaches a login prompt under QEMU and
+# recovers a capability profile from inside the VM.
+make -C build TARGET=amd64-qemu-ubuntu image
+make -C build TARGET=amd64-qemu-ubuntu boot-test
+
+# arm64 cross-builds via binfmt_misc + qemu-user. Not yet verified end to end.
+make -C build TARGET=arm64-qemu-ubuntu image
 ```
+
+Artifacts land in `out/<target>/`: the image, `boot.log`, `capability-profile.json`
+recovered from the booted guest, `manifest.tsv`, and `SHA256SUMS`.
+
+The Debian recipes (`amd64-qemu`, `arm64-qemu`) are the canonical product base but cannot
+be bootstrapped in the OTWONO Cloud environment, whose proxy rejects Debian mirrors.
 
 ## Repository layout
 
