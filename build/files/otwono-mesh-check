@@ -21,4 +21,11 @@ connected=$(echo "$STATUS" | awk '/^connected/ {print $2}')
     exit 1
 }
 
-echo "OTWONO-MESH-OK node=$fingerprint known=$known connected=$connected"
+# The interface address is on the line because a mesh that cannot form is almost always a
+# node with no address, and on a headless box that is invisible otherwise. "none" here
+# means link-local never came up, which is a different problem from "no peers found".
+addr=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | head -1)
+[ -n "$addr" ] || addr=$(ip -4 -o addr show scope link 2>/dev/null | awk '{print $4}' | head -1)
+[ -n "$addr" ] || addr=none
+
+echo "OTWONO-MESH-OK node=$fingerprint addr=$addr known=$known connected=$connected"

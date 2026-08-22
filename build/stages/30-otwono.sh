@@ -273,8 +273,14 @@ cat > "$ROOTFS/etc/systemd/system/otwono-netd.service" <<'UNIT'
 [Unit]
 Description=OTWONO node mesh daemon
 Documentation=file:/usr/share/doc/otwono/NODE-NETWORK.md
-After=otwono-idd.service network.target systemd-tmpfiles-setup.service
+After=otwono-idd.service systemd-networkd.service systemd-tmpfiles-setup.service
 Requires=otwono-permd.service
+# network.target says "networking has been started", not "an interface has an address".
+# mDNS binds its sockets at startup, so a daemon that starts before addressing completes
+# announces on nothing. Wants (not Requires) so a node with no usable link still boots and
+# still serves its local control plane — an OTWONO node offline is a supported state.
+Wants=network-online.target
+After=network-online.target
 RequiresMountsFor=/var/lib/otwono
 
 [Service]
