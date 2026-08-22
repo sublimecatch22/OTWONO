@@ -3,23 +3,24 @@
 //! Brings up the overlay: announce on the LAN, browse for others, authenticate whatever
 //! answers, and publish the result on the control plane.
 //!
-//! # A known deviation
+//! # What this daemon is not trusted with
 //!
-//! This daemon reads the keystore directly, so two processes (`otwono-idd` and this one)
-//! can reach the node's private keys. That is one more than the architecture wants
-//! (docs/security/SECURITY-MODEL.md puts the identity daemon in Z1 and this in Z3, the
-//! hostile-input boundary). The Noise handshake needs the X25519 secret in-process, and
-//! delegating it would mean either shipping the key to this daemon anyway or moving the
-//! whole handshake into `otwono-idd`.
+//! This is the Z3 process — the one that parses input from the network
+//! (docs/security/SECURITY-MODEL.md). It holds the node's X25519 agreement secret, because
+//! Noise needs it in-process, and **nothing else**. The Ed25519 signing key that a NodeID
+//! names lives in `otwono-idd`, and this daemon asks for each session signature over the
+//! control plane ([`signer::BrokeredSigner`], ADR-0010).
 //!
-//! The fix is to split the keystore so `otwono-idd` owns the Ed25519 signing key and this
-//! daemon owns only the X25519 agreement key, asking `otwono-idd` to sign each session
-//! proof. That is a deliberate follow-up, recorded here so it is not mistaken for the
-//! intended design.
+//! Compromising this daemon costs the node its sessions and its agreement key. Both are
+//! replaceable. It does not cost the node its name.
 
 #![forbid(unsafe_code)]
 
-use otwono_identity::NodeIdentity;
+pub mod signer;
+
+pub use signer::{BindError, BrokeredSigner};
+
+use otwono_identity::{NodeId, SessionSigner};
 use otwono_net::{should_initiate, Candidate, LinkAdapter, PeerState, PeerTable, SecureChannel, TcpLink};
 use otwono_proto::{
     unknown_method, CallContext, Client, MethodDescription, RpcError, Service, ServiceDescription,
@@ -51,18 +52,27 @@ pub struct Hello {
 }
 
 pub struct NetState {
-    pub identity: Arc<NodeIdentity>,
+    /// Whatever can sign for this node. In the daemon it is a [`BrokeredSigner`]; in a
+    /// test it is usually a whole `NodeIdentity`, which signs locally.
+    pub signer: Arc<dyn SessionSigner>,
+    node_id: NodeId,
     pub peers: Mutex<PeerTable>,
     pub listen_addr: Mutex<Option<SocketAddr>>,
 }
 
 impl NetState {
-    pub fn new(identity: NodeIdentity) -> Self {
+    pub fn new(signer: Arc<dyn SessionSigner>) -> Self {
+        let node_id = signer.node_id();
         NetState {
-            identity: Arc::new(identity),
+            signer,
+            node_id,
             peers: Mutex::new(PeerTable::new()),
             listen_addr: Mutex::new(None),
         }
+    }
+
+    pub fn node_id(&self) -> &NodeId {
+        &self.node_id
     }
 
     fn now(&self) -> u64 {
@@ -73,7 +83,7 @@ impl NetState {
     pub fn serve_inbound(&self, link: TcpLink) {
         let address = link.peer_addr();
         let _ = link.set_timeout(Some(HANDSHAKE_TIMEOUT));
-        match SecureChannel::accept(link, &self.identity) {
+        match SecureChannel::accept(link, self.signer.as_ref()) {
             Ok(mut channel) => {
                 let node_id = channel.peer().node_id;
                 if let Err(e) = self.exchange_hello(&mut channel, false) {
@@ -128,7 +138,7 @@ impl NetState {
         link.set_timeout(Some(HANDSHAKE_TIMEOUT))
             .map_err(|e| e.to_string())?;
 
-        let mut channel = SecureChannel::initiate(link, &self.identity).map_err(|e| e.to_string())?;
+        let mut channel = SecureChannel::initiate(link, self.signer.as_ref()).map_err(|e| e.to_string())?;
         let proved = channel.peer().node_id;
 
         if proved != candidate.claimed_node_id {
@@ -155,8 +165,8 @@ impl NetState {
         initiator: bool,
     ) -> Result<(), String> {
         let mine = Hello {
-            node_id: self.identity.node_id().to_text(),
-            fingerprint: self.identity.node_id().fingerprint(),
+            node_id: self.node_id.to_text(),
+            fingerprint: self.node_id.fingerprint(),
             software: format!("otwono-netd/{}", env!("CARGO_PKG_VERSION")),
         };
         let encoded = serde_json::to_vec(&mine).map_err(|e| e.to_string())?;
@@ -206,11 +216,20 @@ pub fn run_listener(state: Arc<NetState>, listener: TcpListener) {
     }
 }
 
-/// Discovery loop: browse the LAN and dial whoever we are supposed to dial.
+/// How long the discovery loop waits for a new advertisement before retrying known peers.
+const DISCOVERY_SWEEP: Duration = Duration::from_secs(30);
+
+/// Discovery loop: browse the LAN, dial whoever we are supposed to dial, and keep trying.
+///
+/// The retry sweep is not optional. mDNS delivers `ServiceResolved` once per resolution,
+/// so a dial that loses a startup race — the peer's listener not yet bound, an address
+/// still settling — would otherwise never be attempted again, and the two nodes would sit
+/// forever having discovered each other and connected to nothing.
 pub fn run_discovery(state: Arc<NetState>, discovery: otwono_net::Discovery) {
-    let local = *state.identity.node_id();
+    let local = *state.node_id();
     loop {
-        let Some(candidate) = discovery.next_candidate(Duration::from_secs(30)) else {
+        let Some(candidate) = discovery.next_candidate(DISCOVERY_SWEEP) else {
+            retry_known_peers(&state, &local);
             continue;
         };
         if candidate.claimed_node_id == local {
@@ -242,6 +261,35 @@ pub fn run_discovery(state: Arc<NetState>, discovery: otwono_net::Discovery) {
         match state.dial(&candidate) {
             Ok(id) => eprintln!("otwono-netd: outbound peer authenticated: {}", id.fingerprint()),
             Err(e) => eprintln!("otwono-netd: dial failed: {e}"),
+        }
+    }
+}
+
+/// Re-dial every known peer this node should be initiating to and is not connected to.
+fn retry_known_peers(state: &Arc<NetState>, local: &otwono_identity::NodeId) {
+    let candidates: Vec<_> = state
+        .peers
+        .lock()
+        .unwrap()
+        .retry_candidates()
+        .into_iter()
+        .filter(|(node_id, _)| should_initiate(local, node_id))
+        .collect();
+
+    for (claimed_node_id, address) in candidates {
+        let candidate = Candidate {
+            claimed_node_id,
+            address,
+        };
+        match state.dial(&candidate) {
+            Ok(id) => eprintln!("otwono-netd: peer authenticated on retry: {}", id.fingerprint()),
+            // Expected while the other side is still coming up. The reason is kept on the
+            // peer record either way, so `otwono-netd --peers` can explain a mesh that
+            // will not form.
+            Err(e) => eprintln!(
+                "otwono-netd: retry of {} failed: {e}",
+                claimed_node_id.fingerprint()
+            ),
         }
     }
 }
@@ -304,8 +352,8 @@ impl Service for NetService {
             "net.status" => {
                 let peers = self.state.peers.lock().unwrap();
                 Ok(json!({
-                    "node_id": self.state.identity.node_id().to_text(),
-                    "fingerprint": self.state.identity.node_id().fingerprint(),
+                    "node_id": self.state.node_id().to_text(),
+                    "fingerprint": self.state.node_id().fingerprint(),
                     "listen_addr": self.state.listen_addr.lock().unwrap().map(|a| a.to_string()),
                     "discovery": otwono_net::SERVICE_TYPE,
                     "peers_known": peers.len(),

@@ -206,7 +206,7 @@ fn a_binding_replayed_from_another_node_is_rejected() {
     );
 
     let (a, b) = MemoryLink::pair();
-    let attacker = hostile_responder(b, mallory.agreement_secret().to_bytes(), move |hash| {
+    let attacker = hostile_responder(b, *mallory.agreement().secret_bytes(), move |hash| {
         otwono_net::SessionProof {
             binding: alice_binding,
             handshake_signature: data_encoding::BASE64.encode(
@@ -234,7 +234,7 @@ fn a_session_proof_from_a_different_handshake_is_rejected() {
     let mallory_binding = mallory.agreement_binding();
 
     let (a, b) = MemoryLink::pair();
-    let attacker = hostile_responder(b, mallory.agreement_secret().to_bytes(), move |_hash| {
+    let attacker = hostile_responder(b, *mallory.agreement().secret_bytes(), move |_hash| {
         let wrong_hash = [0x42u8; 32];
         otwono_net::SessionProof {
             binding: mallory_binding,
@@ -263,7 +263,7 @@ fn a_binding_whose_node_id_names_someone_else_is_rejected() {
     binding.node_id = alice_node_id;
 
     let (a, b) = MemoryLink::pair();
-    let attacker = hostile_responder(b, mallory.agreement_secret().to_bytes(), move |hash| {
+    let attacker = hostile_responder(b, *mallory.agreement().secret_bytes(), move |hash| {
         otwono_net::SessionProof {
             binding,
             handshake_signature: data_encoding::BASE64.encode(

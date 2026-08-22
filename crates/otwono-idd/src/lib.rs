@@ -5,16 +5,25 @@
 //! daemon is the point: the number of processes that can touch the node key is the number
 //! of processes whose compromise costs the node its identity.
 //!
+//! # The only holder of the signing key
+//!
+//! Since ADR-0010 this is literally true: `otwono-idd` reads `node.key` and nothing else
+//! does. `otwono-netd` holds only the X25519 agreement key and calls `id.sign_session`
+//! for the one Ed25519 signature a Noise handshake needs. Neither half is enough on its
+//! own — a caller with `id.sign_session` but no agreement key cannot complete a handshake,
+//! because the binding would not match the static key it authenticated with.
+//!
 //! # Which methods are open
 //!
 //! `id.node`, `id.fingerprint`, `id.agreement_binding` and `id.succession` are
 //! unauthenticated on the local socket. Everything they return is already published to any
-//! peer that connects, so guarding them would be theatre. `id.sign` and `id.rotate` are
-//! brokered, because they *use* the key rather than describing it.
+//! peer that connects, so guarding them would be theatre. `id.sign`, `id.sign_session`,
+//! `id.bind_agreement` and `id.rotate` are brokered, because they *use* the key rather
+//! than describing it.
 
 #![forbid(unsafe_code)]
 
-use otwono_identity::{Keystore, NodeIdentity};
+use otwono_identity::{SigningIdentity, SigningKeystore};
 use otwono_proto::{
     unknown_method, CallContext, Client, MethodDescription, RpcError, Service, ServiceDescription,
 };
@@ -26,6 +35,8 @@ use std::sync::{Arc, Mutex};
 pub const SERVICE_NAME: &str = "otwono-idd";
 pub const DESCRIBE_SCHEMA_VERSION: &str = "1.0.0";
 pub const CAPABILITY_SIGN: &str = "id.sign";
+pub const CAPABILITY_SIGN_SESSION: &str = "id.sign_session";
+pub const CAPABILITY_BIND: &str = "id.bind_agreement";
 pub const CAPABILITY_ROTATE: &str = "id.rotate";
 
 /// Domain prefix for anything signed on a caller's behalf.
@@ -37,8 +48,8 @@ pub const CAPABILITY_ROTATE: &str = "id.rotate";
 pub const APPLICATION_DOMAIN: &[u8] = b"otwono-application-v1:";
 
 pub struct IdentityService {
-    keystore: Keystore,
-    identity: Mutex<Arc<NodeIdentity>>,
+    keystore: SigningKeystore,
+    identity: Mutex<Arc<SigningIdentity>>,
     perm_socket: PathBuf,
 }
 
@@ -48,8 +59,20 @@ struct SignParams {
     payload: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct SignSessionParams {
+    /// Base64 Noise handshake hash.
+    handshake_hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BindParams {
+    /// Base64 X25519 public key to vouch for.
+    agreement_public_key: String,
+}
+
 impl IdentityService {
-    pub fn new(keystore: Keystore, identity: NodeIdentity, perm_socket: PathBuf) -> Self {
+    pub fn new(keystore: SigningKeystore, identity: SigningIdentity, perm_socket: PathBuf) -> Self {
         IdentityService {
             keystore,
             identity: Mutex::new(Arc::new(identity)),
@@ -57,8 +80,22 @@ impl IdentityService {
         }
     }
 
-    fn current(&self) -> Arc<NodeIdentity> {
+    fn current(&self) -> Arc<SigningIdentity> {
         Arc::clone(&self.identity.lock().expect("identity lock poisoned"))
+    }
+
+    /// The binding this node currently stands behind, if any.
+    fn binding(&self) -> Result<otwono_identity::AgreementBinding, RpcError> {
+        let bound = self
+            .keystore
+            .bound_agreement_public_key()
+            .map_err(|e| RpcError::internal(format!("cannot read the keystore: {e}")))?
+            .ok_or_else(|| {
+                RpcError::unavailable(
+                    "no agreement key is bound to this node yet; otwono-netd binds one at startup",
+                )
+            })?;
+        Ok(self.current().bind_agreement(&bound))
     }
 
     /// Ask the broker whether this caller may do this. Fail closed if it cannot be reached.
@@ -101,6 +138,52 @@ impl IdentityService {
         }))
     }
 
+    /// Sign one Noise handshake hash on behalf of `otwono-netd`.
+    ///
+    /// This is the call that lets the mesh daemon authenticate without holding the node
+    /// key. It is a signing oracle for the session domain, so it is deliberately narrow:
+    /// the domain is fixed here, and the payload must be exactly a handshake hash. A
+    /// caller cannot steer it into signing anything else.
+    fn handle_sign_session(&self, ctx: &CallContext, params: Value) -> Result<Value, RpcError> {
+        self.authorize(ctx, CAPABILITY_SIGN_SESSION)?;
+        let p: SignSessionParams = serde_json::from_value(params)
+            .map_err(|e| RpcError::invalid_params(format!("id.sign_session: {e}")))?;
+        let hash = data_encoding::BASE64
+            .decode(p.handshake_hash.as_bytes())
+            .map_err(|e| RpcError::invalid_params(format!("handshake_hash must be base64: {e}")))?;
+
+        let identity = self.current();
+        let signature = identity
+            .sign_session(&hash)
+            .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        Ok(json!({
+            "node_id": identity.node_id().to_text(),
+            "signature": data_encoding::BASE64.encode(&signature),
+        }))
+    }
+
+    /// Vouch for an agreement key and remember that we did.
+    ///
+    /// Idempotent: re-binding the same key rewrites the same record and returns the same
+    /// signature, which is what a restarting `otwono-netd` does on every boot.
+    fn handle_bind_agreement(&self, ctx: &CallContext, params: Value) -> Result<Value, RpcError> {
+        self.authorize(ctx, CAPABILITY_BIND)?;
+        let p: BindParams = serde_json::from_value(params)
+            .map_err(|e| RpcError::invalid_params(format!("id.bind_agreement: {e}")))?;
+        let key: [u8; 32] = data_encoding::BASE64
+            .decode(p.agreement_public_key.as_bytes())
+            .map_err(|e| RpcError::invalid_params(format!("agreement_public_key must be base64: {e}")))?
+            .as_slice()
+            .try_into()
+            .map_err(|_| RpcError::invalid_params("an X25519 public key is 32 bytes"))?;
+
+        let identity = self.current();
+        self.keystore
+            .bind_agreement(&identity, &key)
+            .map_err(|e| RpcError::internal(format!("cannot record the binding: {e}")))?;
+        serde_json::to_value(identity.bind_agreement(&key)).map_err(|e| RpcError::internal(e.to_string()))
+    }
+
     fn handle_rotate(&self, ctx: &CallContext) -> Result<Value, RpcError> {
         self.authorize(ctx, CAPABILITY_ROTATE)?;
         let (new, record) = self
@@ -111,6 +194,9 @@ impl IdentityService {
             "node_id": new.node_id().to_text(),
             "fingerprint": new.node_id().fingerprint(),
             "succession": record,
+            // Rotation drops the binding: the new key has vouched for nothing. Saying so
+            // is what tells otwono-netd it must re-bind before it can handshake again.
+            "agreement_rebind_required": true,
         });
         *self.identity.lock().expect("identity lock poisoned") = Arc::new(new);
         Ok(response)
@@ -144,6 +230,16 @@ impl Service for IdentityService {
                     CAPABILITY_SIGN,
                 ),
                 MethodDescription::guarded(
+                    "id.sign_session",
+                    "Sign one Noise handshake hash, so otwono-netd need not hold the node key",
+                    CAPABILITY_SIGN_SESSION,
+                ),
+                MethodDescription::guarded(
+                    "id.bind_agreement",
+                    "Vouch for an X25519 agreement key held by another daemon",
+                    CAPABILITY_BIND,
+                ),
+                MethodDescription::guarded(
                     "id.rotate",
                     "Generate a new node identity, endorsed by the outgoing key",
                     CAPABILITY_ROTATE,
@@ -154,8 +250,20 @@ impl Service for IdentityService {
 
     fn call(&self, ctx: &CallContext, method: &str, params: Value) -> Result<Value, RpcError> {
         match method {
-            "id.node" => serde_json::to_value(self.current().to_public())
-                .map_err(|e| RpcError::internal(e.to_string())),
+            "id.node" => {
+                let bound = self
+                    .keystore
+                    .bound_agreement_public_key()
+                    .map_err(|e| RpcError::internal(format!("cannot read the keystore: {e}")))?
+                    .ok_or_else(|| {
+                        RpcError::unavailable(
+                            "this node has no agreement key bound yet, so it has no publishable \
+                             identity; otwono-netd binds one at startup",
+                        )
+                    })?;
+                serde_json::to_value(self.current().to_public(&bound))
+                    .map_err(|e| RpcError::internal(e.to_string()))
+            }
             "id.fingerprint" => {
                 let identity = self.current();
                 Ok(json!({
@@ -163,8 +271,9 @@ impl Service for IdentityService {
                     "fingerprint": identity.node_id().fingerprint(),
                 }))
             }
-            "id.agreement_binding" => serde_json::to_value(self.current().agreement_binding())
-                .map_err(|e| RpcError::internal(e.to_string())),
+            "id.agreement_binding" => {
+                serde_json::to_value(self.binding()?).map_err(|e| RpcError::internal(e.to_string()))
+            }
             "id.succession" => {
                 let records = self
                     .keystore
@@ -174,6 +283,8 @@ impl Service for IdentityService {
                     .map_err(|e| RpcError::internal(e.to_string()))
             }
             "id.sign" => self.handle_sign(ctx, params),
+            "id.sign_session" => self.handle_sign_session(ctx, params),
+            "id.bind_agreement" => self.handle_bind_agreement(ctx, params),
             "id.rotate" => self.handle_rotate(ctx),
             other => Err(unknown_method(other)),
         }
@@ -183,7 +294,7 @@ impl Service for IdentityService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use otwono_identity::verify_signature;
+    use otwono_identity::{verify_signature, NodeIdentity};
 
     #[test]
     fn application_signatures_cannot_masquerade_as_protocol_messages() {
@@ -218,7 +329,11 @@ mod tests {
     #[test]
     fn the_application_domain_is_distinct_from_every_internal_one() {
         let domain = String::from_utf8_lossy(APPLICATION_DOMAIN).to_string();
-        for internal in ["otwono-agreement-binding-v1:", "otwono-succession-v1:"] {
+        for internal in [
+            "otwono-agreement-binding-v1:",
+            "otwono-succession-v1:",
+            "otwono-session-v1:",
+        ] {
             assert_ne!(domain, internal);
             assert!(
                 !internal.starts_with(&domain),

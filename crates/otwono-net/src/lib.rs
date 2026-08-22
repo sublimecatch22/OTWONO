@@ -17,5 +17,7 @@ pub use discovery::{Candidate, Discovery, DiscoveryError, SERVICE_TYPE};
 pub use link::{BandwidthClass, DutyCycle, EnergyCost, LinkAdapter, LinkError, LinkKind, LinkProperties};
 pub use memory::MemoryLink;
 pub use peer::{should_initiate, PeerRecord, PeerState, PeerTable};
-pub use secure::{HandshakeError, SecureChannel, SessionProof, NOISE_PATTERN};
+pub use secure::{
+    session_proof_message, HandshakeError, SecureChannel, SessionProof, NOISE_PATTERN, SESSION_DOMAIN,
+};
 pub use tcp::TcpLink;

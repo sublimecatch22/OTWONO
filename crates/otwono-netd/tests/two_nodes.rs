@@ -16,7 +16,7 @@ fn start_node() -> (Arc<NetState>, std::net::SocketAddr) {
     let identity = NodeIdentity::generate().unwrap();
     let listener = TcpLink::listen("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let state = Arc::new(NetState::new(identity));
+    let state = Arc::new(NetState::new(Arc::new(identity)));
     {
         let state = Arc::clone(&state);
         std::thread::spawn(move || run_listener(state, listener));
@@ -31,7 +31,7 @@ fn start_node() -> (Arc<NetState>, std::net::SocketAddr) {
 
 fn candidate(state: &NetState, addr: std::net::SocketAddr) -> Candidate {
     Candidate {
-        claimed_node_id: *state.identity.node_id(),
+        claimed_node_id: *state.node_id(),
         address: addr,
     }
 }
@@ -40,8 +40,8 @@ fn candidate(state: &NetState, addr: std::net::SocketAddr) -> Candidate {
 fn two_nodes_authenticate_each_other_over_tcp() {
     let (alice, _alice_addr) = start_node();
     let (bob, bob_addr) = start_node();
-    let alice_id = *alice.identity.node_id();
-    let bob_id = *bob.identity.node_id();
+    let alice_id = *alice.node_id();
+    let bob_id = *bob.node_id();
 
     let proved = alice
         .dial(&candidate(&bob, bob_addr))
@@ -98,7 +98,7 @@ fn a_peer_advertising_someone_elses_node_id_is_refused() {
     assert!(record.last_error.unwrap().contains("advertised"));
 
     // Bob is untouched: he was never legitimately connected under that claim.
-    assert!(alice.peers.lock().unwrap().get(bob.identity.node_id()).is_none());
+    assert!(alice.peers.lock().unwrap().get(bob.node_id()).is_none());
 }
 
 #[test]
@@ -149,24 +149,34 @@ fn three_nodes_form_a_mesh() {
 
 #[test]
 fn identity_survives_a_restart() {
-    // The Phase 3 promise: a node that restarts is recognisably the same node. Uses a
-    // keystore on disk, because that is what makes it true.
+    // The Phase 3 promise: a node that restarts is recognisably the same node. Uses
+    // keystores on disk, because that is what makes it true. Both halves must survive:
+    // the signing key carries the name, and the agreement key has to keep matching the
+    // binding otwono-idd holds for it.
     let dir = std::env::temp_dir().join(format!("otwono-restart-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let keystore = otwono_identity::Keystore::new(&dir);
+    let signing_store = otwono_identity::SigningKeystore::new(&dir);
+    let agreement_store = otwono_identity::AgreementKeystore::new(&dir);
 
-    let (first, _) = keystore.load_or_generate().unwrap();
+    let (first, _) = signing_store.load_or_generate().unwrap();
+    let (first_agreement, _) = agreement_store.load_or_generate().unwrap();
     let original = *first.node_id();
+    let original_agreement = first_agreement.public();
     drop(first);
+    drop(first_agreement);
 
-    let (second, generated) = keystore.load_or_generate().unwrap();
+    let (signing, generated) = signing_store.load_or_generate().unwrap();
     assert!(!generated, "a restart must not mint a new identity");
-    assert_eq!(second.node_id(), &original);
+    assert_eq!(signing.node_id(), &original);
+    let (agreement, generated) = agreement_store.load_or_generate().unwrap();
+    assert!(!generated, "a restart must not mint a new agreement key");
+    assert_eq!(agreement.public(), original_agreement);
+    let second = NodeIdentity::from_parts(signing, agreement);
 
     // And a peer authenticating it after the "restart" sees the same NodeID.
     let listener = TcpLink::listen("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let restarted = Arc::new(NetState::new(second));
+    let restarted = Arc::new(NetState::new(Arc::new(second)));
     {
         let restarted = Arc::clone(&restarted);
         std::thread::spawn(move || run_listener(restarted, listener));

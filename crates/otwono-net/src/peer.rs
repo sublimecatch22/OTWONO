@@ -109,6 +109,23 @@ impl PeerTable {
         self.peers.values().cloned().collect()
     }
 
+    /// Peers worth dialling again: known, addressable, and not currently connected.
+    ///
+    /// mDNS resolves a service *once*. Without a sweep like this, a single failed dial —
+    /// the peer's listener not up yet, an address still settling duplicate detection — is
+    /// permanent, because no second `ServiceResolved` event ever arrives to trigger a
+    /// retry. A mesh that gives up for good after one lost race is not a mesh.
+    pub fn retry_candidates(&self) -> Vec<(NodeId, SocketAddr)> {
+        self.peers
+            .values()
+            .filter(|p| p.state != PeerState::Connected)
+            .filter_map(|p| {
+                let address = p.addresses.first()?.parse().ok()?;
+                Some((p.node_id, address))
+            })
+            .collect()
+    }
+
     pub fn connected(&self) -> Vec<PeerRecord> {
         self.peers
             .values()
@@ -188,6 +205,43 @@ mod tests {
         let mut t = PeerTable::new();
         t.record_authenticated(node(3), None, 100);
         assert_eq!(t.get(&node(3)).unwrap().state, PeerState::Connected);
+    }
+
+    #[test]
+    fn a_failed_peer_stays_a_retry_candidate() {
+        // The bug this exists to prevent: mDNS resolves a service once, so a peer whose
+        // first dial lost a startup race was never dialled again and the mesh never
+        // formed — two nodes each reporting known=1 connected=0 for ever.
+        let mut t = PeerTable::new();
+        t.observe(node(7), addr(9000), 100);
+        t.record_failure(&node(7), "connection refused".into(), 200);
+        assert_eq!(t.retry_candidates(), vec![(node(7), addr(9000))]);
+    }
+
+    #[test]
+    fn a_connected_peer_is_not_retried() {
+        let mut t = PeerTable::new();
+        t.observe(node(8), addr(9000), 100);
+        t.record_authenticated(node(8), Some(addr(9000)), 200);
+        assert!(t.retry_candidates().is_empty(), "no need to redial a live peer");
+    }
+
+    #[test]
+    fn a_peer_with_no_address_is_not_a_retry_candidate() {
+        // Learned by being dialled, so there is nothing to dial back.
+        let mut t = PeerTable::new();
+        t.record_authenticated(node(9), None, 100);
+        t.record_failure(&node(9), "hung up".into(), 200);
+        assert!(t.retry_candidates().is_empty());
+    }
+
+    #[test]
+    fn a_peer_still_only_discovered_is_a_retry_candidate() {
+        // Discovered but never dialled — the case where the very first attempt never
+        // happened, rather than happened and failed.
+        let mut t = PeerTable::new();
+        t.observe(node(10), addr(9000), 100);
+        assert_eq!(t.retry_candidates().len(), 1);
     }
 
     #[test]

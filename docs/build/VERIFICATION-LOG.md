@@ -370,8 +370,102 @@ most of its failures on itself before it earns the one real finding.
 - **No routing and no store-and-forward.** Peers connect directly or not at all.
 - **`otwono-netd` reads the keystore directly**, so two processes can reach the node's
   private keys. The split — `otwono-idd` holding the Ed25519 key, `netd` holding only the
-  agreement key and asking `idd` to sign each session proof — is not done.
+  agreement key and asking `idd` to sign each session proof — is not done. *(Closed after
+  Phase 3; see "Phase 3.5" below.)*
 - **No encrypted identity backup, no TPM sealing, no revocation records.**
 - **Only two nodes, on one segment, on amd64.** No partition-and-heal test, no arm64 run of
   the two-node test, nothing on real hardware.
 
+---
+
+## Phase 3.5 — the signing key leaves the network daemon (ADR-0010)
+
+`otwono-netd` no longer opens `node.key`. It holds only the X25519 agreement key, registers
+that key with `otwono-idd` at startup, and asks for one brokered signature per handshake.
+
+### The mesh still forms
+
+`make -C build TARGET=amd64-qemu-ubuntu two-node-test`:
+
+```
+node A identity: otw1:qpqb-a5gz-d456-9cxh   addr 169.254.156.119/16   connected 1
+node B identity: otw1:rphd-9vmg-ehfv-kmnf   addr 169.254.139.34/16    connected 1
+PASS: two nodes discovered and mutually authenticated
+```
+
+`make -C build TARGET=amd64-qemu-ubuntu verify` also passes, including the new pristine
+check: *no identity, profiles, audit log or seeded machine-id in the artifact*, and
+`otwono-amd64-qemu-ubuntu.img: OK` against the checksum stage 50 recorded.
+
+### Workspace
+
+| Command | Result |
+|---|---|
+| `cargo test --workspace` | **268 tests pass** (239 before) |
+| `clippy -D warnings`, `fmt --check`, `shellcheck -S warning` | clean |
+
+### Proving the boundary rather than asserting it
+
+`tests/control-plane/tests/key_separation.rs` runs the real daemons over real sockets.
+The decisive test **deletes `node.key` from disk** after both mesh daemons have bound, then
+requires the handshake to succeed anyway.
+
+File permissions were the obvious lever and are the wrong one here: CI runs as root, root
+ignores mode bits, and a `chmod 000` test would have passed whether or not `otwono-netd`
+read the key. Deleting the file is decisive for any uid.
+
+The suite also pins the two halves against each other — a caller with `id.sign_session` and
+no agreement secret cannot handshake, and a caller with the agreement secret and no
+`id.sign_session` cannot either — and checks that `id.sign_session` refuses any payload
+that is not a 32-byte handshake hash, so the oracle cannot be steered.
+
+### Two defects this found
+
+**10. The image shipped a seeded `/etc/machine-id`.** debootstrap leaves a concrete value
+behind and nothing cleared it, so every device flashed from the image was, to systemd, the
+same machine. systemd derives per-host secrets from it — including the IPv4 link-local
+address — so both VMs came up on `169.254.158.157/16` and could not reach each other on a
+segment with no DHCP server. It is also the DHCP DUID and the journal's host identity.
+
+Same class as the private-node-key defect from Phase 3: one value that must be per-device,
+baked into a distributable artifact. Stage 50 now truncates the file immediately before the
+filesystem is sealed — systemd's documented "generate one at first boot" marker — and stage
+60 refuses an image whose `/etc/machine-id` is non-empty.
+
+Worth noting that the Phase 3 run passed *despite* this, on distinct addresses. The bug was
+already present; that run got lucky.
+
+**11. A failed dial was never retried.** mDNS delivers `ServiceResolved` once per
+resolution, and the discovery loop only dialled on that event. A dial that lost a startup
+race — the peer's listener not yet bound, an address still settling — was permanent. Both
+nodes then sat at `known=1 connected=0` indefinitely, having found each other and connected
+to nothing.
+
+This is a real robustness defect that the key split *exposed* rather than caused: the extra
+startup round trips shifted the timing enough to lose the race that had previously been won.
+`run_discovery` now sweeps known, unconnected, addressable peers every 30 seconds when no
+new advertisement arrives.
+
+### Diagnosis cost, and what fixed it
+
+The failure looked identical to a permission denial, and the reason was only in the journal
+— invisible on a serial console. Two things resolved it, and both are the pattern that has
+worked every time in this project:
+
+1. **Reproduce on the host first.** A new integration test with *two independent* brokered
+   nodes — the case the single-harness tests missed — passed immediately. That ruled out the
+   handshake logic in seconds instead of a 15-minute QEMU cycle, and pointed at the
+   environment.
+2. **Put the reason where it can be seen.** `otwono-netd --peers` prints the peer table with
+   each peer's last error, and the boot-time mesh check now runs it whenever peers are known
+   but none are connected. The very first run with it printed the answer.
+
+### What Phase 3.5 has *not* changed
+
+- **Every daemon still runs as root.** The separation is by process and code path, not by
+  the kernel. `node.key` at 0600 stops another *user*, not another root process. Finishing
+  this needs the Z2/Z3 user separation and Landlock work, which is not done.
+- **No TPM sealing, no encrypted backup, no revocation records.** Unchanged.
+- **arm64 untested for this change.** The workspace builds for it; the two-node test has
+  only been run on amd64.
+- **Nothing on real hardware.**

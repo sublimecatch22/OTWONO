@@ -1,6 +1,16 @@
 # Node Identity
 
-**Status:** `SPECIFIED`. No implementation yet.
+**Status:** partly `VERIFIED`, partly `SPECIFIED`.
+
+* **Implemented and exercised on a booted system:** the two keys, the NodeID encoding and
+  fingerprint, the on-disk keystore, succession records, and the identity-bound Noise
+  handshake. Two QEMU nodes have authenticated each other — see
+  `docs/build/VERIFICATION-LOG.md`.
+* **Implemented, not yet booted:** the two-daemon key split of ADR-0010, covered by
+  integration tests over real sockets.
+* **Not implemented:** TPM/TrustZone sealing, the encrypted export, service subkeys, the
+  storage key, revocation records, and the user-identity certificate. Everything below
+  describing those is design, not code.
 
 ## 1. Requirements
 
@@ -16,13 +26,23 @@
 | Key | Algorithm | Purpose | Lifetime |
 |---|---|---|---|
 | Node signing key | Ed25519 | Identity, signing records, succession | Long-term |
-| Node agreement key | X25519 (derived) | Noise handshakes | Long-term, rotatable |
+| Node agreement key | X25519 (generated independently) | Noise handshakes | Long-term, rotatable |
 | Session keys | ChaCha20-Poly1305 / AES-GCM via Noise | Channel encryption | Per connection, rekeyed |
 | Service subkeys | Ed25519, signed by the node key | Per-service signing | Medium-term |
 | Storage key | XChaCha20-Poly1305 | At-rest encryption of `PRIVATE`/`SHARED` | Long-term, TPM-sealed |
 
 The long-term key **signs**; it never encrypts bulk traffic. Separating those roles limits
 the damage from any single compromise.
+
+The agreement key is *generated*, not derived from the Ed25519 seed. The birational map
+would have saved a file, but deriving it would tie the two keys together and remove the
+property the separation exists for: the agreement key can be replaced after a suspected
+compromise without the node losing its name.
+
+Because they are separate keys they live in separate processes (ADR-0010). `otwono-idd`
+holds the signing key and nothing else opens it; `otwono-netd` holds the agreement key and
+asks `otwono-idd` for the two signatures a handshake needs. Losing the agreement key costs
+sessions; losing the signing key costs the node's name, permanently.
 
 ## 3. NodeID
 
@@ -40,15 +60,26 @@ complete NodeID; the fingerprint is a UI affordance.
 
 ```
 /var/lib/otwono/identity/
-  node.key            0600, root:root  (or a TPM handle reference)
-  node.pub            0644
-  node.meta.json      created_at, algorithm, tpm_sealed, succession chain
-  subkeys/
+  node.key            0600  Ed25519 seed + the agreement public key it vouches for
+                            (or, with a TPM, a handle reference)     — otwono-idd only
+  agreement.key       0600  X25519 secret                            — otwono-netd only
+  node.pub            0644  the published PublicIdentity
+  succession.jsonl    0644  signed rotation records, append-only
+  subkeys/                  SPECIFIED; not implemented
 ```
 
+Two private files, not one, because two daemons need two different halves and neither
+should hold the other's (ADR-0010). `node.key` records the agreement *public* key so
+`otwono-idd` can say what it has vouched for without holding a secret it has no use for.
+
+Both daemons currently run as root, so the mode bits stop another *user*, not another root
+process. The separation today is by process and code path; kernel enforcement waits on the
+Z2/Z3 user separation and Landlock work.
+
 With a TPM: the key is generated in the TPM and sealed to PCR state; the file holds only a
-handle. Without: an on-disk key, ideally on a LUKS-encrypted root — and the UI says so
-rather than implying hardware protection that is not there.
+handle. **This is not implemented.** Today it is always an on-disk key, ideally on a
+LUKS-encrypted root, and the stored metadata records `hardware_backed: false` so nothing
+downstream can claim protection that is not there.
 
 ## 5. Node identity vs user identity
 

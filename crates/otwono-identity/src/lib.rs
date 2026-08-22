@@ -5,16 +5,22 @@
 //! [`NodeId`] is a multihash of the public key, so any peer can verify the name against
 //! the key with no registry and no connectivity.
 //!
-//! # Two keys, two jobs
+//! # Two keys, two jobs, two processes
 //!
-//! The signing key **signs**. A separate X25519 key does key agreement for Noise. They are
-//! generated together and stored together, and the signing key vouches for the agreement
-//! key with a signed binding record ([`AgreementBinding`]).
+//! The signing key **signs**. A separate X25519 key does key agreement for Noise. The
+//! signing key vouches for the agreement key with a signed binding record
+//! ([`AgreementBinding`]).
 //!
 //! Deriving the X25519 key from the Ed25519 seed would have been one fewer thing to store,
 //! and is what the birational map is for. It is not what this does, because ADR-0006 says
 //! the long-term key signs and never encrypts: separate keys mean the agreement key can be
 //! rotated after a suspected compromise without the node losing its name.
+//!
+//! Because they are separate keys they can live in separate processes, and they do
+//! (ADR-0010). [`SigningIdentity`] is held by `otwono-idd`; [`AgreementKey`] is held by
+//! `otwono-netd`, the daemon that parses input from the network. [`NodeIdentity`] is both
+//! halves at once — what a test or a single-process tool holds, never a daemon. The seam
+//! between them is [`SessionSigner`].
 //!
 //! # Device, not person
 //!
@@ -26,9 +32,14 @@
 
 pub mod keystore;
 pub mod node_id;
+pub mod signer;
 
-pub use keystore::{Keystore, KeystoreError, StoredIdentity, SuccessionRecord, DEFAULT_IDENTITY_DIR};
+pub use keystore::{
+    migrate_combined, AgreementKeystore, KeystoreError, SigningKeystore, StoredAgreementKey,
+    StoredSigningKey, SuccessionRecord, AGREEMENT_KEY_FILE, DEFAULT_IDENTITY_DIR, SIGNING_KEY_FILE,
+};
 pub use node_id::{NodeId, NodeIdError};
+pub use signer::{session_proof_message, SessionSigner, SignerError, HANDSHAKE_HASH_LEN, SESSION_DOMAIN};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -37,45 +48,45 @@ use zeroize::Zeroizing;
 
 pub const SCHEMA_VERSION: &str = "1.0.0";
 
-/// A node's private identity: the signing key plus the agreement key.
-pub struct NodeIdentity {
+/// The Ed25519 half: the key that *names* the node and signs on its behalf.
+///
+/// Held by `otwono-idd` alone. Nothing else in the system loads this key, because the set
+/// of processes that can read it is the set of processes whose compromise costs the node
+/// its identity permanently — a NodeID cannot be re-earned, only succeeded.
+pub struct SigningIdentity {
     signing: SigningKey,
-    agreement: X25519Secret,
     node_id: NodeId,
     created_at_unix_ms: u64,
 }
 
-impl std::fmt::Debug for NodeIdentity {
+impl std::fmt::Debug for SigningIdentity {
     /// Never print key material, not even truncated. A debug line in a log is exactly how
     /// a private key ends up somewhere it should not be.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NodeIdentity")
+        f.debug_struct("SigningIdentity")
             .field("node_id", &self.node_id.to_text())
             .field("created_at_unix_ms", &self.created_at_unix_ms)
             .finish_non_exhaustive()
     }
 }
 
-impl NodeIdentity {
-    /// Generate a fresh identity from the OS entropy source.
+impl SigningIdentity {
+    /// Generate a fresh signing key from the OS entropy source.
     ///
     /// On an SBC at first boot the entropy pool may not be seeded yet. `getrandom` blocks
     /// until it is rather than returning weak bytes, and a failure here is fatal: a
     /// predictable node key is worse than no node.
     pub fn generate() -> Result<Self, IdentityError> {
-        let mut signing_seed = Zeroizing::new([0u8; 32]);
-        let mut agreement_seed = Zeroizing::new([0u8; 32]);
-        getrandom::getrandom(signing_seed.as_mut()).map_err(|e| IdentityError::Entropy(e.to_string()))?;
-        getrandom::getrandom(agreement_seed.as_mut()).map_err(|e| IdentityError::Entropy(e.to_string()))?;
-        Ok(Self::from_seeds(&signing_seed, &agreement_seed, now_unix_ms()))
+        let mut seed = Zeroizing::new([0u8; 32]);
+        getrandom::getrandom(seed.as_mut()).map_err(|e| IdentityError::Entropy(e.to_string()))?;
+        Ok(Self::from_seed(&seed, now_unix_ms()))
     }
 
-    pub fn from_seeds(signing_seed: &[u8; 32], agreement_seed: &[u8; 32], created_at_unix_ms: u64) -> Self {
-        let signing = SigningKey::from_bytes(signing_seed);
+    pub fn from_seed(seed: &[u8; 32], created_at_unix_ms: u64) -> Self {
+        let signing = SigningKey::from_bytes(seed);
         let node_id = NodeId::from_public_key(&signing.verifying_key().to_bytes());
-        NodeIdentity {
+        SigningIdentity {
             signing,
-            agreement: X25519Secret::from(*agreement_seed),
             node_id,
             created_at_unix_ms,
         }
@@ -97,25 +108,12 @@ impl NodeIdentity {
         self.signing.verifying_key().to_bytes()
     }
 
-    pub fn agreement_public(&self) -> X25519Public {
-        X25519Public::from(&self.agreement)
-    }
-
-    /// The X25519 secret, for handing to a Noise session.
-    pub fn agreement_secret(&self) -> &X25519Secret {
-        &self.agreement
-    }
-
     /// The signing seed, for the keystore only.
     ///
     /// Returned wrapped in `Zeroizing` so a caller that drops it does not leave the seed
     /// in freed memory.
-    pub(crate) fn signing_seed(&self) -> Zeroizing<[u8; 32]> {
+    pub(crate) fn seed(&self) -> Zeroizing<[u8; 32]> {
         Zeroizing::new(self.signing.to_bytes())
-    }
-
-    pub(crate) fn agreement_seed(&self) -> Zeroizing<[u8; 32]> {
-        Zeroizing::new(self.agreement.to_bytes())
     }
 
     pub fn sign(&self, message: &[u8]) -> Signature {
@@ -127,26 +125,185 @@ impl NodeIdentity {
     /// A peer that completes a Noise handshake has proved possession of *an* X25519 key.
     /// This is what connects that key to a NodeID, and without it the handshake
     /// authenticates a key rather than a node.
-    pub fn agreement_binding(&self) -> AgreementBinding {
-        let agreement = self.agreement_public().to_bytes();
-        let signature = self.sign(&binding_message(&agreement));
+    ///
+    /// The agreement key is a parameter rather than a field because the process holding
+    /// the signing key does not hold the agreement secret: it vouches for a public key it
+    /// is told about.
+    pub fn bind_agreement(&self, agreement_public_key: &[u8; 32]) -> AgreementBinding {
+        let signature = self.sign(&binding_message(agreement_public_key));
         AgreementBinding {
             node_id: self.node_id,
             public_key: base64_encode(&self.public_key_bytes()),
-            agreement_public_key: base64_encode(&agreement),
+            agreement_public_key: base64_encode(agreement_public_key),
             signature: base64_encode(&signature.to_bytes()),
         }
     }
 
-    /// The public half, in the form a peer receives.
-    pub fn to_public(&self) -> PublicIdentity {
+    /// Sign a session proof. Refuses a hash of the wrong length — see
+    /// [`HANDSHAKE_HASH_LEN`].
+    pub fn sign_session(&self, handshake_hash: &[u8]) -> Result<[u8; 64], SignerError> {
+        if handshake_hash.len() != HANDSHAKE_HASH_LEN {
+            return Err(SignerError::BadHandshakeHash(handshake_hash.len()));
+        }
+        Ok(self.sign(&session_proof_message(handshake_hash)).to_bytes())
+    }
+
+    /// The public half, given the agreement key this node currently uses.
+    pub fn to_public(&self, agreement_public_key: &[u8; 32]) -> PublicIdentity {
         PublicIdentity {
             schema_version: SCHEMA_VERSION.to_string(),
             node_id: self.node_id,
             public_key: base64_encode(&self.public_key_bytes()),
-            agreement_public_key: base64_encode(&self.agreement_public().to_bytes()),
+            agreement_public_key: base64_encode(agreement_public_key),
             created_at_unix_ms: self.created_at_unix_ms,
         }
+    }
+}
+
+/// The X25519 half: the key Noise does key agreement with.
+///
+/// Held by `otwono-netd`. Losing it costs a node its current sessions and nothing else —
+/// it can be replaced, and the signing key vouches for the replacement. That asymmetry
+/// with [`SigningIdentity`] is the whole reason ADR-0006 keeps them separate.
+pub struct AgreementKey {
+    secret: X25519Secret,
+    created_at_unix_ms: u64,
+}
+
+impl std::fmt::Debug for AgreementKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgreementKey")
+            .field("public", &base64_encode(&self.public()))
+            .field("created_at_unix_ms", &self.created_at_unix_ms)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AgreementKey {
+    pub fn generate() -> Result<Self, IdentityError> {
+        let mut seed = Zeroizing::new([0u8; 32]);
+        getrandom::getrandom(seed.as_mut()).map_err(|e| IdentityError::Entropy(e.to_string()))?;
+        Ok(Self::from_seed(&seed, now_unix_ms()))
+    }
+
+    pub fn from_seed(seed: &[u8; 32], created_at_unix_ms: u64) -> Self {
+        AgreementKey {
+            secret: X25519Secret::from(*seed),
+            created_at_unix_ms,
+        }
+    }
+
+    pub fn created_at_unix_ms(&self) -> u64 {
+        self.created_at_unix_ms
+    }
+
+    pub fn public(&self) -> [u8; 32] {
+        X25519Public::from(&self.secret).to_bytes()
+    }
+
+    pub fn secret_bytes(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.secret.to_bytes())
+    }
+}
+
+/// A node's complete private identity: both halves in one process.
+///
+/// This is what a single-process tool or a test holds. The daemons do **not**: `otwono-idd`
+/// holds a [`SigningIdentity`] and `otwono-netd` holds an [`AgreementKey`], and they meet
+/// over the control plane. Keeping the combined type around is deliberate — it is the
+/// honest representation of "one process can do everything", and it is what makes the
+/// handshake tests readable.
+pub struct NodeIdentity {
+    signing: SigningIdentity,
+    agreement: AgreementKey,
+}
+
+impl std::fmt::Debug for NodeIdentity {
+    /// Never print key material, not even truncated.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeIdentity")
+            .field("node_id", &self.signing.node_id.to_text())
+            .field("created_at_unix_ms", &self.signing.created_at_unix_ms)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NodeIdentity {
+    pub fn generate() -> Result<Self, IdentityError> {
+        Ok(NodeIdentity {
+            signing: SigningIdentity::generate()?,
+            agreement: AgreementKey::generate()?,
+        })
+    }
+
+    pub fn from_seeds(signing_seed: &[u8; 32], agreement_seed: &[u8; 32], created_at_unix_ms: u64) -> Self {
+        NodeIdentity {
+            signing: SigningIdentity::from_seed(signing_seed, created_at_unix_ms),
+            agreement: AgreementKey::from_seed(agreement_seed, created_at_unix_ms),
+        }
+    }
+
+    pub fn from_parts(signing: SigningIdentity, agreement: AgreementKey) -> Self {
+        NodeIdentity { signing, agreement }
+    }
+
+    pub fn signing(&self) -> &SigningIdentity {
+        &self.signing
+    }
+
+    pub fn agreement(&self) -> &AgreementKey {
+        &self.agreement
+    }
+
+    pub fn node_id(&self) -> &NodeId {
+        self.signing.node_id()
+    }
+
+    pub fn created_at_unix_ms(&self) -> u64 {
+        self.signing.created_at_unix_ms()
+    }
+
+    pub fn verifying_key(&self) -> VerifyingKey {
+        self.signing.verifying_key()
+    }
+
+    pub fn public_key_bytes(&self) -> [u8; 32] {
+        self.signing.public_key_bytes()
+    }
+
+    pub fn agreement_public(&self) -> X25519Public {
+        X25519Public::from(self.agreement.public())
+    }
+
+    pub fn sign(&self, message: &[u8]) -> Signature {
+        self.signing.sign(message)
+    }
+
+    pub fn agreement_binding(&self) -> AgreementBinding {
+        self.signing.bind_agreement(&self.agreement.public())
+    }
+
+    pub fn to_public(&self) -> PublicIdentity {
+        self.signing.to_public(&self.agreement.public())
+    }
+}
+
+/// A node that holds both halves signs for itself, with no control-plane round trip.
+impl SessionSigner for NodeIdentity {
+    fn node_id(&self) -> NodeId {
+        *self.signing.node_id()
+    }
+
+    fn agreement_secret(&self) -> Zeroizing<[u8; 32]> {
+        self.agreement.secret_bytes()
+    }
+
+    fn agreement_binding(&self) -> Result<AgreementBinding, SignerError> {
+        Ok(NodeIdentity::agreement_binding(self))
+    }
+
+    fn sign_session(&self, handshake_hash: &[u8]) -> Result<[u8; 64], SignerError> {
+        self.signing.sign_session(handshake_hash)
     }
 }
 

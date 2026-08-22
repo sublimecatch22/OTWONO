@@ -152,6 +152,22 @@ mcopy -i "$ESP_IMG" "$ROOTFS/tmp/$EFI_NAME" "::EFI/BOOT/$EFI_NAME"
 rm -f "$ROOTFS/tmp/$EFI_NAME" "$ROOTFS/tmp/otwono-embedded.cfg"
 
 # --- 4. Root filesystems -------------------------------------------------------------------
+# Every device flashed from this image must boot as a *different* machine. debootstrap
+# leaves a concrete /etc/machine-id behind, and a shipped one is inherited by every device:
+# systemd derives per-host secrets from it, including the IPv4 link-local address, so two
+# nodes from one image land on the same address and cannot reach each other on a segment
+# with no DHCP server. It is also the DHCP DUID and the journal's host identity.
+#
+# An empty (zero-byte) /etc/machine-id is systemd's documented "first boot" marker: it
+# generates a random one and commits it. Done here, immediately before the filesystem is
+# sealed, so no earlier chroot step can put a value back.
+log "clearing the seeded machine identity so each device boots as its own machine"
+: > "$ROOTFS/etc/machine-id"
+chmod 0444 "$ROOTFS/etc/machine-id"
+# dbus keys off the same value; a stale copy would defeat the reset.
+rm -f "$ROOTFS/var/lib/dbus/machine-id"
+[ ! -s "$ROOTFS/etc/machine-id" ] || die "/etc/machine-id is still seeded; every device would share it"
+
 log "building root_a from the rootfs ($(du -sm "$ROOTFS" | cut -f1) MiB of content)"
 ROOT_A_IMG="$WORK/root_a.img"
 truncate -s "$(part_size_bytes 2)" "$ROOT_A_IMG"

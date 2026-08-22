@@ -89,6 +89,18 @@ impl ActionRegistry {
                     false,
                 ),
                 ActionSpec::new(
+                    "id.sign_session",
+                    "Sign one Noise handshake hash so otwono-netd can authenticate a peer",
+                    BlastRadius::Reversible,
+                    false,
+                ),
+                ActionSpec::new(
+                    "id.bind_agreement",
+                    "Vouch for an X25519 agreement key held by another daemon",
+                    BlastRadius::Reversible,
+                    false,
+                ),
+                ActionSpec::new(
                     "net.read",
                     "List the peers this node has met",
                     BlastRadius::Read,
@@ -148,6 +160,31 @@ impl ActionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_handshake_capabilities_never_demand_confirmation() {
+        // These fire on every peer connection. If either could be set always_confirm, the
+        // mesh would deadlock on a confirmation channel that does not exist yet.
+        let r = ActionRegistry::builtin();
+        for id in ["id.sign_session", "id.bind_agreement"] {
+            let spec = r.get(id).unwrap_or_else(|| panic!("{id} must be registered"));
+            assert!(!spec.always_confirm, "{id} runs unattended");
+            assert_eq!(spec.blast_radius, BlastRadius::Reversible);
+        }
+    }
+
+    #[test]
+    fn signing_a_session_is_a_narrower_action_than_signing_anything() {
+        // Separate actions so policy can grant the mesh what it needs without granting a
+        // general signing oracle.
+        let r = ActionRegistry::builtin();
+        assert!(r.get("id.sign").is_some());
+        assert!(r.get("id.sign_session").is_some());
+        assert_ne!(
+            r.get("id.sign").unwrap().summary,
+            r.get("id.sign_session").unwrap().summary
+        );
+    }
 
     #[test]
     fn unknown_actions_are_not_invented() {

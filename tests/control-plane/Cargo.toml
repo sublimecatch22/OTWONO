@@ -11,6 +11,11 @@ publish = false
 otwono-proto = { path = "../../crates/otwono-proto" }
 otwono-permd = { path = "../../crates/otwono-permd" }
 otwono-hwd = { path = "../../crates/otwono-hwd" }
+otwono-idd = { path = "../../crates/otwono-idd" }
+otwono-netd = { path = "../../crates/otwono-netd" }
+otwono-net = { path = "../../crates/otwono-net" }
+otwono-identity = { path = "../../crates/otwono-identity" }
 otwono-capability = { path = "../../crates/otwono-capability" }
 serde_json = "1"
+data-encoding = "2"
 rustix = { version = "0.38", features = ["process"] }

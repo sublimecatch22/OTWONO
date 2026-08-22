@@ -23,23 +23,23 @@
 //! The handshake-hash signature is what makes the proof specific to this session. Without
 //! it the binding is a standing document, and an attacker who obtained the agreement key
 //! alone could present a genuine binding forever.
+//!
+//! # Where the keys live
+//!
+//! Only the X25519 secret has to be in this process — `snow` drives the key agreement.
+//! The two Ed25519 signatures come from a [`SessionSigner`], which may sign locally or
+//! call `otwono-idd` over the control plane (ADR-0010). That is why building a proof is
+//! fallible: a node whose signing key is unreachable must abandon the handshake, never
+//! continue unauthenticated.
 
 use crate::link::{LinkAdapter, LinkError};
-use otwono_identity::{AgreementBinding, NodeIdentity, VerifiedPeer};
+use otwono_identity::{AgreementBinding, SessionSigner, SignerError, VerifiedPeer};
 use serde::{Deserialize, Serialize};
+
+pub use otwono_identity::{session_proof_message, SESSION_DOMAIN};
 
 /// The Noise pattern. Changing this is a wire-compatibility break.
 pub const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
-
-/// Domain tag for the per-session signature, distinct from every other signing context.
-pub const SESSION_DOMAIN: &[u8] = b"otwono-session-v1:";
-
-/// The message a session proof signs. Public so tests can forge one and prove it fails.
-pub fn session_proof_message(handshake_hash: &[u8]) -> Vec<u8> {
-    let mut m = SESSION_DOMAIN.to_vec();
-    m.extend_from_slice(handshake_hash);
-    m
-}
 
 /// Largest frame accepted during the handshake. Noise messages are far smaller; the cap
 /// stops a peer forcing a large allocation before it has authenticated.
@@ -73,21 +73,21 @@ impl<L: LinkAdapter> std::fmt::Debug for SecureChannel<L> {
 
 impl<L: LinkAdapter> SecureChannel<L> {
     /// Open a channel as the initiator.
-    pub fn initiate(link: L, identity: &NodeIdentity) -> Result<Self, HandshakeError> {
-        Self::handshake(link, identity, true)
+    pub fn initiate(link: L, signer: &dyn SessionSigner) -> Result<Self, HandshakeError> {
+        Self::handshake(link, signer, true)
     }
 
     /// Accept a channel as the responder.
-    pub fn accept(link: L, identity: &NodeIdentity) -> Result<Self, HandshakeError> {
-        Self::handshake(link, identity, false)
+    pub fn accept(link: L, signer: &dyn SessionSigner) -> Result<Self, HandshakeError> {
+        Self::handshake(link, signer, false)
     }
 
-    fn handshake(mut link: L, identity: &NodeIdentity, initiator: bool) -> Result<Self, HandshakeError> {
+    fn handshake(mut link: L, signer: &dyn SessionSigner, initiator: bool) -> Result<Self, HandshakeError> {
         let params = NOISE_PATTERN
             .parse()
             .map_err(|e| HandshakeError::Noise(format!("{e:?}")))?;
-        let static_secret = identity.agreement_secret().to_bytes();
-        let builder = snow::Builder::new(params).local_private_key(&static_secret);
+        let static_secret = signer.agreement_secret();
+        let builder = snow::Builder::new(params).local_private_key(static_secret.as_ref());
         let mut state = if initiator {
             builder.build_initiator()
         } else {
@@ -123,7 +123,7 @@ impl<L: LinkAdapter> SecureChannel<L> {
 
         // Exchange proofs over the now-encrypted channel. The initiator speaks first, so
         // both sides agree on the order and neither blocks.
-        let proof = build_proof(identity, &handshake_hash);
+        let proof = build_proof(signer, &handshake_hash)?;
         let peer = if initiator {
             send_encrypted(&mut transport, &mut link, &proof)?;
             let theirs: SessionProof = recv_encrypted(&mut transport, &mut link)?;
@@ -172,12 +172,20 @@ impl<L: LinkAdapter> SecureChannel<L> {
     }
 }
 
-fn build_proof(identity: &NodeIdentity, handshake_hash: &[u8]) -> SessionProof {
-    let signature = identity.sign(&session_proof_message(handshake_hash));
-    SessionProof {
-        binding: identity.agreement_binding(),
-        handshake_signature: data_encoding::BASE64.encode(&signature.to_bytes()),
-    }
+/// Build this side's proof.
+///
+/// Both halves can fail when the signer is remote: the binding is fetched and the
+/// signature is a control-plane call. A node that cannot prove who it is must abandon the
+/// handshake rather than continue unauthenticated.
+fn build_proof(signer: &dyn SessionSigner, handshake_hash: &[u8]) -> Result<SessionProof, HandshakeError> {
+    let binding = signer.agreement_binding().map_err(HandshakeError::Signer)?;
+    let signature = signer
+        .sign_session(handshake_hash)
+        .map_err(HandshakeError::Signer)?;
+    Ok(SessionProof {
+        binding,
+        handshake_signature: data_encoding::BASE64.encode(&signature),
+    })
 }
 
 /// Check every link in the chain from NodeID to the key Noise actually authenticated.
@@ -265,6 +273,8 @@ pub enum HandshakeError {
     Noise(String),
     Link(LinkError),
     Identity(otwono_identity::IdentityError),
+    /// This node could not produce its own proof — the signing key is unreachable.
+    Signer(SignerError),
     Malformed(String),
     NoRemoteStatic,
     /// The peer's binding names an agreement key that is not the one it authenticated with.
@@ -280,6 +290,7 @@ impl std::fmt::Display for HandshakeError {
             HandshakeError::Noise(e) => write!(f, "noise handshake failed: {e}"),
             HandshakeError::Link(e) => write!(f, "{e}"),
             HandshakeError::Identity(e) => write!(f, "peer identity invalid: {e}"),
+            HandshakeError::Signer(e) => write!(f, "cannot prove this node's own identity: {e}"),
             HandshakeError::Malformed(e) => write!(f, "malformed handshake payload: {e}"),
             HandshakeError::NoRemoteStatic => {
                 write!(f, "the handshake completed without a remote static key")

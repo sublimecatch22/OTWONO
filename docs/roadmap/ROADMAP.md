@@ -92,8 +92,14 @@ each authenticates the other's NodeID against the key it handshook with, and eac
 identity it generated itself on first boot. Evidence in `docs/build/VERIFICATION-LOG.md`.
 
 **Carried forward:** no radio link adapter, no routing or store-and-forward, no encrypted
-identity backup or TPM sealing, and `otwono-netd` still reads the keystore directly instead
-of asking `otwono-idd` to sign session proofs.
+identity backup, and no TPM sealing.
+
+**Closed after Phase 3 (ADR-0010).** `otwono-netd` no longer reads the keystore. The
+Ed25519 signing key belongs to `otwono-idd`; the mesh daemon holds only the X25519
+agreement key and asks for each session signature over the brokered control plane. Proven
+by an integration test that deletes `node.key` from disk and requires the handshake to
+succeed anyway. Both daemons still run as root, so the separation is by process and code
+path, not yet kernel-enforced.
 
 ---
 

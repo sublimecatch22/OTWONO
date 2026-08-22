@@ -866,8 +866,13 @@ dependencies = [
 name = "otwono-control-plane-tests"
 version = "0.1.0"
 dependencies = [
+ "data-encoding",
  "otwono-capability",
  "otwono-hwd",
+ "otwono-idd",
+ "otwono-identity",
+ "otwono-net",
+ "otwono-netd",
  "otwono-permd",
  "otwono-proto",
  "rustix",
@@ -946,11 +951,13 @@ name = "otwono-netd"
 version = "0.1.0"
 dependencies = [
  "data-encoding",
+ "otwono-idd",
  "otwono-identity",
  "otwono-net",
  "otwono-proto",
  "serde",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]

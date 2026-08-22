@@ -143,11 +143,30 @@ check_absent() { # partition-number guest-path description
     fi
 }
 check_absent 4 "/identity/node.key" "a private node key"
+check_absent 4 "/identity/agreement.key" "a private agreement key"
 check_absent 4 "/capability-profile.json" "a first-boot capability profile"
 check_absent 4 "/control-plane-profile.json" "a first-boot control-plane profile"
 check_absent 2 "/var/log/otwono/audit.jsonl" "an audit log from a previous boot"
+
+# A seeded machine-id is the same class of defect as a seeded node key: one value shared by
+# every device flashed from the image. systemd derives per-host secrets from it, the IPv4
+# link-local address among them, so two nodes from one image collide on a DHCP-less segment.
+# It must be present (systemd needs the file) and empty (its "generate one" marker).
+MACHINE_ID_PART="$PRISTINE_WORK/p2.img"
+if [ ! -f "$MACHINE_ID_PART" ]; then
+    mi_start=$(partx -g -o START -s --nr 2 "$IMAGE" | tr -d ' ')
+    mi_sectors=$(partx -g -o SECTORS -s --nr 2 "$IMAGE" | tr -d ' ')
+    dd if="$IMAGE" of="$MACHINE_ID_PART" bs=512 skip="$mi_start" count="$mi_sectors" status=none
+fi
+rm -f "$PRISTINE_WORK/machine-id"
+debugfs -R "dump /etc/machine-id $PRISTINE_WORK/machine-id" "$MACHINE_ID_PART" 2>/dev/null || true
+[ -f "$PRISTINE_WORK/machine-id" ] \
+    || die "the image has no /etc/machine-id; systemd needs the file to exist"
+[ ! -s "$PRISTINE_WORK/machine-id" ] \
+    || die "the image ships a seeded /etc/machine-id ($(tr -d '\n' < "$PRISTINE_WORK/machine-id")); every device flashed from it would be the same machine"
+
 rm -rf "$PRISTINE_WORK"
-log "  no identity, profiles or audit log in the artifact"
+log "  no identity, profiles, audit log or seeded machine-id in the artifact"
 
 log "re-verifying checksums against the untouched artifact"
 ( cd "$TARGET_OUT" && sha256sum -c SHA256SUMS ) \

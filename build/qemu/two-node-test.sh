@@ -56,13 +56,15 @@ echo "  output     $OUT"
 start=$(partx -g -o START -s --nr 4 "$IMAGE" | tr -d ' ')
 sectors=$(partx -g -o SECTORS -s --nr 4 "$IMAGE" | tr -d ' ')
 dd if="$IMAGE" of="$OUT/data-check.img" bs=512 skip="$start" count="$sectors" status=none
-rm -f "$OUT/found-key"
-debugfs -R "dump /identity/node.key $OUT/found-key" "$OUT/data-check.img" 2>/dev/null || true
-if [ -s "$OUT/found-key" ]; then
-    echo "FAIL: $IMAGE already contains a node identity." >&2
-    echo "      Both VMs would share a NodeID. Rebuild the image (make TARGET=... image)." >&2
-    exit 1
-fi
+for key in node.key agreement.key; do
+    rm -f "$OUT/found-key"
+    debugfs -R "dump /identity/$key $OUT/found-key" "$OUT/data-check.img" 2>/dev/null || true
+    if [ -s "$OUT/found-key" ]; then
+        echo "FAIL: $IMAGE already contains /identity/$key." >&2
+        echo "      Both VMs would share it. Rebuild the image (make TARGET=... image)." >&2
+        exit 1
+    fi
+done
 rm -f "$OUT/data-check.img" "$OUT/found-key"
 echo "  source image carries no identity, as it should"
 

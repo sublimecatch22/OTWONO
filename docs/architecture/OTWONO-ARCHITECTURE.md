@@ -139,8 +139,8 @@ desktop integration is allowed as a *bridge*, never as the source of truth.
 |---|---|---|
 | `otwono-hwd` | Probe hardware; publish the capability profile; watch for hotplug | Decide feature policy for other subsystems beyond publishing the profile |
 | `otwono-aid` | Model catalog, download, admission control, inference sessions | Touch the network overlay directly |
-| `otwono-idd` | Generate/hold node identity keys; sign and verify | Perform network I/O |
-| `otwono-netd` | Links, transport, peer discovery, routing, gateways | Read user files; store user data |
+| `otwono-idd` | Generate and hold the node's **Ed25519 signing key**; sign on behalf of authorized callers; vouch for agreement keys | Perform network I/O; hold an X25519 agreement secret |
+| `otwono-netd` | Links, transport, peer discovery, routing, gateways; holds only the node's **X25519 agreement key** | Read user files; store user data; open the signing key (ADR-0010) |
 | `otwono-stored` | Content-addressed store, visibility labels, replication policy | Make trust decisions about peers |
 | `otwono-svcd` | Host and consume distributed services (wiki, forum, profiles, media) | Bypass `otwono-stored` labels |
 | `otwono-permd` | Issue/verify capability tokens; policy; user prompts; audit log | Perform the privileged action itself |

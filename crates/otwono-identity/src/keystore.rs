@@ -1,11 +1,24 @@
-//! On-disk keystore.
+//! On-disk keystore, split by who is allowed to read what.
 //!
 //! ```text
 //! /var/lib/otwono/identity/
-//!   node.key        0600  signing seed, agreement seed, creation time
-//!   node.pub        0644  the public identity, safe to copy anywhere
-//!   succession.jsonl 0644 signed rotation records, append-only
+//!   node.key         0600  Ed25519 signing seed + the bound agreement public key   (otwono-idd)
+//!   agreement.key    0600  X25519 agreement secret                                 (otwono-netd)
+//!   node.pub         0644  the public identity, safe to copy anywhere
+//!   succession.jsonl 0644  signed rotation records, append-only
 //! ```
+//!
+//! Two files, not one, because two different daemons need two different halves and
+//! neither should be able to read the other's (ADR-0010). `node.key` never contains an
+//! agreement *secret*; it records the agreement *public* key so `otwono-idd` can say what
+//! it has vouched for without holding anything it does not need.
+//!
+//! # Upgrading from the single-file layout
+//!
+//! Phase 3 wrote both seeds into `node.key`. [`SigningKeystore::load`] still reads that
+//! file, and [`migrate_combined`] splits it in place, preserving the node's existing
+//! agreement key so its published `node.pub` does not change. The migration runs once, in
+//! `otwono-idd`, and removes the agreement seed from `node.key` when it is done.
 //!
 //! # What this does not do
 //!
@@ -18,7 +31,10 @@
 //! not implemented. Until it is, losing this file loses the identity, and the first-boot
 //! experience must not imply otherwise.
 
-use crate::{base64_decode, base64_encode, IdentityError, NodeId, NodeIdentity, SCHEMA_VERSION};
+use crate::{
+    base64_decode, base64_encode, AgreementKey, IdentityError, NodeId, NodeIdentity, SigningIdentity,
+    SCHEMA_VERSION,
+};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -26,19 +42,35 @@ use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 pub const DEFAULT_IDENTITY_DIR: &str = "/var/lib/otwono/identity";
-const KEY_FILE: &str = "node.key";
+pub const SIGNING_KEY_FILE: &str = "node.key";
+pub const AGREEMENT_KEY_FILE: &str = "agreement.key";
 const PUB_FILE: &str = "node.pub";
 const SUCCESSION_FILE: &str = "succession.jsonl";
 
-/// The private key file's contents.
+/// `node.key`: what the signing daemon stores.
 #[derive(Serialize, Deserialize)]
-pub struct StoredIdentity {
+pub struct StoredSigningKey {
     pub schema_version: String,
     pub algorithm: String,
     signing_seed: String,
-    agreement_seed: String,
+    /// Base64 X25519 public key this signing key has vouched for, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agreement_public_key: Option<String>,
+    /// Present only in a pre-split keystore. Read for migration, never written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agreement_seed: Option<String>,
     pub created_at_unix_ms: u64,
     /// False until TPM/TrustZone sealing exists. Never set this optimistically.
+    pub hardware_backed: bool,
+}
+
+/// `agreement.key`: what the mesh daemon stores.
+#[derive(Serialize, Deserialize)]
+pub struct StoredAgreementKey {
+    pub schema_version: String,
+    pub algorithm: String,
+    agreement_seed: String,
+    pub created_at_unix_ms: u64,
     pub hardware_backed: bool,
 }
 
@@ -89,13 +121,62 @@ fn succession_message(previous: &NodeId, new: &NodeId, at: u64) -> Vec<u8> {
     .into_bytes()
 }
 
-pub struct Keystore {
+/// A private key file that must be owner-only.
+///
+/// A key file readable by anyone is a compromised key, not a warning. Refusing is the only
+/// honest response: the node cannot know who has already read it.
+fn read_private(path: &Path) -> Result<Zeroizing<String>, KeystoreError> {
+    let text = Zeroizing::new(
+        std::fs::read_to_string(path).map_err(|e| KeystoreError::Io(format!("{}: {e}", path.display())))?,
+    );
+    let mode = std::fs::metadata(path)
+        .map_err(|e| KeystoreError::Io(format!("{}: {e}", path.display())))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(KeystoreError::InsecurePermissions {
+            path: path.to_path_buf(),
+            mode,
+        });
+    }
+    Ok(text)
+}
+
+/// Write a private key file. Created 0600 *before* any bytes reach it.
+fn write_private(path: &Path, body: &str) -> Result<(), KeystoreError> {
+    // mode() on OpenOptions sets the permissions at creation, so there is never an
+    // instant where the file exists world-readable.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| KeystoreError::Io(format!("{}: {e}", path.display())))?;
+    file.write_all(body.as_bytes())
+        .map_err(|e| KeystoreError::Io(format!("{}: {e}", path.display())))?;
+    file.sync_all()
+        .map_err(|e| KeystoreError::Io(format!("{}: {e}", path.display())))?;
+    // Re-assert the mode: an existing file keeps its old permissions through create().
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| KeystoreError::Io(format!("{}: {e}", path.display())))
+}
+
+fn ensure_dir(dir: &Path) -> Result<(), KeystoreError> {
+    std::fs::create_dir_all(dir).map_err(|e| KeystoreError::Io(format!("{}: {e}", dir.display())))?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| KeystoreError::Io(format!("{}: {e}", dir.display())))
+}
+
+/// The Ed25519 half of the keystore. Only `otwono-idd` opens this.
+pub struct SigningKeystore {
     dir: PathBuf,
 }
 
-impl Keystore {
+impl SigningKeystore {
     pub fn new(dir: impl AsRef<Path>) -> Self {
-        Keystore {
+        SigningKeystore {
             dir: dir.as_ref().to_path_buf(),
         }
     }
@@ -105,7 +186,7 @@ impl Keystore {
     }
 
     pub fn key_path(&self) -> PathBuf {
-        self.dir.join(KEY_FILE)
+        self.dir.join(SIGNING_KEY_FILE)
     }
 
     pub fn public_path(&self) -> PathBuf {
@@ -120,39 +201,32 @@ impl Keystore {
         self.key_path().exists()
     }
 
-    /// Load the identity, or generate and persist one if there is none.
+    /// Load the signing key, or generate and persist one if there is none.
     ///
-    /// This is what runs at first boot. It is deliberately the only way a node gets an
-    /// identity: no code path anywhere else invents one.
-    pub fn load_or_generate(&self) -> Result<(NodeIdentity, bool), KeystoreError> {
+    /// This is what runs at first boot. It is deliberately the only way a node gets a
+    /// name: no code path anywhere else invents one.
+    pub fn load_or_generate(&self) -> Result<(SigningIdentity, bool), KeystoreError> {
         if self.exists() {
             Ok((self.load()?, false))
         } else {
-            let identity = NodeIdentity::generate().map_err(KeystoreError::Identity)?;
-            self.persist(&identity)?;
+            let identity = SigningIdentity::generate().map_err(KeystoreError::Identity)?;
+            self.persist(&identity, None)?;
             Ok((identity, true))
         }
     }
 
-    pub fn load(&self) -> Result<NodeIdentity, KeystoreError> {
+    pub fn load(&self) -> Result<SigningIdentity, KeystoreError> {
+        let stored = self.load_stored()?;
+        Ok(SigningIdentity::from_seed(
+            &decode_seed(&stored.signing_seed)?,
+            stored.created_at_unix_ms,
+        ))
+    }
+
+    fn load_stored(&self) -> Result<StoredSigningKey, KeystoreError> {
         let path = self.key_path();
-        let text = Zeroizing::new(
-            std::fs::read_to_string(&path)
-                .map_err(|e| KeystoreError::Io(format!("{}: {e}", path.display())))?,
-        );
-
-        // A key file readable by anyone is a compromised key, not a warning. Refusing is
-        // the only honest response: the node cannot know who has already read it.
-        let mode = std::fs::metadata(&path)
-            .map_err(|e| KeystoreError::Io(format!("{}: {e}", path.display())))?
-            .permissions()
-            .mode()
-            & 0o777;
-        if mode & 0o077 != 0 {
-            return Err(KeystoreError::InsecurePermissions { path, mode });
-        }
-
-        let stored: StoredIdentity = serde_json::from_str(&text)
+        let text = read_private(&path)?;
+        let stored: StoredSigningKey = serde_json::from_str(&text)
             .map_err(|e| KeystoreError::Malformed(format!("{}: {e}", path.display())))?;
         if stored.algorithm != "ed25519" {
             return Err(KeystoreError::Malformed(format!(
@@ -160,66 +234,74 @@ impl Keystore {
                 stored.algorithm
             )));
         }
-
-        let signing = decode_seed(&stored.signing_seed)?;
-        let agreement = decode_seed(&stored.agreement_seed)?;
-        Ok(NodeIdentity::from_seeds(
-            &signing,
-            &agreement,
-            stored.created_at_unix_ms,
-        ))
+        Ok(stored)
     }
 
-    /// Write the identity. The key file is created 0600 *before* any bytes reach it.
-    pub fn persist(&self, identity: &NodeIdentity) -> Result<(), KeystoreError> {
-        std::fs::create_dir_all(&self.dir)
-            .map_err(|e| KeystoreError::Io(format!("{}: {e}", self.dir.display())))?;
-        std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| KeystoreError::Io(format!("{}: {e}", self.dir.display())))?;
+    /// The agreement public key this signing key has vouched for, if any.
+    pub fn bound_agreement_public_key(&self) -> Result<Option<[u8; 32]>, KeystoreError> {
+        match self.load_stored()?.agreement_public_key {
+            Some(text) => Ok(Some(decode_seed(&text)?)),
+            None => Ok(None),
+        }
+    }
 
-        let stored = StoredIdentity {
+    /// Write the signing key, recording which agreement key it vouches for.
+    pub fn persist(
+        &self,
+        identity: &SigningIdentity,
+        agreement_public_key: Option<&[u8; 32]>,
+    ) -> Result<(), KeystoreError> {
+        ensure_dir(&self.dir)?;
+        let stored = StoredSigningKey {
             schema_version: SCHEMA_VERSION.to_string(),
             algorithm: "ed25519".to_string(),
-            signing_seed: base64_encode(identity.signing_seed().as_ref()),
-            agreement_seed: base64_encode(identity.agreement_seed().as_ref()),
+            signing_seed: base64_encode(identity.seed().as_ref()),
+            agreement_public_key: agreement_public_key.map(|k| base64_encode(k)),
+            agreement_seed: None,
             created_at_unix_ms: identity.created_at_unix_ms(),
             hardware_backed: false,
         };
         let body = Zeroizing::new(
             serde_json::to_string_pretty(&stored).map_err(|e| KeystoreError::Malformed(e.to_string()))?,
         );
+        write_private(&self.key_path(), &body)?;
 
-        // mode() on OpenOptions sets the permissions at creation, so there is never an
-        // instant where the file exists world-readable.
-        let key_path = self.key_path();
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&key_path)
-            .map_err(|e| KeystoreError::Io(format!("{}: {e}", key_path.display())))?;
-        file.write_all(body.as_bytes())
-            .map_err(|e| KeystoreError::Io(format!("{}: {e}", key_path.display())))?;
-        file.sync_all()
-            .map_err(|e| KeystoreError::Io(format!("{}: {e}", key_path.display())))?;
-        // Re-assert the mode: an existing file keeps its old permissions through create().
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| KeystoreError::Io(format!("{}: {e}", key_path.display())))?;
-
-        let public = serde_json::to_string_pretty(&identity.to_public())
-            .map_err(|e| KeystoreError::Malformed(e.to_string()))?;
-        std::fs::write(self.public_path(), public + "\n")
-            .map_err(|e| KeystoreError::Io(format!("{}: {e}", self.public_path().display())))?;
-        std::fs::set_permissions(self.public_path(), std::fs::Permissions::from_mode(0o644))
-            .map_err(|e| KeystoreError::Io(format!("{}: {e}", self.public_path().display())))?;
+        // The published file can only be written once there is an agreement key to
+        // publish. Before that the node has a name but nothing to handshake with.
+        if let Some(agreement) = agreement_public_key {
+            let public = serde_json::to_string_pretty(&identity.to_public(agreement))
+                .map_err(|e| KeystoreError::Malformed(e.to_string()))?;
+            std::fs::write(self.public_path(), public + "\n")
+                .map_err(|e| KeystoreError::Io(format!("{}: {e}", self.public_path().display())))?;
+            std::fs::set_permissions(self.public_path(), std::fs::Permissions::from_mode(0o644))
+                .map_err(|e| KeystoreError::Io(format!("{}: {e}", self.public_path().display())))?;
+        }
         Ok(())
     }
 
-    /// Replace the identity with a fresh one, endorsed by the outgoing key.
-    pub fn rotate(&self, now_unix_ms: u64) -> Result<(NodeIdentity, SuccessionRecord), KeystoreError> {
+    /// Record which agreement key this node now uses, and republish `node.pub`.
+    ///
+    /// Takes the identity rather than reloading it. The caller already holds the current
+    /// one, and re-reading private key material from disk on every bind would be both a
+    /// pointless exposure and a race with [`rotate`](Self::rotate) — a bind that reloaded
+    /// mid-rotation would vouch for the agreement key under whichever signing key happened
+    /// to be on disk at that instant.
+    pub fn bind_agreement(
+        &self,
+        identity: &SigningIdentity,
+        agreement_public_key: &[u8; 32],
+    ) -> Result<(), KeystoreError> {
+        self.persist(identity, Some(agreement_public_key))
+    }
+
+    /// Replace the signing key with a fresh one, endorsed by the outgoing key.
+    ///
+    /// The agreement binding does not survive: the new key has vouched for nothing yet, so
+    /// `otwono-netd` must re-bind before the node can handshake again. Saying that out
+    /// loud is better than carrying a binding the new key never made.
+    pub fn rotate(&self, now_unix_ms: u64) -> Result<(SigningIdentity, SuccessionRecord), KeystoreError> {
         let previous = self.load()?;
-        let new = NodeIdentity::generate().map_err(KeystoreError::Identity)?;
+        let new = SigningIdentity::generate().map_err(KeystoreError::Identity)?;
 
         let message = succession_message(previous.node_id(), new.node_id(), now_unix_ms);
         let record = SuccessionRecord {
@@ -245,7 +327,7 @@ impl Keystore {
         file.sync_all()
             .map_err(|e| KeystoreError::Io(format!("{}: {e}", self.succession_path().display())))?;
 
-        self.persist(&new)?;
+        self.persist(&new, None)?;
         Ok((new, record))
     }
 
@@ -260,6 +342,125 @@ impl Keystore {
             .map(|l| serde_json::from_str(l).map_err(|e| KeystoreError::Malformed(e.to_string())))
             .collect()
     }
+}
+
+/// The X25519 half of the keystore. Only `otwono-netd` opens this.
+pub struct AgreementKeystore {
+    dir: PathBuf,
+}
+
+impl AgreementKeystore {
+    pub fn new(dir: impl AsRef<Path>) -> Self {
+        AgreementKeystore {
+            dir: dir.as_ref().to_path_buf(),
+        }
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn key_path(&self) -> PathBuf {
+        self.dir.join(AGREEMENT_KEY_FILE)
+    }
+
+    pub fn exists(&self) -> bool {
+        self.key_path().exists()
+    }
+
+    pub fn load_or_generate(&self) -> Result<(AgreementKey, bool), KeystoreError> {
+        if self.exists() {
+            Ok((self.load()?, false))
+        } else {
+            let key = AgreementKey::generate().map_err(KeystoreError::Identity)?;
+            self.persist(&key)?;
+            Ok((key, true))
+        }
+    }
+
+    pub fn load(&self) -> Result<AgreementKey, KeystoreError> {
+        let path = self.key_path();
+        let text = read_private(&path)?;
+        let stored: StoredAgreementKey = serde_json::from_str(&text)
+            .map_err(|e| KeystoreError::Malformed(format!("{}: {e}", path.display())))?;
+        if stored.algorithm != "x25519" {
+            return Err(KeystoreError::Malformed(format!(
+                "unsupported algorithm {:?}; this build understands x25519",
+                stored.algorithm
+            )));
+        }
+        Ok(AgreementKey::from_seed(
+            &decode_seed(&stored.agreement_seed)?,
+            stored.created_at_unix_ms,
+        ))
+    }
+
+    pub fn persist(&self, key: &AgreementKey) -> Result<(), KeystoreError> {
+        ensure_dir(&self.dir)?;
+        let stored = StoredAgreementKey {
+            schema_version: SCHEMA_VERSION.to_string(),
+            algorithm: "x25519".to_string(),
+            agreement_seed: base64_encode(key.secret_bytes().as_ref()),
+            created_at_unix_ms: key.created_at_unix_ms(),
+            hardware_backed: false,
+        };
+        let body = Zeroizing::new(
+            serde_json::to_string_pretty(&stored).map_err(|e| KeystoreError::Malformed(e.to_string()))?,
+        );
+        write_private(&self.key_path(), &body)
+    }
+}
+
+/// Split a pre-split `node.key` that still holds both seeds.
+///
+/// Returns `Ok(true)` when it did something. Idempotent: a keystore that is already split
+/// is left alone, and so is one that has no `node.key` at all.
+///
+/// The agreement seed is *preserved* rather than regenerated, so an upgraded node keeps
+/// the agreement key its `node.pub` already advertises. Refusing to overwrite an existing
+/// `agreement.key` matters: `otwono-netd` may already have generated one, and clobbering
+/// it would invalidate the binding under a live daemon.
+pub fn migrate_combined(dir: impl AsRef<Path>) -> Result<bool, KeystoreError> {
+    let signing_store = SigningKeystore::new(&dir);
+    if !signing_store.exists() {
+        return Ok(false);
+    }
+    let stored = signing_store.load_stored()?;
+    let Some(legacy_seed) = stored.agreement_seed.as_deref() else {
+        return Ok(false);
+    };
+
+    let agreement_store = AgreementKeystore::new(&dir);
+    let agreement = AgreementKey::from_seed(&decode_seed(legacy_seed)?, stored.created_at_unix_ms);
+    if !agreement_store.exists() {
+        agreement_store.persist(&agreement)?;
+    }
+
+    // Rewrite node.key without the agreement seed, recording the public half instead.
+    let signing = SigningIdentity::from_seed(&decode_seed(&stored.signing_seed)?, stored.created_at_unix_ms);
+    let bound = agreement_store.load()?.public();
+    signing_store.persist(&signing, Some(&bound))?;
+    Ok(true)
+}
+
+/// Write a combined identity as a pre-split `node.key`. Test support for the migration
+/// path — nothing in a shipped binary writes this layout any more.
+#[doc(hidden)]
+pub fn write_combined_for_test(dir: impl AsRef<Path>, identity: &NodeIdentity) -> Result<(), KeystoreError> {
+    let dir = dir.as_ref();
+    ensure_dir(dir)?;
+    let body = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "algorithm": "ed25519",
+        "signing_seed": base64_encode(identity.signing().seed().as_ref()),
+        "agreement_seed": base64_encode(identity.agreement().secret_bytes().as_ref()),
+        "created_at_unix_ms": identity.created_at_unix_ms(),
+        "hardware_backed": false,
+    });
+    write_private(
+        &dir.join(SIGNING_KEY_FILE),
+        &serde_json::to_string_pretty(&body).map_err(|e| KeystoreError::Malformed(e.to_string()))?,
+    )
 }
 
 fn decode_seed(text: &str) -> Result<[u8; 32], KeystoreError> {
@@ -306,80 +507,170 @@ mod tests {
         d
     }
 
+    /// A fully provisioned keystore: signing key, agreement key, and the binding between.
+    fn provisioned(dir: &Path) -> (SigningIdentity, AgreementKey) {
+        let signing_store = SigningKeystore::new(dir);
+        let agreement_store = AgreementKeystore::new(dir);
+        let (signing, _) = signing_store.load_or_generate().unwrap();
+        let (agreement, _) = agreement_store.load_or_generate().unwrap();
+        signing_store
+            .bind_agreement(&signing, &agreement.public())
+            .unwrap();
+        (signing, agreement)
+    }
+
     #[test]
     fn first_run_generates_and_persists() {
-        let ks = Keystore::new(tmpdir("gen"));
-        let (identity, generated) = ks.load_or_generate().unwrap();
+        let dir = tmpdir("gen");
+        let store = SigningKeystore::new(&dir);
+        let (identity, generated) = store.load_or_generate().unwrap();
         assert!(generated, "the first call must generate");
-        assert!(ks.exists());
-        assert!(ks.public_path().exists());
+        assert!(store.exists());
 
-        let (again, generated) = ks.load_or_generate().unwrap();
+        let (again, generated) = store.load_or_generate().unwrap();
         assert!(!generated, "the second call must load, not regenerate");
         assert_eq!(
             identity.node_id(),
             again.node_id(),
             "identity must survive a reload"
         );
-        let _ = std::fs::remove_dir_all(ks.dir());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn the_key_file_is_owner_only_and_the_public_file_is_not() {
-        let ks = Keystore::new(tmpdir("modes"));
-        ks.load_or_generate().unwrap();
-        let key_mode = std::fs::metadata(ks.key_path()).unwrap().permissions().mode() & 0o777;
-        let pub_mode = std::fs::metadata(ks.public_path()).unwrap().permissions().mode() & 0o777;
-        let dir_mode = std::fs::metadata(ks.dir()).unwrap().permissions().mode() & 0o777;
-        assert_eq!(key_mode, 0o600, "the private key must be owner-only");
-        assert_eq!(pub_mode, 0o644);
-        assert_eq!(dir_mode, 0o700);
-        let _ = std::fs::remove_dir_all(ks.dir());
+    fn the_signing_key_file_never_contains_an_agreement_secret() {
+        // The whole point of the split. If this ever holds a seed again, otwono-idd is
+        // storing a key it has no use for and otwono-netd's isolation is decorative.
+        let dir = tmpdir("nosecret");
+        let (_, agreement) = provisioned(&dir);
+        let raw = std::fs::read_to_string(SigningKeystore::new(&dir).key_path()).unwrap();
+        let stored: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(stored.get("agreement_seed").is_none(), "{raw}");
+        assert!(
+            !raw.contains(&base64_encode(agreement.secret_bytes().as_ref())),
+            "{raw}"
+        );
+        // The public half is there, because idd must know what it vouched for.
+        assert_eq!(
+            stored["agreement_public_key"].as_str().unwrap(),
+            base64_encode(&agreement.public())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_agreement_key_file_never_contains_the_signing_seed() {
+        let dir = tmpdir("nosigning");
+        let (signing, _) = provisioned(&dir);
+        let raw = std::fs::read_to_string(AgreementKeystore::new(&dir).key_path()).unwrap();
+        assert!(!raw.contains(&base64_encode(signing.seed().as_ref())), "{raw}");
+        let stored: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(stored.get("signing_seed").is_none(), "{raw}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn both_key_files_are_owner_only_and_the_public_file_is_not() {
+        let dir = tmpdir("modes");
+        provisioned(&dir);
+        let mode = |p: PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(SigningKeystore::new(&dir).key_path()), 0o600);
+        assert_eq!(mode(AgreementKeystore::new(&dir).key_path()), 0o600);
+        assert_eq!(mode(SigningKeystore::new(&dir).public_path()), 0o644);
+        assert_eq!(mode(dir.clone()), 0o700);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_world_readable_key_is_refused_rather_than_used() {
-        let ks = Keystore::new(tmpdir("insecure"));
-        ks.load_or_generate().unwrap();
-        std::fs::set_permissions(ks.key_path(), std::fs::Permissions::from_mode(0o644)).unwrap();
-        let err = ks.load().unwrap_err();
-        assert!(
-            matches!(err, KeystoreError::InsecurePermissions { .. }),
-            "expected a permissions refusal, got {err}"
-        );
+        let dir = tmpdir("insecure");
+        provisioned(&dir);
+        for path in [
+            SigningKeystore::new(&dir).key_path(),
+            AgreementKeystore::new(&dir).key_path(),
+        ] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let err = SigningKeystore::new(&dir).load().unwrap_err();
+        assert!(matches!(err, KeystoreError::InsecurePermissions { .. }), "{err}");
         assert!(err.to_string().contains("compromised"), "{err}");
-        let _ = std::fs::remove_dir_all(ks.dir());
+        let err = AgreementKeystore::new(&dir).load().unwrap_err();
+        assert!(matches!(err, KeystoreError::InsecurePermissions { .. }), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn the_stored_key_never_claims_hardware_backing() {
-        let ks = Keystore::new(tmpdir("hw"));
-        ks.load_or_generate().unwrap();
-        let stored: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(ks.key_path()).unwrap()).unwrap();
-        assert_eq!(stored["hardware_backed"], false, "TPM sealing is not implemented");
-        let _ = std::fs::remove_dir_all(ks.dir());
+    fn neither_stored_key_claims_hardware_backing() {
+        let dir = tmpdir("hw");
+        provisioned(&dir);
+        for path in [
+            SigningKeystore::new(&dir).key_path(),
+            AgreementKeystore::new(&dir).key_path(),
+        ] {
+            let stored: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(stored["hardware_backed"], false, "TPM sealing is not implemented");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_published_public_file_is_self_consistent() {
-        let ks = Keystore::new(tmpdir("pub"));
-        let (identity, _) = ks.load_or_generate().unwrap();
+        let dir = tmpdir("pub");
+        let (signing, agreement) = provisioned(&dir);
         let public: crate::PublicIdentity =
-            serde_json::from_str(&std::fs::read_to_string(ks.public_path()).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(SigningKeystore::new(&dir).public_path()).unwrap())
+                .unwrap();
         assert!(public.is_self_consistent());
-        assert_eq!(public.node_id, *identity.node_id());
-        let _ = std::fs::remove_dir_all(ks.dir());
+        assert_eq!(public.node_id, *signing.node_id());
+        assert_eq!(public.agreement_public_key, base64_encode(&agreement.public()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nothing_is_published_before_an_agreement_key_is_bound() {
+        // A node.pub without an agreement key would either lie or be unusable. Not
+        // writing one is the honest state for a node that cannot yet handshake.
+        let dir = tmpdir("unbound");
+        let store = SigningKeystore::new(&dir);
+        store.load_or_generate().unwrap();
+        assert!(!store.public_path().exists());
+        assert_eq!(store.bound_agreement_public_key().unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn binding_records_the_agreement_key_and_survives_a_reload() {
+        let dir = tmpdir("bind");
+        let (_, agreement) = provisioned(&dir);
+        assert_eq!(
+            SigningKeystore::new(&dir).bound_agreement_public_key().unwrap(),
+            Some(agreement.public())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_agreement_key_survives_a_reload() {
+        let dir = tmpdir("agreload");
+        let store = AgreementKeystore::new(&dir);
+        let (first, generated) = store.load_or_generate().unwrap();
+        assert!(generated);
+        let (again, generated) = store.load_or_generate().unwrap();
+        assert!(!generated, "a restart must not mint a new agreement key");
+        assert_eq!(first.public(), again.public());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn rotation_produces_a_record_the_old_key_endorses() {
-        let ks = Keystore::new(tmpdir("rotate"));
-        let (old, _) = ks.load_or_generate().unwrap();
+        let dir = tmpdir("rotate");
+        let store = SigningKeystore::new(&dir);
+        let (old, _) = provisioned(&dir);
         let old_public = old.public_key_bytes();
         let old_id = *old.node_id();
 
-        let (new, record) = ks.rotate(1_700_000_000_000).unwrap();
+        let (new, record) = store.rotate(1_700_000_000_000).unwrap();
         assert_ne!(new.node_id(), &old_id, "rotation must produce a new identity");
         assert_eq!(record.previous_node_id, old_id);
         assert_eq!(record.new_node_id, *new.node_id());
@@ -387,60 +678,144 @@ mod tests {
             .verify(&old_public)
             .expect("the outgoing key must endorse the new one");
 
-        // The keystore now holds the new identity.
-        assert_eq!(ks.load().unwrap().node_id(), new.node_id());
-        assert_eq!(ks.succession_records().unwrap().len(), 1);
-        let _ = std::fs::remove_dir_all(ks.dir());
+        assert_eq!(store.load().unwrap().node_id(), new.node_id());
+        assert_eq!(store.succession_records().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotation_drops_the_binding_the_old_key_made() {
+        // The new key has vouched for nothing. Carrying the old binding forward would
+        // present a signature the current key never made.
+        let dir = tmpdir("rotbind");
+        let store = SigningKeystore::new(&dir);
+        provisioned(&dir);
+        assert!(store.bound_agreement_public_key().unwrap().is_some());
+        store.rotate(1_700_000_000_000).unwrap();
+        assert_eq!(store.bound_agreement_public_key().unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_succession_record_signed_by_the_wrong_key_is_rejected() {
         // Otherwise anyone could declare themselves the successor to any node.
-        let ks = Keystore::new(tmpdir("forge"));
-        ks.load_or_generate().unwrap();
-        let (_, record) = ks.rotate(1_700_000_000_000).unwrap();
-        let impostor = NodeIdentity::generate().unwrap();
+        let dir = tmpdir("forge");
+        let store = SigningKeystore::new(&dir);
+        store.load_or_generate().unwrap();
+        let (_, record) = store.rotate(1_700_000_000_000).unwrap();
+        let impostor = SigningIdentity::generate().unwrap();
         assert!(record.verify(&impostor.public_key_bytes()).is_err());
-        let _ = std::fs::remove_dir_all(ks.dir());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_tampered_successor_key_is_rejected() {
-        let ks = Keystore::new(tmpdir("swap"));
-        let (old, _) = ks.load_or_generate().unwrap();
+        let dir = tmpdir("swap");
+        let store = SigningKeystore::new(&dir);
+        let (old, _) = store.load_or_generate().unwrap();
         let old_public = old.public_key_bytes();
-        let (_, mut record) = ks.rotate(1_700_000_000_000).unwrap();
-        let attacker = NodeIdentity::generate().unwrap();
+        let (_, mut record) = store.rotate(1_700_000_000_000).unwrap();
+        let attacker = SigningIdentity::generate().unwrap();
         record.new_public_key = base64_encode(&attacker.public_key_bytes());
         assert_eq!(record.verify(&old_public), Err(IdentityError::NodeIdMismatch));
-        let _ = std::fs::remove_dir_all(ks.dir());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn successive_rotations_append_rather_than_replace() {
-        let ks = Keystore::new(tmpdir("chain"));
-        ks.load_or_generate().unwrap();
-        ks.rotate(1).unwrap();
-        ks.rotate(2).unwrap();
-        let records = ks.succession_records().unwrap();
+        let dir = tmpdir("chain");
+        let store = SigningKeystore::new(&dir);
+        store.load_or_generate().unwrap();
+        store.rotate(1).unwrap();
+        store.rotate(2).unwrap();
+        let records = store.succession_records().unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(
             records[0].new_node_id, records[1].previous_node_id,
             "the chain must link"
         );
-        let _ = std::fs::remove_dir_all(ks.dir());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_malformed_key_file_is_an_error_not_a_new_identity() {
         // Silently regenerating would change the node's name and orphan every peer
         // relationship it had.
-        let ks = Keystore::new(tmpdir("corrupt"));
-        std::fs::create_dir_all(ks.dir()).unwrap();
-        std::fs::write(ks.key_path(), "{not json").unwrap();
-        std::fs::set_permissions(ks.key_path(), std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(matches!(ks.load(), Err(KeystoreError::Malformed(_))));
-        assert!(matches!(ks.load_or_generate(), Err(KeystoreError::Malformed(_))));
-        let _ = std::fs::remove_dir_all(ks.dir());
+        let dir = tmpdir("corrupt");
+        let store = SigningKeystore::new(&dir);
+        ensure_dir(&dir).unwrap();
+        write_private(&store.key_path(), "{not json").unwrap();
+        assert!(matches!(store.load(), Err(KeystoreError::Malformed(_))));
+        assert!(matches!(
+            store.load_or_generate(),
+            Err(KeystoreError::Malformed(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migration_splits_a_combined_keystore_without_changing_the_node() {
+        // An upgraded node must keep both its name and the agreement key its published
+        // node.pub already advertises, or every peer that cached it is wrong.
+        let dir = tmpdir("migrate");
+        let combined = NodeIdentity::generate().unwrap();
+        write_combined_for_test(&dir, &combined).unwrap();
+
+        assert!(migrate_combined(&dir).unwrap(), "the first run must migrate");
+
+        let signing_store = SigningKeystore::new(&dir);
+        assert_eq!(signing_store.load().unwrap().node_id(), combined.node_id());
+        assert_eq!(
+            AgreementKeystore::new(&dir).load().unwrap().public(),
+            combined.agreement_public().to_bytes()
+        );
+        assert_eq!(
+            signing_store.bound_agreement_public_key().unwrap(),
+            Some(combined.agreement_public().to_bytes())
+        );
+
+        // The seed is gone from node.key.
+        let raw = std::fs::read_to_string(signing_store.key_path()).unwrap();
+        assert!(
+            !raw.contains(&base64_encode(combined.agreement().secret_bytes().as_ref())),
+            "{raw}"
+        );
+
+        assert!(!migrate_combined(&dir).unwrap(), "migration must be idempotent");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migration_does_not_clobber_an_agreement_key_that_already_exists() {
+        // otwono-netd may have generated one already. Overwriting it would invalidate the
+        // binding under a running daemon.
+        let dir = tmpdir("noclobber");
+        let combined = NodeIdentity::generate().unwrap();
+        write_combined_for_test(&dir, &combined).unwrap();
+        let existing = AgreementKey::generate().unwrap();
+        AgreementKeystore::new(&dir).persist(&existing).unwrap();
+
+        migrate_combined(&dir).unwrap();
+
+        assert_eq!(
+            AgreementKeystore::new(&dir).load().unwrap().public(),
+            existing.public(),
+            "the live agreement key must survive"
+        );
+        assert_eq!(
+            SigningKeystore::new(&dir).bound_agreement_public_key().unwrap(),
+            Some(existing.public()),
+            "the binding must name the key that actually exists"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migration_is_a_no_op_on_an_empty_or_already_split_keystore() {
+        let dir = tmpdir("nomigrate");
+        assert!(!migrate_combined(&dir).unwrap(), "nothing to migrate");
+        provisioned(&dir);
+        assert!(!migrate_combined(&dir).unwrap(), "already split");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

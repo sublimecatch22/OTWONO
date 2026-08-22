@@ -2,9 +2,9 @@
 
 #![forbid(unsafe_code)]
 
-use otwono_identity::{Keystore, DEFAULT_IDENTITY_DIR};
+use otwono_identity::{AgreementKeystore, SessionSigner, DEFAULT_IDENTITY_DIR};
 use otwono_net::{Discovery, TcpLink};
-use otwono_netd::{run_discovery, run_listener, NetService, NetState, DEFAULT_PORT};
+use otwono_netd::{run_discovery, run_listener, BrokeredSigner, NetService, NetState, DEFAULT_PORT};
 use otwono_proto::{Server, Shutdown};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -19,16 +19,22 @@ USAGE:
 OPTIONS:
     --socket <PATH>        Control-plane socket (default $OTWONO_SOCKET_DIR/net.sock)
     --perm-socket <PATH>   Permission broker socket (default $OTWONO_SOCKET_DIR/perm.sock)
+    --id-socket <PATH>     Identity daemon socket (default $OTWONO_SOCKET_DIR/id.sock)
     --identity-dir <PATH>  Keystore directory (default /var/lib/otwono/identity)
     --listen <ADDR>        Overlay listen address (default 0.0.0.0:8443)
     --no-discovery         Do not announce or browse on the LAN
     --status               Query a running daemon and print its overlay status, then exit
+    --peers                Query a running daemon and print its peer table, then exit
     -h, --help             Show this message
 
 EXIT CODES:
     0  clean shutdown
     1  usage error
     2  startup failure
+
+This daemon holds only the node's X25519 agreement key. The Ed25519 key that its NodeID
+names belongs to otwono-idd, which must be running and must grant this daemon the
+id.sign_session capability, or no peer can be authenticated.
 ";
 
 fn main() -> ExitCode {
@@ -59,27 +65,31 @@ enum Error {
 fn run(args: &[String]) -> Result<String, Error> {
     let mut socket: Option<PathBuf> = None;
     let mut perm_socket: Option<PathBuf> = None;
+    let mut id_socket: Option<PathBuf> = None;
     let mut identity_dir = PathBuf::from(DEFAULT_IDENTITY_DIR);
     let mut listen = format!("0.0.0.0:{DEFAULT_PORT}");
     let mut discovery_enabled = true;
     let mut status_only = false;
+    let mut peers_only = false;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--socket" => socket = Some(next(&mut it, "--socket")?.into()),
             "--perm-socket" => perm_socket = Some(next(&mut it, "--perm-socket")?.into()),
+            "--id-socket" => id_socket = Some(next(&mut it, "--id-socket")?.into()),
             "--identity-dir" => identity_dir = next(&mut it, "--identity-dir")?.into(),
             "--listen" => listen = next(&mut it, "--listen")?,
             "--no-discovery" => discovery_enabled = false,
             "--status" => status_only = true,
+            "--peers" => peers_only = true,
             "-h" | "--help" => return Ok(USAGE.to_string()),
             other => return Err(Error::Usage(format!("unknown option {other}"))),
         }
     }
 
     // --status talks to a running daemon; it must not touch the keystore, or a second
-    // invocation would try to generate an identity of its own.
+    // invocation would try to generate an agreement key of its own.
     if status_only {
         let socket = socket.unwrap_or_else(|| otwono_proto::socket_path("net"));
         let mut client = otwono_proto::Client::connect_waiting(&socket, std::time::Duration::from_secs(10))
@@ -101,17 +111,43 @@ fn run(args: &[String]) -> Result<String, Error> {
         ));
     }
 
-    let keystore = Keystore::new(&identity_dir);
-    let (identity, generated) = keystore
+    // Who this node has met, and why any attempt failed. Guarded by net.read, so unlike
+    // --status this asks otwono-permd for a token first: peer identities are
+    // privacy-relevant even though each NodeID is public.
+    //
+    // This exists because a mesh that will not form is otherwise invisible on a headless
+    // box — the reason lives in the journal, and "connected=0" does not say why.
+    if peers_only {
+        let socket = socket.unwrap_or_else(|| otwono_proto::socket_path("net"));
+        let perm_socket = perm_socket.unwrap_or_else(|| otwono_proto::socket_path("perm"));
+        return peer_report(&socket, &perm_socket);
+    }
+
+    // Only the agreement half. This daemon has no way to open node.key and no code path
+    // that would know what to do with it (ADR-0010).
+    let keystore = AgreementKeystore::new(&identity_dir);
+    let (agreement, generated) = keystore
         .load_or_generate()
-        .map_err(|e| Error::Startup(format!("keystore: {e}")))?;
+        .map_err(|e| Error::Startup(format!("agreement keystore: {e}")))?;
     if generated {
         eprintln!(
-            "otwono-netd: generated a new node identity {}",
-            identity.node_id()
+            "otwono-netd: generated a new agreement key in {}",
+            keystore.key_path().display()
         );
     }
-    let node_id = *identity.node_id();
+
+    // Register it with otwono-idd and take back the signed binding. The node's *name*
+    // arrives here, from the signing key; this process cannot derive it.
+    let perm_socket = perm_socket.unwrap_or_else(|| otwono_proto::socket_path("perm"));
+    let id_socket = id_socket.unwrap_or_else(|| otwono_proto::socket_path("id"));
+    let signer = BrokeredSigner::bind(agreement, &id_socket, &perm_socket)
+        .map_err(|e| Error::Startup(format!("cannot bind this node's agreement key: {e}")))?;
+    let node_id = signer.node_id();
+    eprintln!(
+        "otwono-netd: bound to {} via {} (the node key stays in otwono-idd)",
+        node_id.fingerprint(),
+        id_socket.display()
+    );
 
     let listener =
         TcpLink::listen(&listen).map_err(|e| Error::Startup(format!("cannot listen on {listen}: {e}")))?;
@@ -119,7 +155,7 @@ fn run(args: &[String]) -> Result<String, Error> {
         .local_addr()
         .map_err(|e| Error::Startup(format!("cannot read the listen address: {e}")))?;
 
-    let state = Arc::new(NetState::new(identity));
+    let state = Arc::new(NetState::new(Arc::new(signer)));
     {
         let state = Arc::clone(&state);
         std::thread::spawn(move || run_listener(state, listener));
@@ -144,7 +180,6 @@ fn run(args: &[String]) -> Result<String, Error> {
     }
 
     let socket = socket.unwrap_or_else(|| otwono_proto::socket_path("net"));
-    let perm_socket = perm_socket.unwrap_or_else(|| otwono_proto::socket_path("perm"));
     let server = Server::bind(&socket)
         .map_err(|e| Error::Startup(format!("cannot bind {}: {e}", socket.display())))?;
     eprintln!(
@@ -158,6 +193,65 @@ fn run(args: &[String]) -> Result<String, Error> {
         .serve(Arc::new(NetService::new(state, perm_socket)), Shutdown::new())
         .map_err(|e| Error::Startup(format!("serve failed: {e}")))?;
     Ok(String::new())
+}
+
+/// Print one line per known peer: state, address, and the last failure if there was one.
+fn peer_report(socket: &std::path::Path, perm_socket: &std::path::Path) -> Result<String, Error> {
+    let mut broker = otwono_proto::Client::connect_waiting(perm_socket, std::time::Duration::from_secs(5))
+        .map_err(|e| {
+            Error::Startup(format!(
+                "cannot reach otwono-permd at {}: {e}",
+                perm_socket.display()
+            ))
+        })?;
+    let token = broker
+        .call(
+            "perm.request",
+            serde_json::json!({ "action": "net.read", "reason": "otwono-netd --peers" }),
+        )
+        .map_err(|e| Error::Startup(format!("perm.request transport failure: {e}")))?
+        .map_err(|e| Error::Startup(format!("perm.request refused: {}", e.message)))?;
+    let token = token
+        .get("token")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| Error::Startup("perm.request returned no token".into()))?
+        .to_string();
+
+    let mut client = otwono_proto::Client::connect_waiting(socket, std::time::Duration::from_secs(5))
+        .map_err(|e| Error::Startup(format!("cannot reach otwono-netd at {}: {e}", socket.display())))?;
+    let value = client
+        .call_with_capability("net.peers", serde_json::json!({}), &token)
+        .map_err(|e| Error::Startup(format!("net.peers transport failure: {e}")))?
+        .map_err(|e| Error::Startup(format!("net.peers refused: {}", e.message)))?;
+
+    let peers = value
+        .get("peers")
+        .and_then(|p| p.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if peers.is_empty() {
+        return Ok("no peers known\n".to_string());
+    }
+    let mut out = String::new();
+    for peer in peers {
+        let get = |k: &str| peer.get(k).and_then(|v| v.as_str()).unwrap_or("?").to_string();
+        let addresses = peer
+            .get("addresses")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(","))
+            .unwrap_or_default();
+        let addresses = if addresses.is_empty() {
+            "-".to_string()
+        } else {
+            addresses
+        };
+        out.push_str(&format!("{} {} {}", get("fingerprint"), get("state"), addresses));
+        if let Some(err) = peer.get("last_error").and_then(|e| e.as_str()) {
+            out.push_str(&format!(" error={err}"));
+        }
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 fn next<'a>(it: &mut impl Iterator<Item = &'a String>, flag: &str) -> Result<String, Error> {

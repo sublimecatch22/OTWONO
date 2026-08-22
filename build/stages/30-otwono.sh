@@ -131,6 +131,25 @@ action = "net.read"
 subjects = ["uid:0"]
 decision = "allow"
 ttl_seconds = 300
+
+# The mesh cannot authenticate a single peer without these two. otwono-netd holds only the
+# X25519 agreement key; the Ed25519 signature every Noise handshake needs comes from
+# otwono-idd, brokered (ADR-0010). Remove these rules and the node still boots, still
+# discovers peers over mDNS, and connects to none of them.
+#
+# id.sign_session is narrower than id.sign on purpose: it signs a fixed-length handshake
+# hash under a fixed domain, so granting it does not grant a general signing oracle.
+[[rule]]
+action = "id.sign_session"
+subjects = ["uid:0"]
+decision = "allow"
+ttl_seconds = 300
+
+[[rule]]
+action = "id.bind_agreement"
+subjects = ["uid:0"]
+decision = "allow"
+ttl_seconds = 300
 POLICY
 
 log "installing the control-plane runtime directory"
@@ -274,7 +293,11 @@ cat > "$ROOTFS/etc/systemd/system/otwono-netd.service" <<'UNIT'
 Description=OTWONO node mesh daemon
 Documentation=file:/usr/share/doc/otwono/NODE-NETWORK.md
 After=otwono-idd.service systemd-networkd.service systemd-tmpfiles-setup.service
-Requires=otwono-permd.service
+# Both are hard requirements since ADR-0010, not conveniences. This daemon holds only the
+# X25519 agreement key: it registers that key with otwono-idd at startup and asks it for a
+# signature on every handshake, brokered by otwono-permd. Without either, it can discover
+# peers and authenticate none of them, which is a worse state than not running.
+Requires=otwono-permd.service otwono-idd.service
 # network.target says "networking has been started", not "an interface has an address".
 # mDNS binds its sockets at startup, so a daemon that starts before addressing completes
 # announces on nothing. Wants (not Requires) so a node with no usable link still boots and
@@ -285,7 +308,7 @@ RequiresMountsFor=/var/lib/otwono
 
 [Service]
 Type=exec
-ExecStart=/usr/bin/otwono-netd --socket /run/otwono/net.sock --perm-socket /run/otwono/perm.sock
+ExecStart=/usr/bin/otwono-netd --socket /run/otwono/net.sock --perm-socket /run/otwono/perm.sock --id-socket /run/otwono/id.sock
 Restart=on-failure
 RestartSec=2
 

@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 use otwono_idd::IdentityService;
-use otwono_identity::{Keystore, DEFAULT_IDENTITY_DIR};
+use otwono_identity::{migrate_combined, SigningKeystore, DEFAULT_IDENTITY_DIR};
 use otwono_proto::{Server, Shutdown};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -71,7 +71,20 @@ fn run(args: &[String]) -> Result<String, Error> {
         }
     }
 
-    let keystore = Keystore::new(&identity_dir);
+    // Split a pre-ADR-0010 keystore before anything reads it, so an upgraded node keeps
+    // both its name and the agreement key its published node.pub already advertises.
+    match migrate_combined(&identity_dir) {
+        Ok(true) => eprintln!(
+            "otwono-idd: split the combined keystore in {}; the agreement secret now lives in \
+             {} and this daemon no longer holds it",
+            identity_dir.display(),
+            otwono_identity::AGREEMENT_KEY_FILE
+        ),
+        Ok(false) => {}
+        Err(e) => return Err(Error::Startup(format!("keystore migration: {e}"))),
+    }
+
+    let keystore = SigningKeystore::new(&identity_dir);
     let (identity, generated) = keystore
         .load_or_generate()
         .map_err(|e| Error::Startup(format!("keystore: {e}")))?;

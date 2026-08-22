@@ -33,6 +33,7 @@ otwono-identity = { path = "crates/otwono-identity" }
 otwono-net = { path = "crates/otwono-net" }
 otwono-proto = { path = "crates/otwono-proto" }
 otwono-permd = { path = "crates/otwono-permd" }
+otwono-idd = { path = "crates/otwono-idd" }
 
 [profile.release]
 opt-level = "z"

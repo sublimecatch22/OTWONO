@@ -6,19 +6,26 @@
   the typed action registry, fail-closed policy evaluation, scoped capability tokens, and
   the hash-chained audit log. One guarded service (`otwono-hwd`) enforces through it. See
   `docs/build/VERIFICATION-LOG.md`.
-* **Not implemented:** trust zones below are aspirational — both daemons currently run as
-  root, with systemd hardening but no dedicated users and no Landlock. There is no
-  confirmation channel, so an `Ask` decision fails closed with an error. Nothing in the
-  agent, network or storage sections exists yet.
+* **Partly implemented — the Z1/Z3 key boundary.** `otwono-idd` (Z1) is the only process
+  that opens the Ed25519 signing key; `otwono-netd` (Z3) holds only the X25519 agreement
+  key and asks Z1 for each session signature, brokered and audited (ADR-0010). Verified by
+  `tests/control-plane/tests/key_separation.rs`, which deletes `node.key` from disk and
+  requires the handshake to succeed regardless.
+* **Not implemented:** trust zones below are otherwise aspirational — every daemon still
+  runs as root, with systemd hardening but no dedicated users and no Landlock. The Z1/Z3
+  key split above is therefore enforced by *process and code path*, not by the kernel: a
+  0600 key file stops another user, not another root process. There is no confirmation
+  channel, so an `Ask` decision fails closed with an error. Nothing in the agent or storage
+  sections exists yet.
 
 ## 1. Trust zones
 
 | Zone | Contents | Privilege | Hardening |
 |---|---|---|---|
 | Z0 | Kernel, firmware, TPM | Full | Verified boot, lockdown, module signing |
-| Z1 | `otwono-permd`, `otwono-idd`, `otwono-updated` | Root, minimal | Small enough to audit; strict systemd hardening; no network |
+| Z1 | `otwono-permd`, `otwono-idd`, `otwono-updated` | Root, minimal | Small enough to audit; strict systemd hardening; no network. **Sole holder of the node's Ed25519 signing key.** |
 | Z2 | `otwono-hwd`, `otwono-aid`, `otwono-stored`, `otwono-svcd` | Dedicated users | Landlock-scoped filesystem, seccomp, no `exec` except declared backends |
-| Z3 | `otwono-netd` | Dedicated user | **Hostile-input boundary.** No filesystem write outside its spool, no `exec`, narrow seccomp, memory-safe language mandatory |
+| Z3 | `otwono-netd` | Dedicated user | **Hostile-input boundary.** No filesystem write outside its spool, no `exec`, narrow seccomp, memory-safe language mandatory. Holds only the X25519 agreement key — never the key its NodeID names. |
 | Z4 | `otwono-agentd`, app adapters | Unprivileged | Zero ambient privilege; everything brokered |
 | Z5 | User applications | User | Flatpak/bubblewrap where practical |
 | Z6 | Remote peers | None | Authenticated ≠ trusted |
@@ -29,6 +36,10 @@ The two boundaries that matter most:
   hostile input for a living; it gets the tightest sandbox in the system.
 - **Z4 → Z1.** The agent asking to do something privileged. This is where the permission
   broker lives, and where the security of the whole design is decided.
+- **Z3 → Z1.** The mesh daemon asking for a signature it cannot make itself. Narrow by
+  construction: `id.sign_session` signs a fixed-length handshake hash under a fixed domain,
+  and `id.bind_agreement` vouches for a public key. Neither hands anything back that lets
+  the caller sign something of its own choosing (ADR-0010).
 
 ## 2. The permission broker
 
@@ -108,7 +119,8 @@ the real effect.
 - systemd unit baseline: `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`,
   `PrivateTmp`, `PrivateDevices`, `RestrictAddressFamilies`, `SystemCallFilter`,
   `MemoryDenyWriteExecute` where the backend allows it.
-- Landlock per-daemon filesystem scoping; seccomp for `otwono-netd`.
+- Landlock per-daemon filesystem scoping; seccomp for `otwono-netd`. Until these exist, the
+  Z1/Z3 key split is a code-path property, not a kernel-enforced one.
 - No default listening TCP ports beyond ONM's, which is authenticated.
 
 ## 6. What we do not promise

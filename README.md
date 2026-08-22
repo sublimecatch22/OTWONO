@@ -10,10 +10,12 @@ system, same subsystems, same interfaces — the capabilities scale to the hardw
 > **permission broker and hardware daemon now run on both booted systems**: at first boot the
 > guest requests a capability, calls the hardware daemon with it, and the broker writes a
 > hash-chained audit record — all recovered from the image and verified on the host
-> afterwards. **Two nodes now form a mesh**: booted from one image onto a segment with no
+> afterwards. **Two nodes form a mesh**: booted from one image onto a segment with no
 > DHCP server, they discover each other over mDNS and each authenticates the other's
-> cryptographic NodeID. Nothing has run on real hardware yet; there is no radio link, no
-> routing, no AI runtime, and the daemons still run as root pending user separation.
+> cryptographic NodeID — and since ADR-0010 the daemon that talks to the network no longer
+> holds the key its NodeID names. Nothing has run on real hardware yet; there is no radio
+> link, no routing, no AI runtime, and the daemons still run as root pending user
+> separation.
 >
 > Every document and subsystem carries an explicit status (`SPECIFIED` / `IMPLEMENTED` /
 > `VERIFIED`), and nothing here claims to work that has not been run — see
