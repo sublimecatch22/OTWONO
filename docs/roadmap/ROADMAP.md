@@ -28,7 +28,7 @@ a schema-valid profile on real hardware. **Met.**
 
 ---
 
-## Phase 1 — Bootable base images  ← *in progress: amd64 done, arm64 pending*
+## Phase 1 — Bootable base images ✅ complete
 
 **Goal:** an image that boots, on both architectures, with a boot log to prove it.
 
@@ -42,12 +42,13 @@ a schema-valid profile on real hardware. **Met.**
 **Exit criterion:** `boot.log` for both architectures showing a login prompt, plus the
 capability profile recovered from **inside** each VM.
 
-**amd64: met.** `out/amd64-qemu-ubuntu/boot.log` reaches `otwono login:`, and stage 60
-recovers `capability-profile.json` from the guest's own data partition (tier `T0_MICRO`,
-architecture `x86_64`, limited by compute). Details and the four bugs it exposed are in
-`docs/build/VERIFICATION-LOG.md`.
+**Met on both architectures.** Each `boot.log` reaches `otwono login:`, and stage 60
+recovers `capability-profile.json` from the guest's own data partition, reporting `x86_64`
+and `aarch64` respectively. The arm64 image is entirely cross-built on an x86_64 host.
+Details, and the five bugs booting it exposed, are in `docs/build/VERIFICATION-LOG.md`.
 
-**arm64: not yet.** The build has not completed.
+**Not covered by Phase 1:** no image has run on real hardware, and automatic A/B rollback
+is not implemented (both slots exist and are bootable; nothing counts boot attempts yet).
 
 **Risks encountered:** no KVM ⇒ TCG boots take minutes, so the harness now terminates as
 soon as its required patterns appear rather than burning the full timeout; Debian mirrors
@@ -55,7 +56,7 @@ blocked ⇒ only the Ubuntu recipes are exercised here.
 
 ---
 
-## Phase 2 — Service architecture and the permission broker
+## Phase 2 — Service architecture and the permission broker  ← *recommended next milestone*
 
 **Goal:** the Local Control Plane exists and the security model has teeth.
 

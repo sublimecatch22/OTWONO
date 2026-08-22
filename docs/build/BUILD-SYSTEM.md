@@ -1,8 +1,8 @@
 # Reproducible Build System
 
-**Status:** `VERIFIED` on **amd64** — the full pipeline builds an image that boots under
-QEMU to a login prompt and produces a capability profile from inside the VM.
-**arm64 is not yet verified.**
+**Status:** `VERIFIED` on **amd64 and arm64** — the full pipeline builds images that boot
+under QEMU to a login prompt and produce a capability profile from inside the VM,
+recovered afterwards from the guest's own data partition.
 
 See `docs/build/VERIFICATION-LOG.md` for exactly what has been executed and what has not.
 

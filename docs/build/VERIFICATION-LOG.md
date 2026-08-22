@@ -70,11 +70,30 @@ Note: `chroot rootfs otwono-hwctl tier` reports `T0_MICRO` because a bare chroot
 `/proc` or `/sys`. That is the fail-closed behaviour the design requires — an undetectable
 machine must classify down, never up.
 
-## Phase 1 — amd64 image boots
+## Phase 1 — both images boot
 
-**`make -C build TARGET=amd64-qemu-ubuntu boot-test` passes.** The image boots under QEMU
-(TCG, no KVM) to a login prompt in roughly 40 seconds of guest time, and the capability
-profile is recovered from the guest's own data partition afterwards:
+**`boot-test` passes for `amd64-qemu-ubuntu` and `arm64-qemu-ubuntu`.** Both images boot
+under QEMU (TCG, no KVM) to a login prompt, and the capability profile is recovered
+afterwards from the guest's own data partition. amd64 reaches login in roughly 40 seconds
+of guest time; arm64 is fully emulated and considerably slower.
+
+| | amd64 | arm64 |
+|---|---|---|
+| Architecture in profile | `x86_64` | `aarch64` |
+| Tier | `T0_MICRO` | `T0_MICRO` |
+| Limiting axis | compute (Minimal < Low) | compute (Minimal < Low) |
+| Accelerator detected | `simple-framebuffer`, no compute API | none |
+| Kernel | 6.8.0-31-generic, 14.9 MiB | 6.8.0-31-generic, 18.2 MiB |
+| initramfs | 18.0 MiB | 17.3 MiB |
+| Bootloader | `BOOTX64.EFI`, 3.6 MiB | `BOOTAA64.EFI`, 3.5 MiB |
+| Image on disk | 420 MiB | 477 MiB |
+
+The arm64 path is entirely cross-built on an x86_64 host: `debootstrap --foreign` plus a
+second stage under `qemu-aarch64-static`, apt and `update-initramfs` in the emulated
+chroot, and `grub-mkstandalone --format=arm64-efi` run by the target's own grub packages
+inside that chroot.
+
+amd64 detail:
 
 ```
 PASS: every required pattern appeared
@@ -101,7 +120,7 @@ Artifacts: `out/amd64-qemu-ubuntu/boot.log`, `.../capability-profile.json`,
 
 ### Bugs this found
 
-Four defects surfaced that no amount of desk-checking would have, listed because each one
+Five defects surfaced that no amount of desk-checking would have, listed because each one
 says something about where the design was weak.
 
 **1. Kernel with no initramfs.** `update-initramfs: No such file or directory`. The kernel
@@ -135,6 +154,22 @@ This is the case for verifying against the artifact rather than the console: the
 marker said `OTWONO-CAPABILITY-OK` on the broken build. Only reading the file back off the
 guest's disk exposed it.
 
+**5. A framebuffer classified as an integrated GPU.** The amd64 guest reports a
+`simple-framebuffer` DRM card — the EFI framebuffer handover, which has no shader cores and
+no compute API. The probe's rule was "any DRM driver implies Vulkan", so it came back as
+`accelerator=igpu`.
+
+This was not QEMU-specific: every UEFI machine with no real graphics driver loaded looks
+like this, as does every server with an ASPEED or Matrox BMC display. `otwono-hal` now
+carries an explicit display-only driver list, and such devices are still reported —
+honestly, with an empty `compute_apis` — but contribute nothing to the accelerator axis.
+Re-verified on the target: the amd64 guest now reports `accelerator=none`.
+
+The tier was unaffected (`igpu` is still below `gpu_small`, so nothing was unlocked), but
+it would have misled a user and any later logic keyed on `igpu` meaning "try GPU offload".
+Only running the probe on a real boot surfaced it — no fixture in the repository contained
+a framebuffer-only machine.
+
 ### Other corrections made while wiring Phase 1
 
 - `fstab` mounted root `ro`, which cannot boot while `/var` is still on the root
@@ -156,8 +191,11 @@ Environment findings that shaped stage 50:
 
 ## What has *not* been verified
 
-- **arm64 has not been booted.** The arm64 image build has not completed. Only amd64 has a
-  boot log. Nothing should claim a bootable arm64 image.
+- **Only QEMU has been booted.** No image has run on real hardware — no Raspberry Pi, no
+  Rockchip board, no physical x86 machine. QEMU `virt` supplies its own device tree, so the
+  arm64 SBC path (U-Boot, per-board DTBs, vendor kernels) is completely unexercised.
+- **Both test VMs classify as `T0_MICRO`**, so no tier above T0 has been exercised on a
+  booted system.
 - **Automatic A/B rollback is not implemented.** The layout and both menu entries exist and
   slot B is bootable, but nothing counts boot attempts or switches slots yet (Phase 8).
 - **The root filesystem is mounted rw.** An immutable root needs `/var` moved off it first;

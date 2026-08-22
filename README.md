@@ -6,10 +6,11 @@ networking, local AI, distributed services, and offline-first capabilities.
 Runs on **x86_64/AMD64** computers and **ARM64** single-board computers. Same operating
 system, same subsystems, same interfaces — the capabilities scale to the hardware.
 
-> **Project status: Phase 1.** The **amd64 image boots** — under QEMU it reaches a login
-> prompt and produces a hardware capability profile from inside the VM, recovered from the
-> guest's own disk. arm64 is not yet verified. No OTWONO daemon exists yet; the node
-> network, AI runtime, permission broker and distributed services are design only.
+> **Project status: Phase 1 complete.** **Both the amd64 and arm64 images boot** — under
+> QEMU each reaches a login prompt and produces a hardware capability profile from inside
+> the VM, recovered afterwards from the guest's own disk. The arm64 image is cross-built on
+> an x86_64 host. Nothing has run on real hardware yet, and no OTWONO daemon exists: the
+> node network, AI runtime, permission broker and distributed services are design only.
 >
 > Every document and subsystem carries an explicit status (`SPECIFIED` / `IMPLEMENTED` /
 > `VERIFIED`), and nothing here claims to work that has not been run — see
@@ -81,11 +82,10 @@ make -C build list-targets
 
 # Build and boot an amd64 image. Verified: reaches a login prompt under QEMU and
 # recovers a capability profile from inside the VM.
-make -C build TARGET=amd64-qemu-ubuntu image
 make -C build TARGET=amd64-qemu-ubuntu boot-test
 
-# arm64 cross-builds via binfmt_misc + qemu-user. Not yet verified end to end.
-make -C build TARGET=arm64-qemu-ubuntu image
+# arm64 cross-builds via binfmt_misc + qemu-user, and boots the same way.
+make -C build TARGET=arm64-qemu-ubuntu boot-test
 ```
 
 Artifacts land in `out/<target>/`: the image, `boot.log`, `capability-profile.json`

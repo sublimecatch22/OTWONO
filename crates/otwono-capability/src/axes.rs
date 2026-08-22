@@ -268,6 +268,24 @@ mod tests {
     }
 
     #[test]
+    fn a_display_only_framebuffer_yields_no_accelerator() {
+        // Regression: a QEMU amd64 guest reports a `simple-framebuffer` DRM card. It has no
+        // compute API, so the accelerator axis must be `none`, not `igpu`.
+        let mut r = report_pi5_16gb();
+        r.accelerators = vec![otwono_hal::AcceleratorInfo {
+            kind: AcceleratorKind::Gpu,
+            vendor: "unknown".into(),
+            name: None,
+            driver: Some("simple-framebuffer".into()),
+            discrete: false,
+            vram_bytes: None,
+            compute_apis: vec![],
+            source: "test".into(),
+        }];
+        assert_eq!(classify_accelerator(&r), AcceleratorClass::None);
+    }
+
+    #[test]
     fn rotational_disks_never_reach_fast() {
         let mut r = report_workstation();
         r.storage.rotational_only = true;

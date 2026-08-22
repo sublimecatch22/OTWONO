@@ -11,9 +11,9 @@ See [`docs/build/BUILD-SYSTEM.md`](../docs/build/BUILD-SYSTEM.md) for the design
 | `10-bootstrap` | **VERIFIED** | amd64 native and arm64 cross-bootstrap (binfmt_misc + qemu-user second stage) both completed |
 | `20-base-config` | **VERIFIED** | Packages installed in the chroot; serial getty enabled |
 | `30-otwono` | **VERIFIED** | Binaries, schemas, units installed; `otwono-hwctl` runs inside the rootfs |
-| `40-kernel` | **VERIFIED (amd64)** | Kernel 6.8.0-31-generic, 18 MiB initramfs. Asserts the initramfs is a plausible size |
-| `50-image` | **VERIFIED (amd64)** | GPT + ESP + A/B roots + data, assembled with no loop devices and no mounts. 8 GiB apparent, 419 MiB on disk |
-| `60-verify` | **VERIFIED (amd64)** | Boots under QEMU to a login prompt and recovers the capability profile the guest wrote to its own data partition |
+| `40-kernel` | **VERIFIED (amd64 + arm64)** | Kernel 6.8.0-31-generic, 18 MiB initramfs. Asserts the initramfs is a plausible size |
+| `50-image` | **VERIFIED (amd64 + arm64)** | GPT + ESP + A/B roots + data, assembled with no loop devices and no mounts. 8 GiB apparent, 419 MiB on disk |
+| `60-verify` | **VERIFIED (amd64 + arm64)** | Boots under QEMU to a login prompt and recovers the capability profile the guest wrote to its own data partition |
 
 ## Targets
 

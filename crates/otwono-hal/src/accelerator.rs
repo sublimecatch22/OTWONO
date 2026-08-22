@@ -119,7 +119,36 @@ fn is_discrete(vendor: &str, driver: Option<&str>, vram: Option<u64>) -> bool {
     }
 }
 
+/// DRM drivers that only scan out pixels. They register a `card*` node like any GPU but
+/// have no shader cores and no compute API, so they must never contribute to the
+/// accelerator class.
+///
+/// Found by booting: a QEMU amd64 guest reports `simple-framebuffer`, which the earlier
+/// "any DRM driver implies Vulkan" rule classified as an integrated GPU. Every UEFI
+/// machine with no real graphics driver loaded looks like this, so the mistake was not
+/// specific to QEMU.
+const DISPLAY_ONLY_DRIVERS: [&str; 11] = [
+    "simple-framebuffer", // simpledrm — the EFI/VESA framebuffer handover
+    "simpledrm",
+    "efifb",
+    "vesafb",
+    "bochs-drm",
+    "bochs",
+    "cirrus",
+    "qxl",
+    "ast",     // ASPEED BMC display, ubiquitous on servers
+    "mgag200", // Matrox BMC display
+    "vboxvideo",
+];
+
+fn is_display_only(driver: Option<&str>) -> bool {
+    driver.is_some_and(|d| DISPLAY_ONLY_DRIVERS.contains(&d))
+}
+
 fn compute_apis(p: &SystemProbe, driver: Option<&str>) -> Vec<String> {
+    if is_display_only(driver) {
+        return Vec::new();
+    }
     let mut apis = Vec::new();
     match driver {
         Some("nvidia") => {
@@ -134,6 +163,8 @@ fn compute_apis(p: &SystemProbe, driver: Option<&str>) -> Vec<String> {
             }
             apis.push("vulkan".to_string());
         }
+        // A real driver we do not recognise: assume Vulkan is plausible but nothing more.
+        // Being wrong here costs a failed backend probe, not an OOM kill.
         Some(_) => apis.push("vulkan".to_string()),
         None => {}
     }
@@ -272,6 +303,39 @@ mod tests {
     #[test]
     fn unknown_driver_without_vram_is_not_assumed_discrete() {
         assert!(!is_discrete("unknown", Some("weird_gpu"), None));
+    }
+
+    #[test]
+    fn a_framebuffer_is_not_an_accelerator() {
+        // Every UEFI machine without a real graphics driver presents one of these. Calling
+        // it an integrated GPU would advertise compute that does not exist.
+        let probe = SystemProbe::from_root("/nonexistent");
+        for d in [
+            "simple-framebuffer",
+            "simpledrm",
+            "efifb",
+            "bochs-drm",
+            "ast",
+            "mgag200",
+        ] {
+            assert!(is_display_only(Some(d)), "{d} should be display-only");
+            assert!(
+                compute_apis(&probe, Some(d)).is_empty(),
+                "{d} must expose no compute API"
+            );
+        }
+    }
+
+    #[test]
+    fn real_gpu_drivers_are_not_treated_as_display_only() {
+        let probe = SystemProbe::from_root("/nonexistent");
+        for d in ["amdgpu", "i915", "xe", "nvidia", "panfrost", "v3d"] {
+            assert!(!is_display_only(Some(d)), "{d} is a real GPU driver");
+            assert!(
+                !compute_apis(&probe, Some(d)).is_empty(),
+                "{d} should expose at least Vulkan"
+            );
+        }
     }
 
     #[test]
