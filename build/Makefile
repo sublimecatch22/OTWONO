@@ -62,6 +62,14 @@ image:     stage-50
 boot-test: stage-60
 verify:    stage-60
 
+# The Phase 3 exit criterion: two VMs on a private segment forming a mesh.
+.PHONY: two-node-test
+two-node-test: check-recipe
+	@$(BUILD_DIR)/qemu/two-node-test.sh \
+	  --image "$(TARGET_OUT)/otwono-$(TARGET).img" \
+	  --arch "$$(sed -n 's/^arch = "\(.*\)"/\1/p' $(RECIPE) | head -1)" \
+	  --out "$(TARGET_OUT)/two-node"
+
 clean:
 	rm -rf "$(TARGET_OUT)"
 

@@ -22,6 +22,7 @@ OPTIONS:
     --identity-dir <PATH>  Keystore directory (default /var/lib/otwono/identity)
     --listen <ADDR>        Overlay listen address (default 0.0.0.0:8443)
     --no-discovery         Do not announce or browse on the LAN
+    --status               Query a running daemon and print its overlay status, then exit
     -h, --help             Show this message
 
 EXIT CODES:
@@ -61,6 +62,7 @@ fn run(args: &[String]) -> Result<String, Error> {
     let mut identity_dir = PathBuf::from(DEFAULT_IDENTITY_DIR);
     let mut listen = format!("0.0.0.0:{DEFAULT_PORT}");
     let mut discovery_enabled = true;
+    let mut status_only = false;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -70,9 +72,33 @@ fn run(args: &[String]) -> Result<String, Error> {
             "--identity-dir" => identity_dir = next(&mut it, "--identity-dir")?.into(),
             "--listen" => listen = next(&mut it, "--listen")?,
             "--no-discovery" => discovery_enabled = false,
+            "--status" => status_only = true,
             "-h" | "--help" => return Ok(USAGE.to_string()),
             other => return Err(Error::Usage(format!("unknown option {other}"))),
         }
+    }
+
+    // --status talks to a running daemon; it must not touch the keystore, or a second
+    // invocation would try to generate an identity of its own.
+    if status_only {
+        let socket = socket.unwrap_or_else(|| otwono_proto::socket_path("net"));
+        let mut client = otwono_proto::Client::connect_waiting(&socket, std::time::Duration::from_secs(10))
+            .map_err(|e| {
+            Error::Startup(format!("cannot reach otwono-netd at {}: {e}", socket.display()))
+        })?;
+        let value = client
+            .call("net.status", serde_json::json!({}))
+            .map_err(|e| Error::Startup(format!("net.status transport failure: {e}")))?
+            .map_err(|e| Error::Startup(format!("net.status refused: {e}")))?;
+        let get = |k: &str| value.get(k).cloned().unwrap_or(serde_json::Value::Null);
+        return Ok(format!(
+            "node_id     {}\nfingerprint {}\nlisten      {}\nknown       {}\nconnected   {}\n",
+            get("node_id").as_str().unwrap_or("?"),
+            get("fingerprint").as_str().unwrap_or("?"),
+            get("listen_addr").as_str().unwrap_or("?"),
+            get("peers_known").as_u64().unwrap_or(0),
+            get("peers_connected").as_u64().unwrap_or(0),
+        ));
     }
 
     let keystore = Keystore::new(&identity_dir);

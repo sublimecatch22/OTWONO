@@ -1,0 +1,24 @@
+#!/bin/sh
+# OTWONO mesh self check, run once at boot.
+#
+# Confirms the identity and mesh daemons are up and reports what the node can see. On a
+# lone node the peer counts are zero and that is a pass: having no neighbours is a normal
+# state for a local-first OS, not a fault. The two-VM test in build/qemu/ is what asserts
+# that peers are actually found.
+set -eu
+
+STATUS=$(/usr/bin/otwono-netd --status --socket /run/otwono/net.sock)
+
+fingerprint=$(echo "$STATUS" | awk '/^fingerprint/ {print $2}')
+known=$(echo "$STATUS" | awk '/^known/ {print $2}')
+connected=$(echo "$STATUS" | awk '/^connected/ {print $2}')
+
+[ -n "$fingerprint" ] || { echo "OTWONO-MESH-FAIL no fingerprint in net.status" >&2; exit 1; }
+
+# The identity must be on disk, or it did not survive and will not survive a reboot.
+[ -s /var/lib/otwono/identity/node.key ] || {
+    echo "OTWONO-MESH-FAIL no node key persisted" >&2
+    exit 1
+}
+
+echo "OTWONO-MESH-OK node=$fingerprint known=$known connected=$connected"

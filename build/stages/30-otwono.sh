@@ -125,6 +125,12 @@ action = "audit.read"
 subjects = ["uid:0"]
 decision = "allow"
 ttl_seconds = 300
+
+[[rule]]
+action = "net.read"
+subjects = ["uid:0"]
+decision = "allow"
+ttl_seconds = 300
 POLICY
 
 log "installing the control-plane runtime directory"
@@ -221,6 +227,140 @@ AmbientCapabilities=
 WantedBy=multi-user.target
 UNIT
 
+log "installing the identity and mesh units"
+cat > "$ROOTFS/etc/systemd/system/otwono-idd.service" <<'UNIT'
+[Unit]
+Description=OTWONO identity daemon
+Documentation=file:/usr/share/doc/otwono/NODE-IDENTITY.md
+After=otwono-permd.service systemd-tmpfiles-setup.service
+Requires=otwono-permd.service
+RequiresMountsFor=/var/lib/otwono
+Before=otwono-netd.service
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/otwono-idd --socket /run/otwono/id.sock --perm-socket /run/otwono/perm.sock
+Restart=on-failure
+RestartSec=2
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# The identity daemon holds the node key and has no business on the network.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=/run/otwono /var/lib/otwono
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+cat > "$ROOTFS/etc/systemd/system/otwono-netd.service" <<'UNIT'
+[Unit]
+Description=OTWONO node mesh daemon
+Documentation=file:/usr/share/doc/otwono/NODE-NETWORK.md
+After=otwono-idd.service network.target systemd-tmpfiles-setup.service
+Requires=otwono-permd.service
+RequiresMountsFor=/var/lib/otwono
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/otwono-netd --socket /run/otwono/net.sock --perm-socket /run/otwono/perm.sock
+Restart=on-failure
+RestartSec=2
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# This daemon is the hostile-input boundary (Z3), so it faces the network by
+# definition. AF_NETLINK is needed to enumerate interfaces for mDNS.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+ReadWritePaths=/run/otwono /var/lib/otwono
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+log "installing link-local networking for the mesh"
+# The mesh must come up on a segment with no DHCP server — two directly-connected nodes,
+# a field deployment, an ad-hoc radio link. IPv4 link-local gives every interface an
+# address without one. DHCP is still preferred where it exists; this is the fallback.
+install -d -m 0755 "$ROOTFS/etc/systemd/network"
+cat > "$ROOTFS/etc/systemd/network/50-otwono-mesh.network" <<'NETWORK'
+[Match]
+Name=en* eth*
+
+[Network]
+DHCP=yes
+# Without this a segment with no DHCP server leaves the interface addressless and the
+# mesh cannot form at all.
+LinkLocalAddressing=yes
+IPv6AcceptRA=yes
+MulticastDNS=yes
+
+[DHCPv4]
+UseDNS=yes
+NETWORK
+chroot "$ROOTFS" systemctl enable systemd-networkd.service 2>/dev/null \
+    || warn "could not enable systemd-networkd"
+
+log "installing the first-boot mesh check"
+install -d -m 0755 "$ROOTFS/usr/lib/otwono"
+install -m 0755 "$BUILD_DIR/files/otwono-mesh-check" "$ROOTFS/usr/lib/otwono/mesh-check"
+cat > "$ROOTFS/etc/systemd/system/otwono-mesh-check.service" <<'UNIT'
+[Unit]
+Description=OTWONO mesh self check
+After=otwono-netd.service
+Requires=otwono-netd.service
+RequiresMountsFor=/var/lib/otwono
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/otwono/mesh-check
+StandardOutput=journal+console
+StandardError=journal+console
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
 log "installing the first-boot control-plane check"
 install -d -m 0755 "$ROOTFS/usr/lib/otwono"
 install -m 0755 "$BUILD_DIR/files/otwono-control-plane-check" \
@@ -254,7 +394,7 @@ LockPersonality=yes
 WantedBy=multi-user.target
 UNIT
 
-for unit in otwono-permd otwono-hwd otwono-control-plane-check; do
+for unit in otwono-permd otwono-hwd otwono-idd otwono-netd otwono-control-plane-check otwono-mesh-check; do
     chroot "$ROOTFS" systemctl enable "$unit.service" 2>/dev/null \
         || warn "could not enable $unit.service"
 done
@@ -263,8 +403,10 @@ log "installing documentation"
 install -d -m 0755 "$ROOTFS/usr/share/doc/otwono"
 install -m 0644 "$REPO_ROOT/docs/hardware/CAPABILITY-TIERS.md" "$ROOTFS/usr/share/doc/otwono/"
 install -m 0644 "$REPO_ROOT/docs/security/SECURITY-MODEL.md" "$ROOTFS/usr/share/doc/otwono/"
+install -m 0644 "$REPO_ROOT/docs/network/NODE-IDENTITY.md" "$ROOTFS/usr/share/doc/otwono/"
+install -m 0644 "$REPO_ROOT/docs/network/NODE-NETWORK.md" "$ROOTFS/usr/share/doc/otwono/"
 install -m 0644 "$REPO_ROOT/README.md" "$ROOTFS/usr/share/doc/otwono/"
 
-manifest_add "otwono-layer" "binaries, schemas, policy, 4 units installed"
+manifest_add "otwono-layer" "binaries, schemas, policy, 6 units installed"
 stage_mark_complete 30-otwono
 stage_done

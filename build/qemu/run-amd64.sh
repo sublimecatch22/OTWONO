@@ -20,11 +20,11 @@ REQUIRED=()
 if [ -n "${OTWONO_BOOT_EXPECT:-}" ]; then
     REQUIRED=("$OTWONO_BOOT_EXPECT")
 else
-    REQUIRED=("otwono login:" "OTWONO-CAPABILITY-OK" "OTWONO-CONTROL-PLANE-OK")
+    REQUIRED=("otwono login:" "OTWONO-CAPABILITY-OK" "OTWONO-CONTROL-PLANE-OK" "OTWONO-MESH-OK")
 fi
 # Patterns that mean the boot definitively failed; matching one aborts early rather
 # than burning the whole timeout under TCG.
-FAIL_PATTERN="${OTWONO_BOOT_FAIL:-Kernel panic|Attempted to kill init|Entering emergency mode|You are in emergency mode|Failed to start .*otwono}"
+FAIL_PATTERN="${OTWONO_BOOT_FAIL:-Kernel panic|Attempted to kill init|Entering emergency mode|You are in emergency mode|Failed to start .*otwono|OTWONO-MESH-FAIL|OTWONO-CONTROL-PLANE-FAIL}"
 
 usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
