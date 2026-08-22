@@ -301,3 +301,77 @@ a 60s grace, naming the missing markers and any failed OTWONO unit.
   Both QEMU guests classify identically, so the tiering logic itself is still only covered
   by fixtures.
 
+---
+
+## Phase 3 — two nodes form a mesh
+
+**`make -C build TARGET=amd64-qemu-ubuntu two-node-test` passes.**
+
+Two VMs booted from one pristine image onto a private QEMU socket segment — no host
+bridge, no root, and deliberately no DHCP server — discovered each other over mDNS and
+mutually authenticated:
+
+```
+node A identity: otw1:cdbt-mhkj-1cn7-90xn  addr 169.254.45.141/16   connected 1
+node B identity: otw1:38ch-v2b2-zc2f-9mg9  addr 169.254.158.157/16  connected 1
+PASS: two nodes discovered and mutually authenticated
+```
+
+Each node generated its own identity on first boot (a re-run produced a different pair,
+confirming it is not baked into the image), each obtained a distinct IPv4 link-local
+address with no DHCP server present, and each authenticated the other's NodeID against the
+key it handshook with.
+
+### Workspace
+
+| Command | Result |
+|---|---|
+| `cargo test --workspace` | **239 tests pass** (153 before Phase 3) |
+| `clippy -D warnings`, `fmt --check`, `shellcheck` | clean |
+
+### The defect this found
+
+**9. The boot test baked a private node key into the release image.** Stage 60 booted the
+artifact in place. A guest writes its first-boot state to its own disk, so the boot
+generated a node identity and left the private key inside the file every device would be
+flashed from. Confirmed by extracting the data partition: `/identity/node.key` with a
+usable ed25519 seed, plus both first-boot profiles, plus the audit log on the root
+partition.
+
+Every device flashed from such an image would share one NodeID and one private key, and any
+of them could impersonate any other. It also invalidated the `SHA256SUMS` written in stage
+50, because the file changed after it was checksummed — and stage 60 verified the checksum
+only *before* booting, so nothing noticed.
+
+It surfaced because both VMs reported the same fingerprint and each then skipped the
+other's mDNS advertisement as its own broadcast. Nothing short of booting two nodes from
+one image would have shown it.
+
+Fixed three ways: stage 60 boots a copy; the artifact is checked afterwards for any
+first-boot residue and the checksum re-verified; and the two-node harness refuses a source
+image that already contains an identity, failing in about a second instead of timing out.
+
+### What the harness cost
+
+Of six failures in the two-node test, five were the harness rather than the system:
+`pipefail` killing the script twice (firmware detection, then `mesh_field`), waiting for
+`otwono-netd` lines that only ever reach the journal, matching a truncated marker prefix on
+a serial console that flushes mid-line, and — the interesting one — QEMU giving both guests
+the same default MAC, so IPv4 link-local derived the same address for both and duplicate
+detection could not help, since each node saw only its own ARP probe.
+
+Worth recording because the ratio is the point: an integration test at this level spends
+most of its failures on itself before it earns the one real finding.
+
+### What Phase 3 has *not* verified
+
+- **No radio.** Only TCP over IP. The `LinkAdapter` interface exists and LoRa's constraints
+  are modelled and unit-tested, but no non-IP adapter has been written.
+- **No routing and no store-and-forward.** Peers connect directly or not at all.
+- **`otwono-netd` reads the keystore directly**, so two processes can reach the node's
+  private keys. The split — `otwono-idd` holding the Ed25519 key, `netd` holding only the
+  agreement key and asking `idd` to sign each session proof — is not done.
+- **No encrypted identity backup, no TPM sealing, no revocation records.**
+- **Only two nodes, on one segment, on amd64.** No partition-and-heal test, no arm64 run of
+  the two-node test, nothing on real hardware.
+

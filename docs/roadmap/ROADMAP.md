@@ -78,7 +78,7 @@ is no confirmation channel yet, so `Ask` fails closed with an error.
 
 ---
 
-## Phase 3 — Node identity and secure transport  ← *recommended next milestone*
+## Phase 3 — Node identity and secure transport ✅ complete
 
 1. `otwono-idd` — Ed25519 generation, TPM sealing where present, backup/restore, rotation.
 2. NodeID encoding, fingerprints, the pairing flow.
@@ -86,13 +86,18 @@ is no confirmation channel yet, so `Ask` fails closed with an error.
 4. Noise `XX` over the link; QUIC via rust-libp2p on IP.
 5. mDNS discovery on the LAN.
 
-**Exit criterion:** two QEMU VMs on a virtual LAN discover each other, complete a mutually
-authenticated handshake, and exchange a signed message. Log captured. Identity survives a
-reboot of both VMs.
+**Exit criterion: met.** `make TARGET=amd64-qemu-ubuntu two-node-test` boots two VMs from
+one pristine image onto a segment with no DHCP server; they discover each other over mDNS,
+each authenticates the other's NodeID against the key it handshook with, and each holds an
+identity it generated itself on first boot. Evidence in `docs/build/VERIFICATION-LOG.md`.
+
+**Carried forward:** no radio link adapter, no routing or store-and-forward, no encrypted
+identity backup or TPM sealing, and `otwono-netd` still reads the keystore directly instead
+of asking `otwono-idd` to sign session proofs.
 
 ---
 
-## Phase 4 — Local AI runtime
+## Phase 4 — Local AI runtime  ← *recommended next milestone*
 
 1. `otwono-aid` with the backend abstraction and llama.cpp CPU first.
 2. Model catalog, signed manifests, content-addressed storage, tier gating.

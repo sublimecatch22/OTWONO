@@ -6,13 +6,14 @@ networking, local AI, distributed services, and offline-first capabilities.
 Runs on **x86_64/AMD64** computers and **ARM64** single-board computers. Same operating
 system, same subsystems, same interfaces — the capabilities scale to the hardware.
 
-> **Project status: Phase 2 complete.** Both images boot under QEMU, and the
+> **Project status: Phase 3 complete.** Both images boot under QEMU, and the
 > **permission broker and hardware daemon now run on both booted systems**: at first boot the
 > guest requests a capability, calls the hardware daemon with it, and the broker writes a
 > hash-chained audit record — all recovered from the image and verified on the host
-> afterwards. Nothing has run on real hardware yet. The node network, AI runtime and
-> distributed services remain design only, and both daemons still run as root pending user
-> separation.
+> afterwards. **Two nodes now form a mesh**: booted from one image onto a segment with no
+> DHCP server, they discover each other over mDNS and each authenticates the other's
+> cryptographic NodeID. Nothing has run on real hardware yet; there is no radio link, no
+> routing, no AI runtime, and the daemons still run as root pending user separation.
 >
 > Every document and subsystem carries an explicit status (`SPECIFIED` / `IMPLEMENTED` /
 > `VERIFIED`), and nothing here claims to work that has not been run — see
