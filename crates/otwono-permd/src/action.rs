@@ -89,6 +89,18 @@ impl ActionRegistry {
                     false,
                 ),
                 ActionSpec::new(
+                    "net.read",
+                    "List the peers this node has met",
+                    BlastRadius::Read,
+                    false,
+                ),
+                ActionSpec::new(
+                    "net.connect",
+                    "Open an authenticated connection to a peer",
+                    BlastRadius::Reversible,
+                    false,
+                ),
+                ActionSpec::new(
                     "id.rotate",
                     "Replace this node's identity key, changing its NodeID",
                     BlastRadius::Irreversible,

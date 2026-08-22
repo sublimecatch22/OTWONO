@@ -6,12 +6,16 @@
 
 #![forbid(unsafe_code)]
 
+pub mod discovery;
 pub mod link;
 pub mod memory;
+pub mod peer;
 pub mod secure;
 pub mod tcp;
 
+pub use discovery::{Candidate, Discovery, DiscoveryError, SERVICE_TYPE};
 pub use link::{BandwidthClass, DutyCycle, EnergyCost, LinkAdapter, LinkError, LinkKind, LinkProperties};
 pub use memory::MemoryLink;
+pub use peer::{should_initiate, PeerRecord, PeerState, PeerTable};
 pub use secure::{HandshakeError, SecureChannel, SessionProof, NOISE_PATTERN};
 pub use tcp::TcpLink;

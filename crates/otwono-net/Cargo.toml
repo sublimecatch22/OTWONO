@@ -13,6 +13,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 snow = "0.9"
 data-encoding = "2"
+mdns-sd = "0.11"
 
 [dev-dependencies]
 data-encoding = "2"
