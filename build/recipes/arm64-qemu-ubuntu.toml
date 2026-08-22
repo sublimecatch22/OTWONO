@@ -18,12 +18,15 @@ snapshot = ""
 
 [packages]
 include = "systemd systemd-sysv udev dbus ca-certificates locales less nano iproute2 iputils-ping openssh-server"
-kernel = "linux-image-generic"
-firmware = "linux-firmware"
+kernel = "linux-image-virtual"
+# QEMU exposes only virtio devices, which need no firmware blobs.
+# linux-firmware is 467 MiB and would be 60% of the image. Real boards
+# set this per BSP.
+firmware = ""
 
 [boot]
 firmware = "uefi"
-bootloader = "grub-efi-arm64"
+bootloader = "grub-efi-arm64-bin"
 console = "ttyAMA0,115200"
 
 [image]

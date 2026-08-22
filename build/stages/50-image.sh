@@ -1,29 +1,196 @@
 #!/usr/bin/env bash
-# Stage 50 — assemble the bootable disk image: GPT, filesystems, bootloader.
-#
-# STATUS: NOT IMPLEMENTED — Phase 1. See docs/roadmap/ROADMAP.md.
+# Stage 50 — assemble the bootable disk image.
 #
 # Network access: none.
-# Privileges: root (loop devices, mkfs, bootloader install).
+# Privileges: root (the rootfs contains root-owned files and device nodes).
+#
+# Layout:
+#   GPT: [ OTWONO-ESP vfat ] [ OTWONO-ROOT-A ext4 ] [ OTWONO-ROOT-B ext4 ] [ OTWONO-DATA ext4 ]
+#
+# No loop devices and no mounts. Each filesystem is built as a standalone file — ext4 with
+# `mkfs.ext4 -d`, FAT with mtools — and written into the image at its partition offset.
+# That works without udev (which this build environment does not run), and it is
+# deterministic: nothing depends on the host's mount namespace or device naming.
+#
+# Output: $TARGET_OUT/otwono-$TARGET.img
 source "$(dirname "${BASH_SOURCE[0]}")/../lib/common.sh"
 stage_begin 50-image
 
-cat >&2 <<'PLAN'
-Stage 50 is not implemented yet. It is the second half of Phase 1.
+ROOTFS="$TARGET_OUT/rootfs"
+IMAGE="$TARGET_OUT/otwono-$TARGET.img"
+WORK="$TARGET_OUT/image-work"
 
-Intended layout (docs/build/UPDATE-ARCHITECTURE.md):
-  GPT: [ OTWONO-ESP 512M vfat ] [ OTWONO-ROOT-A ] [ OTWONO-ROOT-B ] [ OTWONO-DATA ]
+[ -d "$ROOTFS/usr" ] || die "no rootfs at $ROOTFS; run stages 10..40 first"
+require_root
+assert_rootfs_unmounted "$ROOTFS"
 
-What it must do:
-  1. truncate a sparse image of [image] size, sgdisk the four partitions
-  2. mkfs each partition with the labels stage 20's fstab already expects
-  3. populate ROOT-A from the rootfs with deterministic ownership and timestamps
-  4. install the bootloader: grub-efi-amd64 / grub-efi-arm64 into the ESP
-  5. write the boot-counter environment used for automatic rollback
-  6. emit SHA256SUMS and the package manifest lock beside the image
+for t in sgdisk mkfs.ext4 mkfs.vfat mmd mcopy partx; do
+    require_tool "$t"
+done
 
-Reproducibility requirements for this stage:
-  - mke2fs -d with a fixed UUID derived from the recipe id and SOURCE_DATE_EPOCH
-  - no build-host timestamps anywhere in the image
-PLAN
-die "stage 50 not implemented (Phase 1)"
+ARCH="$(recipe_get target arch)"
+CONSOLE="$(recipe_get boot console "ttyS0,115200")"
+IMAGE_MIB=$(size_to_mib "$(recipe_get image size "8G")")
+ESP_MIB=$(size_to_mib "$(recipe_get image esp_size "512M")")
+ROOT_MIB=$(size_to_mib "$(recipe_get image root_size "3G")")
+
+case "$ARCH" in
+    amd64) GRUB_FORMAT="x86_64-efi"; EFI_NAME="BOOTX64.EFI" ;;
+    arm64) GRUB_FORMAT="arm64-efi";  EFI_NAME="BOOTAA64.EFI" ;;
+    *) die "unsupported arch: $ARCH" ;;
+esac
+
+DATA_MIB=$((IMAGE_MIB - ESP_MIB - 2 * ROOT_MIB - 2))
+[ "$DATA_MIB" -ge 256 ] || die "image size ${IMAGE_MIB}M leaves only ${DATA_MIB}M for data; enlarge [image] size"
+
+require_space_gib 4
+rm -rf "$WORK"; mkdir -p "$WORK"
+rm -f "$IMAGE"
+
+# --- 1. Partition table ----------------------------------------------------------------
+log "creating a ${IMAGE_MIB} MiB image with a GPT layout"
+truncate -s "${IMAGE_MIB}M" "$IMAGE"
+sgdisk --zap-all "$IMAGE" > /dev/null 2>&1 || true
+sgdisk \
+    --disk-guid="$(derive_uuid disk)" \
+    -n "1:1M:+${ESP_MIB}M"  -t 1:ef00 -c 1:"OTWONO-ESP"    -u "1:$(derive_uuid part-esp)" \
+    -n "2:0:+${ROOT_MIB}M"  -t 2:8304 -c 2:"OTWONO-ROOT-A" -u "2:$(derive_uuid part-root-a)" \
+    -n "3:0:+${ROOT_MIB}M"  -t 3:8304 -c 3:"OTWONO-ROOT-B" -u "3:$(derive_uuid part-root-b)" \
+    -n "4:0:0"              -t 4:8300 -c 4:"OTWONO-DATA"   -u "4:$(derive_uuid part-data)" \
+    "$IMAGE" > /dev/null
+sgdisk --verify "$IMAGE" > /dev/null || die "the partition table did not verify"
+
+# partx reads the table straight out of the file, so we never need the kernel to scan it.
+part_start_bytes() { partx -g -o START -s --nr "$1" "$IMAGE" | tr -d ' ' | awk '{print $1 * 512}'; }
+part_size_bytes()  { partx -g -o SECTORS -s --nr "$1" "$IMAGE" | tr -d ' ' | awk '{print $1 * 512}'; }
+
+for n in 1 2 3 4; do
+    log "  p$n  start $(part_start_bytes "$n")  size $(part_size_bytes "$n")"
+done
+
+# --- 2. ESP ------------------------------------------------------------------------------
+log "building the ESP"
+ESP_IMG="$WORK/esp.img"
+truncate -s "$(part_size_bytes 1)" "$ESP_IMG"
+mkfs.vfat -F 32 -n "OTWONO-ESP" -i "$(derive_fat_id esp)" "$ESP_IMG" > /dev/null
+
+KVER=$(cat "$TARGET_OUT/kernel-version" 2>/dev/null || true)
+[ -n "$KVER" ] || die "no kernel-version recorded; run stage 40"
+VMLINUZ="$ROOTFS/boot/vmlinuz-$KVER"
+INITRD="$ROOTFS/boot/initrd.img-$KVER"
+[ -f "$VMLINUZ" ] || die "missing $VMLINUZ"
+[ -f "$INITRD" ]  || die "missing $INITRD"
+
+# The kernel and initramfs live on the ESP, not on the root filesystem. GRUB then needs
+# only FAT support to boot either slot, which keeps the standalone EFI binary small and
+# means a damaged root filesystem still reaches a boot menu.
+mmd -i "$ESP_IMG" ::EFI ::EFI/BOOT ::EFI/otwono ::EFI/otwono/a ::EFI/otwono/b
+mcopy -i "$ESP_IMG" "$VMLINUZ" ::EFI/otwono/a/vmlinuz
+mcopy -i "$ESP_IMG" "$INITRD"  ::EFI/otwono/a/initrd.img
+# Slot B starts as a copy of slot A so the inactive entry is bootable from day one; the
+# update mechanism (Phase 8) replaces it.
+mcopy -i "$ESP_IMG" "$VMLINUZ" ::EFI/otwono/b/vmlinuz
+mcopy -i "$ESP_IMG" "$INITRD"  ::EFI/otwono/b/initrd.img
+
+# Order matters: /dev/console is whichever console= comes LAST, and that is where
+# systemd sends unit output configured with StandardOutput=...+console. The serial port
+# must therefore be last, or the capability report goes to a VGA console nobody is
+# capturing. tty0 still comes first so a physical monitor also shows the boot.
+CMDLINE_COMMON="ro console=tty0 console=$CONSOLE systemd.show_status=true"
+
+cat > "$WORK/grub.cfg" <<GRUBCFG
+# OTWONO boot menu. Generated by build/stages/50-image.sh — do not edit in the image.
+#
+# Terminal is left at the EFI default: under QEMU with -nographic the firmware routes its
+# console to the serial port, so the menu appears there without a serial command that
+# would have to differ between x86 (ttyS0/16550) and arm64 (ttyAMA0/PL011).
+set timeout=3
+set default=0
+
+# Boot-slot selection. Phase 8 replaces this with a counter in grubenv that decrements on
+# each attempt and falls back to the other slot; the menu entries are already shaped for it.
+menuentry 'OTWONO (slot A)' --id otwono-a {
+    search --no-floppy --label --set=root OTWONO-ESP
+    linux /EFI/otwono/a/vmlinuz root=LABEL=OTWONO-ROOT-A $CMDLINE_COMMON
+    initrd /EFI/otwono/a/initrd.img
+}
+
+menuentry 'OTWONO (slot B)' --id otwono-b {
+    search --no-floppy --label --set=root OTWONO-ESP
+    linux /EFI/otwono/b/vmlinuz root=LABEL=OTWONO-ROOT-B $CMDLINE_COMMON
+    initrd /EFI/otwono/b/initrd.img
+}
+GRUBCFG
+mcopy -i "$ESP_IMG" "$WORK/grub.cfg" ::EFI/otwono/grub.cfg
+
+# --- 3. Bootloader -----------------------------------------------------------------------
+# grub-mkstandalone runs inside the target rootfs so the EFI binary is built for the
+# target architecture by the target's own grub packages. On arm64 that is a foreign-arch
+# chroot under qemu-user, which stage 10 already set up.
+log "building the standalone $GRUB_FORMAT EFI binary"
+cat > "$ROOTFS/tmp/otwono-embedded.cfg" <<'EMBED'
+search --no-floppy --label --set=root OTWONO-ESP
+configfile ($root)/EFI/otwono/grub.cfg
+EMBED
+
+chroot "$ROOTFS" grub-mkstandalone \
+    --format="$GRUB_FORMAT" \
+    --output="/tmp/$EFI_NAME" \
+    --locales="" --themes="" --fonts="" \
+    --modules="part_gpt fat ext2 normal linux echo all_video test search search_label configfile gzio loadenv efi_gop" \
+    "boot/grub/grub.cfg=/tmp/otwono-embedded.cfg" 2>&1 | tail -5
+
+[ -f "$ROOTFS/tmp/$EFI_NAME" ] || die "grub-mkstandalone produced no $EFI_NAME"
+EFI_BYTES=$(stat -c %s "$ROOTFS/tmp/$EFI_NAME")
+[ "$EFI_BYTES" -gt 100000 ] || die "$EFI_NAME is only $EFI_BYTES bytes; the module set did not link in"
+log "  $EFI_NAME is $EFI_BYTES bytes"
+mcopy -i "$ESP_IMG" "$ROOTFS/tmp/$EFI_NAME" "::EFI/BOOT/$EFI_NAME"
+rm -f "$ROOTFS/tmp/$EFI_NAME" "$ROOTFS/tmp/otwono-embedded.cfg"
+
+# --- 4. Root filesystems -------------------------------------------------------------------
+log "building root_a from the rootfs ($(du -sm "$ROOTFS" | cut -f1) MiB of content)"
+ROOT_A_IMG="$WORK/root_a.img"
+truncate -s "$(part_size_bytes 2)" "$ROOT_A_IMG"
+mkfs.ext4 -q -F \
+    -L "OTWONO-ROOT-A" \
+    -U "$(derive_uuid fs-root-a)" \
+    -E "root_owner=0:0" \
+    -d "$ROOTFS" \
+    "$ROOT_A_IMG"
+
+log "building root_b (empty; the update mechanism populates it)"
+ROOT_B_IMG="$WORK/root_b.img"
+truncate -s "$(part_size_bytes 3)" "$ROOT_B_IMG"
+mkfs.ext4 -q -F -L "OTWONO-ROOT-B" -U "$(derive_uuid fs-root-b)" "$ROOT_B_IMG"
+
+log "building the data partition"
+DATA_IMG="$WORK/data.img"
+truncate -s "$(part_size_bytes 4)" "$DATA_IMG"
+mkfs.ext4 -q -F -L "OTWONO-DATA" -U "$(derive_uuid fs-data)" "$DATA_IMG"
+
+# --- 5. Write the filesystems into the image -------------------------------------------------
+write_partition() { # number image-file
+    local n="$1" src="$2" start
+    start=$(part_start_bytes "$n")
+    log "writing p$n from $(basename "$src") at offset $start"
+    dd if="$src" of="$IMAGE" bs=1M seek=$((start / 1024 / 1024)) conv=notrunc,sparse status=none
+}
+write_partition 1 "$ESP_IMG"
+write_partition 2 "$ROOT_A_IMG"
+write_partition 3 "$ROOT_B_IMG"
+write_partition 4 "$DATA_IMG"
+
+rm -rf "$WORK"
+
+# --- 6. Checksums and manifest ---------------------------------------------------------------
+rm -f "$TARGET_OUT/SHA256SUMS"
+checksum_artifact "$IMAGE"
+
+APPARENT=$(stat -c %s "$IMAGE")
+ACTUAL=$(( $(stat -c %b "$IMAGE") * $(stat -c %B "$IMAGE") ))
+log "image $IMAGE"
+log "  apparent size $((APPARENT / 1024 / 1024)) MiB, on disk $((ACTUAL / 1024 / 1024)) MiB"
+
+manifest_add "image" "$(basename "$IMAGE"), ${IMAGE_MIB}M, kernel $KVER, $GRUB_FORMAT"
+stage_mark_complete 50-image
+stage_done

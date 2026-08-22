@@ -19,11 +19,12 @@ snapshot = ""
 [packages]
 include = "systemd systemd-sysv udev dbus ca-certificates locales less nano iproute2 iputils-ping openssh-server"
 kernel = "linux-image-arm64"
-firmware = "firmware-linux-free"
+# QEMU virtio needs no firmware blobs. Real boards set this per BSP.
+firmware = ""
 
 [boot]
 firmware = "uefi"
-bootloader = "grub-efi-arm64"
+bootloader = "grub-efi-arm64-bin"
 console = "ttyAMA0,115200"
 
 [image]

@@ -28,7 +28,7 @@ a schema-valid profile on real hardware. **Met.**
 
 ---
 
-## Phase 1 — Bootable base images  ← *recommended next milestone*
+## Phase 1 — Bootable base images  ← *in progress: amd64 done, arm64 pending*
 
 **Goal:** an image that boots, on both architectures, with a boot log to prove it.
 
@@ -39,11 +39,19 @@ a schema-valid profile on real hardware. **Met.**
 5. `60-verify` — QEMU boot to a login prompt, serial captured to a log.
 6. `otwono-hwctl` shipped in the image and run at first boot.
 
-**Exit criterion:** `out/amd64-qemu/boot.log` and `out/arm64-qemu/boot.log` both showing a
-login prompt, plus `otwono-hwctl profile --json` output captured from **inside** each VM.
+**Exit criterion:** `boot.log` for both architectures showing a login prompt, plus the
+capability profile recovered from **inside** each VM.
 
-**Risks:** no KVM ⇒ slow TCG boots; Debian mirrors blocked in this environment ⇒ the Ubuntu
-recipe is what CI can exercise; arm64 U-Boot/EFI on `qemu-virt` needs care.
+**amd64: met.** `out/amd64-qemu-ubuntu/boot.log` reaches `otwono login:`, and stage 60
+recovers `capability-profile.json` from the guest's own data partition (tier `T0_MICRO`,
+architecture `x86_64`, limited by compute). Details and the four bugs it exposed are in
+`docs/build/VERIFICATION-LOG.md`.
+
+**arm64: not yet.** The build has not completed.
+
+**Risks encountered:** no KVM ⇒ TCG boots take minutes, so the harness now terminates as
+soon as its required patterns appear rather than burning the full timeout; Debian mirrors
+blocked ⇒ only the Ubuntu recipes are exercised here.
 
 ---
 

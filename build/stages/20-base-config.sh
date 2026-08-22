@@ -43,10 +43,16 @@ echo 'LANG=C.UTF-8' > "$ROOTFS/etc/locale.conf"
 # fstab matches the A/B layout stage 50 creates. Labels, not UUIDs: the image is written
 # to many devices and a UUID baked at build time would be wrong on all but one of them.
 log "writing fstab for the A/B layout"
+#
+# Root is mounted rw for now. The A/B design wants an immutable root, but that also needs
+# /var moved off the root filesystem (tmpfs or the data partition) and the corresponding
+# systemd wiring. Doing half of it — ro root with /var still on it — does not boot. The
+# immutable root lands with the update work in Phase 8; the partition layout is already
+# correct for it.
 cat > "$ROOTFS/etc/fstab" <<'FSTAB'
-LABEL=OTWONO-ROOT-A  /                ext4  ro,noatime,errors=remount-ro  0 1
-LABEL=OTWONO-ESP     /boot/efi        vfat  umask=0077                    0 2
-LABEL=OTWONO-DATA    /var/lib/otwono  ext4  rw,noatime                    0 2
+LABEL=OTWONO-ROOT-A  /                ext4  rw,noatime,errors=remount-ro  0 1
+LABEL=OTWONO-ESP     /boot/efi        vfat  umask=0077,nofail             0 2
+LABEL=OTWONO-DATA    /var/lib/otwono  ext4  rw,noatime,nofail             0 2
 FSTAB
 
 log "installing base packages inside the chroot"

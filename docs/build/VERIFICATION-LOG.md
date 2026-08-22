@@ -70,10 +70,98 @@ Note: `chroot rootfs otwono-hwctl tier` reports `T0_MICRO` because a bare chroot
 `/proc` or `/sys`. That is the fail-closed behaviour the design requires — an undetectable
 machine must classify down, never up.
 
+## Phase 1 — amd64 image boots
+
+**`make -C build TARGET=amd64-qemu-ubuntu boot-test` passes.** The image boots under QEMU
+(TCG, no KVM) to a login prompt in roughly 40 seconds of guest time, and the capability
+profile is recovered from the guest's own data partition afterwards:
+
+```
+PASS: every required pattern appeared
+  matched: otwono login:
+  matched: OTWONO-CAPABILITY-OK
+[60-verify] profile recovered from the guest's data partition:
+[60-verify]   tier            T0_MICRO
+[60-verify]   limiting factor compute (Minimal < Low)
+[60-verify]   architecture    x86_64
+[60-verify]   axes            compute=minimal memory=low accelerator=igpu
+                              storage=constrained network=offline power=unconstrained
+```
+
+`T0_MICRO` is the correct answer for the test VM, not a defect: 2 vCPUs classify `compute`
+as `minimal`, and the composed tier is the weakest binding axis. Seeing the tiering
+mechanism produce a defensible answer on a machine that is genuinely small is the point.
+
+The boot chain observed in the log: GRUB menu with both A/B entries → slot A auto-selected
+→ kernel and initramfs loaded from the ESP → `root=LABEL=OTWONO-ROOT-A` → systemd →
+`EXT4-fs (vda2): re-mounted r/w` → `otwono login:`.
+
+Artifacts: `out/amd64-qemu-ubuntu/boot.log`, `.../capability-profile.json`,
+`.../otwono-amd64-qemu-ubuntu.img` (8 GiB apparent, 419 MiB on disk).
+
+### Bugs this found
+
+Four defects surfaced that no amount of desk-checking would have, listed because each one
+says something about where the design was weak.
+
+**1. Kernel with no initramfs.** `update-initramfs: No such file or directory`. The kernel
+package only *recommends* `initramfs-tools`, and the build uses `--no-install-recommends`,
+so the rootfs got a kernel plus a dangling `/boot/initrd.img` symlink. Stage 40's assertion
+that the initramfs exceeds 4 MiB turned this into a clear build-time error rather than an
+unbootable image found minutes into a TCG boot.
+
+**2. 467 MiB of firmware for hardware QEMU does not expose.** `linux-firmware` was 60% of a
+768 MiB rootfs. `[packages] firmware` is now empty for the QEMU recipes and remains
+available per BSP. The rootfs dropped to 322 MiB.
+
+**3. Console output going to a console nobody was reading.** `/dev/console` is whichever
+`console=` argument comes *last*, so `console=ttyS0 console=tty0` sent every unit's console
+output to the VGA console while the harness captured the serial port. The order is now
+`console=tty0 console=ttyS0,115200`.
+
+**4. Persistent state written to the wrong filesystem — the serious one.** The first boot
+that passed the console check still wrote `capability-profile.json` to `/var/lib/otwono` on
+the **root** partition, not to the mounted data partition. Cause: `nofail` in fstab removes
+a mount from `local-fs.target`'s ordering (systemd.mount(5)), so `After=local-fs.target`
+no longer guarantees it is mounted; the service won the race and wrote into the directory
+underneath the mount point, which the mount then shadowed.
+
+Had this shipped, node state would have lived on the root filesystem — and an A/B update
+replaces the root filesystem, so the capability profile and later the **node identity keys**
+would be silently destroyed on every update. The fix is `RequiresMountsFor=/var/lib/otwono`,
+and every future OTWONO unit that touches persistent state needs it.
+
+This is the case for verifying against the artifact rather than the console: the console
+marker said `OTWONO-CAPABILITY-OK` on the broken build. Only reading the file back off the
+guest's disk exposed it.
+
+### Other corrections made while wiring Phase 1
+
+- `fstab` mounted root `ro`, which cannot boot while `/var` is still on the root
+  filesystem. Root is `rw` until the immutable-root work in Phase 8; the partition layout
+  is already correct for it.
+- The capability-report unit had `PrivateNetwork=yes`. sysfs's net class is namespaced, so
+  the probe would have seen only `lo` and reported every machine offline.
+- `nofail` on the ESP and data mounts, so a missing partition does not drop the machine
+  into emergency mode.
+
+Environment findings that shaped stage 50:
+
+- `losetup --partscan` creates **no partition device nodes** here — there is no udev. Stage
+  50 therefore uses no loop devices and no mounts: `mkfs.ext4 -d` populates ext4 from a
+  directory and mtools populates FAT, then each filesystem is written into the image at its
+  partition offset. Verified in isolation: ownership, modes and contents survive.
+- `SOURCE_DATE_EPOCH` is exported as `0` in this environment, which predates the FAT epoch
+  (1980) and makes mtools write nonsense dates. The build clamps it, with a warning.
+
 ## What has *not* been verified
 
-- **No image has been built and no image has been booted.** There is no boot log. Anything
-  claiming a bootable OTWONO image would be false.
+- **arm64 has not been booted.** The arm64 image build has not completed. Only amd64 has a
+  boot log. Nothing should claim a bootable arm64 image.
+- **Automatic A/B rollback is not implemented.** The layout and both menu entries exist and
+  slot B is bootable, but nothing counts boot attempts or switches slots yet (Phase 8).
+- **The root filesystem is mounted rw.** An immutable root needs `/var` moved off it first;
+  a ro root with `/var` still on it does not boot. Phase 8.
 - No daemon exists, so nothing about the Local Control Plane, permissions, identity,
   networking, AI runtime, storage, or distributed services has been exercised at all —
   those are all `SPECIFIED`.

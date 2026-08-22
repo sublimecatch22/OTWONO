@@ -9,9 +9,22 @@
 #   build/qemu/run-arm64.sh --image out/arm64-qemu/otwono-arm64-qemu.img
 #   build/qemu/run-arm64.sh --image IMG --boot-test --log out/boot.log
 set -euo pipefail
+# shellcheck source=build/qemu/common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 IMAGE=""; LOG=""; BOOT_TEST=0; TIMEOUT=1200; MEMORY=4096; SMP=2; CPU="cortex-a72"
-EXPECT_PATTERN="${OTWONO_BOOT_EXPECT:-otwono login:|OTWONO capability profile|Reached target}"
+# Every pattern here must appear. A login prompt is the only honest "it booted"
+# ("Reached target" shows up while a boot is still failing), and the capability banner
+# proves the OTWONO layer actually ran on the target rather than just on the build host.
+REQUIRED=()
+if [ -n "${OTWONO_BOOT_EXPECT:-}" ]; then
+    REQUIRED=("$OTWONO_BOOT_EXPECT")
+else
+    REQUIRED=("otwono login:" "OTWONO-CAPABILITY-OK")
+fi
+# Patterns that mean the boot definitively failed; matching one aborts early rather
+# than burning the whole timeout under TCG.
+FAIL_PATTERN="${OTWONO_BOOT_FAIL:-Kernel panic|Attempted to kill init|Entering emergency mode|You are in emergency mode}"
 
 usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
@@ -74,18 +87,10 @@ QEMU_ARGS=(
 
 if [ "$BOOT_TEST" = 1 ]; then
     LOG="${LOG:-$(dirname "$IMAGE")/boot.log}"
-    echo "boot test: timeout ${TIMEOUT}s, log $LOG, expecting /$EXPECT_PATTERN/"
-    set +e
-    timeout --foreground "$TIMEOUT" qemu-system-aarch64 "${QEMU_ARGS[@]}" < /dev/null > "$LOG" 2>&1
-    rc=$?
-    set -e
-    if grep -qE "$EXPECT_PATTERN" "$LOG"; then
-        echo "PASS: boot reached the expected state (qemu exit $rc)"
-        exit 0
-    fi
-    echo "FAIL: expected pattern not found in $LOG (qemu exit $rc)" >&2
-    tail -40 "$LOG" >&2
-    exit 1
+    echo "boot test: timeout ${TIMEOUT}s, log $LOG"
+    printf '  required: %s\n' "${REQUIRED[@]}"
+    run_boot_test "$LOG" "$TIMEOUT" qemu-system-aarch64 "${QEMU_ARGS[@]}"
+    exit $?
 fi
 
 exec qemu-system-aarch64 "${QEMU_ARGS[@]}"

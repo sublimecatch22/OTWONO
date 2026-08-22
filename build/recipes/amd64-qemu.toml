@@ -23,11 +23,12 @@ snapshot = ""
 # atomically, so everything optional belongs in Flatpak or a later layer.
 include = "systemd systemd-sysv udev dbus ca-certificates locales less nano iproute2 iputils-ping openssh-server"
 kernel = "linux-image-amd64"
-firmware = "firmware-linux-free"
+# QEMU virtio needs no firmware blobs. Real boards set this per BSP.
+firmware = ""
 
 [boot]
 firmware = "uefi"
-bootloader = "grub-efi-amd64"
+bootloader = "grub-efi-amd64-bin"
 console = "ttyS0,115200"
 
 [image]

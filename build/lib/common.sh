@@ -13,6 +13,17 @@ set -euo pipefail
 : "${TARGET_OUT:?TARGET_OUT must be set}"
 : "${SOURCE_DATE_EPOCH:?SOURCE_DATE_EPOCH must be set}"
 
+# FAT timestamps start at 1980-01-01. An earlier epoch (this dev environment exports
+# SOURCE_DATE_EPOCH=0) makes mtools write nonsense dates into the ESP, so clamp it. Every
+# other stage still honours the caller's value; only the floor moves.
+readonly FAT_EPOCH_FLOOR=315532800
+if [ "$SOURCE_DATE_EPOCH" -lt "$FAT_EPOCH_FLOOR" ]; then
+    printf '[build] SOURCE_DATE_EPOCH=%s predates the FAT epoch; clamping to %s (1980-01-01)\n' \
+        "$SOURCE_DATE_EPOCH" "$FAT_EPOCH_FLOOR" >&2
+    SOURCE_DATE_EPOCH="$FAT_EPOCH_FLOOR"
+    export SOURCE_DATE_EPOCH
+fi
+
 STAGE_NAME="${STAGE_NAME:-unknown}"
 
 log()  { printf '[%s] %s\n' "$STAGE_NAME" "$*"; }
@@ -64,6 +75,28 @@ recipe_get() { # section key [default]
     printf '%s' "$value"
 }
 
+# Like recipe_get, but an absent or explicitly empty value is a legitimate answer rather
+# than a build failure. Use for genuinely optional keys ("this target needs no firmware").
+recipe_get_opt() { # section key
+    awk -v sect="$1" -v k="$2" '
+        /^[[:space:]]*\[/ { gsub(/^[[:space:]]*\[|\][[:space:]]*$/, ""); cur = $0; next }
+        {
+            line = $0
+            sub(/#.*$/, "", line)
+            if (cur != sect) next
+            split(line, kv, "=")
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", kv[1])
+            if (kv[1] != k) next
+            val = line
+            sub(/^[^=]*=[[:space:]]*/, "", val)
+            gsub(/^"|"[[:space:]]*$/, "", val)
+            gsub(/[[:space:]]+$/, "", val)
+            print val
+            exit
+        }
+    ' "$RECIPE"
+}
+
 # --- Manifest ------------------------------------------------------------------------
 manifest_path() { printf '%s/manifest.tsv' "$TARGET_OUT"; }
 
@@ -101,6 +134,47 @@ require_space_gib() { # gib
     local need="$1" avail
     avail=$(( $(df -Pk "$TARGET_OUT" 2>/dev/null | awk 'NR==2{print $4}' || echo 0) / 1024 / 1024 ))
     [ "$avail" -ge "$need" ] || die "need ${need} GiB free under $TARGET_OUT, have ${avail} GiB"
+}
+
+# --- Sizes ---------------------------------------------------------------------------
+# Convert a recipe size ("512M", "3G", "8192") to whole MiB.
+size_to_mib() {
+    local v="$1" n unit
+    n="${v%[!0-9]}"; unit="${v#"$n"}"
+    case "$unit" in
+        M|MiB|m|"") printf '%s' "$n" ;;
+        G|GiB|g)    printf '%s' "$((n * 1024))" ;;
+        K|KiB|k)    printf '%s' "$((n / 1024))" ;;
+        *) die "cannot parse size: $v" ;;
+    esac
+}
+
+# --- Deterministic identifiers ---------------------------------------------------------
+# Filesystem UUIDs must be stable across builds or the image is not reproducible, and they
+# must differ per role or the kernel picks the wrong partition. Derive both properties
+# from the recipe id, the role, and the build epoch.
+derive_uuid() { # role
+    local h
+    h=$(printf '%s|%s|%s' "$TARGET" "$1" "$SOURCE_DATE_EPOCH" | sha256sum | cut -c1-32)
+    printf '%s-%s-%s-%s-%s' "${h:0:8}" "${h:8:4}" "${h:12:4}" "${h:16:4}" "${h:20:12}"
+}
+
+# FAT volume ids are 32 bits, written as eight hex digits.
+derive_fat_id() { # role
+    printf '%s|%s|%s' "$TARGET" "$1" "$SOURCE_DATE_EPOCH" | sha256sum | cut -c1-8 | tr 'a-f' 'A-F'
+}
+
+# --- Safety ----------------------------------------------------------------------------
+# Imaging a rootfs that still has /dev, /proc or /sys bind-mounted would copy the build
+# host's kernel interfaces into the image. Refuse rather than produce a corrupt image.
+assert_rootfs_unmounted() { # rootfs
+    local rootfs mounted
+    rootfs="$(readlink -f "$1")"
+    mounted=$(awk -v r="$rootfs/" '$2 ~ "^"r {print $2}' /proc/mounts)
+    if [ -n "$mounted" ]; then
+        die "these paths are still mounted under the rootfs; unmount them before imaging:
+$mounted"
+    fi
 }
 
 # Reproducible tar: fixed mtime, sorted entries, no owner names.

@@ -23,3 +23,4 @@ Rules:
 | 0006 | Ed25519 node identity, separate from user identity | accepted |
 | 0007 | Fail-closed data visibility labels with provenance propagation | accepted |
 | 0008 | A/B image updates with automatic rollback | accepted |
+| 0009 | Mount-free image assembly, and the kernel on the ESP | accepted |

@@ -11,9 +11,9 @@ See [`docs/build/BUILD-SYSTEM.md`](../docs/build/BUILD-SYSTEM.md) for the design
 | `10-bootstrap` | **VERIFIED** | amd64 native and arm64 cross-bootstrap (binfmt_misc + qemu-user second stage) both completed |
 | `20-base-config` | **VERIFIED** | Packages installed in the chroot; serial getty enabled |
 | `30-otwono` | **VERIFIED** | Binaries, schemas, units installed; `otwono-hwctl` runs inside the rootfs |
-| `40-kernel` | **NOT IMPLEMENTED** | Phase 1. Fails loudly with the intended plan rather than producing a kernel-less image |
-| `50-image` | **NOT IMPLEMENTED** | Phase 1. Same |
-| `60-verify` | **PARTIAL** | The QEMU harnesses are implemented and runnable; there is no image to boot yet |
+| `40-kernel` | **VERIFIED (amd64)** | Kernel 6.8.0-31-generic, 18 MiB initramfs. Asserts the initramfs is a plausible size |
+| `50-image` | **VERIFIED (amd64)** | GPT + ESP + A/B roots + data, assembled with no loop devices and no mounts. 8 GiB apparent, 419 MiB on disk |
+| `60-verify` | **VERIFIED (amd64)** | Boots under QEMU to a login prompt and recovers the capability profile the guest wrote to its own data partition |
 
 ## Targets
 
@@ -31,3 +31,19 @@ what CI in this environment can actually reach. Both must keep working.
 
 Create `build/bsp/<vendor>-<board>/bsp.toml` rather than forking a recipe. Mainline kernel
 first; a vendor kernel is a documented exception with an exit plan.
+
+
+## Image assembly without loop devices
+
+Stage 50 builds each filesystem as a standalone file — ext4 via `mkfs.ext4 -d`, FAT via
+mtools — and writes it into the disk image at its partition offset. Nothing is mounted and
+no loop device is used.
+
+That is not a workaround for this environment alone, though it started as one: `losetup
+--partscan` creates no partition nodes here because there is no udev. Avoiding mounts also
+removes the build's dependence on the host's mount namespace and device naming, which is
+what reproducibility needs.
+
+The boot chain puts the kernel and initramfs on the ESP rather than the root filesystem, so
+GRUB needs only FAT support, the standalone EFI binary stays small, and a damaged root
+filesystem still reaches a boot menu.

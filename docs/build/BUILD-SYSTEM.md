@@ -1,7 +1,10 @@
 # Reproducible Build System
 
-**Status:** `SPECIFIED` (design) · `IMPLEMENTED` (`00-probe-env` stage, Makefile skeleton,
-QEMU harness scripts) · **not yet `VERIFIED`** — no image has been built or booted.
+**Status:** `VERIFIED` on **amd64** — the full pipeline builds an image that boots under
+QEMU to a login prompt and produces a capability profile from inside the VM.
+**arm64 is not yet verified.**
+
+See `docs/build/VERIFICATION-LOG.md` for exactly what has been executed and what has not.
 
 ## 1. Strategy
 
