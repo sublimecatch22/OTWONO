@@ -198,6 +198,10 @@ Rules:
 - Rust: `#![forbid(unsafe_code)]` unless an ADR justifies otherwise; `unsafe` requires a
   `// SAFETY:` comment.
 - Every crate must build for both `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`.
+- **The toolchain is pinned** in `rust-toolchain.toml`. CI runs `clippy -D warnings`, and an
+  unpinned toolchain means a new Rust release can turn a green branch red with no code
+  change. Bumping the pin is a deliberate commit that also fixes whatever the new release
+  found. Do not work around a new lint by loosening CI.
 
 ---
 

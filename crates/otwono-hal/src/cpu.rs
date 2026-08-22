@@ -143,13 +143,14 @@ fn parse_cpuinfo(text: &str, info: &mut CpuInfo) {
             }
             "physical id" => current_physical_id = Some(value.to_string()),
             "core id" => current_core_id = Some(value.to_string()),
-            "flags" | "Features" => {
-                if info.flags.is_empty() {
-                    let mut flags: Vec<String> = value.split_whitespace().map(str::to_string).collect();
-                    flags.sort();
-                    info.features = parse_features(&flags);
-                    info.flags = flags;
-                }
+            // Guarded rather than nested: only the first processor block's flag list is
+            // read. Every core reports the same set, and on big.LITTLE the first block is
+            // the one the scheduler starts threads on.
+            "flags" | "Features" if info.flags.is_empty() => {
+                let mut flags: Vec<String> = value.split_whitespace().map(str::to_string).collect();
+                flags.sort();
+                info.features = parse_features(&flags);
+                info.flags = flags;
             }
             _ => {}
         }

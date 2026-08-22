@@ -10,7 +10,8 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+# Matches rust-toolchain.toml. Older compilers are untested, so we do not claim them.
+rust-version = "1.97"
 license = "Apache-2.0"
 repository = "https://github.com/sublimecatch22/otwono"
 

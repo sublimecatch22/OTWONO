@@ -11,6 +11,11 @@ Everything below was run in the OTWONO Cloud development environment
 
 ## Rust workspace
 
+Run against the **pinned toolchain** in `rust-toolchain.toml` (Rust 1.97.0). The pin exists
+because PR #1's first CI run failed on a clippy `collapsible_match` lint present in 1.97
+and absent in the 1.94 this work was developed against — a green local run is only
+meaningful if it uses the same compiler CI does.
+
 | Command | Result |
 |---|---|
 | `cargo test --workspace` | **83 tests pass**, 0 fail (33 capability unit, 29 hal unit, 4 hal fixture, 4 capability fixture, 7 hwctl, 5 schema contract, 1 doc-test) |
@@ -20,6 +25,7 @@ Everything below was run in the OTWONO Cloud development environment
 | `file target/aarch64-unknown-linux-gnu/release/otwono-hwctl` | `ELF 64-bit LSB pie executable, ARM aarch64` |
 | `qemu-aarch64-static -L /usr/aarch64-linux-gnu … otwono-hwctl profile --root …/aarch64-rpi5-8gb-synthetic` | **runs and classifies correctly** — the arm64 binary executes, it does not merely link |
 | `shellcheck -S warning tools/*.sh build/{stages,qemu,lib}/*.sh` | clean |
+| Same suite re-run under Rust 1.94 before the pin | also clean — the 1.94/1.97 clippy divergence was the only difference |
 
 ## Hardware detection on the live machine
 
