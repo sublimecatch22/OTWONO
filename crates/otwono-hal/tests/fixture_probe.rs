@@ -56,6 +56,49 @@ fn every_fixture_declares_its_provenance() {
     assert!(checked >= 3, "expected at least three fixtures, found {checked}");
 }
 
+/// Git cannot store an empty directory.
+///
+/// Several sysfs markers *are* directories whose mere presence is the signal —
+/// `net/*/wireless`, `thermal_zone*`, device-tree `npu@*` nodes. An empty one survives in
+/// a working tree and silently vanishes on a fresh clone, so the fixture then describes
+/// different hardware in CI than it does on the machine that wrote it. That is exactly how
+/// `rpi5_fixture_detects_arm_features_and_an_integrated_gpu` passed locally and failed in
+/// CI: `wlan0/wireless` was never committed, so `wlan0` came back as Ethernet.
+///
+/// Every marker directory must therefore hold a `.gitkeep`. This test fails on the
+/// author's machine rather than waiting for CI to notice.
+#[test]
+fn no_fixture_directory_is_empty() {
+    fn walk(dir: &Path, empty: &mut Vec<PathBuf>) {
+        let mut has_entries = false;
+        for entry in std::fs::read_dir(dir).unwrap().filter_map(Result::ok) {
+            has_entries = true;
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, empty);
+            }
+        }
+        if !has_entries {
+            empty.push(dir.to_path_buf());
+        }
+    }
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let mut empty = Vec::new();
+    walk(&root, &mut empty);
+
+    assert!(
+        empty.is_empty(),
+        "these fixture directories are empty and will not survive a fresh clone; \
+         add a .gitkeep to each:\n  {}",
+        empty
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    );
+}
+
 #[test]
 fn real_capture_of_the_dev_vm_round_trips() {
     let dir = fixture("x86_64-cloud-vm");

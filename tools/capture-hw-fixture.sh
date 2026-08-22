@@ -50,6 +50,18 @@ mark_present() {
     : > "$dst"
 }
 
+mark_dir() {
+    # Some sysfs markers are directories (net/*/wireless, thermal zones, device-tree
+    # nodes). The probe only checks that they exist. Git cannot track an empty directory,
+    # so drop a .gitkeep inside — without it the marker silently vanishes on a fresh
+    # clone and the fixture quietly describes different hardware.
+    local src="$1"
+    [ -e "$src" ] || return 0
+    local dst="$OUT/${src#/}"
+    mkdir -p "$dst"
+    printf '%s\n' "# Marker directory. Its presence is what the probe checks; git cannot track an empty directory." > "$dst/.gitkeep"
+}
+
 echo "capturing to $OUT"
 
 # --- CPU -------------------------------------------------------------------------------
@@ -89,7 +101,7 @@ for n in /dev/nvidiactl /dev/nvidia0 /dev/kfd /dev/rknpu /dev/hailo0 /dev/apex_0
     mark_present "$n"
 done
 for d in /proc/device-tree/npu*; do
-    [ -e "$d" ] && mkdir -p "$OUT/${d#/}"
+    mark_dir "$d"
 done
 
 # --- Storage ---------------------------------------------------------------------------
@@ -106,8 +118,8 @@ for d in /sys/class/net/*; do
     copy_file "$d/type"
     copy_file "$d/operstate"
     copy_file "$d/speed"
-    [ -e "$d/wireless" ] && mkdir -p "$OUT/${d#/}/wireless"
-    [ -e "$d/phy80211" ] && mkdir -p "$OUT/${d#/}/phy80211"
+    mark_dir "$d/wireless"
+    mark_dir "$d/phy80211"
 done
 copy_file /proc/net/route
 
@@ -118,7 +130,7 @@ for d in /sys/class/power_supply/*; do
     copy_file "$d/online"
 done
 for d in /sys/class/thermal/thermal_zone*; do
-    [ -d "$d" ] && mkdir -p "$OUT/${d#/}"
+    mark_dir "$d"
 done
 
 # --- Filesystem capacity ---------------------------------------------------------------
