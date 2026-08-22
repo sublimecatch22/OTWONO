@@ -140,16 +140,23 @@ cleanup() {
 trap cleanup EXIT
 
 # The mesh line reports what each node can see: OTWONO-MESH-OK node=<fp> known=N connected=N
+#
+# Always succeeds, printing an empty string when the marker has not appeared yet. That
+# matters: under `set -o pipefail` a grep that matches nothing fails the whole pipeline,
+# and inside `x=$(mesh_field ...)` with `set -e` that terminates the script with no
+# message. This harness has been bitten by that twice — once here and once in firmware
+# detection — so the guard belongs inside the function rather than at each call site.
 mesh_field() { # logfile field
     grep -ao "OTWONO-MESH-OK[^\r]*" "$1" 2>/dev/null | tail -1 |
-        tr ' ' '\n' | awk -F= -v k="$2" '$1 == k {print $2}' | tail -1
+        tr ' ' '\n' | awk -F= -v k="$2" '$1 == k {print $2}' | tail -1 || true
+    return 0
 }
 
 echo "waiting for both nodes to form a mesh (TCG, up to ${TIMEOUT}s)"
 deadline=$(( $(date +%s) + TIMEOUT ))
 result=timeout
 while [ "$(date +%s)" -lt "$deadline" ]; do
-    if grep -qa "Kernel panic\|OTWONO-MESH-FAIL" "$OUT/node-a.log" "$OUT/node-b.log"; then
+    if grep -qa "Kernel panic\|OTWONO-MESH-FAIL" "$OUT/node-a.log" "$OUT/node-b.log" 2>/dev/null; then
         result=fail; break
     fi
     # Wait on the periodic mesh marker, not on otwono-netd's own log lines: the daemon
@@ -157,7 +164,9 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     # version of this test waited for evidence that could not appear.
     a_conn=$(mesh_field "$OUT/node-a.log" connected)
     b_conn=$(mesh_field "$OUT/node-b.log" connected)
-    if [ "${a_conn:-0}" -ge 1 ] && [ "${b_conn:-0}" -ge 1 ]; then
+    case "$a_conn" in ''|*[!0-9]*) a_conn=0 ;; esac
+    case "$b_conn" in ''|*[!0-9]*) b_conn=0 ;; esac
+    if [ "$a_conn" -ge 1 ] && [ "$b_conn" -ge 1 ]; then
         result=pass; break
     fi
     sleep 5
@@ -187,8 +196,11 @@ B_ID=$(mesh_field "$OUT/node-b.log" node)
 }
 
 # Both sides must report a peer. A one-sided count would mean a half-open session.
-[ "$(mesh_field "$OUT/node-a.log" connected)" -ge 1 ] || { echo "FAIL: node A has no peer" >&2; exit 1; }
-[ "$(mesh_field "$OUT/node-b.log" connected)" -ge 1 ] || { echo "FAIL: node B has no peer" >&2; exit 1; }
+for n in a b; do
+    conn=$(mesh_field "$OUT/node-$n.log" connected)
+    case "$conn" in ''|*[!0-9]*) conn=0 ;; esac
+    [ "$conn" -ge 1 ] || { echo "FAIL: node $n reports no peer" >&2; exit 1; }
+done
 
 echo "PASS: two nodes discovered and mutually authenticated"
 echo "  A $A_ID"
