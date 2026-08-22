@@ -114,24 +114,32 @@ prepare_firmware() { # node
 }
 
 # Node A listens for the segment, node B connects to it. Together they are one L2 link.
-start_node() { # node netdev-spec logfile
-    local n="$1" netdev="$2" log="$3"
+#
+# Each guest needs its own MAC. QEMU hands every guest the same default
+# (52:54:00:12:34:56) when none is given, and IPv4 link-local derives its address from the
+# MAC — so both nodes came up on 169.254.158.157/16 and nothing could reach anything.
+# Duplicate-address detection cannot save you either: with identical MACs each node sees
+# its own ARP probe and concludes the address is free.
+start_node() { # node netdev-spec logfile mac
+    local n="$1" netdev="$2" log="$3" mac="$4"
     prepare_firmware "$n"
     "$QEMU" "${MACHINE[@]}" \
         -m 2048 -smp 2 \
         -drive if=pflash,format=raw,unit=0,readonly=on,file="$OUT/code-$n.fd" \
         -drive if=pflash,format=raw,unit=1,file="$OUT/vars-$n.fd" \
         -drive if=virtio,format=raw,file="$OUT/node-$n.img" \
-        -netdev "$netdev" -device virtio-net-pci,netdev=seg \
+        -netdev "$netdev" -device virtio-net-pci,netdev=seg,mac="$mac" \
         -nographic -serial mon:stdio -no-reboot \
         < /dev/null > "$log" 2>&1 &
     echo $!
 }
 
 : > "$OUT/node-a.log"; : > "$OUT/node-b.log"
-PID_A=$(start_node a "socket,id=seg,listen=127.0.0.1:$SEGMENT_PORT" "$OUT/node-a.log")
+# Locally-administered unicast addresses (the 0x02 bit set in the first octet), distinct
+# per node.
+PID_A=$(start_node a "socket,id=seg,listen=127.0.0.1:$SEGMENT_PORT" "$OUT/node-a.log" "52:54:00:07:11:01")
 sleep 2
-PID_B=$(start_node b "socket,id=seg,connect=127.0.0.1:$SEGMENT_PORT" "$OUT/node-b.log")
+PID_B=$(start_node b "socket,id=seg,connect=127.0.0.1:$SEGMENT_PORT" "$OUT/node-b.log" "52:54:00:07:11:02")
 
 cleanup() {
     kill "$PID_A" "$PID_B" 2>/dev/null || true
@@ -147,8 +155,12 @@ trap cleanup EXIT
 # message. This harness has been bitten by that twice — once here and once in firmware
 # detection — so the guard belongs inside the function rather than at each call site.
 mesh_field() { # logfile field
-    grep -ao "OTWONO-MESH-OK[^\r]*" "$1" 2>/dev/null | tail -1 |
-        tr ' ' '\n' | awk -F= -v k="$2" '$1 == k {print $2}' | tail -1 || true
+    # Match the *complete* marker shape, not a prefix. A serial console interleaves
+    # carriage returns and flushes mid-line, so the newest occurrence is often a partial
+    # one like "OTWONO-MESH-OK node=otw1:nask-s". Taking tail -1 of a loose match then
+    # yields an empty field and the poll loop never sees the value that is plainly there.
+    grep -aoE "OTWONO-MESH-OK node=[^ ]+ addr=[^ ]+ known=[0-9]+ connected=[0-9]+" "$1" 2>/dev/null |
+        tail -1 | tr ' ' '\n' | awk -F= -v k="$2" '$1 == k {print $2}' | tail -1 || true
     return 0
 }
 
@@ -175,8 +187,18 @@ done
 echo
 echo "node A identity: $(mesh_field "$OUT/node-a.log" node)"
 echo "node B identity: $(mesh_field "$OUT/node-b.log" node)"
+echo "node A address: $(mesh_field "$OUT/node-a.log" addr)"
+echo "node B address: $(mesh_field "$OUT/node-b.log" addr)"
 echo "node A peers connected: $(mesh_field "$OUT/node-a.log" connected)"
 echo "node B peers connected: $(mesh_field "$OUT/node-b.log" connected)"
+
+A_ADDR=$(mesh_field "$OUT/node-a.log" addr)
+B_ADDR=$(mesh_field "$OUT/node-b.log" addr)
+if [ -n "$A_ADDR" ] && [ "$A_ADDR" = "$B_ADDR" ]; then
+    echo "FAIL: both nodes hold $A_ADDR. Their MACs collide, so link-local gave them the" >&2
+    echo "      same address and neither can reach the other." >&2
+    exit 1
+fi
 
 if [ "$result" != pass ]; then
     echo "FAIL: the two nodes did not form a mesh ($result)" >&2
