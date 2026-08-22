@@ -56,7 +56,7 @@ blocked ⇒ only the Ubuntu recipes are exercised here.
 
 ---
 
-## Phase 2 — Service architecture and the permission broker  ← *recommended next milestone*
+## Phase 2 — Service architecture and the permission broker ✅ complete
 
 **Goal:** the Local Control Plane exists and the security model has teeth.
 
@@ -66,12 +66,19 @@ blocked ⇒ only the Ubuntu recipes are exercised here.
 4. systemd units with the full hardening baseline; Landlock scoping.
 5. Integration tests over a temp socket directory; **negative** authorization tests.
 
-**Exit criterion:** an integration test in which an unauthorized caller is refused, an
-authorized caller succeeds, and the audit log's hash chain verifies.
+**Exit criterion: met, and then some.** 14 integration tests run both daemons over real
+Unix sockets: an unauthorized caller is refused, an authorized caller succeeds, and the
+hash chain verifies. Beyond the criterion, the same path was exercised on a **booted
+amd64 image** — the guest fetched its profile through permd and hwd at first boot, and the
+audit log it wrote was recovered and verified on the host.
+
+**Carried forward (not done):** both daemons run as root; the dedicated Z2/Z3 users and
+Landlock scoping listed above are outstanding, and need group-aware socket binding. There
+is no confirmation channel yet, so `Ask` fails closed with an error.
 
 ---
 
-## Phase 3 — Node identity and secure transport
+## Phase 3 — Node identity and secure transport  ← *recommended next milestone*
 
 1. `otwono-idd` — Ed25519 generation, TPM sealing where present, backup/restore, rotation.
 2. NodeID encoding, fingerprints, the pairing flow.

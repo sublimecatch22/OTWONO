@@ -118,6 +118,9 @@ Splitting along **privilege** and **failure-domain** lines gives us:
 
 ### 2.3 The Local Control Plane
 
+> **Status: `VERIFIED`.** Implemented in `otwono-proto` and running on a booted amd64
+> image. The rest of this section describes what exists.
+
 One IPC mechanism for everything: **JSON-RPC 2.0, newline-delimited, over Unix domain
 sockets** at `/run/otwono/<service>.sock`.
 

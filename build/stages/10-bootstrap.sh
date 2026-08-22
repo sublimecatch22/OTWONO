@@ -45,17 +45,7 @@ if [ "$ARCH" != "$HOST_ARCH" ]; then
     log "cross-architecture bootstrap ($HOST_ARCH host, $ARCH target)"
     require_tool "qemu-${ARCH/arm64/aarch64}-static" "package: qemu-user-static"
 
-    if [ ! -f /proc/sys/fs/binfmt_misc/register ]; then
-        log "mounting binfmt_misc"
-        mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc \
-            || die "cannot mount binfmt_misc; the foreign second stage will not run"
-    fi
-    if ! compgen -G '/proc/sys/fs/binfmt_misc/*aarch64*' > /dev/null; then
-        log "registering the aarch64 binfmt handler"
-        printf ':otwono-aarch64:M::\\x7fELF\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\xb7\\x00:\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff:/usr/bin/qemu-aarch64-static:F\n' \
-            > /proc/sys/fs/binfmt_misc/register \
-            || warn "could not register the binfmt handler; it may already exist"
-    fi
+    ensure_foreign_arch_support "$ARCH"
 fi
 
 rm -rf "$ROOTFS"

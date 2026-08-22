@@ -1,7 +1,15 @@
 # Security Model
 
-**Status:** `SPECIFIED`. No enforcement code exists yet. Nothing in this document is
-currently protecting anything.
+**Status:** partly `VERIFIED`, mostly `SPECIFIED`.
+
+* **Implemented and exercised on a booted system:** the permission broker (`otwono-permd`),
+  the typed action registry, fail-closed policy evaluation, scoped capability tokens, and
+  the hash-chained audit log. One guarded service (`otwono-hwd`) enforces through it. See
+  `docs/build/VERIFICATION-LOG.md`.
+* **Not implemented:** trust zones below are aspirational — both daemons currently run as
+  root, with systemd hardening but no dedicated users and no Landlock. There is no
+  confirmation channel, so an `Ask` decision fails closed with an error. Nothing in the
+  agent, network or storage sections exists yet.
 
 ## 1. Trust zones
 

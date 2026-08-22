@@ -6,11 +6,13 @@ networking, local AI, distributed services, and offline-first capabilities.
 Runs on **x86_64/AMD64** computers and **ARM64** single-board computers. Same operating
 system, same subsystems, same interfaces — the capabilities scale to the hardware.
 
-> **Project status: Phase 1 complete.** **Both the amd64 and arm64 images boot** — under
-> QEMU each reaches a login prompt and produces a hardware capability profile from inside
-> the VM, recovered afterwards from the guest's own disk. The arm64 image is cross-built on
-> an x86_64 host. Nothing has run on real hardware yet, and no OTWONO daemon exists: the
-> node network, AI runtime, permission broker and distributed services are design only.
+> **Project status: Phase 2 complete (amd64).** Both images boot under QEMU, and the
+> **permission broker and hardware daemon now run on the booted system**: at first boot the
+> guest requests a capability, calls the hardware daemon with it, and the broker writes a
+> hash-chained audit record — all recovered from the image and verified on the host
+> afterwards. Nothing has run on real hardware yet. The node network, AI runtime and
+> distributed services remain design only, and both daemons still run as root pending user
+> separation.
 >
 > Every document and subsystem carries an explicit status (`SPECIFIED` / `IMPLEMENTED` /
 > `VERIFIED`), and nothing here claims to work that has not been run — see
@@ -33,7 +35,7 @@ Four things make it different from a desktop Linux with a chatbot bolted on:
 | | |
 |---|---|
 | **Hardware-adaptive** | One capability profile decides what this machine may do. A Pi Zero gets a command-grammar assistant and a relay node; a workstation gets 70B-class models, multiple agents, and serves AI to authorized peers. Nothing else in the system re-derives "is this machine big enough". |
-| **AI as an OS subsystem** | The assistant drives ordinary open-source applications — LibreOffice, GIMP, ffmpeg, Kdenlive — through a typed, permission-brokered adapter layer. It has no ambient privilege, ever. |
+| **AI as an OS subsystem** | The assistant drives ordinary open-source applications — LibreOffice, GIMP, ffmpeg, Kdenlive — through a typed, permission-brokered adapter layer. It has no ambient privilege, ever. The broker exists today: every privileged call needs a scoped, time-limited capability token, and a policy saying `allow` on a destructive action still yields "confirmation required". |
 | **Decentralized by default** | Every installation has a cryptographic node identity and can join a peer-to-peer overlay over Ethernet, Wi-Fi, or radio. Wiki, forums, messaging, profiles, and media sharing keep working when the Internet does not. |
 | **Data has a policy** | Every object is `PRIVATE`, `SHARED`, `PUBLIC`, or `REPLICATED`. The default is `PRIVATE`, unparseable means `PRIVATE`, and derived content inherits the most restrictive label of its inputs. Enforced in the store *and* independently at network egress. |
 
@@ -63,6 +65,13 @@ cargo test --workspace
 
 # What tier is this machine, and why?
 cargo run -p otwono-hwctl -- profile
+
+# Ask the running daemons instead of probing locally
+cargo run -p otwono-hwctl -- remote
+
+# Validate a policy file, or check an audit log's hash chain
+cargo run -p otwono-permd -- --check --policy-dir /etc/otwono/policy.d
+cargo run -p otwono-permd -- --verify-audit /var/log/otwono/audit.jsonl
 
 # The machine-readable contract other subsystems consume
 cargo run -p otwono-hwctl -- profile --json
@@ -99,11 +108,17 @@ be bootstrapped in the OTWONO Cloud environment, whose proxy rejects Debian mirr
 ```
 CLAUDE.md      permanent engineering instructions (normative)
 docs/          architecture, network, ai, security, hardware, build, services, roadmap, decisions
-crates/        Rust workspace — otwono-hal, otwono-capability, otwono-hwctl
+crates/
+  otwono-hal          injectable hardware probes
+  otwono-capability   axis classification, tiers, feature gates
+  otwono-proto        Local Control Plane: JSON-RPC 2.0 over Unix sockets
+  otwono-permd        permission broker: actions, policy, tokens, audit log
+  otwono-hwd          hardware daemon (first guarded service)
+  otwono-hwctl        inspection CLI, local and over the control plane
 schemas/       JSON Schemas — the cross-language contracts
-build/         Makefile, recipes, numbered stages, QEMU harnesses
+build/         Makefile, recipes, numbered stages, QEMU harnesses, installed files
 tools/         environment probe, hardware fixture capture
-tests/         cross-component and contract tests
+tests/         contract tests and control-plane integration tests
 ```
 
 ## Contributing

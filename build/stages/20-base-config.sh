@@ -16,6 +16,7 @@ if stage_is_complete 20-base-config; then
 fi
 
 require_root
+ensure_foreign_arch_support "$(recipe_get target arch)"
 
 ARCH="$(recipe_get target arch)"
 SUITE="$(recipe_get base suite)"

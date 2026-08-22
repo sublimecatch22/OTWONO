@@ -40,6 +40,10 @@ case "$ARCH" in
     *) die "unsupported arch: $ARCH" ;;
 esac
 
+# This stage runs grub-mkstandalone inside the target rootfs, so it needs the same
+# foreign-arch support the bootstrap did — and a partial rebuild may have skipped stage 10.
+ensure_foreign_arch_support "$ARCH"
+
 DATA_MIB=$((IMAGE_MIB - ESP_MIB - 2 * ROOT_MIB - 2))
 [ "$DATA_MIB" -ge 256 ] || die "image size ${IMAGE_MIB}M leaves only ${DATA_MIB}M for data; enlarge [image] size"
 

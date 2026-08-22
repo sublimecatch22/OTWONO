@@ -12,6 +12,7 @@ stage_begin 40-kernel
 ROOTFS="$TARGET_OUT/rootfs"
 [ -d "$ROOTFS/usr" ] || die "no rootfs at $ROOTFS; run stage 10 first"
 require_root
+ensure_foreign_arch_support "$(recipe_get target arch)"
 
 ARCH="$(recipe_get target arch)"
 KERNEL="$(recipe_get packages kernel)"

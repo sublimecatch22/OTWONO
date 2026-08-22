@@ -14,6 +14,7 @@ TOOLS="$TARGET_OUT/host-tools"
 # Not skipped when already complete: this stage installs the OTWONO layer itself, so it
 # must re-run whenever the binaries are rebuilt. It is cheap and fully idempotent.
 require_root
+ensure_foreign_arch_support "$(recipe_get target arch)"
 
 log "installing binaries"
 install -d -m 0755 "$ROOTFS/usr/bin"

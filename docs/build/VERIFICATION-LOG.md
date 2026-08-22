@@ -210,3 +210,83 @@ Environment findings that shaped stage 50:
   real capture. No probe has run on a real Raspberry Pi, Rockchip board, or GPU machine.
 - Reproducibility is designed but not measured: no two-run byte-comparison has been done,
   and snapshot mirror pinning is not wired up.
+
+---
+
+## Phase 2 — the control plane runs on a booted system
+
+**`make -C build TARGET=amd64-qemu-ubuntu boot-test` passes with the daemons in the image.**
+
+Both daemons start under the full hardening baseline, and the guest fetches its own
+capability profile *through* the control plane at first boot:
+
+```
+[  OK  ] Started otwono-permd.service - OTWONO permission broker.
+[  OK  ] Started otwono-hwd.service   - OTWONO hardware daemon.
+OTWONO-CONTROL-PLANE-OK tier=T0_MICRO audit_records=3
+```
+
+Zero `Failed to start .*otwono` lines in the boot log.
+
+Stage 60 then recovers three artifacts from the image and checks them on the host:
+
+| Artifact | Source | Result |
+|---|---|---|
+| `capability-profile.json` | data partition, written by the local probe | tier `T0_MICRO`, arch `x86_64` |
+| `control-plane-profile.json` | data partition, fetched via permd + hwd | tier `T0_MICRO` — **matches the local probe** |
+| `audit.jsonl` | root partition, written by the broker | 3 records, **chain intact** |
+
+The audit trail the guest wrote, verified on the host with `otwono-permd --verify-audit`:
+
+```
+seq=1 request         uid:0  hw.read  allow   prev=000000000000… hash=4c30beda0b10…
+seq=2 token_issued    uid:0  hw.read  issued  prev=4c30beda0b10… hash=7b2b774b9a9c…
+seq=3 token_verified  uid:0  hw.read  valid   prev=7b2b774b9a9c… hash=5e6e6dc245f4…
+```
+
+That sequence is the whole point of the phase: a capability was requested, a policy decision
+was recorded, a token was issued, and a separate daemon verified it before serving data —
+with each record chained to the one before.
+
+### Workspace
+
+| Command | Result |
+|---|---|
+| `cargo test --workspace` | **153 tests pass** (87 before Phase 2) |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| `cargo fmt --all --check` | clean |
+| `shellcheck` over `tools/`, `build/{stages,qemu,lib,files}` | clean |
+
+14 of those tests are integration tests running both daemons on real Unix sockets rather
+than in-process, because `SO_PEERCRED` is part of what is under test.
+
+### Bugs this found
+
+**6. A shell quoting error that only a boot could surface.** The control-plane check began
+life inlined in the unit's `ExecStart`. Through a heredoc *and* systemd's escaping the
+quoting broke, and the only symptom was `/bin/sh: 1: Syntax error: Unterminated quoted
+string` several minutes into a QEMU run.
+
+It is now a script in `build/files/`, installed by stage 30 and linted by shellcheck in CI.
+A quoting error there now fails a fifteen-second job instead of a ten-minute boot. The
+general rule this produced: **no non-trivial shell inside a systemd unit** — put it in a
+file that the linter can see.
+
+**7. The boot harness burned the full timeout on a missing marker.** A guest sitting at a
+login prompt never exits, so a marker that never arrives cost the entire 600s. The harness
+now notes when the login prompt appears — systemd is finished by then — and gives up after
+a 60s grace, naming the missing markers and any failed OTWONO unit.
+
+### What Phase 2 has *not* verified
+
+- **Both daemons run as root.** The dedicated Z2/Z3 users and Landlock scoping in the
+  Phase 2 description are not implemented. User separation needs group-aware socket
+  binding so a non-root `otwono-hwd` can reach the broker's socket.
+- **No confirmation channel exists**, so an `Ask` decision returns an error. That is
+  fail-closed and correct for now, but it means the confirmation path itself is untested
+  beyond the unit level.
+- **The audit chain is tamper-evident, not tamper-proof.** An attacker who can rewrite the
+  whole file can recompute every hash. Anchoring the chain head somewhere the writer cannot
+  reach is Phase 3 work.
+- Only one tier (`T0_MICRO`) and one policy shape have been exercised on a booted system.
+

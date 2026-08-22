@@ -121,6 +121,47 @@ stage_is_complete() { [ -f "$(stage_marker "$1")" ]; }
 
 stage_mark_complete() { mkdir -p "$TARGET_OUT"; : > "$(stage_marker "$1")"; }
 
+# --- Foreign-architecture execution ----------------------------------------------------
+# Every stage that chroots into a foreign-arch rootfs needs binfmt_misc registered, not
+# just the one that bootstrapped it. Registration lives in the kernel, not in the rootfs,
+# so it does not survive a container restart — and a partial rebuild that skips stage 10
+# would otherwise fail deep inside the next chroot with a bare "Exec format error".
+ensure_foreign_arch_support() { # target-arch
+    local arch="$1" host qemu
+    host="$(dpkg --print-architecture)"
+    [ "$arch" != "$host" ] || return 0
+
+    case "$arch" in
+        arm64) qemu=/usr/bin/qemu-aarch64-static ;;
+        amd64) qemu=/usr/bin/qemu-x86_64-static ;;
+        *) die "no qemu-user interpreter known for arch $arch" ;;
+    esac
+    [ -x "$qemu" ] || die "missing $qemu (package: qemu-user-static); cannot run $arch binaries"
+
+    if [ ! -f /proc/sys/fs/binfmt_misc/register ]; then
+        log "mounting binfmt_misc for $arch execution"
+        mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc \
+            || die "cannot mount binfmt_misc; $arch binaries cannot run on this $host host"
+    fi
+
+    if compgen -G "/proc/sys/fs/binfmt_misc/*${arch}*" > /dev/null \
+        || compgen -G '/proc/sys/fs/binfmt_misc/*aarch64*' > /dev/null; then
+        return 0
+    fi
+
+    log "registering the $arch binfmt handler"
+    # The trailing F flag opens the interpreter at registration time, so it works without
+    # copying qemu-user into every rootfs.
+    case "$arch" in
+        arm64)
+            printf ':otwono-aarch64:M::\\x7fELF\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\xb7\\x00:\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff:%s:F\n' "$qemu" \
+                > /proc/sys/fs/binfmt_misc/register \
+                || die "could not register the arm64 binfmt handler"
+            ;;
+        *) die "no binfmt magic defined for arch $arch" ;;
+    esac
+}
+
 # --- Guards --------------------------------------------------------------------------
 require_root() {
     [ "$(id -u)" = 0 ] || die "this stage needs root (rootfs ownership and mounts)"
