@@ -18,6 +18,7 @@ USAGE:
 
 COMMANDS:
     profile     Print the capability profile (tier, axes, feature gates)
+    remote      Fetch the profile from the running daemons over the control plane
     hardware    Print the raw hardware report only
     tier        Print just the tier identifier
     help        Show this message
@@ -27,6 +28,10 @@ OPTIONS:
     --root <PATH>           Probe a captured fixture tree instead of the live system
     --overrides <PATH>      Override file (default /etc/otwono/capability.override.toml)
     --no-overrides          Ignore the override file entirely
+
+OPTIONS (remote):
+    --perm-socket <PATH>    Permission broker socket (default $OTWONO_SOCKET_DIR/perm.sock)
+    --hw-socket <PATH>      Hardware daemon socket (default $OTWONO_SOCKET_DIR/hw.sock)
 
 EXIT CODES:
     0  success
@@ -64,6 +69,8 @@ struct Options {
     root: PathBuf,
     overrides: Option<PathBuf>,
     use_overrides: bool,
+    perm_socket: Option<PathBuf>,
+    hw_socket: Option<PathBuf>,
 }
 
 fn parse_args(args: &[String]) -> Result<Options, Error> {
@@ -73,6 +80,8 @@ fn parse_args(args: &[String]) -> Result<Options, Error> {
         root: PathBuf::from("/"),
         overrides: None,
         use_overrides: true,
+        perm_socket: None,
+        hw_socket: None,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -92,6 +101,20 @@ fn parse_args(args: &[String]) -> Result<Options, Error> {
                         .ok_or_else(|| Error::Usage("--overrides needs a path".into()))?,
                 )
             }
+            "--perm-socket" => {
+                opts.perm_socket = Some(
+                    it.next()
+                        .map(PathBuf::from)
+                        .ok_or_else(|| Error::Usage("--perm-socket needs a path".into()))?,
+                )
+            }
+            "--hw-socket" => {
+                opts.hw_socket = Some(
+                    it.next()
+                        .map(PathBuf::from)
+                        .ok_or_else(|| Error::Usage("--hw-socket needs a path".into()))?,
+                )
+            }
             "-h" | "--help" | "help" => opts.command = "help".into(),
             other if other.starts_with('-') => return Err(Error::Usage(format!("unknown option {other}"))),
             other if opts.command.is_empty() => opts.command = other.to_string(),
@@ -108,6 +131,12 @@ fn run(args: &[String]) -> Result<String, Error> {
     let opts = parse_args(args)?;
     if opts.command == "help" {
         return Ok(USAGE.to_string());
+    }
+
+    // `remote` talks to the running daemons instead of probing locally, so it must not
+    // fall through to the local probe path below.
+    if opts.command == "remote" {
+        return run_remote(&opts);
     }
 
     let probe = SystemProbe::from_root(&opts.root);
@@ -147,6 +176,66 @@ fn run(args: &[String]) -> Result<String, Error> {
         "tier" => Ok(format!("{}\n", profile.tier.as_str())),
         other => Err(Error::Usage(format!("unknown command {other}"))),
     }
+}
+
+/// Fetch the profile the way anything else on the system would: ask the broker for a
+/// capability, then call the hardware daemon with it.
+///
+/// This is the operator's check that the control plane is actually working, and it is what
+/// the first-boot unit runs. Probing locally proves the prober works; this proves the
+/// daemons, the sockets, the policy and the token path all work.
+fn run_remote(opts: &Options) -> Result<String, Error> {
+    use otwono_proto::Client;
+
+    let perm_socket = opts
+        .perm_socket
+        .clone()
+        .unwrap_or_else(|| otwono_proto::socket_path("perm"));
+    let hw_socket = opts
+        .hw_socket
+        .clone()
+        .unwrap_or_else(|| otwono_proto::socket_path("hw"));
+
+    // At first boot this runs while the daemons are still binding, so wait rather than
+    // racing them.
+    let wait = std::time::Duration::from_secs(5);
+    let mut perm = Client::connect_waiting(&perm_socket, wait).map_err(|e| {
+        Error::Runtime(format!(
+            "cannot reach the permission broker at {}: {e}",
+            perm_socket.display()
+        ))
+    })?;
+    let granted = perm
+        .call(
+            "perm.request",
+            serde_json::json!({ "action": "hw.read", "reason": "otwono-hwctl remote" }),
+        )
+        .map_err(|e| Error::Runtime(format!("perm.request transport failure: {e}")))?
+        .map_err(|e| Error::Runtime(format!("permission broker refused hw.read: {e}")))?;
+    let token = granted
+        .get("token")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| Error::Runtime("broker returned no token".into()))?;
+
+    let mut hw = Client::connect_waiting(&hw_socket, wait).map_err(|e| {
+        Error::Runtime(format!(
+            "cannot reach the hardware daemon at {}: {e}",
+            hw_socket.display()
+        ))
+    })?;
+    let value = hw
+        .call_with_capability("hw.profile", serde_json::json!({}), token)
+        .map_err(|e| Error::Runtime(format!("hw.profile transport failure: {e}")))?
+        .map_err(|e| Error::Runtime(format!("hardware daemon refused: {e}")))?;
+
+    if opts.json {
+        return serde_json::to_string_pretty(&value)
+            .map(|s| s + "\n")
+            .map_err(|e| Error::Runtime(e.to_string()));
+    }
+    let profile: CapabilityProfile = serde_json::from_value(value)
+        .map_err(|e| Error::Runtime(format!("daemon returned an unreadable profile: {e}")))?;
+    Ok(render_profile(&profile))
 }
 
 fn gib(bytes: u64) -> String {
@@ -337,6 +426,32 @@ mod tests {
     #[test]
     fn no_arguments_shows_help() {
         assert!(run(&[]).unwrap().contains("USAGE"));
+    }
+
+    #[test]
+    fn remote_socket_options_are_parsed() {
+        // Regression: these arms were silently dropped by a bad patch and every
+        // `--perm-socket` invocation failed as an unknown option.
+        let o = parse_args(&argv(&[
+            "remote",
+            "--perm-socket",
+            "/p.sock",
+            "--hw-socket",
+            "/h.sock",
+        ]))
+        .unwrap();
+        assert_eq!(o.command, "remote");
+        assert_eq!(o.perm_socket.as_deref(), Some(std::path::Path::new("/p.sock")));
+        assert_eq!(o.hw_socket.as_deref(), Some(std::path::Path::new("/h.sock")));
+    }
+
+    #[test]
+    fn remote_reports_an_unreachable_broker_as_a_runtime_error() {
+        let r = run(&argv(&["remote", "--perm-socket", "/nonexistent/p.sock"]));
+        match r {
+            Err(Error::Runtime(m)) => assert!(m.contains("permission broker"), "{m}"),
+            other => panic!("expected a runtime error, got {other:?}"),
+        }
     }
 
     #[test]

@@ -1,0 +1,16 @@
+[package]
+name = "otwono-control-plane-tests"
+description = "Integration tests: the Local Control Plane, the permission broker, and a guarded service together."
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+otwono-proto = { path = "../../crates/otwono-proto" }
+otwono-permd = { path = "../../crates/otwono-permd" }
+otwono-hwd = { path = "../../crates/otwono-hwd" }
+otwono-capability = { path = "../../crates/otwono-capability" }
+serde_json = "1"
+rustix = { version = "0.38", features = ["process"] }

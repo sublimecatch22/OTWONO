@@ -4,7 +4,11 @@ members = [
     "crates/otwono-hal",
     "crates/otwono-capability",
     "crates/otwono-hwctl",
+    "crates/otwono-proto",
+    "crates/otwono-permd",
+    "crates/otwono-hwd",
     "tests/schema",
+    "tests/control-plane",
 ]
 
 [workspace.package]
@@ -21,6 +25,8 @@ serde_json = "1"
 toml = "0.8"
 otwono-hal = { path = "crates/otwono-hal" }
 otwono-capability = { path = "crates/otwono-capability" }
+otwono-proto = { path = "crates/otwono-proto" }
+otwono-permd = { path = "crates/otwono-permd" }
 
 [profile.release]
 opt-level = "z"

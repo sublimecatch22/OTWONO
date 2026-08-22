@@ -1,0 +1,14 @@
+[package]
+name = "otwono-proto"
+description = "OTWONO Local Control Plane: JSON-RPC 2.0 over newline-delimited Unix domain sockets."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# socket_peercred without writing `unsafe` ourselves; std's peer_cred() is still unstable.
+rustix = { version = "0.38", features = ["net", "fs"] }

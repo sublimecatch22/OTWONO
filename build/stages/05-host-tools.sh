@@ -26,7 +26,7 @@ log "building workspace for $RUST_TARGET"
 ( cd "$REPO_ROOT" && env ${LINKER_ENV:-} cargo build --release --workspace --target "$RUST_TARGET" )
 
 BIN_SRC="$REPO_ROOT/target/$RUST_TARGET/release"
-BINARIES=(otwono-hwctl)
+BINARIES=(otwono-hwctl otwono-permd otwono-hwd)
 
 : > "$OUTDIR/manifest"
 for b in "${BINARIES[@]}"; do
