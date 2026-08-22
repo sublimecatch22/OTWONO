@@ -221,12 +221,15 @@ WantedBy=multi-user.target
 UNIT
 
 log "installing the first-boot control-plane check"
+install -d -m 0755 "$ROOTFS/usr/lib/otwono"
+install -m 0755 "$BUILD_DIR/files/otwono-control-plane-check" \
+    "$ROOTFS/usr/lib/otwono/control-plane-check"
 cat > "$ROOTFS/etc/systemd/system/otwono-control-plane-check.service" <<'UNIT'
 [Unit]
 Description=OTWONO control-plane self check
 After=otwono-hwd.service
 Requires=otwono-hwd.service
-RequiresMountsFor=/var/lib/otwono
+RequiresMountsFor=/var/lib/otwono /var/log/otwono
 Before=multi-user.target
 
 [Service]
@@ -234,11 +237,7 @@ Type=oneshot
 RemainAfterExit=yes
 # Proves the whole path end to end from inside the running system: ask the broker for a
 # capability, call the hardware daemon with it, and confirm the audit log recorded it.
-ExecStart=/bin/sh -c '\
-    /usr/bin/otwono-hwctl remote --json > /var/lib/otwono/control-plane-profile.json && \
-    tier=$$(/usr/bin/otwono-hwctl remote --json | sed -n "s/.*\"tier\": \"\\([^\"]*\\)\".*/\\1/p" | head -1) && \
-    records=$$(wc -l < /var/log/otwono/audit.jsonl) && \
-    echo "OTWONO-CONTROL-PLANE-OK tier=$$tier audit_records=$$records"'
+ExecStart=/usr/lib/otwono/control-plane-check
 StandardOutput=journal+console
 StandardError=journal+console
 

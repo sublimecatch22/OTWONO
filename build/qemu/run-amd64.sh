@@ -24,7 +24,7 @@ else
 fi
 # Patterns that mean the boot definitively failed; matching one aborts early rather
 # than burning the whole timeout under TCG.
-FAIL_PATTERN="${OTWONO_BOOT_FAIL:-Kernel panic|Attempted to kill init|Entering emergency mode|You are in emergency mode}"
+FAIL_PATTERN="${OTWONO_BOOT_FAIL:-Kernel panic|Attempted to kill init|Entering emergency mode|You are in emergency mode|Failed to start .*otwono}"
 
 usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 

@@ -1,0 +1,38 @@
+#!/bin/sh
+# OTWONO control-plane self check, run once at boot.
+#
+# Proves the whole authorization path works on the running system: ask the permission
+# broker for a capability, call the hardware daemon with it, and confirm the broker
+# recorded the exchange. Probing hardware locally proves the prober works; only this
+# proves the daemons, sockets, policy, tokens and audit log work together.
+#
+# This is a file, not an inline ExecStart. A previous attempt inlined it and shipped a
+# quoting bug that only surfaced as a boot failure minutes into a QEMU run; as a file it
+# is linted by shellcheck in CI like every other script in this repository.
+set -eu
+
+PROFILE=/var/lib/otwono/control-plane-profile.json
+AUDIT=/var/log/otwono/audit.jsonl
+
+/usr/bin/otwono-hwctl remote --json > "$PROFILE"
+
+# No jq in the base image, so pull the tier out with grep. The profile is machine-written
+# JSON, so the field appears exactly once at the top level.
+tier=$(grep -o '"tier"[[:space:]]*:[[:space:]]*"[^"]*"' "$PROFILE" | head -1 | cut -d'"' -f4)
+[ -n "$tier" ] || { echo "OTWONO-CONTROL-PLANE-FAIL no tier in $PROFILE" >&2; exit 1; }
+
+if [ -r "$AUDIT" ]; then
+    records=$(wc -l < "$AUDIT" | tr -d ' ')
+else
+    echo "OTWONO-CONTROL-PLANE-FAIL broker wrote no audit log at $AUDIT" >&2
+    exit 1
+fi
+
+# The broker must have recorded the request and the token verification; a profile served
+# with an empty audit trail would mean enforcement ran without leaving evidence.
+[ "$records" -ge 2 ] || {
+    echo "OTWONO-CONTROL-PLANE-FAIL only $records audit record(s)" >&2
+    exit 1
+}
+
+echo "OTWONO-CONTROL-PLANE-OK tier=$tier audit_records=$records"

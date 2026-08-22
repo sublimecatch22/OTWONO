@@ -9,16 +9,24 @@
 #
 # Success requires *every* pattern in REQUIRED to appear. A boot that reaches a login
 # prompt but never emits a capability profile is not a working OTWONO image.
+#
+# The login prompt also bounds the wait. Once the guest is sitting at a getty, systemd has
+# finished; a marker that has not appeared by then is not going to. Waiting the full
+# timeout in that case turned a broken one-line unit into a ten-minute feedback loop, so
+# after the prompt appears the harness allows a short grace period and then gives up.
 run_boot_test() { # log-file timeout qemu-binary args...
     local log="$1" timeout_s="$2" qemu="$3"; shift 3
     local settle="${OTWONO_BOOT_SETTLE:-15}"
-    local pid deadline result missing
+    local grace="${OTWONO_BOOT_GRACE:-60}"
+    local login_re="${OTWONO_BOOT_LOGIN:-login:}"
+    local pid deadline result missing login_seen_at now
 
     : > "$log"
     "$qemu" "$@" < /dev/null > "$log" 2>&1 &
     pid=$!
     deadline=$(( $(date +%s) + timeout_s ))
     result=timeout
+    login_seen_at=0
 
     while kill -0 "$pid" 2>/dev/null; do
         if grep -qaE "$FAIL_PATTERN" "$log"; then result=fail; break; fi
@@ -29,7 +37,16 @@ run_boot_test() { # log-file timeout qemu-binary args...
         done
         if [ "$missing" = 0 ]; then result=pass; break; fi
 
-        if [ "$(date +%s)" -ge "$deadline" ]; then result=timeout; break; fi
+        now=$(date +%s)
+        if [ "$login_seen_at" = 0 ] && grep -qaE "$login_re" "$log"; then
+            login_seen_at=$now
+        fi
+        if [ "$login_seen_at" != 0 ] && [ $(( now - login_seen_at )) -ge "$grace" ]; then
+            result=stalled
+            break
+        fi
+
+        if [ "$now" -ge "$deadline" ]; then result=timeout; break; fi
         sleep 2
     done
 
@@ -49,6 +66,17 @@ run_boot_test() { # log-file timeout qemu-binary args...
             echo "FAIL: the boot failed outright" >&2
             grep -naE "$FAIL_PATTERN" "$log" | head -5 >&2
             tail -40 "$log" >&2
+            return 1 ;;
+        stalled)
+            echo "FAIL: the guest reached a login prompt but never emitted every marker" >&2
+            echo "      (waited ${grace}s after the prompt; set OTWONO_BOOT_GRACE to extend)" >&2
+            for pat in "${REQUIRED[@]}"; do
+                grep -qaE "$pat" "$log" && echo "  matched: $pat" >&2 || echo "  MISSING: $pat" >&2
+            done
+            # A failed OTWONO unit is almost always the cause, so surface it directly
+            # rather than making the reader hunt through the console dump.
+            grep -naE "Failed to start .*otwono|otwono.*Syntax error|otwono.*not found" "$log" | head -5 >&2
+            tail -30 "$log" >&2
             return 1 ;;
         *)
             echo "FAIL: timed out after ${timeout_s}s" >&2

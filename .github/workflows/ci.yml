@@ -71,7 +71,7 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Lint
-        run: shellcheck -S warning tools/*.sh build/stages/*.sh build/qemu/*.sh build/lib/*.sh
+        run: shellcheck -S warning tools/*.sh build/stages/*.sh build/qemu/*.sh build/lib/*.sh build/files/*
 
   environment:
     name: Environment probe
