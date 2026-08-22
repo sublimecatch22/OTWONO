@@ -49,9 +49,26 @@ echo "  arch       $ARCH"
 echo "  segment    127.0.0.1:$SEGMENT_PORT"
 echo "  output     $OUT"
 
+# The source image must not already contain an identity. If it does, both copies inherit
+# the same NodeID, each sees its own fingerprint in the other's mDNS advertisement, skips
+# it as its own, and the test times out after twenty minutes with no useful message. Worse,
+# an image that ships with a key is a security defect in its own right. Fail in seconds.
+start=$(partx -g -o START -s --nr 4 "$IMAGE" | tr -d ' ')
+sectors=$(partx -g -o SECTORS -s --nr 4 "$IMAGE" | tr -d ' ')
+dd if="$IMAGE" of="$OUT/data-check.img" bs=512 skip="$start" count="$sectors" status=none
+rm -f "$OUT/found-key"
+debugfs -R "dump /identity/node.key $OUT/found-key" "$OUT/data-check.img" 2>/dev/null || true
+if [ -s "$OUT/found-key" ]; then
+    echo "FAIL: $IMAGE already contains a node identity." >&2
+    echo "      Both VMs would share a NodeID. Rebuild the image (make TARGET=... image)." >&2
+    exit 1
+fi
+rm -f "$OUT/data-check.img" "$OUT/found-key"
+echo "  source image carries no identity, as it should"
+
 # Independent disks: a shared one would mean a shared identity.
 for n in a b; do
-    cp --reflink=auto "$IMAGE" "$OUT/node-$n.img"
+    cp --sparse=always "$IMAGE" "$OUT/node-$n.img"
 done
 
 # `ls a b | head -1` looks tempting here and is a trap: ls exits non-zero when any

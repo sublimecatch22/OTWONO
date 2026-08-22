@@ -27,8 +27,18 @@ for want in OTWONO-ESP OTWONO-ROOT-A OTWONO-ROOT-B OTWONO-DATA; do
 done
 log "  all four partitions present"
 
+# Boot a copy, never the artifact. A guest writes its first-boot state — a generated node
+# identity, profiles, an audit log — into its own disk. Booting the release image in place
+# therefore bakes one node's private key into the file every device is flashed from, and
+# invalidates the SHA256SUMS computed in stage 50. Both of those happened before this
+# changed; see docs/build/VERIFICATION-LOG.md.
+BOOT_IMAGE="$TARGET_OUT/boot-under-test.img"
+log "copying the image so the boot cannot mutate the artifact"
+rm -f "$BOOT_IMAGE"
+cp --sparse=always "$IMAGE" "$BOOT_IMAGE"
+
 log "booting under QEMU (no KVM here, so TCG; this takes minutes)"
-"$BUILD_DIR/qemu/run-$ARCH.sh" --image "$IMAGE" --boot-test --log "$BOOT_LOG" \
+"$BUILD_DIR/qemu/run-$ARCH.sh" --image "$BOOT_IMAGE" --boot-test --log "$BOOT_LOG" \
     || die "boot test failed; see $BOOT_LOG"
 
 # --- Recover the profile the guest wrote to its own data partition ----------------------
@@ -46,9 +56,9 @@ dump_guest_file() { # partition-number guest-path output-path
     local part="$1" guest="$2" out="$3" start sectors img
     img="$WORK/p$part.img"
     if [ ! -f "$img" ]; then
-        start=$(partx -g -o START -s --nr "$part" "$IMAGE" | tr -d ' ')
-        sectors=$(partx -g -o SECTORS -s --nr "$part" "$IMAGE" | tr -d ' ')
-        dd if="$IMAGE" of="$img" bs=512 skip="$start" count="$sectors" status=none
+        start=$(partx -g -o START -s --nr "$part" "$BOOT_IMAGE" | tr -d ' ')
+        sectors=$(partx -g -o SECTORS -s --nr "$part" "$BOOT_IMAGE" | tr -d ' ')
+        dd if="$BOOT_IMAGE" of="$img" bs=512 skip="$start" count="$sectors" status=none
     fi
     rm -f "$out"
     debugfs -R "dump $guest $out" "$img" 2>/dev/null || true
@@ -111,7 +121,40 @@ else
     die "the guest wrote no audit log; the broker did not run"
 fi
 
+# --- The shipped artifact must carry no first-boot state -------------------------------
+# Regression guard for the defect above: a node key inside a distributable image means
+# every device flashed from it shares one identity and can impersonate the others.
+log "verifying the release image carries no first-boot state"
+PRISTINE_WORK="$TARGET_OUT/pristine-check"
+rm -rf "$PRISTINE_WORK"; mkdir -p "$PRISTINE_WORK"
+check_absent() { # partition-number guest-path description
+    local part="$1" guest="$2" what="$3" start sectors img out
+    img="$PRISTINE_WORK/p$part.img"
+    if [ ! -f "$img" ]; then
+        start=$(partx -g -o START -s --nr "$part" "$IMAGE" | tr -d ' ')
+        sectors=$(partx -g -o SECTORS -s --nr "$part" "$IMAGE" | tr -d ' ')
+        dd if="$IMAGE" of="$img" bs=512 skip="$start" count="$sectors" status=none
+    fi
+    out="$PRISTINE_WORK/found"
+    rm -f "$out"
+    debugfs -R "dump $guest $out" "$img" 2>/dev/null || true
+    if [ -s "$out" ]; then
+        die "the release image contains $what ($guest); a boot mutated the artifact"
+    fi
+}
+check_absent 4 "/identity/node.key" "a private node key"
+check_absent 4 "/capability-profile.json" "a first-boot capability profile"
+check_absent 4 "/control-plane-profile.json" "a first-boot control-plane profile"
+check_absent 2 "/var/log/otwono/audit.jsonl" "an audit log from a previous boot"
+rm -rf "$PRISTINE_WORK"
+log "  no identity, profiles or audit log in the artifact"
+
+log "re-verifying checksums against the untouched artifact"
+( cd "$TARGET_OUT" && sha256sum -c SHA256SUMS ) \
+    || die "the image no longer matches the checksum stage 50 recorded"
+
 rm -rf "$WORK"
+rm -f "$BOOT_IMAGE"
 
 log "boot log: $BOOT_LOG"
 manifest_add "boot-test" "passed; tier $(jq -r .tier "$PROFILE" 2>/dev/null || echo unknown), log $(basename "$BOOT_LOG")"
