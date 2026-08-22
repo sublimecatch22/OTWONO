@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Reproducible builds: a fixed epoch so artifacts do not vary by run time.
+  SOURCE_DATE_EPOCH: "1767225600"
+
+jobs:
+  rust:
+    name: Rust workspace
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the aarch64 target and cross linker
+        run: |
+          rustup target add aarch64-unknown-linux-gnu
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      # Every crate must build for both architectures (CLAUDE.md Section 5).
+      - name: Cross-build for aarch64
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --workspace --release --target aarch64-unknown-linux-gnu
+
+      - name: Verify the aarch64 binary is actually aarch64
+        run: |
+          file target/aarch64-unknown-linux-gnu/release/otwono-hwctl | grep -q 'ARM aarch64'
+
+      # The cross-built binary must run, not merely link.
+      - name: Run the aarch64 binary under qemu-user
+        run: |
+          sudo apt-get install -y qemu-user-static
+          qemu-aarch64-static -L /usr/aarch64-linux-gnu \
+            target/aarch64-unknown-linux-gnu/release/otwono-hwctl \
+            profile --no-overrides \
+            --root crates/otwono-hal/tests/fixtures/aarch64-rpi5-8gb-synthetic
+
+  shell:
+    name: Shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Lint
+        run: shellcheck -S warning tools/*.sh build/stages/*.sh build/qemu/*.sh build/lib/*.sh
+
+  environment:
+    name: Environment probe
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Informational: records what the runner can do, so a later build failure is
+      # explainable. Never gates the build.
+      - run: tools/probe-env.sh || true

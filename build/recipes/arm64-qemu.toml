@@ -1,0 +1,40 @@
+# OTWONO image recipe — arm64, UEFI, for QEMU `virt`.
+#
+# This is the generic SBSA-style arm64 target. Real single-board computers that need a
+# vendor kernel, a U-Boot offset blob, or board device trees get their own BSP under
+# build/bsp/<vendor>-<board>/ rather than a fork of this recipe.
+
+[target]
+id = "arm64-qemu"
+arch = "arm64"
+description = "arm64 UEFI image for QEMU virt"
+
+[base]
+distro = "debian"
+suite = "trixie"
+mirror = "https://deb.debian.org/debian"
+components = "main contrib non-free-firmware"
+snapshot = ""
+
+[packages]
+include = "systemd systemd-sysv udev dbus ca-certificates locales less nano iproute2 iputils-ping openssh-server"
+kernel = "linux-image-arm64"
+firmware = "firmware-linux-free"
+
+[boot]
+firmware = "uefi"
+bootloader = "grub-efi-arm64"
+console = "ttyAMA0,115200"
+
+[image]
+size = "8G"
+layout = "ab"
+esp_size = "512M"
+root_size = "3G"
+filesystem = "ext4"
+
+[qemu]
+machine = "virt"
+cpu = "cortex-a72"
+memory = "4096"
+smp = "2"

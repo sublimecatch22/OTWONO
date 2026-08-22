@@ -1,0 +1,31 @@
+# Build output — images, rootfs trees, logs. Never committed.
+/out/
+/target/
+**/target/
+
+# Keys and identities must never enter the repository.
+/build/keys/*
+!/build/keys/.gitkeep
+*.key
+*.pem
+*.p12
+id_ed25519*
+
+# Model weights are content-addressed artifacts, not source.
+*.gguf
+*.onnx
+*.safetensors
+/models/
+
+# Images and rootfs archives
+*.img
+*.iso
+*.qcow2
+*.rootfs.tar*
+
+# Editor and OS noise
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/

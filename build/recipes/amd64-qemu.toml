@@ -1,0 +1,44 @@
+# OTWONO image recipe — amd64, UEFI, for QEMU q35 with virtio.
+#
+# Debian is the canonical product base (ADR-0002). Note that the OTWONO Cloud dev
+# environment's egress proxy currently rejects Debian mirrors, so this recipe cannot be
+# bootstrapped there; use amd64-qemu-ubuntu for CI in that environment.
+
+[target]
+id = "amd64-qemu"
+arch = "amd64"
+description = "amd64 UEFI image for QEMU q35"
+
+[base]
+distro = "debian"
+suite = "trixie"
+mirror = "https://deb.debian.org/debian"
+components = "main contrib non-free-firmware"
+# Pin to a snapshot for reproducibility. Empty means "use the live mirror" and gives up
+# byte-for-byte reproducibility; set this before any release build.
+snapshot = ""
+
+[packages]
+# Kept minimal on purpose: the base image is the thing we must be able to update
+# atomically, so everything optional belongs in Flatpak or a later layer.
+include = "systemd systemd-sysv udev dbus ca-certificates locales less nano iproute2 iputils-ping openssh-server"
+kernel = "linux-image-amd64"
+firmware = "firmware-linux-free"
+
+[boot]
+firmware = "uefi"
+bootloader = "grub-efi-amd64"
+console = "ttyS0,115200"
+
+[image]
+size = "8G"
+layout = "ab"          # ESP + root_a + root_b + otwono-data
+esp_size = "512M"
+root_size = "3G"
+filesystem = "ext4"
+
+[qemu]
+machine = "q35"
+cpu = "max"
+memory = "4096"
+smp = "2"

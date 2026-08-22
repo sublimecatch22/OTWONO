@@ -1,0 +1,25 @@
+# Architecture Decision Records
+
+One file per decision: `ADR-NNNN-short-title.md`.
+
+Format: **Context** (forces at play) → **Decision** → **Consequences** (good and bad)
+→ **Alternatives rejected, and why**.
+
+Status: `proposed` · `accepted` · `superseded by ADR-NNNN` · `deprecated`.
+
+Rules:
+- A decision that is hard to reverse gets an ADR **before** the code.
+- Replacing working code requires an ADR (see `CLAUDE.md` §2.2).
+- Introducing a language, a mesh routing protocol, an updater, or a screen-synthesis app
+  adapter each require an ADR.
+
+| ADR | Title | Status |
+|---|---|---|
+| 0001 | Rust for privileged system daemons | accepted |
+| 0002 | Debian-derived base with a staged image builder | accepted |
+| 0003 | JSON-RPC 2.0 over Unix sockets as the Local Control Plane | accepted |
+| 0004 | Capability vector with tier composition, not a single score | accepted |
+| 0005 | Integrate inference backends; never write an engine | accepted |
+| 0006 | Ed25519 node identity, separate from user identity | accepted |
+| 0007 | Fail-closed data visibility labels with provenance propagation | accepted |
+| 0008 | A/B image updates with automatic rollback | accepted |
