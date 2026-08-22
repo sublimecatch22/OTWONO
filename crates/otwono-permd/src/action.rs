@@ -83,6 +83,18 @@ impl ActionRegistry {
                 ),
                 ActionSpec::new("fs.read", "Read a file or directory", BlastRadius::Read, false),
                 ActionSpec::new(
+                    "id.sign",
+                    "Sign a payload with this node's identity key",
+                    BlastRadius::Reversible,
+                    false,
+                ),
+                ActionSpec::new(
+                    "id.rotate",
+                    "Replace this node's identity key, changing its NodeID",
+                    BlastRadius::Irreversible,
+                    true,
+                ),
+                ActionSpec::new(
                     "fs.write",
                     "Create or modify a file",
                     BlastRadius::Reversible,
@@ -156,6 +168,20 @@ mod tests {
                 "{id} should not need confirmation"
             );
         }
+    }
+
+    #[test]
+    fn signing_is_guarded_but_does_not_stop_for_confirmation() {
+        // Signing is privileged — it makes the node's key vouch for something — but it is
+        // a normal brokered call. Rotation is not: it changes the node's name and orphans
+        // every peer relationship, so a person has to say yes.
+        let r = ActionRegistry::builtin();
+        assert!(!r.get("id.sign").unwrap().always_confirm);
+        assert!(r.get("id.rotate").unwrap().always_confirm);
+        assert_eq!(
+            r.get("id.rotate").unwrap().blast_radius,
+            BlastRadius::Irreversible
+        );
     }
 
     #[test]
