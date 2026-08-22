@@ -54,20 +54,29 @@ for n in a b; do
     cp --reflink=auto "$IMAGE" "$OUT/node-$n.img"
 done
 
+# `ls a b | head -1` looks tempting here and is a trap: ls exits non-zero when any
+# argument is missing, and with `set -o pipefail` that kills the script with no message.
+first_existing() {
+    for candidate in "$@"; do
+        [ -f "$candidate" ] && { printf '%s' "$candidate"; return 0; }
+    done
+    return 1
+}
+
 # shellcheck disable=SC2054  # commas belong to QEMU option values, not array syntax
 case "$ARCH" in
     amd64)
         QEMU=qemu-system-x86_64
         MACHINE=(-machine q35,accel=tcg -cpu max)
-        FW_CODE=$(ls /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd 2>/dev/null | head -1)
-        FW_VARS_SRC=$(ls /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd 2>/dev/null | head -1)
+        FW_CODE=$(first_existing /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd || true)
+        FW_VARS_SRC=$(first_existing /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd || true)
         PFLASH_SIZE=0
         ;;
     arm64)
         QEMU=qemu-system-aarch64
         MACHINE=(-machine virt,accel=tcg -cpu cortex-a72)
-        FW_CODE=$(ls /usr/share/AAVMF/AAVMF_CODE.fd /usr/share/qemu-efi-aarch64/QEMU_EFI.fd 2>/dev/null | head -1)
-        FW_VARS_SRC=$(ls /usr/share/AAVMF/AAVMF_VARS.fd 2>/dev/null | head -1)
+        FW_CODE=$(first_existing /usr/share/AAVMF/AAVMF_CODE.fd /usr/share/qemu-efi-aarch64/QEMU_EFI.fd || true)
+        FW_VARS_SRC=$(first_existing /usr/share/AAVMF/AAVMF_VARS.fd || true)
         PFLASH_SIZE=64
         ;;
     *) echo "unsupported arch: $ARCH" >&2; exit 1 ;;
