@@ -768,10 +768,10 @@ and a CUDA workstation and `ai.capabilities` describes the machine.
 
 | Command | Result |
 |---|---|
-| `cargo test --workspace` | **433 tests pass** (365 before) |
+| `cargo test --workspace` | **434 tests pass** (365 before) |
 | `clippy -D warnings`, `fmt --check`, `shellcheck -S warning` | clean |
 
-### Three defects found by the tests that were written for them
+### Four defects found by the tests that were written for them
 
 **17. The engine was put in its own process group, which is precisely wrong.** It reads as
 the tidy thing to do and it defeats the mechanism it looks like it supports: the supervisor
@@ -791,6 +791,24 @@ cmake's log to `"$BUILD/../cmake.log"` before creating `$BUILD`, so the redirect
 before cmake ran — and the error message named a path with `/../` in it, which is nobody's
 idea of a clue. Only caught by running the stage's clone-and-build path from scratch rather
 than against the cache I had already warmed by hand.
+
+**20. A fast-failing engine's last words were lost to a race — found by CI, not by me.**
+`stderr_tail()` read whatever the reader thread had accumulated so far. A dead child and a
+fully-drained pipe are different events, and an engine that cannot load a model says why
+and exits within milliseconds, so `try_wait` reported the exit while the explanation was
+still in the pipe. The caller got `""` — the diagnosis lost in exactly the case it is
+collected for.
+
+It passed here every time and failed on a GitHub runner, which is the whole lesson: an
+idle four-core box is not a schedule, it is one schedule. The reader now sets a flag at
+EOF and `stderr_tail()` waits for it, bounded at two seconds so an engine that left a child
+holding the pipe cannot hang the error path. The timeout branch was reordered to kill
+first and read after, for the same reason — a complete tail beats whatever arrived by the
+deadline.
+
+The regression test makes the race deterministic instead of hoping for it: the fake engine
+writes 200 lines and exits at once, and the assertion is on the *last* line. Re-run 12
+times with eight spinners saturating the CPU: 0 failures.
 
 ### Reproducibility: improved, measured, and still not there
 

@@ -20,6 +20,7 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,6 +33,13 @@ pub const MAX_SOCKET_PATH: usize = 107;
 
 /// How much engine stderr to keep for diagnostics.
 const STDERR_TAIL_LINES: usize = 40;
+
+/// How long to wait for the stderr reader to reach EOF once the engine has exited.
+///
+/// Bounded rather than a plain join: the pipe stays open as long as *any* process holds
+/// the write end, so an engine that left a child behind would otherwise hang the error
+/// path — inside the code whose whole job is to explain a failure.
+const STDERR_DRAIN_WAIT: Duration = Duration::from_secs(2);
 
 /// How often to re-poll `/health` while the engine loads.
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -78,6 +86,13 @@ pub struct Engine {
     context_tokens: u32,
     sequences: u32,
     stderr: Arc<Mutex<Vec<String>>>,
+    /// Set by the stderr reader when it reaches EOF.
+    ///
+    /// Needed because a dead child and a fully-read pipe are different events. An engine
+    /// that fails to load says why and exits immediately, so `try_wait` reports the exit
+    /// while its last words are still in the pipe — the diagnosis is lost precisely in the
+    /// case it was collected for.
+    stderr_done: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -156,11 +171,13 @@ impl Engine {
         // a pipe nobody reads fills up and blocks the writer — the engine would hang
         // partway through loading and look like a timeout.
         let stderr = Arc::new(Mutex::new(Vec::new()));
+        let stderr_done = Arc::new(AtomicBool::new(true));
         if let Some(pipe) = child.stderr.take() {
-            drain(pipe, Some(Arc::clone(&stderr)));
+            stderr_done.store(false, Ordering::Release);
+            drain(pipe, Some(Arc::clone(&stderr)), Some(Arc::clone(&stderr_done)));
         }
         if let Some(pipe) = child.stdout.take() {
-            drain(pipe, None);
+            drain(pipe, None, None);
         }
 
         let engine = Engine {
@@ -170,6 +187,7 @@ impl Engine {
             context_tokens: request.context_tokens,
             sequences: request.sequences,
             stderr,
+            stderr_done,
         };
         engine.wait_until_healthy(config.startup_timeout)
     }
@@ -285,7 +303,17 @@ impl Engine {
     ///
     /// Worth keeping: an engine that fails to load a model says why here, and discarding
     /// it turns a diagnosable problem into "exit code 1".
+    ///
+    /// Waits, briefly, for the reader thread to reach EOF. Without that this races the
+    /// very failure it documents — a model that will not load makes the engine exit within
+    /// milliseconds, so `try_wait` sees the exit while the explanation is still in the
+    /// pipe, and the caller gets an empty string. That is not theoretical: it passed
+    /// locally and failed on a loaded CI runner.
     pub fn stderr_tail(&self) -> String {
+        let deadline = Instant::now() + STDERR_DRAIN_WAIT;
+        while !self.stderr_done.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         self.stderr
             .lock()
             .map(|lines| lines.join("\n"))
@@ -321,8 +349,15 @@ impl Drop for Engine {
 ///
 /// Always reads, even when the output is discarded, because an unread pipe eventually
 /// blocks the writer.
-fn drain<R: std::io::Read + Send + 'static>(pipe: R, keep: Option<Arc<Mutex<Vec<String>>>>) {
+fn drain<R: std::io::Read + Send + 'static>(
+    pipe: R,
+    keep: Option<Arc<Mutex<Vec<String>>>>,
+    done: Option<Arc<AtomicBool>>,
+) {
     std::thread::spawn(move || {
+        // Set on every exit path, including a read error. A flag that is only set on the
+        // happy path is a two-second stall on the unhappy one.
+        let _guard = done.map(FinishedOnDrop);
         for line in BufReader::new(pipe).lines() {
             let Ok(line) = line else { return };
             if let Some(buffer) = &keep {
@@ -334,6 +369,15 @@ fn drain<R: std::io::Read + Send + 'static>(pipe: R, keep: Option<Arc<Mutex<Vec<
             }
         }
     });
+}
+
+/// Marks the drain as finished however the reader thread leaves, panic included.
+struct FinishedOnDrop(Arc<AtomicBool>);
+
+impl Drop for FinishedOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 #[derive(Debug)]
@@ -505,6 +549,32 @@ mod tests {
         assert_eq!(*status, Some(3));
         // The engine's own diagnosis is the whole value of capturing stderr.
         assert!(stderr.contains("bad magic"), "{stderr:?}");
+    }
+
+    #[test]
+    fn a_fast_failing_engines_last_words_are_not_lost_to_the_race() {
+        // The regression this exists for: the engine writes a lot and exits at once, so
+        // `try_wait` reports the exit long before the reader has drained the pipe. The
+        // earlier version returned an empty string here, and did it only under load --
+        // it passed locally and failed on a CI runner.
+        let dir = TempDir::new("race");
+        let model = dir.0.join("m.gguf");
+        std::fs::write(&model, b"x").unwrap();
+        let fake = dir.0.join("fake-server");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\ni=0\nwhile [ $i -lt 200 ]; do echo \"line $i\" >&2; i=$((i+1)); done\n\
+             echo 'error loading model: the last word' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+        let err = Engine::start(&config(&dir.0, fake.to_str().unwrap()), &load(&model)).unwrap_err();
+        let EngineError::Died { stderr, .. } = &err else {
+            panic!("expected Died, got {err:?}");
+        };
+        // The *last* line specifically: anything less means the tail was read early.
+        assert!(stderr.contains("the last word"), "{stderr:?}");
     }
 
     #[test]
