@@ -228,7 +228,12 @@ simply be spawned the way a backend adapter is.
 
 Downloading therefore needs a separate brokered component with its own network namespace,
 its own hardening, and a policy about which hosts it may contact — that last part being a
-design decision in its own right, not an implementation detail. It is recorded as **OQ-13**.
+design decision in its own right, not an implementation detail. **ADR-0014 settles it**
+(closing OQ-13): one daemon, `otwono-fetchd`, is the only component that makes outbound
+client connections to hosts outside the mesh. Callers name a source from an allow-list and
+a path suffix, never a URL; the response lands in a spool and the caller verifies it.
+`ai.models.pull` therefore becomes a fetch followed by the `ai.models.install` below —
+**the pull adds no new trust code.** Neither the daemon nor the action exists yet.
 
 Splitting it this way has a payoff already banked: everything that decides whether to
 *trust* a model is tested exhaustively with no network anywhere near it.

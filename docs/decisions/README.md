@@ -28,3 +28,4 @@ Rules:
 | 0011 | Drive llama.cpp as a supervised adapter process, not a linked library | accepted |
 | 0012 | Confine the inference engine with Landlock, applied by the adapter to itself | accepted |
 | 0013 | Boot the Raspberry Pi 4 through U-Boot's UEFI, not vendor UEFI | accepted |
+| 0014 | One brokered fetch daemon for outbound HTTPS; the mesh keeps its own transport | accepted |

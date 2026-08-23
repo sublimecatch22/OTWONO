@@ -17,5 +17,12 @@ Do not treat any of these as settled, and do not let code quietly settle one.
 | **OQ-10** | Are LoRa duty-cycle rules encodable generically, or does the OS need per-region regulatory profiles shipped as data? | Phase 9 | Phase 9 |
 | **OQ-11** | Distributed search ranking without a global index and without a reputation system — is a useful ranking even possible? | Phase 6 | Phase 6 research |
 | **OQ-12** | Do we ship a browser integration for `onm://`, or a local HTTP gateway with a reserved hostname? Extension maintenance versus a weaker security boundary | Phase 6 | Phase 6 |
-| **OQ-13** | Where does brokered network egress live? `otwono-aid` has `PrivateNetwork=yes` and should keep it, so `ai.models.pull`, ONM fetches and update downloads all need a component that may reach the network — and a policy for which hosts it may contact. One egress daemon or one per subsystem? | Phase 4 (`ai.models.pull`), Phase 8 | Phase 4 |
 | **OQ-14** | The arm64 boot counter. ADR-0008 names U-Boot `bootcount`, but the packaged `u-boot-rpi` for the Pi 4 is built with `CONFIG_BOOTCOUNT_LIMIT` off (measured 2026-08-23). Rebuild U-Boot with it, or count boots in userspace against a grubenv-equivalent on the ESP? | Phase 8 | Phase 8 |
+
+## Resolved
+
+Kept with their original IDs, because other documents cite them.
+
+| ID | Question | Settled by |
+|---|---|---|
+| **OQ-13** | Where does brokered network egress live? One egress daemon or one per subsystem? | **ADR-0014** — one `otwono-fetchd` for outbound HTTPS; `otwono-netd` keeps ONM's own transport |

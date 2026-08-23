@@ -26,6 +26,7 @@
 | Z1 | `otwono-permd`, `otwono-idd`, `otwono-updated` | Root, minimal | Small enough to audit; strict systemd hardening; no network. **Sole holder of the node's Ed25519 signing key.** |
 | Z2 | `otwono-hwd`, `otwono-aid`, `otwono-stored`, `otwono-svcd` | Dedicated users | Landlock-scoped filesystem, seccomp, no `exec` except declared backends |
 | Z3 | `otwono-netd` | Dedicated user | **Hostile-input boundary.** No filesystem write outside its spool, no `exec`, narrow seccomp, memory-safe language mandatory. Holds only the X25519 agreement key — never the key its NodeID names. |
+| Z3 | `otwono-fetchd` | Dedicated user | **Hostile-input boundary, separate process from the mesh daemon** so a compromise of one does not yield the other's keys. The only component that makes outbound client connections to hosts outside the mesh, and the only network-facing one that **holds no keys at all** (ADR-0014). `IPAddressDeny=localhost link-local multicast`; no `AF_NETLINK`. |
 | Z4 | `otwono-agentd`, app adapters | Unprivileged | Zero ambient privilege; everything brokered |
 | Z5 | User applications | User | Flatpak/bubblewrap where practical |
 | Z6 | Remote peers | None | Authenticated ≠ trusted |
@@ -72,7 +73,13 @@ Regardless of policy or model confidence:
 
 - Deleting or overwriting user data
 - Promoting a visibility label (`PRIVATE` → anything more exposed)
-- Sending data off-node
+- Sending data off-node (`net.egress`). **Amended by ADR-0014:** `net.fetch` — retrieving
+  content from a source already on the allow-list — is a separate, narrower action that
+  does not confirm per call. The confirmation moved to the moment the source was added,
+  which is a `policy.write`. This rule is about exporting the user's data; a fetch from an
+  approved host is not that, and requiring a person for it would make unattended update
+  downloads impossible on a headless node. The request path remains a bounded, logged
+  covert channel, which ADR-0014 states rather than denies.
 - Installing or removing software
 - Changing security policy
 - Enabling a network role that spends the user's bandwidth, disk, or GPU

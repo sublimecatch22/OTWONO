@@ -107,7 +107,7 @@ path, not yet kernel-enforced.
 
 1. ~~`otwono-aid` with the backend abstraction and llama.cpp CPU first.~~ **done**
 2. ~~Model catalog, signed manifests, content-addressed storage, tier gating.~~ **done**
-   (fetching over the network is not — see OQ-13)
+   (fetching over the network is not — the design is settled in ADR-0014, unimplemented)
 3. ~~Admission control with a real refusal path — `ModelTooLargeForTier` must be observed.~~
    **done**
 4. GPU/NPU backends behind capability detection.
@@ -163,7 +163,7 @@ acceptably on a Pi. Tier-appropriate models remain OQ-6.
 
 **Still open:** Also missing:
 streaming, PID/mount isolation and a seccomp filter around the engine, **model download
-(`ai.models.pull`, blocked on OQ-13)**, `ai.models.remove`, embeddings, ASR and TTS,
+(`ai.models.pull`, designed in ADR-0014 and waiting on `otwono-fetchd`)**, `ai.models.remove`, embeddings, ASR and TTS,
 GPU/NPU backends, and the tiered assistant shapes.
 
 ---

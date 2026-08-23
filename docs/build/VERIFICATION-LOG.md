@@ -1311,3 +1311,80 @@ image is written to a card and a board is booted with a serial console. ADR-0013
   known.
 - **That U-Boot's `EFI_LOADER` will load our GRUB build specifically.** `CONFIG_EFI_LOADER=y`
   says the subsystem is present, not that this binary runs.
+
+---
+
+## Egress investigation (ADR-0014) — measurement only, nothing built
+
+Recorded 2026-08-23. As with ADR-0013, this is a decision with no code behind it, and the
+measurements it rests on should be reproducible. **Nothing here claims a fetcher exists.**
+
+### The systemd directive the hardening depends on
+
+ADR-0014 leans on `IPAddressDeny=localhost link-local multicast` to contain SSRF. That was
+checked rather than assumed, on systemd 255 (255.4-1ubuntu8.17):
+
+```
+$ systemd-analyze verify ./otwono-fetchd-probe.service
+Binding to IPv6 address not available since kernel does not support IPv6.
+$ echo $?
+0
+```
+
+Silence is only evidence if the tool is capable of speaking, so the same tool was given a
+misspelled key and an invalid token:
+
+```
+$ systemd-analyze verify ./bogus.service
+bogus.service:6: Unknown key name 'IPAddressDenyy' in section 'Service', ignoring.
+bogus.service:7: Invalid address prefix is specified in [Service] IPAddressDeny=, ignoring
+  assignment: not-a-real-token
+```
+
+It catches both, so its acceptance of `localhost link-local multicast` means the directive
+and the tokens are real. The IPv6 line is this container's kernel, not the unit.
+
+What this does **not** establish is that the filter runs: `IPAddressDeny` is a cgroup BPF
+program, and on a kernel without `CONFIG_CGROUP_BPF` systemd logs a failure and starts the
+unit anyway. The ADR says so in its consequences rather than treating the directive as a
+boundary.
+
+### The HTTP client, measured rather than argued
+
+Both candidates resolved and their dependency trees counted on 2026-08-23:
+
+| | crates (`cargo tree -e normal`, unique) | async runtime |
+|---|---|---|
+| `ureq` 3.4.0 | **28** | none |
+| `reqwest` 0.13.4, `default-features = false`, `features = ["rustls","blocking"]` | **85** | `tokio` + `hyper` |
+
+Both land on `rustls` + `ring`; the difference is the runtime. This workspace has no async
+runtime in it today, and `reqwest`'s blocking mode runs a tokio reactor internally, so the
+narrower crate is also the one that does not change the shape of the codebase.
+`ca-certificates` is already in all four recipes, so no image change is needed for trust
+roots.
+
+### What already exists, and therefore is not being rebuilt
+
+The pieces ADR-0014 assumes are in the tree and tested:
+
+- `net.egress` is already a registered action with `BlastRadius::Egress` and
+  `always_confirm: true`, so `net.fetch` is a narrowing of something that exists rather
+  than a new concept — the same move `id.sign` → `id.sign_session` made in ADR-0010, whose
+  rationale the registry's own test states.
+- `otwono-ai`'s `install()` already streams a BLAKE3 over the blob, checks size first, and
+  stages-and-renames. Because the fetcher hands back a spool path and nothing more, that
+  code is what verifies a downloaded model, unchanged and with no network near it.
+- `otwono-aid.service` has `PrivateNetwork=yes` and `RestrictAddressFamilies=AF_UNIX`, and
+  keeps both under this decision.
+
+### What this does not prove
+
+- **That any of it works.** There is no `otwono-fetchd` crate, no `net.fetch` action, no
+  schema and no unit. `cargo test --workspace` still reports 471 tests, because this
+  changed documentation only.
+- **That the allow-list model is workable against real model hosts.** A host needing a
+  query string, a signed URL, or an auth header does not fit the named-source interface as
+  specified. That is a deliberate constraint and it is untested against a real registry.
+- **That the covert channel is as narrow as claimed.** The bound on a path suffix is a
+  design intent, not a measurement.
