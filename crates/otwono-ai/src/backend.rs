@@ -5,16 +5,13 @@
 //! the model manifest. It is a pure function, and it is unit-testable against fixture
 //! profiles with no hardware present."
 //!
-//! # Nothing is integrated yet
+//! # Selection is not availability
 //!
-//! [`installed_backends`] returns what this build can *actually* execute, which today is
-//! empty: no inference engine has been linked. [`select_backend`] therefore reports
-//! [`SelectionError::NoBackendInstalled`] on every machine, and says so plainly instead of
-//! naming `llama-cpp-cpu` and failing at load time.
-//!
-//! The selection logic is still worth having now, and is fully tested, because it is the
-//! thing that decides whether a Pi uses NEON CPU inference or an RK3588's NPU — and that
-//! decision has to be reviewable before an engine is wired in, not after.
+//! What this module decides is *which* backend should run a model. Whether any backend is
+//! installed at all is a property of the filesystem, and lives in [`crate::discovery`].
+//! Keeping them apart is what lets the interesting decision — a Pi choosing NEON CPU
+//! inference over an RK3588's NPU — be unit-tested on a machine that has neither, by
+//! passing the available set in explicitly.
 
 use otwono_capability::axes::AcceleratorClass;
 use otwono_capability::CapabilityProfile;
@@ -75,19 +72,6 @@ impl BackendId {
     }
 }
 
-/// Backends this build can actually execute.
-///
-/// Empty, deliberately. No inference engine is integrated (`STATUS: SPECIFIED` in
-/// `docs/ai/AI-RUNTIME.md` §3). Returning an empty set is what makes every downstream
-/// answer honest: `ai.capabilities` reports no local inference, and a load attempt is
-/// refused with a reason rather than a crash.
-///
-/// When llama.cpp lands, it is this function that changes, and every test below that
-/// pins selection behaviour keeps working because it passes the set in explicitly.
-pub fn installed_backends() -> Vec<BackendId> {
-    Vec::new()
-}
-
 /// The backend chosen for a model, and why.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendSelection {
@@ -102,8 +86,9 @@ pub struct BackendSelection {
 
 /// Choose a backend for `manifest` on `profile`, from `available`.
 ///
-/// `available` is a parameter rather than a call to [`installed_backends`] so the decision
-/// can be exercised for hardware and builds that are not the one running the test.
+/// `available` is a parameter rather than a call to [`crate::installed_backends`] so the
+/// decision can be exercised for hardware and installs that are not the one running the
+/// test.
 pub fn select_backend(
     manifest: &ModelManifest,
     profile: &CapabilityProfile,
@@ -177,7 +162,7 @@ fn require_vendor(profile: &CapabilityProfile, vendor: &str, label: &str) -> Res
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectionError {
-    /// This build links no inference engine at all.
+    /// No inference engine is installed on this machine at all.
     NoBackendInstalled,
     /// Engines exist, but none of the ones this model declares can run here.
     NoUsableBackend { rejected: Vec<(BackendId, String)> },
@@ -188,7 +173,7 @@ impl std::fmt::Display for SelectionError {
         match self {
             SelectionError::NoBackendInstalled => write!(
                 f,
-                "this build has no inference backend linked, so no model can be run locally"
+                "no inference backend is installed on this node, so no model can be run locally"
             ),
             SelectionError::NoUsableBackend { rejected } => {
                 write!(f, "no usable backend for this model:")?;
@@ -219,12 +204,9 @@ mod tests {
     }
 
     #[test]
-    fn this_build_has_no_backend_and_says_so() {
-        // The honest answer today. If this test starts failing because a backend was
-        // linked, that is the moment to also make ai.infer real — not before.
-        assert!(installed_backends().is_empty());
+    fn a_machine_with_nothing_installed_is_told_so_rather_than_offered_a_backend() {
         assert_eq!(
-            select_backend(&tiny(), &pi5(), &installed_backends()),
+            select_backend(&tiny(), &pi5(), &[]),
             Err(SelectionError::NoBackendInstalled)
         );
     }

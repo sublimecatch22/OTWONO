@@ -3,7 +3,10 @@
 //! The unit tests in `otwono-ai` prove the admission arithmetic. This proves the parts
 //! that only exist once there are two processes: that `ai.read` is actually enforced, that
 //! a refusal comes back as a *successful call reporting a refusal* rather than an RPC
-//! error, and that `ai.infer` tells the truth about there being no engine.
+//! error, and that `ai.infer` tells the truth when this node has no backend installed.
+//!
+//! Inference on a node that *does* have one is `ai_infer_llama.rs`, which needs a real
+//! engine and is skipped without one.
 
 use otwono_ai::manifest::{Footprint, ModelCapability, ModelFormat, ModelManifest};
 use otwono_ai::signature::testing::sign;
@@ -23,6 +26,13 @@ const MIB: u64 = 1024 * 1024;
 const POLICY: &str = r#"
 [[rule]]
 action = "ai.read"
+decision = "allow"
+ttl_seconds = 300
+
+# Granted so that a refusal from ai.infer below can only be about the missing backend.
+# Without this the call fails on authorization first and proves nothing about inference.
+[[rule]]
+action = "ai.infer"
 decision = "allow"
 ttl_seconds = 300
 "#;
@@ -121,6 +131,7 @@ impl Harness {
             classify(&report_pi4_4gb()),
             trust,
             perm_socket.clone(),
+            Vec::new(),
         ));
         let server = Server::bind(&ai_socket).unwrap();
         let s = shutdown.clone();
@@ -169,7 +180,7 @@ impl Drop for Harness {
 #[test]
 fn capabilities_are_open_and_admit_to_having_no_engine() {
     // The headline boolean anything deciding whether to offer a local assistant reads. It
-    // must not be optimistic while no backend is linked.
+    // must not be optimistic on a node with nothing installed.
     let h = Harness::start("caps");
     let value = Client::connect(&h.ai_socket)
         .unwrap()
@@ -263,26 +274,49 @@ fn asking_about_a_model_that_is_not_here_is_an_invalid_request() {
 }
 
 #[test]
-fn infer_refuses_because_there_is_no_engine_not_because_of_policy() {
-    // The distinction matters: a caller must be able to tell "you may not" from "this
-    // build cannot". Policy grants nothing for ai.infer here, so the unauthorized answer
-    // comes first -- and that is itself the honest one until an engine exists.
-    let h = Harness::start("infer");
+fn infer_without_a_capability_is_refused_before_the_node_says_what_it_has() {
+    // Authorization comes first deliberately: an unauthenticated caller should not be able
+    // to probe which backends a node has by reading the shape of the refusal.
+    let h = Harness::start("infer-guard");
     let err = Client::connect(&h.ai_socket)
         .unwrap()
-        .call("ai.infer", json!({ "prompt": "hello" }))
+        .call(
+            "ai.infer",
+            json!({ "model_id": "fits-1b", "prompt": "hello", "max_tokens": 8 }),
+        )
         .unwrap()
-        .expect_err("ai.infer cannot succeed in this build");
+        .expect_err("ai.infer needs a capability");
+    assert_eq!(err.code, code::UNAUTHORIZED);
+}
+
+#[test]
+fn infer_on_a_node_with_no_backend_installed_says_exactly_that() {
+    // The harness installs none, which is the state of a stock image. The refusal must
+    // name the cause: with ai.infer granted by policy, "you may not" is ruled out, so what
+    // is left has to be about the machine.
+    let h = Harness::start("infer-none");
+    let token = h.token("ai.infer");
+    let err = Client::connect(&h.ai_socket)
+        .unwrap()
+        .call_with_capability(
+            "ai.infer",
+            json!({ "model_id": "fits-1b", "prompt": "hello", "max_tokens": 8 }),
+            &token,
+        )
+        .unwrap()
+        .expect_err("nothing is installed to run it");
+    assert_eq!(err.code, code::UNAVAILABLE);
     assert!(
-        err.code == code::UNAUTHORIZED || err.code == code::UNAVAILABLE,
-        "{err:?}"
+        err.message.contains("no inference backend is installed"),
+        "the refusal must name the cause: {}",
+        err.message
     );
 }
 
 #[test]
-fn describe_marks_infer_as_not_implemented() {
-    // `describe` is how another component discovers what this node offers. It must not
-    // advertise inference this build cannot do.
+fn describe_advertises_infer_behind_its_own_capability() {
+    // `describe` is how another component discovers what this node offers. Reading a
+    // model and running one are separate grants, and describe is where that is published.
     let h = Harness::start("describe");
     let value = Client::connect(&h.ai_socket)
         .unwrap()
@@ -294,8 +328,7 @@ fn describe_marks_infer_as_not_implemented() {
         .iter()
         .find(|m| m["name"] == "ai.infer")
         .expect("ai.infer must be described");
-    assert!(
-        infer["summary"].as_str().unwrap().contains("NOT IMPLEMENTED"),
-        "{infer:#?}"
-    );
+    assert_eq!(infer["capability"], "ai.infer", "{infer:#?}");
+    let list = methods.iter().find(|m| m["name"] == "ai.models.list").unwrap();
+    assert_eq!(list["capability"], "ai.read", "{list:#?}");
 }

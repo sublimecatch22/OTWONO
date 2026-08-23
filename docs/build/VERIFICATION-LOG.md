@@ -653,3 +653,179 @@ are both reachable.
 - **No publisher key is distributed.** The trust store works; nothing populates it.
 - **Signature verification has not been exercised on a booted node with a real signed
   model,** because there are no models. Only `publishers=0` has been observed on hardware.
+
+---
+
+## Phase 4 slice 3 — llama.cpp, actually running
+
+A prompt now goes from a control-plane client, through the permission broker and admission
+control, into a real inference engine, and comes back as generated tokens. The slice is
+the integration itself: no engine was written, and none was linked.
+
+### The shape, and why it has three processes
+
+```
+otwono-aid  ──NDJSON JSON-RPC on stdio──▶  otwono-llama-backend  ──HTTP over a
+ (daemon)      (otwono_ai::supervisor)         (otwono-llama)        Unix socket──▶  llama-server
+```
+
+Each boundary earns its place, and ADR-0011 records the alternatives that were rejected:
+
+- **The daemon links no engine.** FFI into `libllama` would put `unsafe` in a privileged
+  daemon and make `cargo test --workspace` need a C++ toolchain and an engine build on
+  every machine — the whole workspace behind its slowest dependency.
+- **A Unix socket, not a loopback TCP port.** `llama-server` has no authentication, so a
+  port on `127.0.0.1` would let any local account drive the model and read what is in
+  flight. A socket in a `0700` directory is protected by the filesystem.
+- **An adapter process rather than HTTP in the daemon.** llama.cpp is one backend of
+  several and the others look nothing like it — whisper.cpp has no server, Piper reads
+  stdin. The daemon learns one dialect; adapters absorb the differences.
+
+### Verified end to end, against a real engine
+
+Not a mock anywhere in the chain. `tests/control-plane/tests/ai_infer_llama.rs` stands up
+the permission broker and `otwono-aid` on real sockets, with a filesystem laid out like an
+installed node, and asks for a completion:
+
+```
+test a_prompt_goes_all_the_way_to_the_model_and_back ... completion: "thkIth}M of.Ebq"
+ok
+test result: ok. 6 passed; 0 failed
+```
+
+The text is gibberish because the model's weights are random, and that is deliberate — see
+below. What the tests assert is that real work happened and was accounted for: tokens
+predicted, prompt evaluated, the right stop reason, one engine process and not two, no
+engine left running afterwards.
+
+Two of those six deserve naming:
+
+- **The context window the engine gets is the one admission control granted.** The test
+  reads the engine's own `/proc/<pid>/cmdline` and checks `--ctx-size 256`. This is the
+  join most likely to rot silently: if the number admission control computed against the
+  node's memory budget never reaches the engine, the whole calculation is decoration and
+  everything still appears to work.
+- **The engine does not outlive the daemon.** Otherwise a node fills up with orphaned
+  engines holding a model each.
+
+### There is no model to test with, so one is generated
+
+Downloading a published model is not available here — the egress allow-list has no model
+host — and a 2 GB download is a poor test dependency anywhere. So
+`tools/make-tiny-gguf.py` synthesizes one: a genuine GGUF with the tensors, tokenizer and
+metadata llama.cpp requires for `general.architecture = llama`, at 386 KB.
+
+The vocabulary is printable ASCII with **no byte-fallback tokens**, and that detail was
+learned the hard way. The first version had the usual 256 `<0xXX>` tokens; a model with
+random weights samples uniformly, promptly emitted bytes that were not valid UTF-8, and
+llama.cpp's response parser returned a 500. That looks exactly like an integration bug and
+is not one. Restricting the vocabulary makes every possible output valid UTF-8 by
+construction, so the only thing left that can fail the test is the thing under test.
+
+This proves the integration and says nothing about output quality. A test asserting on the
+*text* would be asserting on one model's behaviour, which is not what is being integrated.
+
+### Both architectures, and the same tokens from each
+
+The arm64 engine is cross-compiled, so "it is an ELF for aarch64" is a weak claim. It was
+run:
+
+| Engine | How | Result |
+|---|---|---|
+| x86-64, native | directly | 7/7 end-to-end tests pass |
+| aarch64, cross-compiled | `qemu-aarch64-static`, via a wrapper script | 7/7 pass |
+
+Both produced `thkIth}M of.Ebq` for the same prompt and seed. Identical output across two
+architectures is a stronger statement than either run alone.
+
+The wrapper script is also the shape the supervisor was built for — "a backend is
+realistically a wrapper script around an engine" — so the subtree-kill path was exercised
+for real rather than against a stand-in.
+
+### Boot verification
+
+| Target | Result | Boot line |
+|---|---|---|
+| `amd64-qemu-ubuntu`, `AI_ENGINE=llama.cpp` | PASS | `OTWONO-AI-OK tier=T0_MICRO local_inference=available backends=llama-cpp-cpu models=0 publishers=0` |
+| `arm64-qemu-ubuntu`, `AI_ENGINE=llama.cpp` | PASS | `OTWONO-AI-OK tier=T0_MICRO local_inference=available backends=llama-cpp-cpu models=0 publishers=0` |
+| `amd64-qemu-ubuntu`, default (no engine) | PASS | `OTWONO-AI-OK tier=T0_MICRO local_inference=unavailable backends=none models=0 publishers=0` |
+
+The third row is not a formality. The boot check's logic changed in this slice, so the
+path a stock image takes was re-verified from a clean tree — a rebuild in place would have
+tested "no engine requested" against a rootfs that still had one from the previous run.
+
+`models=0` is the honest state: the engine is installed and discovered, and there is
+nothing for it to run because no model ships in an image and no download exists.
+**Inference has not been performed on a booted node** — only on the host, against the
+engines those images contain.
+
+The boot check now cross-checks two figures that come from the same probe: if the backend
+list and the `local_inference` flag disagree, the node is lying about itself and the check
+fails. Backends are discovered on disk, not compiled in, so one build serves a CPU-only Pi
+and a CUDA workstation and `ai.capabilities` describes the machine.
+
+### Workspace
+
+| Command | Result |
+|---|---|
+| `cargo test --workspace` | **433 tests pass** (365 before) |
+| `clippy -D warnings`, `fmt --check`, `shellcheck -S warning` | clean |
+
+### Three defects found by the tests that were written for them
+
+**17. The engine was put in its own process group, which is precisely wrong.** It reads as
+the tidy thing to do and it defeats the mechanism it looks like it supports: the supervisor
+kills the *adapter's* process group, so an engine in its own group is outside the blast
+radius. `Drop` does not save you either — it does not run on SIGKILL. The end-to-end test
+caught it immediately: `llama-server 19627 survived the adapter it was started by`. The
+engine now inherits the adapter's group, and the adapter signals the engine by pid.
+
+**18. The stop reason was read from fields the engine no longer sends.** The mapping was
+written against `stopped_eos` / `stopped_word` / `stopped_limit`; the engine reports a
+single `stop_type` string. Every completion came back as `Other` — with the text intact,
+which is what makes it dangerous: it looks like working software. Both shapes are now read,
+newest first, because an engine upgrade must not be able to silently degrade a field.
+
+**19. A build log redirected through a directory that did not exist yet.** Stage 35 wrote
+cmake's log to `"$BUILD/../cmake.log"` before creating `$BUILD`, so the redirect failed
+before cmake ran — and the error message named a path with `/../` in it, which is nobody's
+idea of a clue. Only caught by running the stage's clone-and-build path from scratch rather
+than against the cache I had already warmed by hand.
+
+### Reproducibility: improved, measured, and still not there
+
+CLAUDE.md §7 requires reproducible builds, so this was tested rather than assumed: build the
+same pinned commit twice, in different directories, and compare.
+
+They differed. Chasing it found that `-ffile-prefix-map` was needed and was not sufficient:
+
+1. Absolute build paths were baked into the binary. Fixed with `-ffile-prefix-map`;
+   confirmed by finding zero occurrences of the build directory and 230 of the mapped
+   prefix.
+2. The bundled browser chat UI is embedded in the binary, and its asset filenames are
+   content hashes that change between builds — 2.6 MB of the diff. It is now built with
+   `LLAMA_BUILD_UI=OFF`, which is right for three separate reasons: the engine is already
+   started with `--no-webui`, an unauthenticated HTTP surface is not something to ship
+   unused, and the binary lost 3.2 MB (17.3 MB → 14.1 MB).
+3. **Something still differs.** Two builds now produce binaries of *identical size* and
+   different hashes. That source has not been identified, and the build is therefore **not
+   byte-reproducible**. The commit pin is verified — a moved tag is a hard failure — but a
+   rebuild cannot yet be checked against a published hash. Recorded as open.
+
+### What this slice does not do
+
+- **No streaming.** One request, one response. Interactive use wants tokens as they are
+  produced, which needs several frames per request *and* a control plane that can carry
+  them onward. `llama-server` can stream; the gap is ours.
+- **No sandbox around the engine.** It is a large C++ program parsing untrusted model files,
+  running with the adapter's privileges, confined only by `otwono-aid.service`'s hardening
+  and a new `MemoryMax=80%` cgroup cap. bubblewrap or Landlock is the right answer and is
+  not written.
+- **No model distribution**, so `ai.models.pull` is still absent and no booted node has a
+  model.
+- **No GPU variants.** Discovery has directories for `vulkan`, `cuda` and `rocm` and
+  selection already prefers them correctly, but no build stage produces them.
+- **Phase 4's exit criterion is not met.** It asks for the same `ai.infer` served on an
+  amd64 *and* an arm64 VM with tier-appropriate models. Inference has run on the host
+  against both architectures' engines; it has not run on a booted VM, because there is no
+  model on one.

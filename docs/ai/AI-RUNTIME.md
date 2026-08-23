@@ -1,25 +1,29 @@
 # AI Runtime Abstraction
 
-**Status:** partly `IMPLEMENTED`, mostly `SPECIFIED`.
+**Status:** partly `VERIFIED`, partly `IMPLEMENTED`, partly `SPECIFIED`.
 
+* **`VERIFIED` — local inference runs.** llama.cpp is integrated as a supervised adapter
+  process (ADR-0011, §3.1). A prompt goes from a control-plane client through the
+  permission broker, admission control, the supervisor, the adapter and `llama-server` into
+  a GGUF model and comes back as generated tokens. Exercised end to end against a real
+  engine by `crates/otwono-llama/tests/end_to_end.rs` and
+  `tests/control-plane/tests/ai_infer_llama.rs`; see `docs/build/VERIFICATION-LOG.md` for
+  the run.
 * **Implemented and unit tested:** the model manifest and its JSON Schema
   (`schemas/model-manifest.schema.json`), the footprint arithmetic, **admission control**
-  including every refusal in §4, backend *selection* as a pure function, and the on-disk
-  catalog. In `crates/otwono-ai`, exercised against the fixture machines in
-  `otwono-capability`'s `testing` module.
-* **Implemented and exercised over sockets:** `ai.capabilities`, `ai.models.list` and
-  `ai.admit` in `otwono-aid`, guarded by the `ai.read` capability.
-* **Not implemented — no inference happens.** No engine is linked into any build.
-  `installed_backends()` returns an empty set, `ai.capabilities` reports
-  `local_inference_available: false`, and `ai.infer` refuses. Everything in §3 below
-  describes backends we intend to integrate, not backends that are present.
-* **Implemented and unit tested:** manifest signature verification against a configured
-  publisher trust store, and the out-of-process backend supervisor of §3 — crash, hang,
-  protocol-violation and oversized-output paths all covered against a fake backend that
-  misbehaves to order.
-* **Not implemented:** `ai.models.pull`, `ai.embed`, `ai.transcribe`, `ai.synthesize`,
-  `ai.vision`, `ai.session.*`, remote inference over ONM, and every tiered assistant shape
-  in §6.
+  including every refusal in §4, backend *selection* as a pure function, the on-disk
+  catalog, manifest signature verification against a publisher trust store, the
+  out-of-process backend supervisor, and backend discovery. In `crates/otwono-ai`,
+  exercised against the fixture machines in `otwono-capability`'s `testing` module.
+* **Implemented and exercised over sockets:** `ai.capabilities`, `ai.models.list`,
+  `ai.admit` and `ai.infer` in `otwono-aid`.
+* **Not shipped by default.** The engine is 17 MiB of third-party C++ per architecture and
+  a ten-minute build, so images opt in with `AI_ENGINE=llama.cpp`. A stock image reports
+  `local_inference_available: false` and refuses `ai.infer` with a reason — which is
+  accurate, not a stub.
+* **Not implemented:** streaming (§3.2), `ai.models.pull`, `ai.embed`, `ai.transcribe`,
+  `ai.synthesize`, `ai.vision`, `ai.session.*`, remote inference over ONM, and every tiered
+  assistant shape in §6.
 
 ## 1. The problem
 
@@ -38,7 +42,7 @@ must not care.
 | `ai.models.list` | The catalog, each entry with whether this machine can run it and why not — **implemented** |
 | `ai.admit` | Dry run: would this model load, at what cost, and if not what context would fit — **implemented** |
 | `ai.models.pull` / `ai.models.remove` | Catalog management — specified |
-| `ai.infer` | Text completion / chat, streaming — **refuses: no engine linked** |
+| `ai.infer` | Text completion — **implemented**, non-streaming, gated by `ai.infer` |
 | `ai.embed` | Embeddings for RAG |
 | `ai.transcribe` | Speech to text |
 | `ai.synthesize` | Text to speech |
@@ -68,6 +72,48 @@ We integrate; we do not write an inference engine.
 | vLLM | High-throughput multi-request serving | T4 |
 | Remote peer | Another node's `otwono-aid` over ONM | any, opt-in |
 
+### 3.1 How llama.cpp is attached
+
+`STATUS: VERIFIED`. Three processes, decided in ADR-0011:
+
+```
+otwono-aid  ──NDJSON JSON-RPC on stdio──▶  otwono-llama-backend  ──HTTP over a
+ (daemon)      (otwono_ai::supervisor)         (otwono-llama)        Unix socket──▶  llama-server
+```
+
+- The daemon links no engine, so a model loader that segfaults cannot take the control
+  plane with it — and `cargo test --workspace` needs no C++ toolchain, no engine and no
+  model file.
+- The adapter translates; it does not re-solve. `llama-server` already does model loading,
+  KV-cache reuse across requests, slot management and sampling.
+- The engine listens on a **Unix socket in a `0700` directory**, not a loopback TCP port.
+  `llama-server` has no authentication, so on a multi-user machine a port would let any
+  local account drive the model and read what is in flight.
+- Availability is **discovered on disk**, never decided at compile time: a backend exists
+  when its adapter is under `/usr/libexec/otwono/ai-backends` and its engine under
+  `/usr/lib/otwono/ai/llama.cpp/<variant>/bin/`. One OTWONO build therefore serves a
+  CPU-only Pi and a CUDA workstation, and `ai.capabilities` describes the machine rather
+  than the build.
+
+Every `ai.infer` goes through admission control first, and the engine is started with the
+context window admission control granted — not with its own defaults, which know nothing
+about this node's reserve. That is asserted directly: a test reads the engine's
+`/proc/<pid>/cmdline` and checks the `--ctx-size` it was actually given.
+
+### 3.2 What is not there yet
+
+- **Streaming.** One request, one response. Interactive use wants tokens as they are
+  produced, which needs several frames per request *and* a control plane that can carry
+  them to the caller. `llama-server` can stream; the gap is ours.
+- **Sandboxing the engine.** It is a large C++ program parsing untrusted model files and it
+  runs with the adapter's privileges, confined only by `otwono-aid.service`'s hardening and
+  a `MemoryMax=80%` cgroup cap. A `bubblewrap` or Landlock confinement is the right answer
+  and is not written.
+- **Any backend other than llama.cpp.** whisper.cpp, Piper, ONNX Runtime and vLLM each need
+  their own adapter. The protocol is deliberately engine-neutral so that is additive work.
+- **GPU variants.** The discovery layout has directories for `vulkan`, `cuda` and `rocm`,
+  and selection already prefers them correctly, but no build stage produces them.
+
 Rules:
 
 - Backends run **out of process** and are supervised. A backend crash is a typed error,
@@ -81,6 +127,8 @@ Rules:
   pure function, and it is unit-testable against fixture profiles with no hardware present.
 - A backend that fails to load falls back down the list and records why, so `ai.capabilities`
   can explain "CUDA present but the driver is too old" instead of silently going slow.
+  *(Specified; today a load failure is reported rather than retried against the next
+  backend.)*
 
 ## 4. Admission control
 

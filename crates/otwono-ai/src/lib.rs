@@ -15,22 +15,26 @@
 //!
 //! # What it deliberately does not do
 //!
-//! No inference. No model downloading. `otwono-ai` cannot load a model and does not pretend
-//! to — there is no backend integrated yet, and [`select_backend`] says so honestly rather
-//! than naming one that would fail on first use.
+//! No inference, and no dependency on anything that performs inference. This crate names
+//! the backend that *should* run a model and reports which are installed on disk
+//! ([`discovery`]); running one is `otwono-llama`'s job, under `otwono-aid`. The dependency
+//! only ever points that way, so `cargo test -p otwono-ai` needs no engine, no C++
+//! toolchain and no model file.
 
 #![forbid(unsafe_code)]
 
 pub mod admission;
 pub mod backend;
 pub mod catalog;
+pub mod discovery;
 pub mod manifest;
 pub mod signature;
 pub mod supervisor;
 
 pub use admission::{admit, Admission, AdmissionError, AdmissionRequest, Reserve};
-pub use backend::{installed_backends, select_backend, BackendId, BackendSelection, SelectionError};
+pub use backend::{select_backend, BackendId, BackendSelection, SelectionError};
 pub use catalog::{Catalog, CatalogEntry, CatalogError, CatalogProblem, DEFAULT_MODEL_DIR};
+pub use discovery::{discover, installed_backends, installed_backends_in, BackendInstall};
 pub use manifest::{Footprint, ManifestError, ModelCapability, ModelFormat, ModelManifest, Signature};
 pub use signature::{PublisherTrust, SignatureError, SignatureStatus, TrustError};
 pub use supervisor::{BackendError, BackendHello, BackendProcess, PROTOCOL_VERSION};

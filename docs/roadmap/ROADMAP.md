@@ -105,9 +105,10 @@ path, not yet kernel-enforced.
 
 ## Phase 4 — Local AI runtime  ← *in progress*
 
-1. `otwono-aid` with the backend abstraction and llama.cpp CPU first.
+1. ~~`otwono-aid` with the backend abstraction and llama.cpp CPU first.~~ **done**
 2. Model catalog, signed manifests, content-addressed storage, tier gating.
-3. Admission control with a real refusal path — `ModelTooLargeForTier` must be observed.
+3. ~~Admission control with a real refusal path — `ModelTooLargeForTier` must be observed.~~
+   **done**
 4. GPU/NPU backends behind capability detection.
 5. Tiered assistant shapes T0–T2.
 
@@ -127,9 +128,20 @@ trust store that ships empty, with trusted / unsigned / untrusted-publisher / ta
 as four distinct outcomes; and the out-of-process backend supervisor, with its crash, hang,
 protocol and flooding paths tested against a fake backend.
 
-**Still open:** no inference engine is linked, so `ai.infer` refuses and the `ai.infer`
-half of the exit criterion is not met. No model download, no embeddings, ASR or TTS, no
-GPU/NPU backend, no tiered assistant shapes.
+**Done (slice 3):** llama.cpp integrated as a supervised adapter process (ADR-0011) and
+`ai.infer` implemented. A prompt goes from a control-plane client through the permission
+broker, admission control, `otwono_ai::supervisor`, `otwono-llama-backend` and
+`llama-server` into a GGUF model and returns generated tokens. Backends are discovered on
+disk rather than compiled in, so one build serves a CPU-only Pi and a CUDA workstation.
+Build stage 35 produces the engine for either architecture from a pinned upstream tag,
+verified against the commit that tag pointed at; it is opt-in (`AI_ENGINE=llama.cpp`)
+because the engine is 17 MiB per architecture and a ten-minute build.
+
+**Still open:** the exit criterion is **not met**. `ai.infer` has been served on the host
+against a synthetic model, not on a booted amd64 *and* arm64 VM with tier-appropriate
+models — there is no model distribution, so no VM has a model to run. Also missing:
+streaming, any sandbox around the engine beyond the daemon's own hardening, model download,
+embeddings, ASR and TTS, GPU/NPU backends, and the tiered assistant shapes.
 
 ---
 

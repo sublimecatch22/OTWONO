@@ -14,10 +14,12 @@ system, same subsystems, same interfaces — the capabilities scale to the hardw
 > DHCP server, they discover each other over mDNS and each authenticates the other's
 > cryptographic NodeID — and since ADR-0010 the daemon that talks to the network no longer
 > holds the key its NodeID names. Nothing has run on real hardware yet; there is no radio
-> link and no routing. **The AI runtime can now say what a node could run** — model
-> catalog, admission control, signed-manifest verification, and a supervised out-of-process
-> backend contract, all tested rather than assumed — but no inference engine is linked, so
-> `ai.infer` refuses and nothing here has run a model.
+> link and no routing. **Local inference now works**: llama.cpp is integrated as a
+> supervised adapter process (ADR-0011), and a prompt travels from a control-plane client
+> through the permission broker, admission control, the supervisor and `llama-server` into
+> a GGUF model and back as generated tokens. It is off by default — the engine is 17 MiB of
+> third-party C++ per architecture, so images opt in with `AI_ENGINE=llama.cpp` — and there
+> is no streaming, no sandbox around the engine, and no model ships with the image.
 > The daemons still run as root pending user separation.
 >
 > Every document and subsystem carries an explicit status (`SPECIFIED` / `IMPLEMENTED` /

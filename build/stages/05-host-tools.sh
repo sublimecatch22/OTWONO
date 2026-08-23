@@ -20,28 +20,35 @@ require_tool cargo
 [ "$ARCH" = "arm64" ] && require_tool aarch64-linux-gnu-gcc "package: gcc-aarch64-linux-gnu"
 
 OUTDIR="$TARGET_OUT/host-tools"
-mkdir -p "$OUTDIR/bin"
+mkdir -p "$OUTDIR/bin" "$OUTDIR/libexec"
 
 log "building workspace for $RUST_TARGET"
 ( cd "$REPO_ROOT" && env ${LINKER_ENV:-} cargo build --release --workspace --target "$RUST_TARGET" )
 
 BIN_SRC="$REPO_ROOT/target/$RUST_TARGET/release"
 BINARIES=(otwono-hwctl otwono-permd otwono-hwd otwono-idd otwono-netd otwono-aid)
+# AI backend adapters. Not in /usr/bin: nothing invokes them by hand, they are spawned by
+# otwono-aid, and discovery finds them by path (otwono_ai::discovery).
+ADAPTERS=(otwono-llama-backend)
 
 : > "$OUTDIR/manifest"
-for b in "${BINARIES[@]}"; do
+stage_binary() { # source-name destination-dir
+    local b="$1" dest="$2"
     [ -f "$BIN_SRC/$b" ] || die "expected binary not produced: $BIN_SRC/$b"
-    install -m 0755 "$BIN_SRC/$b" "$OUTDIR/bin/$b"
-    printf '%s\t%s\t%s\n' "$b" "$(sha256sum "$OUTDIR/bin/$b" | cut -d' ' -f1)" \
-        "$(stat -c %s "$OUTDIR/bin/$b")" >> "$OUTDIR/manifest"
-    log "staged $b ($(stat -c %s "$OUTDIR/bin/$b") bytes)"
-done
+    install -m 0755 "$BIN_SRC/$b" "$dest/$b"
+    printf '%s\t%s\t%s\n' "$b" "$(sha256sum "$dest/$b" | cut -d' ' -f1)" \
+        "$(stat -c %s "$dest/$b")" >> "$OUTDIR/manifest"
+    log "staged $b ($(stat -c %s "$dest/$b") bytes)"
+}
+
+for b in "${BINARIES[@]}"; do stage_binary "$b" "$OUTDIR/bin"; done
+for b in "${ADAPTERS[@]}"; do stage_binary "$b" "$OUTDIR/libexec"; done
 
 # Confirm we actually produced binaries for the target architecture rather than the host's.
 EXPECT_MACHINE=$([ "$ARCH" = arm64 ] && echo "ARM aarch64" || echo "x86-64")
-for b in "${BINARIES[@]}"; do
-    file "$OUTDIR/bin/$b" | grep -q "$EXPECT_MACHINE" \
-        || die "$b is not a $EXPECT_MACHINE binary: $(file -b "$OUTDIR/bin/$b")"
+for b in "$OUTDIR/bin"/* "$OUTDIR/libexec"/*; do
+    file "$b" | grep -q "$EXPECT_MACHINE" \
+        || die "$(basename "$b") is not a $EXPECT_MACHINE binary: $(file -b "$b")"
 done
 log "verified all binaries are $EXPECT_MACHINE"
 

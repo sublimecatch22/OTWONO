@@ -4,6 +4,7 @@ members = [
     "crates/otwono-hal",
     "crates/otwono-capability",
     "crates/otwono-ai",
+    "crates/otwono-llama",
     "crates/otwono-hwctl",
     "crates/otwono-identity",
     "crates/otwono-net",
@@ -32,6 +33,7 @@ toml = "0.8"
 otwono-hal = { path = "crates/otwono-hal" }
 otwono-capability = { path = "crates/otwono-capability" }
 otwono-ai = { path = "crates/otwono-ai" }
+otwono-llama = { path = "crates/otwono-llama" }
 otwono-identity = { path = "crates/otwono-identity" }
 otwono-net = { path = "crates/otwono-net" }
 otwono-proto = { path = "crates/otwono-proto" }

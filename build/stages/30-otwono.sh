@@ -23,6 +23,13 @@ for b in "$TOOLS/bin/"*; do
     log "  /usr/bin/$(basename "$b")"
 done
 
+log "installing AI backend adapters"
+install -d -m 0755 "$ROOTFS/usr/libexec/otwono/ai-backends"
+for b in "$TOOLS/libexec/"*; do
+    install -m 0755 "$b" "$ROOTFS/usr/libexec/otwono/ai-backends/$(basename "$b")"
+    log "  /usr/libexec/otwono/ai-backends/$(basename "$b")"
+done
+
 log "installing schemas"
 install -d -m 0755 "$ROOTFS/usr/share/otwono/schemas"
 install -m 0644 "$REPO_ROOT"/schemas/*.json "$ROOTFS/usr/share/otwono/schemas/"
@@ -197,6 +204,11 @@ install -d -m 0755 "$ROOTFS/usr/lib/tmpfiles.d"
 cat > "$ROOTFS/usr/lib/tmpfiles.d/otwono.conf" <<'TMPFILES'
 d /run/otwono 0755 root root -
 d /var/log/otwono 0750 root root -
+# The inference engine's socket lives here. 0700, and that mode is the whole security
+# boundary: llama-server speaks HTTP with no authentication, so anything that can open the
+# socket can drive the model and read what is in flight. A loopback TCP port -- the obvious
+# alternative -- would be open to every local user instead (ADR-0011).
+d /run/otwono/ai 0700 root root -
 TMPFILES
 
 log "installing the daemon units"
@@ -482,10 +494,11 @@ WantedBy=multi-user.target
 UNIT
 
 log "installing the AI daemon unit"
-# No inference backend is linked into this build, so this daemon answers questions about
-# what the node *could* run and refuses ai.infer. It is still worth running: the catalog
-# and the admission decision are what a UI needs to know whether to offer an assistant at
-# all, and getting a truthful "no" at boot is better than discovering it at first use.
+# Whether this node can run a model is a property of the filesystem, not of the build: the
+# daemon discovers backends under /usr/libexec/otwono/ai-backends and /usr/lib/otwono/ai at
+# startup (ADR-0011). With none installed it still serves the catalog and the admission
+# decision -- what a UI needs to know whether to offer an assistant at all -- and refuses
+# ai.infer with a reason. A truthful "no" at boot beats discovering it at first use.
 cat > "$ROOTFS/etc/systemd/system/otwono-aid.service" <<'UNIT'
 [Unit]
 Description=OTWONO AI daemon
@@ -502,13 +515,22 @@ Type=exec
 ExecStart=/usr/bin/otwono-aid --socket /run/otwono/ai.sock --perm-socket /run/otwono/perm.sock --hw-socket /run/otwono/hw.sock --model-dir /var/lib/otwono/models --publishers /etc/otwono/publishers.d
 Restart=on-failure
 RestartSec=2
+# An inference engine is memory-hungry by nature and admission control already reasons
+# about the node's budget, but a runaway must not be able to take the machine with it.
+# The cgroup is the backstop the arithmetic cannot be: it applies to the whole tree,
+# including the engine, and it is enforced by the kernel rather than by our own honesty.
+MemoryMax=80%
+# Killing the control group on stop is what guarantees no llama-server outlives the daemon.
+KillMode=control-group
 
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-# No business on the network: it reads no hardware itself and downloads nothing. Model
-# fetching is not implemented, and when it is it will be a brokered egress action.
+# No business on the network: it reads no hardware itself and downloads nothing, and the
+# inference engine it starts talks to it over a Unix socket rather than a loopback port
+# precisely so this can stay on (ADR-0011). Model fetching is not implemented, and when it
+# is it will be a brokered egress action.
 PrivateNetwork=yes
 RestrictAddressFamilies=AF_UNIX
 ReadWritePaths=/run/otwono /var/lib/otwono

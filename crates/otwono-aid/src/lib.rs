@@ -1,51 +1,122 @@
 //! OTWONO AI daemon.
 //!
-//! Answers three questions on the control plane: what can this node do, what models does
-//! it have, and would this model load. It does **not** run inference — see below.
+//! Answers four questions on the control plane: what can this node do, what models does it
+//! have, would this model load, and — when a backend is installed — what does the model
+//! say.
 //!
 //! # STATUS
 //!
-//! `ai.capabilities`, `ai.models.list` and `ai.admit` are implemented and tested, as is
-//! model signature verification against a configured publisher trust store, and the
-//! out-of-process backend supervisor the engine will eventually run behind.
-//! **`ai.infer` is not implemented.** No inference engine is linked into this build, and
-//! the method says so with `NoBackendAvailable` rather than returning a plausible-looking
-//! answer. That is deliberate: a stubbed `ai.infer` would be a mock on the default code
-//! path of a shipped binary, which CLAUDE.md §2.2 forbids, and every caller built against
-//! it would be built against a lie.
+//! `ai.capabilities`, `ai.models.list`, `ai.admit` and `ai.infer` are implemented and
+//! tested. `ai.infer` runs a real model through a real engine, or refuses; what it never
+//! does is return a plausible-looking answer from no model at all.
 //!
-//! # Why admission before inference
+//! Whether it can run anything depends on the *machine*, not on this build: backends are
+//! discovered on disk (`otwono_ai::discovery`), so a node with no engine installed still
+//! reports `local_inference_available: false` and refuses with a reason.
+//!
+//! # Every inference goes through admission control
 //!
 //! `docs/ai/AI-RUNTIME.md` §4: the common failure of local AI on small hardware is a
-//! confident load followed by the OOM killer. That decision is pure logic over a manifest
-//! and a capability profile, so it can be got right — and tested against every fixture
-//! machine — before any engine exists. Wiring an engine in first would mean the refusal
-//! path is whatever the engine happens to do when it runs out of memory.
+//! confident load followed by the OOM killer. So `ai.infer` does not load what `ai.admit`
+//! would refuse, and it loads it with exactly the context window admission control charged
+//! the memory budget for — not with the engine's own defaults, which know nothing about
+//! this node's reserve.
+//!
+//! That ordering is the reason admission control was built first. Had the engine gone in
+//! first, the refusal path would be whatever llama.cpp happens to do when it runs out of
+//! memory, which on a Pi is to be killed by the kernel.
 
 #![forbid(unsafe_code)]
 
 use otwono_ai::{
     admission::{largest_admissible_context, MemoryPool},
-    admit, installed_backends, AdmissionRequest, Catalog, PublisherTrust,
+    admit, Admission, AdmissionRequest, BackendId, BackendInstall, BackendProcess, Catalog, PublisherTrust,
 };
 use otwono_capability::CapabilityProfile;
+use otwono_proto::message::Request;
 use otwono_proto::{
     unknown_method, CallContext, Client, MethodDescription, RpcError, Service, ServiceDescription,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Mutex;
+use std::time::Duration;
 
 pub const SERVICE_NAME: &str = "otwono-aid";
 pub const DESCRIBE_SCHEMA_VERSION: &str = "1.0.0";
 pub const CAPABILITY_READ: &str = "ai.read";
 pub const CAPABILITY_INFER: &str = "ai.infer";
 
+/// Where a backend adapter creates its engine socket.
+pub const DEFAULT_BACKEND_RUNTIME_DIR: &str = "/run/otwono/ai";
+
+/// How long an adapter has to answer `hello`.
+///
+/// Short on purpose: the adapter says hello *before* loading a model, so this covers
+/// process startup only. If it needed to cover a model load it would have to be minutes,
+/// and a minutes-long hello timeout cannot tell a slow node from a dead adapter.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a model may take to load.
+const LOAD_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How long one completion may take.
+const INFER_TIMEOUT: Duration = Duration::from_secs(900);
+
 pub struct AiService {
     catalog: Catalog,
     profile: CapabilityProfile,
     trust: PublisherTrust,
     perm_socket: PathBuf,
+    /// Backends found on disk at startup.
+    ///
+    /// Read once rather than on every call: the answer changes only when packages are
+    /// installed, and a daemon that re-probed per request would report a half-installed
+    /// backend the moment a file appeared, mid-upgrade.
+    installs: Vec<BackendInstall>,
+    backend_runtime_dir: PathBuf,
+    /// The one loaded model, if any.
+    ///
+    /// One at a time, and the mutex serializes inference. That is not a placeholder for
+    /// concurrency to be added later: the memory budget admission control computed is for
+    /// **one** model, and a second concurrent load would spend it twice. Multiple
+    /// simultaneous requests are what a backend's own sequence slots are for.
+    session: Mutex<Option<Session>>,
+    next_request_id: AtomicI64,
+}
+
+/// A running backend adapter with a model loaded.
+struct Session {
+    process: BackendProcess,
+    model_id: String,
+    backend: BackendId,
+    context_tokens: u32,
+    sequences: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct InferParams {
+    model_id: String,
+    prompt: String,
+    /// Upper bound on generated tokens. Required, because an unbounded request occupies
+    /// the node's only engine for as long as the model keeps talking.
+    max_tokens: u32,
+    #[serde(default)]
+    context_tokens: Option<u32>,
+    #[serde(default)]
+    temperature: Option<f32>,
+    #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    top_k: Option<u32>,
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default)]
+    stop: Vec<String>,
+    #[serde(default)]
+    allow_unsigned: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,13 +136,29 @@ impl AiService {
         profile: CapabilityProfile,
         trust: PublisherTrust,
         perm_socket: PathBuf,
+        installs: Vec<BackendInstall>,
     ) -> Self {
         AiService {
             catalog,
             profile,
             trust,
             perm_socket,
+            installs,
+            backend_runtime_dir: PathBuf::from(DEFAULT_BACKEND_RUNTIME_DIR),
+            session: Mutex::new(None),
+            next_request_id: AtomicI64::new(1),
         }
+    }
+
+    /// Override where backend adapters put their engine sockets. For tests, which cannot
+    /// write to `/run`.
+    pub fn with_backend_runtime_dir(mut self, dir: impl AsRef<Path>) -> Self {
+        self.backend_runtime_dir = dir.as_ref().to_path_buf();
+        self
+    }
+
+    fn installed(&self) -> Vec<BackendId> {
+        self.installs.iter().map(|i| i.backend).collect()
     }
 
     fn authorize(&self, ctx: &CallContext, action: &str) -> Result<(), RpcError> {
@@ -96,7 +183,7 @@ impl AiService {
 
     /// What this node can do right now. Open: it describes the machine, not its contents.
     fn capabilities(&self) -> Value {
-        let backends = installed_backends();
+        let backends = self.installed();
         json!({
             "schema_version": DESCRIBE_SCHEMA_VERSION,
             "tier": self.profile.tier.as_str(),
@@ -108,7 +195,7 @@ impl AiService {
             // local assistant needs one boolean, and it must not be optimistic.
             "local_inference_available": !backends.is_empty(),
             "notes": if backends.is_empty() {
-                vec!["no inference backend is linked into this build; ai.infer will refuse"]
+                vec!["no inference backend is installed on this node; ai.infer will refuse"]
             } else {
                 vec![]
             },
@@ -120,7 +207,7 @@ impl AiService {
             .catalog
             .list()
             .map_err(|e| RpcError::internal(format!("cannot read the model catalog: {e}")))?;
-        let backends = installed_backends();
+        let backends = self.installed();
 
         let models: Vec<Value> = entries
             .iter()
@@ -184,7 +271,7 @@ impl AiService {
             sequences: p.sequences.unwrap_or(1),
             allow_unsigned: p.allow_unsigned,
         };
-        let backends = installed_backends();
+        let backends = self.installed();
 
         match admit(&entry.manifest, &self.profile, &request, &backends, &self.trust) {
             Ok(a) => Ok(json!({
@@ -219,6 +306,218 @@ impl AiService {
             })),
         }
     }
+
+    /// Run a prompt through a locally installed model.
+    ///
+    /// The order of operations is the whole design:
+    ///
+    /// 1. **Admission control decides**, exactly as `ai.admit` would, including the
+    ///    signature check. A model that would be refused as a dry run is refused here too —
+    ///    otherwise `ai.admit` would be advice the system itself ignores.
+    /// 2. **The weights must be present.** A manifest without its blob is a catalog entry,
+    ///    not a model, and "file not found" from inside an engine is a poor way to learn it.
+    /// 3. **The engine is started with admission control's numbers**, not its own defaults.
+    /// 4. **An already-loaded model is reused.** Reloading per request would dominate the
+    ///    wall clock on exactly the hardware this project exists for.
+    fn infer(&self, params: Value) -> Result<Value, RpcError> {
+        let p: InferParams =
+            serde_json::from_value(params).map_err(|e| RpcError::invalid_params(format!("ai.infer: {e}")))?;
+        if p.max_tokens == 0 {
+            return Err(RpcError::invalid_params("max_tokens must be at least 1"));
+        }
+
+        let entry = self
+            .catalog
+            .get(&p.model_id)
+            .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+
+        let request = AdmissionRequest {
+            context_tokens: p.context_tokens,
+            sequences: 1,
+            allow_unsigned: p.allow_unsigned,
+        };
+        let backends = self.installed();
+        let admission =
+            admit(&entry.manifest, &self.profile, &request, &backends, &self.trust).map_err(|e| {
+                // A refusal carries what would fit, so a caller can retry with a smaller
+                // context instead of guessing. `ai.admit` returns the same figure.
+                RpcError::unavailable(format!("ai.infer refused: {e}")).with_data(json!({
+                    "model_id": entry.manifest.id,
+                    "largest_admissible_context": largest_admissible_context(
+                        &entry.manifest, &self.profile, &request, &backends, &self.trust,
+                    ),
+                }))
+            })?;
+
+        if !entry.weights_present {
+            return Err(RpcError::unavailable(format!(
+                "the manifest for {} is in the catalog but its weights are not; \
+                 nothing has been downloaded yet",
+                entry.manifest.id
+            )));
+        }
+        let weights = self.catalog.blob_path(&entry.manifest.blake3);
+
+        let install = self
+            .installs
+            .iter()
+            .find(|i| i.backend == admission.selection.backend)
+            .ok_or_else(|| {
+                // Should be unreachable: admission chose from exactly this set. Reported
+                // rather than unwrapped, because an unreachable state that panics takes
+                // the daemon down with it.
+                RpcError::internal(format!(
+                    "admission chose {} but it is not installed",
+                    admission.selection.backend.as_str()
+                ))
+            })?
+            .clone();
+
+        let mut guard = self
+            .session
+            .lock()
+            .map_err(|_| RpcError::internal("the inference lock was poisoned by an earlier panic"))?;
+
+        self.ensure_loaded(&mut guard, &install, &admission, &weights)?;
+        let session = guard.as_mut().expect("ensure_loaded leaves a session");
+
+        let mut infer_params = json!({
+            "prompt": p.prompt,
+            "max_tokens": p.max_tokens,
+        });
+        let map = infer_params.as_object_mut().expect("object literal");
+        for (key, value) in [
+            ("temperature", p.temperature.map(|v| json!(v))),
+            ("top_p", p.top_p.map(|v| json!(v))),
+            ("top_k", p.top_k.map(|v| json!(v))),
+            ("seed", p.seed.map(|v| json!(v))),
+        ] {
+            if let Some(value) = value {
+                map.insert(key.to_string(), value);
+            }
+        }
+        if !p.stop.is_empty() {
+            map.insert("stop".to_string(), json!(p.stop));
+        }
+
+        let result = self
+            .backend_call(session, "backend.infer", infer_params, INFER_TIMEOUT)
+            .inspect_err(|_| {
+                // A backend that failed mid-inference is not trustworthy for the next
+                // request: it may be dead, or holding a half-finished response that would
+                // be read as the answer to whatever comes next. Drop it and reload.
+                *guard = None;
+            })?;
+
+        Ok(json!({
+            "schema_version": DESCRIBE_SCHEMA_VERSION,
+            "model_id": entry.manifest.id,
+            "backend": admission.selection.backend.as_str(),
+            "context_tokens": admission.context_tokens,
+            "text": result["text"],
+            "tokens_predicted": result["tokens_predicted"],
+            "tokens_evaluated": result["tokens_evaluated"],
+            "stop_reason": result["stop_reason"],
+            "prompt_truncated": result["prompt_truncated"],
+            "timings": result["timings"],
+        }))
+    }
+
+    /// Make sure the right model is loaded in the right backend, reusing what is there.
+    fn ensure_loaded(
+        &self,
+        guard: &mut Option<Session>,
+        install: &BackendInstall,
+        admission: &Admission,
+        weights: &Path,
+    ) -> Result<(), RpcError> {
+        if let Some(session) = guard.as_ref() {
+            // Context is part of the identity of a load: the same model at a larger context
+            // is a different memory reservation, and reusing the smaller one would silently
+            // give the caller less room than admission control granted.
+            if session.model_id == admission.model_id
+                && session.backend == install.backend
+                && session.context_tokens == admission.context_tokens
+                && session.sequences == admission.sequences
+            {
+                return Ok(());
+            }
+        }
+        // Stop the old one before starting the new one: two resident models would need
+        // twice the memory that was budgeted.
+        *guard = None;
+
+        std::fs::create_dir_all(&self.backend_runtime_dir).map_err(|e| {
+            RpcError::internal(format!(
+                "cannot create {}: {e}",
+                self.backend_runtime_dir.display()
+            ))
+        })?;
+
+        let mut command = std::process::Command::new(&install.adapter);
+        command
+            .arg("--engine")
+            .arg(&install.engine)
+            .arg("--runtime-dir")
+            .arg(&self.backend_runtime_dir);
+        let process =
+            BackendProcess::spawn(install.backend.as_str(), &mut command, HELLO_TIMEOUT).map_err(|e| {
+                RpcError::unavailable(format!(
+                    "cannot start the {} backend: {e}",
+                    install.backend.as_str()
+                ))
+            })?;
+
+        let mut session = Session {
+            process,
+            model_id: admission.model_id.clone(),
+            backend: install.backend,
+            context_tokens: admission.context_tokens,
+            sequences: admission.sequences,
+        };
+        self.backend_call(
+            &mut session,
+            "backend.load",
+            json!({
+                "model_path": weights.display().to_string(),
+                "context_tokens": admission.context_tokens,
+                "sequences": admission.sequences,
+            }),
+            LOAD_TIMEOUT,
+        )?;
+        *guard = Some(session);
+        Ok(())
+    }
+
+    /// One JSON-RPC round trip to a backend adapter.
+    fn backend_call(
+        &self,
+        session: &mut Session,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, RpcError> {
+        let id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let request = serde_json::to_value(Request::new(id, method, params))
+            .map_err(|e| RpcError::internal(format!("cannot encode {method}: {e}")))?;
+        let response = session.process.request(&request, timeout).map_err(|e| {
+            RpcError::unavailable(format!("the {} backend failed: {e}", session.backend.as_str()))
+        })?;
+
+        if let Some(error) = response.get("error") {
+            let message = error["message"].as_str().unwrap_or("no message");
+            // Pass the backend's own words through. It is the only part of the system that
+            // knows why a particular GGUF would not load.
+            return Err(RpcError::unavailable(format!(
+                "the {} backend refused {method}: {message}",
+                session.backend.as_str()
+            )));
+        }
+        response
+            .get("result")
+            .cloned()
+            .ok_or_else(|| RpcError::internal(format!("{method} returned neither a result nor an error")))
+    }
 }
 
 impl Service for AiService {
@@ -244,7 +543,7 @@ impl Service for AiService {
                 ),
                 MethodDescription::guarded(
                     "ai.infer",
-                    "NOT IMPLEMENTED: no inference backend is linked into this build",
+                    "Run a prompt through a locally installed model, subject to admission control",
                     CAPABILITY_INFER,
                 ),
             ],
@@ -263,13 +562,17 @@ impl Service for AiService {
                 self.admit_model(params)
             }
             "ai.infer" => {
-                // Authorize first so the refusal is about the missing engine and not a
-                // way to probe the method without a capability.
+                // Authorize before anything else, so that a node with no backend refuses
+                // unauthenticated callers on the capability rather than leaking that it
+                // has nothing installed.
                 self.authorize(ctx, CAPABILITY_INFER)?;
-                Err(RpcError::unavailable(
-                    "ai.infer is not implemented: no inference backend is linked into this build. \
-                     Use ai.capabilities to see what this node can do.",
-                ))
+                if self.installs.is_empty() {
+                    return Err(RpcError::unavailable(
+                        "no inference backend is installed on this node, so ai.infer cannot run \
+                         anything. Use ai.capabilities to see what this node can do.",
+                    ));
+                }
+                self.infer(params)
             }
             other => Err(unknown_method(other)),
         }

@@ -1,7 +1,8 @@
 //! `otwono-aid` — the OTWONO AI daemon.
 //!
-//! No inference backend is linked into this build; see the crate docs. This daemon answers
-//! what a node could run, and refuses `ai.infer` honestly.
+//! Backends are discovered on disk at startup, so this daemon answers what *this machine*
+//! can run rather than what the build was compiled with. With no backend installed it
+//! still serves the catalog and admission control, and refuses `ai.infer` with a reason.
 
 #![forbid(unsafe_code)]
 
@@ -29,6 +30,7 @@ OPTIONS:
     --model-dir <PATH>     Model catalog directory (default /var/lib/otwono/models)
     --hw-socket <PATH>     Hardware daemon socket (default $OTWONO_SOCKET_DIR/hw.sock)
     --publishers <PATH>    Trusted model publishers (default /etc/otwono/publishers.d)
+    --root <PATH>          Filesystem root to discover AI backends under (default /)
     --capabilities         Print what this node can do and exit
     -h, --help             Show this message
 
@@ -37,8 +39,8 @@ EXIT CODES:
     1  usage error
     2  startup failure
 
-This build links no inference engine, so ai.infer refuses. Model admission, backend
-selection and the catalog are implemented; see docs/ai/AI-RUNTIME.md.
+Inference requires a backend installed under /usr/libexec/otwono/ai-backends and
+/usr/lib/otwono/ai; without one, ai.infer refuses. See docs/ai/AI-RUNTIME.md.
 ";
 
 fn main() -> ExitCode {
@@ -72,6 +74,7 @@ fn run(args: &[String]) -> Result<String, Error> {
     let mut model_dir = PathBuf::from(DEFAULT_MODEL_DIR);
     let mut hw_socket: Option<PathBuf> = None;
     let mut publisher_dir = PathBuf::from(DEFAULT_PUBLISHER_DIR);
+    let mut root = PathBuf::from("/");
     let mut capabilities_only = false;
 
     let mut it = args.iter();
@@ -82,6 +85,7 @@ fn run(args: &[String]) -> Result<String, Error> {
             "--model-dir" => model_dir = next_path(&mut it, "--model-dir")?,
             "--hw-socket" => hw_socket = Some(next_path(&mut it, "--hw-socket")?),
             "--publishers" => publisher_dir = next_path(&mut it, "--publishers")?,
+            "--root" => root = next_path(&mut it, "--root")?,
             "--capabilities" => capabilities_only = true,
             "-h" | "--help" => return Ok(USAGE.to_string()),
             other => return Err(Error::Usage(format!("unknown option {other}"))),
@@ -106,8 +110,12 @@ fn run(args: &[String]) -> Result<String, Error> {
     let trust = PublisherTrust::load_dir(&publisher_dir)
         .map_err(|e| Error::Startup(format!("publisher trust store: {e}")))?;
 
+    // Probed once, here, and handed to the service. Re-probing per request would report a
+    // backend the instant a file appeared during an upgrade, half-installed.
+    let installs = otwono_ai::discover(&root);
+
     if capabilities_only {
-        let backends = otwono_ai::installed_backends();
+        let backends: Vec<_> = installs.iter().map(|i| i.backend).collect();
         let (entries, problems) = catalog
             .list()
             .map_err(|e| Error::Startup(format!("cannot read the model catalog: {e}")))?;
@@ -116,7 +124,7 @@ fn run(args: &[String]) -> Result<String, Error> {
             profile.tier.as_str(),
             profile.axes.accelerator.as_str(),
             if backends.is_empty() {
-                "none linked in this build".to_string()
+                "none".to_string()
             } else {
                 backends
                     .iter()
@@ -142,14 +150,23 @@ fn run(args: &[String]) -> Result<String, Error> {
     let server = Server::bind(&socket)
         .map_err(|e| Error::Startup(format!("cannot bind {}: {e}", socket.display())))?;
     eprintln!(
-        "otwono-aid: listening on {} (tier {}, no inference backend linked)",
+        "otwono-aid: listening on {} (tier {}, backends: {})",
         socket.display(),
-        profile.tier.as_str()
+        profile.tier.as_str(),
+        if installs.is_empty() {
+            "none".to_string()
+        } else {
+            installs
+                .iter()
+                .map(|i| i.backend.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
     );
 
     server
         .serve(
-            Arc::new(AiService::new(catalog, profile, trust, perm_socket)),
+            Arc::new(AiService::new(catalog, profile, trust, perm_socket, installs)),
             Shutdown::new(),
         )
         .map_err(|e| Error::Startup(format!("serve failed: {e}")))?;
