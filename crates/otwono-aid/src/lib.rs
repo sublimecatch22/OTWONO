@@ -79,6 +79,17 @@ pub struct AiService {
     /// backend the moment a file appeared, mid-upgrade.
     installs: Vec<BackendInstall>,
     backend_runtime_dir: PathBuf,
+    /// Whether a backend adapter can actually confine itself here, measured once at
+    /// startup by running one with `--probe`.
+    ///
+    /// Measured rather than assumed, and measured *by this process*, because the answer
+    /// depends on this daemon's own sandbox: the landlock syscalls are not in systemd's
+    /// `@system-service` set, so a unit that filters to it gets EPERM and an adapter reads
+    /// that as "no Landlock". A probe run from anywhere else — a boot script under a
+    /// lighter unit, say — answers a different question and would report confinement that
+    /// the real backend does not get. That happened, on a booted node, and is why this
+    /// lives here.
+    backend_confinement: String,
     /// Let backends run without kernel confinement.
     ///
     /// Off by default, and it has to be reachable from *here* rather than only from the
@@ -163,6 +174,7 @@ impl AiService {
         perm_socket: PathBuf,
         installs: Vec<BackendInstall>,
     ) -> Self {
+        let backend_confinement = probe_backend_confinement(&installs);
         AiService {
             catalog,
             profile,
@@ -170,6 +182,7 @@ impl AiService {
             perm_socket,
             installs,
             backend_runtime_dir: PathBuf::from(DEFAULT_BACKEND_RUNTIME_DIR),
+            backend_confinement,
             allow_unconfined_backends: false,
             session: Mutex::new(None),
             next_request_id: AtomicI64::new(1),
@@ -226,6 +239,8 @@ impl AiService {
             "accelerator": self.profile.axes.accelerator.as_str(),
             "installed_backends": backends.iter().map(|b| b.as_str()).collect::<Vec<_>>(),
             "trusted_publishers": self.trust.len(),
+            // Measured in this process, so it is the answer the real backend will get.
+            "backend_confinement": self.backend_confinement,
             // The honest headline. Anything reading this to decide whether to offer a
             // local assistant needs one boolean, and it must not be optimistic.
             "local_inference_available": !backends.is_empty(),
@@ -628,6 +643,31 @@ impl AiService {
             .get("result")
             .cloned()
             .ok_or_else(|| RpcError::internal(format!("{method} returned neither a result nor an error")))
+    }
+}
+
+/// Ask an installed adapter whether it can confine itself here.
+///
+/// One short-lived subprocess at startup. It has to be a subprocess: finding out means
+/// applying a Landlock ruleset, which is irreversible, and a daemon that confined itself to
+/// answer a status question would have answered it by breaking.
+///
+/// `"unknown"` when there is no adapter to ask, which is not a failure — a node with no
+/// backend has nothing to confine.
+fn probe_backend_confinement(installs: &[BackendInstall]) -> String {
+    let Some(install) = installs.first() else {
+        return "unknown".to_string();
+    };
+    match std::process::Command::new(&install.adapter)
+        .arg("--probe")
+        .output()
+    {
+        Ok(output) => String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("landlock="))
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        Err(_) => "unknown".to_string(),
     }
 }
 

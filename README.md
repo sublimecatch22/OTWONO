@@ -14,10 +14,12 @@ system, same subsystems, same interfaces — the capabilities scale to the hardw
 > DHCP server, they discover each other over mDNS and each authenticates the other's
 > cryptographic NodeID — and since ADR-0010 the daemon that talks to the network no longer
 > holds the key its NodeID names. Nothing has run on real hardware yet; there is no radio
-> link and no routing. **Local inference now works**: llama.cpp is integrated as a
-> supervised adapter process (ADR-0011), and a prompt travels from a control-plane client
-> through the permission broker, admission control, the supervisor and `llama-server` into
-> a GGUF model and back as generated tokens. It is off by default — the engine is 17 MiB of
+> link and no routing. **Local inference now works on a booted node**: llama.cpp is
+> integrated as a supervised adapter process (ADR-0011), and on both architectures a booted
+> VM installs a model over its own control plane and completes a prompt — through the
+> permission broker, admission control, the supervisor, Landlock confinement and
+> `llama-server` — printing `OTWONO-AI-INFER-OK … tokens=8` into its boot log. The model is
+> synthetic, so that proves the path and nothing about how a real model performs. It is off by default — the engine is 17 MiB of
 > third-party C++ per architecture, so images opt in with `AI_ENGINE=llama.cpp` — and there
 > is no streaming, and no model ships with the image or can be downloaded yet — but a model
 > handed to the node is now installed only after its weights are hashed against its signed

@@ -1,0 +1,68 @@
+#!/bin/sh
+# OTWONO boot-time inference check.
+#
+# Installs the bundled smoke model and runs one completion through it, on the running
+# system. Everything before this proved inference on a build host; this is the first thing
+# that proves it on a booted node: the daemons, the permission broker, the capability
+# tokens, the Landlock confinement, the systemd hardening and the engine, together, on the
+# target architecture.
+#
+# Only present in an image built with AI_SMOKE_MODEL=1. A release image ships no model and
+# no policy granting ai.admin, and stage 60 asserts as much.
+#
+# The model has random weights, so the text is gibberish. What is checked is that tokens
+# were produced and counted -- asserting on the content would be asserting on a fixture.
+set -eu
+
+MODEL_DIR=/usr/share/otwono/smoke-model
+MODEL_ID=otwono-smoke-test
+
+[ -f "$MODEL_DIR/manifest.json" ] || {
+    echo "OTWONO-AI-INFER-FAIL no smoke model at $MODEL_DIR" >&2
+    exit 1
+}
+
+# The engine has to be there, or this is testing nothing. Fail loudly rather than skip:
+# this unit is only installed when the image was built to have one.
+[ -x /usr/lib/otwono/ai/llama.cpp/cpu/bin/llama-server ] || {
+    echo "OTWONO-AI-INFER-FAIL no inference engine installed" >&2
+    exit 1
+}
+
+# Unsigned on purpose: signing the smoke model would need a publisher key baked into the
+# build, and every node trusting that key would trust whoever holds it. The opt-in is
+# explicit here, which also exercises the unsigned-install path on a real system.
+/usr/bin/otwono-aictl install \
+    --manifest "$MODEL_DIR/manifest.json" \
+    --blob "$MODEL_DIR/model.gguf" \
+    --allow-unsigned || {
+    echo "OTWONO-AI-INFER-FAIL could not install the smoke model" >&2
+    exit 1
+}
+
+# Re-hash what was just installed. Install verified it; this proves the verification is
+# reachable on the running system and not only in a unit test.
+/usr/bin/otwono-aictl verify "$MODEL_ID" | grep -q "weights match the manifest" || {
+    echo "OTWONO-AI-INFER-FAIL installed weights do not match the manifest" >&2
+    exit 1
+}
+
+# A fixed seed and a small budget: this is a smoke test under TCG emulation, not a
+# benchmark. --json because grepping prose is how boot checks rot.
+OUT=$(/usr/bin/otwono-aictl infer "$MODEL_ID" \
+    --prompt "The quick brown fox" \
+    --max-tokens 8 --seed 1 --temperature 0.8 \
+    --allow-unsigned --json) || {
+    echo "OTWONO-AI-INFER-FAIL inference call failed" >&2
+    exit 1
+}
+
+# No jq in the base image; these are machine-written fields appearing once each.
+tokens=$(echo "$OUT" | grep -o '"tokens_predicted"[[:space:]]*:[[:space:]]*[0-9]*' | head -1 | tr -dc '0-9')
+backend=$(echo "$OUT" | grep -o '"backend"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
+
+[ -n "$tokens" ] || { echo "OTWONO-AI-INFER-FAIL no token count in the reply" >&2; exit 1; }
+[ "$tokens" -gt 0 ] || { echo "OTWONO-AI-INFER-FAIL the model produced $tokens tokens" >&2; exit 1; }
+[ -n "$backend" ] || { echo "OTWONO-AI-INFER-FAIL no backend named in the reply" >&2; exit 1; }
+
+echo "OTWONO-AI-INFER-OK model=$MODEL_ID backend=$backend tokens=$tokens"

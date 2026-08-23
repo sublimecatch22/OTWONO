@@ -75,6 +75,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--gguf-py", required=True, help="path to llama.cpp's gguf-py directory")
     ap.add_argument("--out", required=True, help="path to write the .gguf to")
+    ap.add_argument("--manifest", help="also write an OTWONO model manifest describing the output")
+    ap.add_argument("--model-id", default="otwono-smoke-test", help="manifest id, used with --manifest")
     ap.add_argument("--seed", type=int, default=20260823)
     ap.add_argument("--layers", type=int, default=2)
     ap.add_argument("--embd", type=int, default=64)
@@ -159,6 +161,66 @@ def main():
 
     print(f"wrote {out} ({out.stat().st_size} bytes): "
           f"{n_layer} layers, n_embd={n_embd}, n_head={n_head}, n_ff={n_ff}, vocab={n_vocab}")
+
+    if args.manifest:
+        write_manifest(args, out, n_embd, n_layer, n_vocab, head_dim)
+
+
+def write_manifest(args, gguf_path, n_embd, n_layer, n_vocab, head_dim):
+    """Emit a manifest that genuinely describes the file just written.
+
+    The digest is computed here, from these bytes, rather than being copied from anywhere:
+    the whole point of `ai.models.install` is that it refuses a manifest whose digest does
+    not match, so a manifest generator that guessed would only ever produce a refusal.
+
+    It is deliberately *unsigned*. Signing would need a publisher key, and shipping one in
+    a build would mean every node that trusts it trusts whoever holds it -- exactly what
+    the empty trust store exists to avoid. So this model installs only with the explicit
+    unsigned opt-in, which also means the boot check exercises that path.
+    """
+    import json
+    import pathlib as _pathlib
+
+    try:
+        import blake3
+    except ImportError:
+        sys.exit("--manifest needs the blake3 module (pip install blake3)")
+
+    hasher = blake3.blake3()
+    with open(gguf_path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            hasher.update(chunk)
+
+    size = gguf_path.stat().st_size
+    # 2 x n_layer x n_embd x 4 bytes per token for an f32 KV cache, x 1024 tokens.
+    kv_per_1k = 2 * n_layer * n_embd * 4 * 1024
+    manifest = {
+        "schema_version": "1.0.0",
+        "id": args.model_id,
+        "family": "llama",
+        "parameters": n_vocab * n_embd * 2 + n_layer * n_embd * n_embd * 4,
+        "quantization": "F32",
+        "format": "gguf",
+        "blake3": hasher.hexdigest(),
+        "size_bytes": size,
+        "min_tier": "T0_MICRO",
+        "footprint": {
+            "weights_bytes": size,
+            "kv_per_1k_ctx_bytes": kv_per_1k,
+            # A llama-server process costs tens of megabytes before it touches a model.
+            # Under-declaring it is how admission control says yes and the OOM killer
+            # disagrees, which is the failure this whole subsystem exists to prevent.
+            "overhead_bytes": 64 * 1024 * 1024,
+        },
+        "max_context": args.ctx,
+        "capabilities": ["chat"],
+        "license": "apache-2.0",
+        "backends": ["llama-cpp-cpu"],
+    }
+    path = _pathlib.Path(args.manifest)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(manifest, indent=2) + "\n")
+    print(f"wrote {path}: id={manifest['id']} blake3={manifest['blake3'][:16]}... unsigned")
 
 
 if __name__ == "__main__":

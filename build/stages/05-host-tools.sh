@@ -26,7 +26,7 @@ log "building workspace for $RUST_TARGET"
 ( cd "$REPO_ROOT" && env ${LINKER_ENV:-} cargo build --release --workspace --target "$RUST_TARGET" )
 
 BIN_SRC="$REPO_ROOT/target/$RUST_TARGET/release"
-BINARIES=(otwono-hwctl otwono-permd otwono-hwd otwono-idd otwono-netd otwono-aid)
+BINARIES=(otwono-hwctl otwono-aictl otwono-permd otwono-hwd otwono-idd otwono-netd otwono-aid)
 # AI backend adapters. Not in /usr/bin: nothing invokes them by hand, they are spawned by
 # otwono-aid, and discovery finds them by path (otwono_ai::discovery).
 ADAPTERS=(otwono-llama-backend)

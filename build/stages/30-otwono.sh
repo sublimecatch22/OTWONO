@@ -543,6 +543,14 @@ RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 SystemCallFilter=@system-service
+# @sandbox on top, for exactly three syscalls: landlock_create_ruleset, landlock_add_rule
+# and landlock_restrict_self. They are not in @system-service, so without this the backend
+# adapter's attempt to confine itself returns EPERM -- and the adapter reads that as "this
+# kernel has no Landlock" and refuses to start (ADR-0012). Our own hardening was preventing
+# the engine from being confined, and the failure looked exactly like a kernel without the
+# feature. Found by the boot-time inference check, which is the only thing that runs the
+# real daemon, with its real unit, on a real node.
+SystemCallFilter=@sandbox
 SystemCallErrorNumber=EPERM
 CapabilityBoundingSet=
 AmbientCapabilities=

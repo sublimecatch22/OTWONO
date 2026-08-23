@@ -2,6 +2,11 @@
 
 **Status:** partly `VERIFIED`, partly `IMPLEMENTED`, partly `SPECIFIED`.
 
+* **`VERIFIED` — local inference runs on a booted node.** Both architectures boot, install a
+  model over the control plane and complete a prompt, printing
+  `OTWONO-AI-INFER-OK … tokens=8`. Built with `AI_SMOKE_MODEL=1`, which bundles a generated
+  model and a policy granting `ai.admin`; a release image ships neither and stage 60 asserts
+  it.
 * **`VERIFIED` — local inference runs.** llama.cpp is integrated as a supervised adapter
   process (ADR-0011, §3.1). A prompt goes from a control-plane client through the
   permission broker, admission control, the supervisor, the adapter and `llama-server` into

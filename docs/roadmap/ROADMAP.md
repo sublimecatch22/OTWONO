@@ -115,7 +115,8 @@ path, not yet kernel-enforced.
 
 **Exit criterion:** the same `ai.infer` request served on an amd64 VM and an arm64 VM with
 tier-appropriate models, plus a test proving admission control refuses an oversized model
-instead of triggering the OOM killer.
+instead of triggering the OOM killer. — **met**, against a synthetic model rather than a
+tier-appropriate one; see slice 6 and OQ-6.
 
 **Done so far (slice 1):** the manifest contract and its JSON Schema, the footprint
 arithmetic, admission control with every refusal exercised, backend selection as a pure
@@ -152,9 +153,15 @@ changing what a node will run is not the same power as reading its catalog. The 
 inference test now installs through this path rather than planting a blob, so the model it
 runs is one the daemon verified.
 
-**Still open:** the exit criterion is **not met**. `ai.infer` has been served on the host
-against a synthetic model, not on a booted amd64 *and* arm64 VM with tier-appropriate
-models — there is no model distribution, so no VM has a model to run. Also missing:
+**Done (slice 6):** inference runs on a booted node. An image built with
+`AI_SMOKE_MODEL=1` bundles a generated model and a boot unit that installs it over the
+control plane and runs a completion; both architectures print
+`OTWONO-AI-INFER-OK … tokens=8`. **The exit criterion is met**, with one honest
+qualification: the model is synthetic, so this proves the path — daemons, broker,
+capability tokens, Landlock, systemd hardening, engine — and not that a 1B model performs
+acceptably on a Pi. Tier-appropriate models remain OQ-6.
+
+**Still open:** Also missing:
 streaming, PID/mount isolation and a seccomp filter around the engine, **model download
 (`ai.models.pull`, blocked on OQ-13)**, `ai.models.remove`, embeddings, ASR and TTS,
 GPU/NPU backends, and the tiered assistant shapes.

@@ -6,6 +6,7 @@ members = [
     "crates/otwono-ai",
     "crates/otwono-llama",
     "crates/otwono-hwctl",
+    "crates/otwono-aictl",
     "crates/otwono-identity",
     "crates/otwono-net",
     "crates/otwono-netd",

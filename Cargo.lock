@@ -899,6 +899,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "otwono-aictl"
+version = "0.1.0"
+dependencies = [
+ "otwono-proto",
+ "serde_json",
+]
+
+[[package]]
 name = "otwono-aid"
 version = "0.1.0"
 dependencies = [

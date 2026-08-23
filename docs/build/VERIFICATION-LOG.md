@@ -1089,3 +1089,107 @@ a real hole and not a test artifact.
   is the answer for on-demand re-checking, and it is a thing a caller asks for.
 - **No progress reporting.** `ai.models.install` is synchronous, which is fine for a local
   copy and will not be fine for a download.
+
+---
+
+## Phase 4 slice 6 — inference on a booted node, and two defects only a boot could find
+
+Every previous claim about inference was measured on a build host. This slice moves it onto
+the target: a booted node installs a model over its own control plane and completes a
+prompt.
+
+| Target | Boot line |
+|---|---|
+| `amd64-qemu-ubuntu` | `OTWONO-AI-INFER-OK model=otwono-smoke-test backend=llama-cpp-cpu tokens=8` |
+| `arm64-qemu-ubuntu` | `OTWONO-AI-INFER-OK model=otwono-smoke-test backend=llama-cpp-cpu tokens=8` |
+| `amd64-qemu-ubuntu`, no smoke flag | `OTWONO-AI-OK … sandbox=full models=0` and the release-purity check passes |
+
+**Phase 4's exit criterion is met**, with one qualification stated rather than buried: the
+model is synthetic, so this proves the *path* — daemons, broker, capability tokens,
+admission control, Landlock, systemd hardening, adapter, engine — and not that a 1B model
+performs acceptably on a Pi. Tier-appropriate models are OQ-6.
+
+### How it works, and what stays out of a release image
+
+`AI_SMOKE_MODEL=1` adds build stage 36, which generates the model (~400 KB, random weights,
+not downloaded and not committed), writes a manifest whose digest is computed from the
+bytes just written, and installs a boot unit plus a policy drop-in granting `ai.read`,
+`ai.infer` and `ai.admin`.
+
+That policy is the reason this is opt-in and loud. A shipped `ai.admin` grant lets anything
+on the box change what the node will run. Stage 60 now asserts a release image contains
+neither the model nor the drop-in, so forgetting to turn it off fails the build rather than
+reaching a user.
+
+The check drives `otwono-aictl`, a new CLI. The AI subsystem had none — there was no way to
+install a model or run a prompt without hand-writing JSON-RPC into a socket. It asks the
+broker for a capability like any other client, so if policy does not grant the action it
+fails exactly as anything else would.
+
+### Defect 22: our own hardening prevented the engine from being confined
+
+First boot: `OTWONO-AI-INFER-FAIL`, with the adapter reporting *"this kernel does not
+enforce Landlock"* — on a kernel that demonstrably does, and on the same boot where the
+check had just printed `sandbox=full`.
+
+The landlock syscalls are in systemd's **`@sandbox`** group, not `@system-service`.
+`otwono-aid.service` filters to `@system-service` with `SystemCallErrorNumber=EPERM`, so
+the adapter's `landlock_create_ruleset` returned EPERM — and the crate maps any error other
+than `EOPNOTSUPP` to "not implemented". Hardening written to protect the daemon was
+disabling the confinement protecting the node from the daemon's own child, and the symptom
+was indistinguishable from an old kernel.
+
+Confirmed rather than guessed, by asking the image's own systemd:
+
+```
+$ systemd-analyze syscall-filter @system-service | grep -i landlock   # nothing
+$ systemd-analyze syscall-filter @sandbox
+    landlock_add_rule
+    landlock_create_ruleset
+    landlock_restrict_self
+    seccomp
+```
+
+Fixed by adding `SystemCallFilter=@sandbox` to the unit — three syscalls, plus `seccomp`,
+which a process can only use to restrict itself further.
+
+### Defect 23: the boot check was measuring the wrong process
+
+Worse than the first, and hidden by it. `sandbox=full` was printed on the very boot where
+the engine could not be confined at all, because the check ran the adapter's `--probe`
+*itself* — under `otwono-ai-check.service`, which has no `SystemCallFilter`. It measured its
+own environment and reported it as the daemon's.
+
+A status check that answers a different question than the one it appears to answer is worse
+than no check: it is the reason the first failure was confusing rather than obvious. The
+daemon now probes once at startup, in its own sandbox, and publishes the result as
+`backend_confinement` in `ai.capabilities`; the boot check reads that over the socket.
+
+### Defect 24: the engine could not start in the image it shipped in
+
+Second boot got further and failed with
+`libgomp.so.1: cannot open shared object file`. llama.cpp links OpenMP and the minimal base
+had no `libgomp1`. Two fixes, and the second matters more: `libgomp1` added to the recipes,
+and **stage 35 now walks the engine's `readelf -d` NEEDED list against the rootfs and fails
+the build** if anything is missing. This cost a twenty-minute QEMU cycle to discover; the
+check finds it in a second, for any future engine variant.
+
+### Workspace
+
+| Command | Result |
+|---|---|
+| `cargo test --workspace` | **471 tests pass** (459 before) |
+| `clippy -D warnings`, `fmt --check`, `shellcheck -S warning` | clean |
+
+### A note on the marker mechanism
+
+The QEMU runners took `OTWONO_BOOT_EXPECT` to *replace* the required-marker list. Using it
+to add the inference marker would have silently stopped checking the other four — a test
+that passes for a worse reason. Added `OTWONO_BOOT_EXPECT_EXTRA`, which appends.
+
+### What this does not prove
+
+- **Nothing about model quality or speed.** Random weights, eight tokens, under TCG.
+- **Nothing about real models.** No node has run anything a person would want to use, and
+  nothing downloads models (OQ-13).
+- **Nothing about concurrent load.** One prompt, one engine, one sequence.

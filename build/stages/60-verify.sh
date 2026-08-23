@@ -172,6 +172,18 @@ check_absent 4 "/capability-profile.json" "a first-boot capability profile"
 check_absent 4 "/control-plane-profile.json" "a first-boot control-plane profile"
 check_absent 2 "/var/log/otwono/audit.jsonl" "an audit log from a previous boot"
 
+# Build stage 36 can bundle a synthetic model and a policy granting ai.admin. That is for
+# proving inference works on a booted node, and it must never reach a release image: a
+# shipped ai.admin grant lets anything on the box change what the node will run. Skipped
+# when the build asked for it, and asserted otherwise — the whole point is that forgetting
+# to turn it off is caught here rather than in the field.
+if [ -n "${AI_SMOKE_MODEL:-}" ] && [ "${AI_SMOKE_MODEL}" != "0" ]; then
+    log "  smoke model requested; skipping the release-purity check for it"
+else
+    check_absent 2 "/etc/otwono/policy.d/90-ai-smoke.toml" "a test policy granting ai.admin"
+    check_absent 2 "/usr/share/otwono/smoke-model/manifest.json" "a bundled test model"
+fi
+
 # A seeded machine-id is the same class of defect as a seeded node key: one value shared by
 # every device flashed from the image. systemd derives per-host secrets from it, the IPv4
 # link-local address among them, so two nodes from one image collide on a DHCP-less segment.

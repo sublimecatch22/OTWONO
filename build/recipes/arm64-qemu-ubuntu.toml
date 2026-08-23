@@ -17,7 +17,7 @@ components = "main universe"
 snapshot = ""
 
 [packages]
-include = "systemd systemd-sysv udev dbus ca-certificates locales less nano iproute2 iputils-ping openssh-server"
+include = "systemd systemd-sysv udev dbus ca-certificates locales less nano iproute2 iputils-ping openssh-server libgomp1"
 kernel = "linux-image-virtual"
 # QEMU exposes only virtio devices, which need no firmware blobs.
 # linux-firmware is 467 MiB and would be 60% of the image. Real boards

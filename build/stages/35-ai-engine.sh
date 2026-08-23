@@ -144,6 +144,22 @@ install -d -m 0755 "$DEST"
 install -m 0755 "$SERVER" "$DEST/llama-server"
 log "installed /usr/lib/otwono/ai/llama.cpp/cpu/bin/llama-server"
 
+# Every shared library the engine needs must already be in the image. Checked here because
+# the alternative is finding out at boot: the first version of this stage shipped an engine
+# that could not start because libgomp.so.1 was absent, and the only symptom was a failed
+# inference twenty minutes into a QEMU run. `readelf` reads any architecture's ELF, which
+# matters for the cross-built arm64 engine.
+log "checking the engine's shared libraries are in the image"
+MISSING=""
+for lib in $(readelf -d "$SERVER" | awk '/NEEDED/{gsub(/[\[\]]/, "", $NF); print $NF}'); do
+    if ! find "$ROOTFS/usr/lib" "$ROOTFS/lib" -name "$lib" 2>/dev/null | grep -q .; then
+        MISSING="$MISSING $lib"
+    fi
+done
+[ -z "$MISSING" ] || die "the engine needs libraries this image does not have:$MISSING
+  add the providing package to the recipe's [packages] include list"
+log "  all engine libraries resolve inside the image"
+
 # The adapter has to be there too, or discovery reports nothing — deliberately, because an
 # engine with no way to drive it would make ai.capabilities promise inference that always
 # fails. Stage 30 installs it; fail here rather than shipping a half-install.

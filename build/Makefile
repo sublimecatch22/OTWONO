@@ -5,6 +5,8 @@
 #   make TARGET=amd64-qemu image        stages 10..50
 #   make TARGET=amd64-qemu AI_ENGINE=llama.cpp image     ... with local inference
 #   make TARGET=amd64-qemu engine-repro-check            engine builds twice, identically?
+#   make TARGET=amd64-qemu AI_ENGINE=llama.cpp AI_SMOKE_MODEL=1 verify
+#                                                        ... and run a prompt at boot
 #   make TARGET=amd64-qemu boot-test    stage 60 (QEMU boot, TCG-safe timeouts)
 #   make TARGET=arm64-qemu image
 #   make list-targets
@@ -33,10 +35,15 @@ SOURCE_DATE_EPOCH ?= 1767225600
 # it should not pay for it. Set AI_ENGINE=llama.cpp, or put it in the recipe's [ai] section.
 AI_ENGINE ?=
 
-export SOURCE_DATE_EPOCH OUT TARGET RECIPE REPO_ROOT BUILD_DIR TARGET_OUT AI_ENGINE
+# Bundle a synthetic model and a boot-time inference check. Off by default and must stay
+# that way: it puts a test model *and* a policy granting ai.admin into the image. Needs
+# AI_ENGINE=llama.cpp, since an inference check with no engine can only fail.
+AI_SMOKE_MODEL ?=
+
+export SOURCE_DATE_EPOCH OUT TARGET RECIPE REPO_ROOT BUILD_DIR TARGET_OUT AI_ENGINE AI_SMOKE_MODEL
 
 .PHONY: help probe list-targets check-recipe rootfs image boot-test verify clean distclean \
-        stage-10 stage-20 stage-30 stage-35 stage-40 stage-50 stage-60 host-tools \
+        stage-10 stage-20 stage-30 stage-35 stage-36 stage-40 stage-50 stage-60 host-tools \
         engine-repro-check
 
 help:
@@ -70,11 +77,12 @@ stage-10: check-recipe ; @$(STAGES)/10-bootstrap.sh
 stage-20: stage-10     ; @$(STAGES)/20-base-config.sh
 stage-30: stage-20 host-tools ; @$(STAGES)/30-otwono.sh
 stage-35: stage-30     ; @$(STAGES)/35-ai-engine.sh
-stage-40: stage-35     ; @$(STAGES)/40-kernel.sh
+stage-36: stage-35     ; @$(STAGES)/36-ai-smoke-model.sh
+stage-40: stage-36     ; @$(STAGES)/40-kernel.sh
 stage-50: stage-40     ; @$(STAGES)/50-image.sh
 stage-60: stage-50     ; @$(STAGES)/60-verify.sh
 
-rootfs:    stage-35
+rootfs:    stage-36
 image:     stage-50
 boot-test: stage-60
 verify:    stage-60

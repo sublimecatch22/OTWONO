@@ -21,7 +21,11 @@ snapshot = ""
 [packages]
 # Kept minimal on purpose: the base image is the thing we must be able to update
 # atomically, so everything optional belongs in Flatpak or a later layer.
-include = "systemd systemd-sysv udev dbus ca-certificates locales less nano iproute2 iputils-ping openssh-server"
+#
+# libgomp1 is the exception that looks out of place: llama.cpp links OpenMP, so an image
+# built with AI_ENGINE=llama.cpp cannot start its engine without it. ~150 KB, and stage 35
+# fails the build if any of the engine's libraries are absent, so this stays honest.
+include = "systemd systemd-sysv udev dbus ca-certificates locales less nano iproute2 iputils-ping openssh-server libgomp1"
 kernel = "linux-image-amd64"
 # QEMU virtio needs no firmware blobs. Real boards set this per BSP.
 firmware = ""

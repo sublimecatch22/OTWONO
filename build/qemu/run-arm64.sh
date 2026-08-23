@@ -22,6 +22,14 @@ if [ -n "${OTWONO_BOOT_EXPECT:-}" ]; then
 else
     REQUIRED=("otwono login:" "OTWONO-CAPABILITY-OK" "OTWONO-CONTROL-PLANE-OK" "OTWONO-MESH-OK" "OTWONO-AI-OK")
 fi
+# Additional markers, appended rather than replacing the list. OTWONO_BOOT_EXPECT swaps the
+# whole set, which is right for a one-off probe and wrong for "this image also does X":
+# using it to add the inference marker would have silently stopped checking the other four.
+if [ -n "${OTWONO_BOOT_EXPECT_EXTRA:-}" ]; then
+    for extra in $OTWONO_BOOT_EXPECT_EXTRA; do
+        REQUIRED+=("$extra")
+    done
+fi
 # Patterns that mean the boot definitively failed; matching one aborts early rather
 # than burning the whole timeout under TCG.
 FAIL_PATTERN="${OTWONO_BOOT_FAIL:-Kernel panic|Attempted to kill init|Entering emergency mode|You are in emergency mode|Failed to start .*otwono|OTWONO-MESH-FAIL|OTWONO-CONTROL-PLANE-FAIL}"

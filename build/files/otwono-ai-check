@@ -31,16 +31,17 @@ publishers=$(echo "$STATUS" | awk '/^publishers/ {print $2}')
 # Everything after the "backends" label, since there may be several separated by commas.
 backends=$(echo "$STATUS" | sed -n 's/^backends *//p' | tr -d ' ')
 
-# Whether the kernel will confine the inference engine (ADR-0012). Asked of the adapter,
-# because finding out means actually applying a Landlock ruleset and only the adapter
-# knows how; --probe does it in a process that exits immediately.
-ADAPTER=/usr/libexec/otwono/ai-backends/otwono-llama-backend
-if [ -x "$ADAPTER" ]; then
-    sandbox=$("$ADAPTER" --probe 2>/dev/null | sed -n 's/^landlock=//p')
-    [ -n "$sandbox" ] || sandbox=unknown
-else
-    sandbox=no-adapter
-fi
+# Whether the inference engine will actually be confined (ADR-0012).
+#
+# Asked of the *running daemon* over the socket, not probed here. An earlier version ran
+# the adapter's --probe directly from this script and reported "full" on a node where the
+# real backend could not be confined at all: the landlock syscalls are not in systemd's
+# @system-service set, so otwono-aid's own filter denied them, while this unit -- which has
+# no SystemCallFilter -- was free to use them. The check was measuring its own environment
+# and calling it the daemon's. The daemon now measures at startup and reports it, and this
+# reads that.
+sandbox=$(/usr/bin/otwono-aictl capabilities --json 2>/dev/null     | grep -o '"backend_confinement"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
+[ -n "$sandbox" ] || sandbox=unknown
 
 [ -n "$tier" ] || { echo "OTWONO-AI-FAIL no tier from otwono-aid" >&2; exit 1; }
 [ -n "$infer" ] || { echo "OTWONO-AI-FAIL no inference status from otwono-aid" >&2; exit 1; }
