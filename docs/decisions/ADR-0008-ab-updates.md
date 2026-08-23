@@ -27,6 +27,13 @@ relayed by untrusted peers safely; delta transfer works on a `Narrow` link.
 partition is separate and the root slot is kept small; the health check must be meaningful
 or rollback protects nothing; per-architecture bootloader integration is real, fiddly work.
 
+## Note added 2026-08-23 (ADR-0013)
+
+The arm64 half of the boot-attempt counter above needs revisiting. The `u-boot-rpi`
+package in the archive is built with `CONFIG_BOOTCOUNT_LIMIT` off, so on a Raspberry Pi 4
+there is no `bootcount` as shipped. Rebuilding U-Boot or counting elsewhere is **OQ-14**,
+to be settled in Phase 8. Nothing else in this ADR changes.
+
 ## Alternatives rejected
 
 - **apt upgrade in place** — no atomicity, no rollback, and a failure mode that requires

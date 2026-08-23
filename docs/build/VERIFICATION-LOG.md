@@ -1214,3 +1214,100 @@ schedule, and passing on it is weak evidence.
 - **Nothing about real models.** No node has run anything a person would want to use, and
   nothing downloads models (OQ-13).
 - **Nothing about concurrent load.** One prompt, one engine, one sequence.
+
+---
+
+## Pi 4 boot-chain investigation (ADR-0013) — measurement only, nothing built
+
+Recorded 2026-08-23. This entry exists because ADR-0013 is a decision with no code and no
+boot behind it, and the measurements it rests on should be reproducible by someone who
+doubts them. **Nothing in this section is a claim that anything boots on a Pi.**
+
+### What was measured, and how
+
+Reachability, by `git ls-remote --heads` through the environment's proxy:
+
+```
+tianocore/edk2               git: OK
+tianocore/edk2-platforms     git: OK
+tianocore/edk2-non-osi       git: OK
+raspberrypi/firmware         git: OK
+raspberrypi/rpi-eeprom       git: OK
+pftf/RPi4                    git: OK
+```
+
+Git works for all of them; GitHub Releases and the API do not (403 at the proxy), which is
+why the ADR treats "distributed as a release archive" as a real cost.
+
+Clone sizes, both blobless (`--filter=blob:none --depth 1`):
+
+- `raspberrypi/firmware` with `sparse-checkout set boot` — **131 MB**, HEAD `06df1d1a`
+  (2026-08-21). Contains `start4.elf` (2,298,048 bytes), `fixup4.dat`, `bcm2711-rpi-4-b.dtb`
+  (56,407 bytes), and 380 overlays.
+- `tianocore/edk2` — **171 MB**, and `.gitmodules` lists 13 further submodules (openssl,
+  mbedtls, libspdm, brotli, oniguruma, googletest, …). That is the floor for building
+  `RPI_EFI.fd` ourselves, before edk2-platforms, edk2-non-osi, and an EDK2 build
+  environment.
+
+Package presence, `ports.ubuntu.com` `noble` `main`+`universe`, `binary-arm64` (1,591,568
+lines of `Packages` fetched and grepped):
+
+```
+linux-firmware-raspi       0
+raspi-firmware             0
+linux-image-raspi          1        6.8.0-1004.4
+rpi-eeprom                 1        20.4-1ubuntu2
+u-boot-rpi                 1        2024.01+dfsg-1ubuntu5
+```
+
+No VideoCore firmware package for arm64 in either component, which is what forces the
+pinned git checkout above.
+
+`u-boot-rpi` ships its build configs, so the decisive facts came from the package itself
+rather than from documentation:
+
+```
+$ zcat usr/share/doc/u-boot-rpi/configs/config.rpi_4.gz | grep -E 'EFI_LOADER|BOOTEFI_BOOTMGR|EFI_VARIABLE_FILE_STORE|BOOTCOUNT'
+CONFIG_EFI_LOADER=y
+CONFIG_CMD_BOOTEFI_BOOTMGR=y
+CONFIG_EFI_VARIABLE_FILE_STORE=y
+# CONFIG_BOOTCOUNT_LIMIT is not set
+```
+
+The first three are why the decision is possible: a U-Boot that can run our existing
+`BOOTAA64.EFI` and store EFI variables on the ESP is already packaged in an archive this
+environment can reach. The fourth is why ADR-0008 now carries a note — the arm64 rollback
+counter it names is not compiled in (OQ-14).
+
+The `pftf/RPi4` disqualifiers are quotations from its own `Readme.md` at HEAD `6bd9f0a`
+(2026-05-28), reproduced in ADR-0013; the 3 GB default RAM cap and its interactive-only
+override are the ones that end the argument for a headless node whose capability tier is
+derived from total memory.
+
+`tryboot_a_b` — the A/B mechanism the native chain would need — is real and mature:
+`firmware-2711/release-notes.md` records "[tryboot] conditional statement + tryboot_a_b
+mode" promoted to DEFAULT on 2022-12-01. GPT is likewise supported by the Pi 4 bootloader:
+"Add support GPT and Hybrid MBR partition tables" (2020-05), which is what lets stage 50's
+existing `ef00` ESP serve as the Pi's boot partition unchanged.
+
+### Why there is no boot log
+
+```
+$ qemu-system-aarch64 -machine help | grep -i raspi
+raspi0  raspi1ap  raspi2b  raspi3ap  raspi3b
+```
+
+QEMU 8.2.2 here has no Raspberry Pi 4 machine model, and there is no Pi hardware attached
+to this environment. The chain in ADR-0013 therefore cannot be exercised at all until an
+image is written to a card and a board is booted with a serial console. ADR-0013 is
+**STATUS: SPECIFIED** and says so.
+
+### What this does not prove
+
+- **That the chain works.** Every link is plausible from vendor documentation and package
+  metadata. None has been run.
+- **That the ESP layout survives contact with the EEPROM.** GPT support is documented; that
+  our particular GPT, offsets, and FAT parameters are acceptable to `start4.elf` is not
+  known.
+- **That U-Boot's `EFI_LOADER` will load our GRUB build specifically.** `CONFIG_EFI_LOADER=y`
+  says the subsystem is present, not that this binary runs.
