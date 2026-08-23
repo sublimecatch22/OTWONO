@@ -1187,6 +1187,27 @@ The QEMU runners took `OTWONO_BOOT_EXPECT` to *replace* the required-marker list
 to add the inference marker would have silently stopped checking the other four — a test
 that passes for a worse reason. Added `OTWONO_BOOT_EXPECT_EXTRA`, which appends.
 
+### Defect 25: a test flake CI found and this machine could not
+
+`an_engine_that_exits_immediately_is_a_crash_with_its_stderr` failed on the runner with
+`Text file busy (os error 26)` — `ETXTBSY` on exec, not the crash it was asserting.
+
+A property of fork/exec in a multithreaded program, not of the code under test. `cargo test`
+runs tests as threads of one process: when one thread has just written a fake engine script
+and another forks for its own spawn, the child inherits the writer's still-open descriptor
+until it execs, and `execve` on an inode any process holds open for writing returns
+`ETXTBSY`. Rust opens files `O_CLOEXEC`, which closes the window at exec but not between
+fork and exec.
+
+Fixed with a bounded retry in the three tests that exec a script they wrote — deliberately
+in the tests and not in `Engine::start`, because a shipped node execs an installed binary
+nobody is writing, and a retry there would paper over a real failure. Re-run ten times with
+six spinners saturating the CPU: 0 failures.
+
+The pattern is now familiar enough to name: this is the third defect this slice that only
+appeared somewhere other than a quiet developer machine. An idle four-core box is one
+schedule, and passing on it is weak evidence.
+
 ### What this does not prove
 
 - **Nothing about model quality or speed.** Random weights, eight tokens, under TCG.

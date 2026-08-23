@@ -495,6 +495,31 @@ mod tests {
         }
     }
 
+    /// Start the engine, retrying briefly on `ETXTBSY`.
+    ///
+    /// Only the tests that exec a script they just wrote need this, and the reason is a
+    /// property of fork/exec in a multithreaded program rather than of the code under test.
+    /// `cargo test` runs tests as threads of one process: when this thread has just written
+    /// a fake engine and another thread forks for its own spawn, the child inherits this
+    /// thread's still-open write descriptor until it execs — and `execve` on an inode any
+    /// process holds open for writing returns `ETXTBSY`. Rust opens files `O_CLOEXEC`, which
+    /// closes the window at exec but not between fork and exec.
+    ///
+    /// It showed up only on a CI runner, where there are enough cores to actually overlap.
+    /// A shipped node execs an installed binary nobody is writing, so the retry belongs
+    /// here and not in `Engine::start`.
+    fn start_retrying_busy(config: &EngineConfig, request: &LoadRequest) -> Result<Engine, EngineError> {
+        for _ in 0..50 {
+            match Engine::start(config, request) {
+                Err(EngineError::Spawn { reason, .. }) if reason.contains("Text file busy") => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => return other,
+            }
+        }
+        Engine::start(config, request)
+    }
+
     #[test]
     fn a_missing_engine_binary_is_named_not_guessed() {
         let dir = TempDir::new("nobin");
@@ -542,7 +567,7 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
 
-        let err = Engine::start(&config(&dir.0, fake.to_str().unwrap()), &load(&model)).unwrap_err();
+        let err = start_retrying_busy(&config(&dir.0, fake.to_str().unwrap()), &load(&model)).unwrap_err();
         let EngineError::Died { status, stderr } = &err else {
             panic!("expected Died, got {err:?}");
         };
@@ -569,7 +594,7 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
 
-        let err = Engine::start(&config(&dir.0, fake.to_str().unwrap()), &load(&model)).unwrap_err();
+        let err = start_retrying_busy(&config(&dir.0, fake.to_str().unwrap()), &load(&model)).unwrap_err();
         let EngineError::Died { stderr, .. } = &err else {
             panic!("expected Died, got {err:?}");
         };
@@ -587,7 +612,7 @@ mod tests {
         std::fs::write(&fake, "#!/bin/sh\necho 'still loading' >&2\nsleep 600\n").unwrap();
         std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
 
-        let err = Engine::start(&config(&dir.0, fake.to_str().unwrap()), &load(&model)).unwrap_err();
+        let err = start_retrying_busy(&config(&dir.0, fake.to_str().unwrap()), &load(&model)).unwrap_err();
         let EngineError::StartupTimeout { stderr, .. } = &err else {
             panic!("expected StartupTimeout, got {err:?}");
         };
