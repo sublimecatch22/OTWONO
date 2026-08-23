@@ -16,6 +16,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 data-encoding = "2"
+# Content addressing for model weights. Already the hash otwono-permd chains the audit log
+# with, so this is one hash function in the system rather than two (CLAUDE.md §2.3).
+blake3 = "1"
 # For killing a backend's whole process group without unsafe.
 rustix = { version = "0.38", features = ["process"] }
 

@@ -35,6 +35,11 @@ ttl_seconds = 300
 action = "ai.infer"
 decision = "allow"
 ttl_seconds = 300
+
+[[rule]]
+action = "ai.admin"
+decision = "allow"
+ttl_seconds = 300
 "#;
 
 struct Harness {
@@ -331,4 +336,143 @@ fn describe_advertises_infer_behind_its_own_capability() {
     assert_eq!(infer["capability"], "ai.infer", "{infer:#?}");
     let list = methods.iter().find(|m| m["name"] == "ai.models.list").unwrap();
     assert_eq!(list["capability"], "ai.read", "{list:#?}");
+}
+
+/// A manifest whose digest and size genuinely describe `body`, signed by the trusted key.
+fn model_for(body: &[u8]) -> ModelManifest {
+    let mut m = manifest("installable-1b", body.len() as u64, Tier::T0Micro, false);
+    m.blake3 = blake3_hex(body);
+    m.size_bytes = body.len() as u64;
+    m.footprint.weights_bytes = body.len() as u64;
+    sign(&mut m, TRUSTED_SEED);
+    m
+}
+
+fn blake3_hex(body: &[u8]) -> String {
+    otwono_ai::hash_file(&{
+        let p = std::env::temp_dir().join(format!("otw-h-{}-{}", std::process::id(), body.len()));
+        std::fs::write(&p, body).unwrap();
+        p
+    })
+    .unwrap()
+}
+
+/// Write a manifest and a blob to disk and return their paths.
+fn staged(h: &Harness, m: &ModelManifest, body: &[u8]) -> (PathBuf, PathBuf) {
+    let manifest_path = h.dir.join(format!("{}.json", m.id));
+    let blob_path = h.dir.join(format!("{}.gguf", m.id));
+    std::fs::write(&manifest_path, serde_json::to_vec_pretty(m).unwrap()).unwrap();
+    std::fs::write(&blob_path, body).unwrap();
+    (manifest_path, blob_path)
+}
+
+#[test]
+fn installing_a_model_verifies_its_weights_and_makes_it_visible_to_the_catalog() {
+    let h = Harness::start("install");
+    let body = b"these bytes are the weights".as_slice();
+    let m = model_for(body);
+    let (manifest_path, blob_path) = staged(&h, &m, body);
+
+    let result = h.call(
+        "ai.models.install",
+        json!({
+            "manifest_path": manifest_path.display().to_string(),
+            "blob_path": blob_path.display().to_string(),
+        }),
+        "ai.admin",
+    );
+    assert_eq!(result["model_id"], m.id);
+    assert_eq!(result["blake3"], m.blake3);
+    assert_eq!(result["already_present"], false);
+    assert_eq!(result["provenance"]["status"], "trusted");
+
+    // It is in the catalog now, with its weights.
+    let models = h.call("ai.models.list", json!({}), "ai.read");
+    let entry = models["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == m.id.as_str())
+        .expect("the installed model should be listed");
+    assert_eq!(entry["weights_present"], true);
+}
+
+#[test]
+fn weights_that_do_not_match_a_correctly_signed_manifest_are_refused() {
+    // The hole this closes: before verification existed, blake3 was only a filename, so a
+    // trusted manifest paired with somebody else's bytes installed and loaded as trusted.
+    let h = Harness::start("swapped");
+    let body = b"these bytes are the weights".as_slice();
+    let m = model_for(body);
+    let (manifest_path, blob_path) = staged(&h, &m, body);
+    std::fs::write(&blob_path, b"these bytes are NOT the weights").unwrap();
+
+    let err = Client::connect(&h.ai_socket)
+        .unwrap()
+        .call_with_capability(
+            "ai.models.install",
+            json!({
+                "manifest_path": manifest_path.display().to_string(),
+                "blob_path": blob_path.display().to_string(),
+            }),
+            &h.token("ai.admin"),
+        )
+        .unwrap()
+        .expect_err("the digest does not match");
+    assert_eq!(err.code, code::INVALID_PARAMS);
+    assert!(
+        err.message.contains("do not match the manifest") || err.message.contains("bytes and the file is"),
+        "the refusal must name the mismatch: {}",
+        err.message
+    );
+}
+
+#[test]
+fn installing_requires_the_admin_capability_not_merely_read() {
+    // Reading a catalog and changing what the node will run are different powers.
+    let h = Harness::start("installguard");
+    let err = Client::connect(&h.ai_socket)
+        .unwrap()
+        .call_with_capability(
+            "ai.models.install",
+            json!({ "manifest_path": "/x.json", "blob_path": "/x.gguf" }),
+            &h.token("ai.read"),
+        )
+        .unwrap()
+        .expect_err("ai.read must not authorize an install");
+    assert!(
+        err.code == code::UNAUTHORIZED || err.code == code::FORBIDDEN,
+        "{err:?}"
+    );
+}
+
+#[test]
+fn verifying_a_model_reports_a_mismatch_as_a_result_rather_than_an_error() {
+    // A caller auditing a catalog should not have to handle an exception per corrupt model.
+    let h = Harness::start("verify");
+    let body = b"these bytes are the weights".as_slice();
+    let m = model_for(body);
+    let (manifest_path, blob_path) = staged(&h, &m, body);
+    h.call(
+        "ai.models.install",
+        json!({
+            "manifest_path": manifest_path.display().to_string(),
+            "blob_path": blob_path.display().to_string(),
+        }),
+        "ai.admin",
+    );
+
+    let good = h.call("ai.models.verify", json!({ "model_id": m.id }), "ai.read");
+    assert_eq!(good["digest_matches"], true, "{good}");
+
+    // Somebody with write access to the blob store swaps the weights afterwards.
+    std::fs::write(
+        h.dir.join("models/blobs").join(&m.blake3),
+        b"tampered tampered tampered!",
+    )
+    .unwrap();
+
+    let bad = h.call("ai.models.verify", json!({ "model_id": m.id }), "ai.read");
+    assert_eq!(bad["digest_matches"], false, "{bad}");
+    assert_ne!(bad["blake3"], m.blake3.as_str());
 }

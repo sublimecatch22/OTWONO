@@ -31,6 +31,11 @@ OPTIONS:
     --hw-socket <PATH>     Hardware daemon socket (default $OTWONO_SOCKET_DIR/hw.sock)
     --publishers <PATH>    Trusted model publishers (default /etc/otwono/publishers.d)
     --root <PATH>          Filesystem root to discover AI backends under (default /)
+    --allow-unconfined-backends
+                           Run inference backends without kernel confinement. Off by
+                           default: on a kernel without Landlock a backend refuses to
+                           start rather than parse untrusted model files unconfined
+                           (ADR-0012). This is how an operator overrides that.
     --capabilities         Print what this node can do and exit
     -h, --help             Show this message
 
@@ -75,6 +80,7 @@ fn run(args: &[String]) -> Result<String, Error> {
     let mut hw_socket: Option<PathBuf> = None;
     let mut publisher_dir = PathBuf::from(DEFAULT_PUBLISHER_DIR);
     let mut root = PathBuf::from("/");
+    let mut allow_unconfined_backends = false;
     let mut capabilities_only = false;
 
     let mut it = args.iter();
@@ -86,6 +92,7 @@ fn run(args: &[String]) -> Result<String, Error> {
             "--hw-socket" => hw_socket = Some(next_path(&mut it, "--hw-socket")?),
             "--publishers" => publisher_dir = next_path(&mut it, "--publishers")?,
             "--root" => root = next_path(&mut it, "--root")?,
+            "--allow-unconfined-backends" => allow_unconfined_backends = true,
             "--capabilities" => capabilities_only = true,
             "-h" | "--help" => return Ok(USAGE.to_string()),
             other => return Err(Error::Usage(format!("unknown option {other}"))),
@@ -166,7 +173,10 @@ fn run(args: &[String]) -> Result<String, Error> {
 
     server
         .serve(
-            Arc::new(AiService::new(catalog, profile, trust, perm_socket, installs)),
+            Arc::new(
+                AiService::new(catalog, profile, trust, perm_socket, installs)
+                    .with_unconfined_backends(allow_unconfined_backends),
+            ),
             Shutdown::new(),
         )
         .map_err(|e| Error::Startup(format!("serve failed: {e}")))?;

@@ -41,7 +41,9 @@ must not care.
 | `ai.capabilities` | What this node can do right now, given its tier and loaded models — **implemented** |
 | `ai.models.list` | The catalog, each entry with whether this machine can run it and why not — **implemented** |
 | `ai.admit` | Dry run: would this model load, at what cost, and if not what context would fit — **implemented** |
-| `ai.models.pull` / `ai.models.remove` | Catalog management — specified |
+| `ai.models.install` | Install from a local manifest and weights, verifying both — **implemented**, needs `ai.admin` |
+| `ai.models.verify` | Re-hash an installed model against its manifest — **implemented** |
+| `ai.models.pull` / `ai.models.remove` | Fetching over the network, and removal — specified; see §5.1 |
 | `ai.infer` | Text completion — **implemented**, non-streaming, gated by `ai.infer` |
 | `ai.embed` | Embeddings for RAG |
 | `ai.transcribe` | Speech to text |
@@ -186,6 +188,45 @@ Models are content-addressed blobs plus a signed manifest:
   "backends": ["llama-cpp-cpu", "llama-cpp-vulkan", "llama-cpp-cuda"]
 }
 ```
+
+### What the digest is for
+
+`blake3` in a manifest was, until Phase 4 slice 5, only a *filename*: the catalog joined it
+onto the blob directory and nothing hashed the contents. A signed manifest paired with a
+swapped blob therefore loaded as trusted — the signature covered the manifest, the manifest
+named a digest, and nobody checked the bytes against it. Signing was doing half a job.
+
+`ai.models.install` now hashes the blob and refuses on mismatch, so the chain runs end to
+end: a trusted publisher signs a manifest, the manifest names a digest, and the digest names
+these exact bytes. Size is checked first, because a truncated download is the common case
+and costs a `stat` rather than a full hash.
+
+Verification happens **at install, not at load**. Hashing is linear in model size, and
+paying it on every load — on the hardware this project exists for — would tax the common
+path to defend against an attacker who already has write access to a root-owned directory,
+which is to say root. `ai.models.verify` re-checks on demand, and reports a mismatch as a
+successful call rather than an error: auditing a catalog should not mean handling an
+exception per corrupt model.
+
+Installs are atomic. A blob is staged beside its destination and renamed into place, so an
+interrupted install leaves a stray `.incoming-*` file and never a truncated blob under a
+name claiming to be complete — which matters because `weights_present` is a file-exists
+check and would answer yes.
+
+### 5.1 Fetching is not implemented, and where it will live
+
+`ai.models.pull` is still absent, and the reason is architectural rather than a matter of
+effort. `otwono-aid` runs with `PrivateNetwork=yes` and `RestrictAddressFamilies=AF_UNIX`;
+it has no network and should not gain one, since it is the daemon that must keep answering
+when other things break. A child process inherits that namespace, so the fetcher cannot
+simply be spawned the way a backend adapter is.
+
+Downloading therefore needs a separate brokered component with its own network namespace,
+its own hardening, and a policy about which hosts it may contact — that last part being a
+design decision in its own right, not an implementation detail. It is recorded as **OQ-13**.
+
+Splitting it this way has a payoff already banked: everything that decides whether to
+*trust* a model is tested exhaustively with no network anywhere near it.
 
 - Models are **never** committed to git.
 - Manifests are signed; unsigned or unverified models require an explicit opt-in and run

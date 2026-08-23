@@ -17,3 +17,4 @@ Do not treat any of these as settled, and do not let code quietly settle one.
 | **OQ-10** | Are LoRa duty-cycle rules encodable generically, or does the OS need per-region regulatory profiles shipped as data? | Phase 9 | Phase 9 |
 | **OQ-11** | Distributed search ranking without a global index and without a reputation system — is a useful ranking even possible? | Phase 6 | Phase 6 research |
 | **OQ-12** | Do we ship a browser integration for `onm://`, or a local HTTP gateway with a reserved hostname? Extension maintenance versus a weaker security boundary | Phase 6 | Phase 6 |
+| **OQ-13** | Where does brokered network egress live? `otwono-aid` has `PrivateNetwork=yes` and should keep it, so `ai.models.pull`, ONM fetches and update downloads all need a component that may reach the network — and a policy for which hosts it may contact. One egress daemon or one per subsystem? | Phase 4 (`ai.models.pull`), Phase 8 | Phase 4 |

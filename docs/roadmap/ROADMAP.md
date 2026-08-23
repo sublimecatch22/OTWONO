@@ -106,7 +106,8 @@ path, not yet kernel-enforced.
 ## Phase 4 — Local AI runtime  ← *in progress*
 
 1. ~~`otwono-aid` with the backend abstraction and llama.cpp CPU first.~~ **done**
-2. Model catalog, signed manifests, content-addressed storage, tier gating.
+2. ~~Model catalog, signed manifests, content-addressed storage, tier gating.~~ **done**
+   (fetching over the network is not — see OQ-13)
 3. ~~Admission control with a real refusal path — `ModelTooLargeForTier` must be observed.~~
    **done**
 4. GPU/NPU backends behind capability detection.
@@ -143,11 +144,20 @@ and the system libraries and nothing else — in particular not `/var/lib/otwono
 It fails closed on a kernel that will not enforce it. Both booted images report
 `sandbox=full`.
 
+**Done (slice 5):** models can be *installed*, and installing verifies. `ai.models.install`
+hashes the weights against the manifest's `blake3` and refuses on mismatch — closing a hole
+where a signed manifest plus a swapped blob loaded as trusted — and installs atomically.
+`ai.models.verify` re-checks on demand. Guarded by a new `ai.admin` capability, because
+changing what a node will run is not the same power as reading its catalog. The full-stack
+inference test now installs through this path rather than planting a blob, so the model it
+runs is one the daemon verified.
+
 **Still open:** the exit criterion is **not met**. `ai.infer` has been served on the host
 against a synthetic model, not on a booted amd64 *and* arm64 VM with tier-appropriate
 models — there is no model distribution, so no VM has a model to run. Also missing:
-streaming, PID/mount isolation and a seccomp filter around the engine, model download,
-embeddings, ASR and TTS, GPU/NPU backends, and the tiered assistant shapes.
+streaming, PID/mount isolation and a seccomp filter around the engine, **model download
+(`ai.models.pull`, blocked on OQ-13)**, `ai.models.remove`, embeddings, ASR and TTS,
+GPU/NPU backends, and the tiered assistant shapes.
 
 ---
 

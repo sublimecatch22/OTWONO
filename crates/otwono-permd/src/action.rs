@@ -107,6 +107,16 @@ impl ActionRegistry {
                     false,
                 ),
                 ActionSpec::new("ai.infer", "Run local inference", BlastRadius::Reversible, false),
+                // Installing a model puts executable content on the node: a model that can
+                // call tools is instructions from whoever published it. Irreversible
+                // because the blob store is content-addressed and an install is not undone
+                // by removing the manifest.
+                ActionSpec::new(
+                    "ai.admin",
+                    "Install or remove a model, changing what this node will run",
+                    BlastRadius::Irreversible,
+                    false,
+                ),
                 ActionSpec::new(
                     "net.read",
                     "List the peers this node has met",

@@ -991,3 +991,101 @@ for every test after it.
 - **Landlock governs new opens, not descriptors already open** when it is applied.
 - **The engine has still never been compromised in a test.** What is verified is that the
   boundary exists and that the kernel enforces it, not that it survives an actual exploit.
+
+---
+
+## Phase 4 slice 5 — a model can be installed, and installing verifies
+
+### Scope, stated up front
+
+This slice was started as `ai.models.pull` and delivers the *install* half. The fetch half
+is blocked on something real rather than on effort: `otwono-aid` runs with
+`PrivateNetwork=yes` and `RestrictAddressFamilies=AF_UNIX`, and a child process inherits
+that namespace, so a downloader cannot simply be spawned the way a backend adapter is.
+Giving the daemon a network would undo a deliberate choice — it is the process that must
+keep answering when other things break. Downloading therefore needs a separate brokered
+component with its own namespace and a policy about which hosts it may contact, and that
+policy is a design decision, not an implementation detail. Recorded as **OQ-13**;
+`ai.models.pull` stays absent until it is answered.
+
+The split has a payoff already banked: everything that decides whether to *trust* a model is
+now tested exhaustively with no network anywhere near it.
+
+### The hole this closes
+
+`blake3` in a manifest was only a *filename*. `Catalog::blob_path` joined it onto the blob
+directory and **nothing ever hashed the contents**. So a manifest signed by a trusted
+publisher, paired with somebody else's bytes, installed and loaded as trusted — the
+signature covered the manifest, the manifest named a digest, and no code compared the
+digest to the file. The signature work of slice 2 was doing half a job and the earlier
+verification log recorded the placeholder digest in the test fixtures without noticing what
+it implied.
+
+`ai.models.install` hashes the blob and refuses on mismatch. The chain now runs end to end:
+a trusted publisher signs a manifest, the manifest names a digest, the digest names these
+exact bytes.
+
+### What was built
+
+| Method | Capability | Behaviour |
+|---|---|---|
+| `ai.models.install` | `ai.admin` (new) | Verifies provenance, size and digest, then installs atomically |
+| `ai.models.verify` | `ai.read` | Re-hashes an installed model against its manifest |
+
+`ai.admin` is a new action in the permission registry with `BlastRadius::Irreversible`.
+Reading a catalog and changing what a node will run are different powers, and there is a
+test asserting an `ai.read` token cannot install.
+
+Order of checks is deliberate: provenance first (no reason to hash gigabytes for a manifest
+we will refuse anyway), then size (a truncated download is the common case and costs a
+`stat`), then the digest.
+
+### Verified
+
+| Command | Result |
+|---|---|
+| `cargo test --workspace` | **459 tests pass** (443 before) |
+| `clippy -D warnings`, `fmt --check`, `shellcheck -S warning` | clean |
+| `amd64-qemu-ubuntu` boot, `AI_ENGINE=llama.cpp` | `OTWONO-AI-OK … backends=llama-cpp-cpu sandbox=full models=0 publishers=0` |
+
+The boot was re-run because both `otwono-aid` and `otwono-permd` changed — a new action in
+the registry is validated against the shipped policy at startup, and that is exactly the
+kind of change that boots fine on a developer's machine and fails on an image.
+
+**The full-stack inference test now installs through this path** rather than planting a blob
+with a placeholder digest. So the model that gets loaded and produces tokens is one the
+daemon hashed and accepted, and the caveat recorded in slice 3 — "the catalog does not
+currently verify content against the digest" — no longer applies.
+
+### The tests worth naming
+
+- **A correctly signed manifest with the wrong bytes is refused.** The case the whole slice
+  exists for, asserted both as a unit test and over real sockets.
+- **A tampered manifest is refused with `allow_unsigned` both false and true.** The opt-in
+  means "I know where this came from", never "somebody changed this".
+- **A failed install leaves the blob directory empty.** No `.incoming-*` stray that
+  `weights_present` would count as a model.
+- **`verify` notices weights swapped after install**, which is the honest limit of
+  verify-at-install stated as a test rather than a caveat.
+- **Hashing a file larger than one chunk is correct.** The read loop is the kind of thing
+  that works on small inputs and silently truncates on large ones, so it gets 2 MB.
+
+### One design gap this surfaced, in the previous slice
+
+Fail-closed confinement (ADR-0012) had no operator escape hatch **at the daemon level**. The
+adapter accepted `--allow-unconfined`, but `otwono-aid` never passed it, so on a kernel
+without Landlock there was no way to run inference at all — a decision that belongs to an
+operator in a unit file, not to us by omission. `otwono-aid` now takes
+`--allow-unconfined-backends`, off by default, and logs at every backend start when it is
+on. Found because the full-stack test could not spawn a backend on this dev kernel; it was
+a real hole and not a test artifact.
+
+### What this does not do
+
+- **No `ai.models.pull`.** See OQ-13 above. Nothing downloads anything.
+- **No `ai.models.remove`**, so a catalog only grows.
+- **Verification is not re-done at load.** Deliberate — it is linear in model size, and the
+  attacker it would stop already has write access to a root-owned directory. `ai.models.verify`
+  is the answer for on-demand re-checking, and it is a thing a caller asks for.
+- **No progress reporting.** `ai.models.install` is synchronous, which is fine for a local
+  copy and will not be fine for a download.

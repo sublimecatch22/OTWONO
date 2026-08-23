@@ -1,8 +1,8 @@
 //! OTWONO AI daemon.
 //!
-//! Answers four questions on the control plane: what can this node do, what models does it
-//! have, would this model load, and — when a backend is installed — what does the model
-//! say.
+//! Answers, on the control plane: what can this node do, what models does it have, would
+//! this model load, are its weights still the weights its manifest describes, and — when a
+//! backend is installed — what does the model say.
 //!
 //! # STATUS
 //!
@@ -30,7 +30,8 @@
 
 use otwono_ai::{
     admission::{largest_admissible_context, MemoryPool},
-    admit, Admission, AdmissionRequest, BackendId, BackendInstall, BackendProcess, Catalog, PublisherTrust,
+    admit, install, verify_installed, Admission, AdmissionRequest, BackendId, BackendInstall, BackendProcess,
+    Catalog, InstallRequest, ModelManifest, Provenance, PublisherTrust,
 };
 use otwono_capability::CapabilityProfile;
 use otwono_proto::message::Request;
@@ -48,6 +49,7 @@ pub const SERVICE_NAME: &str = "otwono-aid";
 pub const DESCRIBE_SCHEMA_VERSION: &str = "1.0.0";
 pub const CAPABILITY_READ: &str = "ai.read";
 pub const CAPABILITY_INFER: &str = "ai.infer";
+pub const CAPABILITY_ADMIN: &str = "ai.admin";
 
 /// Where a backend adapter creates its engine socket.
 pub const DEFAULT_BACKEND_RUNTIME_DIR: &str = "/run/otwono/ai";
@@ -77,6 +79,14 @@ pub struct AiService {
     /// backend the moment a file appeared, mid-upgrade.
     installs: Vec<BackendInstall>,
     backend_runtime_dir: PathBuf,
+    /// Let backends run without kernel confinement.
+    ///
+    /// Off by default, and it has to be reachable from *here* rather than only from the
+    /// adapter's command line: on a kernel without Landlock the adapter fails closed
+    /// (ADR-0012), and if the daemon could not pass the override there would be no way for
+    /// an operator to run inference on such a kernel at all — which is a decision for them,
+    /// made in a unit file, not one for us to make by omission.
+    allow_unconfined_backends: bool,
     /// The one loaded model, if any.
     ///
     /// One at a time, and the mutex serializes inference. That is not a placeholder for
@@ -94,6 +104,21 @@ struct Session {
     backend: BackendId,
     context_tokens: u32,
     sequences: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct InstallParams {
+    /// A manifest JSON file on local disk.
+    manifest_path: String,
+    /// The weights the manifest describes.
+    blob_path: String,
+    #[serde(default)]
+    allow_unsigned: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct VerifyParams {
+    model_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -145,6 +170,7 @@ impl AiService {
             perm_socket,
             installs,
             backend_runtime_dir: PathBuf::from(DEFAULT_BACKEND_RUNTIME_DIR),
+            allow_unconfined_backends: false,
             session: Mutex::new(None),
             next_request_id: AtomicI64::new(1),
         }
@@ -154,6 +180,15 @@ impl AiService {
     /// write to `/run`.
     pub fn with_backend_runtime_dir(mut self, dir: impl AsRef<Path>) -> Self {
         self.backend_runtime_dir = dir.as_ref().to_path_buf();
+        self
+    }
+
+    /// Permit backends to run unconfined on a kernel that will not enforce Landlock.
+    ///
+    /// Deliberately a builder call and not a default: turning it on is a decision, and the
+    /// daemon logs it at every backend start.
+    pub fn with_unconfined_backends(mut self, allow: bool) -> Self {
+        self.allow_unconfined_backends = allow;
         self
     }
 
@@ -305,6 +340,70 @@ impl AiService {
                 ),
             })),
         }
+    }
+
+    /// Put a model into the catalog, having proved it is the model its manifest describes.
+    ///
+    /// Local paths only. Downloading is a different problem with a different threat model:
+    /// it needs network egress, and this daemon runs with `PrivateNetwork=yes` precisely so
+    /// that it has none. Fetching therefore belongs in a separate brokered component, and
+    /// splitting it out means everything that decides whether to *trust* a model is tested
+    /// without a network anywhere near it (`docs/ai/AI-RUNTIME.md` §5).
+    fn install_model(&self, params: Value) -> Result<Value, RpcError> {
+        let p: InstallParams = serde_json::from_value(params)
+            .map_err(|e| RpcError::invalid_params(format!("ai.models.install: {e}")))?;
+
+        let text = std::fs::read_to_string(&p.manifest_path)
+            .map_err(|e| RpcError::invalid_params(format!("cannot read {}: {e}", p.manifest_path)))?;
+        let manifest: ModelManifest = serde_json::from_str(&text).map_err(|e| {
+            RpcError::invalid_params(format!("{} is not a model manifest: {e}", p.manifest_path))
+        })?;
+
+        let installed = install(
+            &self.catalog,
+            &manifest,
+            Path::new(&p.blob_path),
+            &self.trust,
+            &InstallRequest {
+                allow_unsigned: p.allow_unsigned,
+            },
+        )
+        // A refusal here is the caller's problem — a bad digest, an unsigned manifest they
+        // did not opt into — not a node fault, so it is invalid_params and carries the
+        // reason verbatim.
+        .map_err(|e| RpcError::invalid_params(format!("ai.models.install refused: {e}")))?;
+
+        Ok(json!({
+            "schema_version": DESCRIBE_SCHEMA_VERSION,
+            "model_id": installed.model_id,
+            "blake3": installed.blake3,
+            "size_bytes": installed.size_bytes,
+            "already_present": installed.already_present,
+            "provenance": match &installed.provenance {
+                Provenance::Trusted { publisher } => json!({ "status": "trusted", "publisher": publisher }),
+                Provenance::Unsigned => json!({ "status": "unsigned" }),
+                Provenance::UntrustedPublisher => json!({ "status": "untrusted_publisher" }),
+            },
+        }))
+    }
+
+    /// Re-hash an installed model's weights.
+    ///
+    /// A successful call reporting `digest_matches: false` is the interesting answer, and
+    /// it is a result rather than an error: a caller auditing a catalog should not have to
+    /// handle an exception per corrupt model.
+    fn verify_model(&self, params: Value) -> Result<Value, RpcError> {
+        let p: VerifyParams = serde_json::from_value(params)
+            .map_err(|e| RpcError::invalid_params(format!("ai.models.verify: {e}")))?;
+        let v = verify_installed(&self.catalog, &p.model_id)
+            .map_err(|e| RpcError::invalid_params(e.to_string()))?;
+        Ok(json!({
+            "schema_version": DESCRIBE_SCHEMA_VERSION,
+            "model_id": v.model_id,
+            "weights_present": v.weights_present,
+            "digest_matches": v.digest_matches,
+            "blake3": v.actual,
+        }))
     }
 
     /// Run a prompt through a locally installed model.
@@ -465,6 +564,13 @@ impl AiService {
             .arg(self.catalog.blob_dir())
             .arg("--runtime-dir")
             .arg(&self.backend_runtime_dir);
+        if self.allow_unconfined_backends {
+            eprintln!(
+                "otwono-aid: starting the {} backend unconfined; the operator asked for this",
+                install.backend.as_str()
+            );
+            command.arg("--allow-unconfined");
+        }
         let process =
             BackendProcess::spawn(install.backend.as_str(), &mut command, HELLO_TIMEOUT).map_err(|e| {
                 RpcError::unavailable(format!(
@@ -547,6 +653,16 @@ impl Service for AiService {
                     CAPABILITY_READ,
                 ),
                 MethodDescription::guarded(
+                    "ai.models.install",
+                    "Install a model from a local manifest and weights, verifying both first",
+                    CAPABILITY_ADMIN,
+                ),
+                MethodDescription::guarded(
+                    "ai.models.verify",
+                    "Re-hash an installed model's weights and compare them to its manifest",
+                    CAPABILITY_READ,
+                ),
+                MethodDescription::guarded(
                     "ai.infer",
                     "Run a prompt through a locally installed model, subject to admission control",
                     CAPABILITY_INFER,
@@ -565,6 +681,14 @@ impl Service for AiService {
             "ai.admit" => {
                 self.authorize(ctx, CAPABILITY_READ)?;
                 self.admit_model(params)
+            }
+            "ai.models.install" => {
+                self.authorize(ctx, CAPABILITY_ADMIN)?;
+                self.install_model(params)
+            }
+            "ai.models.verify" => {
+                self.authorize(ctx, CAPABILITY_READ)?;
+                self.verify_model(params)
             }
             "ai.infer" => {
                 // Authorize before anything else, so that a node with no backend refuses

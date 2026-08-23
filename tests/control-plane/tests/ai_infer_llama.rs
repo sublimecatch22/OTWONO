@@ -47,12 +47,14 @@ ttl_seconds = 300
 action = "ai.infer"
 decision = "allow"
 ttl_seconds = 300
+
+[[rule]]
+action = "ai.admin"
+decision = "allow"
+ttl_seconds = 300
 "#;
 
 const MODEL_ID: &str = "tiny-test-model";
-/// Not a real digest of the weights. The catalog addresses blobs by this string and does
-/// not currently verify the content against it, so the test only needs the two to agree.
-const BLOB_NAME: &str = "0000000000000000000000000000000000000000000000000000000000000001";
 const PUBLISHER_SEED: u8 = 11;
 
 struct Harness {
@@ -99,7 +101,7 @@ fn requirements() -> Option<(PathBuf, PathBuf, PathBuf)> {
     Some((PathBuf::from(server), PathBuf::from(model), adapter))
 }
 
-fn manifest(weights_bytes: u64, max_context: u32) -> ModelManifest {
+fn manifest(blake3: String, weights_bytes: u64, max_context: u32) -> ModelManifest {
     ModelManifest {
         schema_version: otwono_ai::manifest::SCHEMA_VERSION.to_string(),
         id: MODEL_ID.to_string(),
@@ -107,7 +109,7 @@ fn manifest(weights_bytes: u64, max_context: u32) -> ModelManifest {
         parameters: 100_000,
         quantization: "F32".into(),
         format: ModelFormat::Gguf,
-        blake3: BLOB_NAME.to_string(),
+        blake3,
         size_bytes: weights_bytes,
         min_tier: otwono_capability::Tier::T0Micro,
         footprint: Footprint {
@@ -152,17 +154,15 @@ impl Harness {
             "the fixture install tree should be discovered: {installs:?}"
         );
 
-        // The weights, addressed the way the catalog addresses them.
+        // The manifest describes the real file: a real digest over the real bytes. It is
+        // installed through ai.models.install below rather than planted here, so this test
+        // exercises the same verification any other model goes through.
         let weights_bytes = std::fs::metadata(model).unwrap().len();
-        std::fs::copy(model, dir.join("models/blobs").join(BLOB_NAME)).unwrap();
-
-        let mut m = manifest(weights_bytes, 512);
+        let digest = otwono_ai::hash_file(model).expect("hash the model");
+        let mut m = manifest(digest, weights_bytes, 512);
         let trust = sign(&mut m, PUBLISHER_SEED);
-        std::fs::write(
-            dir.join("models/manifests").join(format!("{MODEL_ID}.json")),
-            serde_json::to_string_pretty(&m).unwrap(),
-        )
-        .unwrap();
+        let staged_manifest = dir.join("staged-manifest.json");
+        std::fs::write(&staged_manifest, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
 
         let perm_socket = dir.join("perm.sock");
         let ai_socket = dir.join("ai.sock");
@@ -190,7 +190,12 @@ impl Harness {
                 perm_socket.clone(),
                 installs,
             )
-            .with_backend_runtime_dir(dir.join("run")),
+            .with_backend_runtime_dir(dir.join("run"))
+            // On a kernel that will not enforce Landlock the adapter fails closed, which
+            // is the point of ADR-0012. These tests are about inference, not confinement
+            // — that is asserted in otwono-llama's own end-to-end suite — so they take the
+            // operator's escape hatch when the kernel leaves them no choice.
+            .with_unconfined_backends(!landlock_enforced(adapter)),
         );
         let server_sock = Server::bind(&ai_socket).unwrap();
         let s = shutdown.clone();
@@ -199,12 +204,25 @@ impl Harness {
         Client::connect_waiting(&perm_socket, Duration::from_secs(5)).expect("permd never came up");
         Client::connect_waiting(&ai_socket, Duration::from_secs(5)).expect("aid never came up");
 
-        Harness {
+        let harness = Harness {
             dir,
             perm_socket,
             ai_socket,
             shutdown,
-        }
+        };
+
+        // Install over the control plane, exactly as a user would. Nothing is placed in the
+        // blob store by hand, so the digest the daemon later loads is one it verified.
+        let installed = harness.call(
+            "ai.models.install",
+            json!({
+                "manifest_path": staged_manifest.display().to_string(),
+                "blob_path": model.display().to_string(),
+            }),
+            "ai.admin",
+        );
+        assert_eq!(installed["provenance"]["status"], "trusted", "{installed}");
+        harness
     }
 
     fn token(&self, action: &str) -> String {
@@ -216,6 +234,15 @@ impl Harness {
             .as_str()
             .unwrap()
             .to_string()
+    }
+
+    fn call(&self, method: &str, params: Value, action: &str) -> Value {
+        let token = self.token(action);
+        Client::connect(&self.ai_socket)
+            .unwrap()
+            .call_with_capability(method, params, &token)
+            .unwrap()
+            .unwrap_or_else(|e| panic!("{method} refused: {}", e.message))
     }
 
     fn infer(&self, params: Value) -> Result<Value, otwono_proto::RpcError> {
@@ -408,6 +435,18 @@ fn the_engine_does_not_outlive_the_daemon_that_started_it() {
         std::thread::sleep(Duration::from_millis(100));
     }
     panic!("llama-server {} survived the daemon that started it", pids[0]);
+}
+
+/// Whether this kernel enforces Landlock, asked of the adapter.
+///
+/// In-process probing is not an option: finding out means actually restricting a process,
+/// which would confine the test runner for every test after it.
+fn landlock_enforced(adapter: &Path) -> bool {
+    std::process::Command::new(adapter)
+        .arg("--probe")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// Whether a pid is a live process. A zombie is not: inside a container a reparented child

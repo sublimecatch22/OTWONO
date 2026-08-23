@@ -19,7 +19,9 @@ system, same subsystems, same interfaces — the capabilities scale to the hardw
 > through the permission broker, admission control, the supervisor and `llama-server` into
 > a GGUF model and back as generated tokens. It is off by default — the engine is 17 MiB of
 > third-party C++ per architecture, so images opt in with `AI_ENGINE=llama.cpp` — and there
-> is no streaming and no model ships with the image. The engine runs confined: the adapter
+> is no streaming, and no model ships with the image or can be downloaded yet — but a model
+> handed to the node is now installed only after its weights are hashed against its signed
+> manifest, closing a gap where a swapped blob would have loaded as trusted. The engine runs confined: the adapter
 > applies a Landlock ruleset to itself before starting it, so a compromised model parser
 > cannot reach the node's identity key (ADR-0012), verified on both booted images.
 > The daemons still run as root pending user separation.
