@@ -55,9 +55,24 @@ layout = "ab"        # ESP + root_a + root_b + data
 | `manifest.lock` | Package, version, arch, sha256 — an auditable bill of materials |
 | Deterministic UUIDs derived from recipe + epoch | Bit-identical images |
 | `SHA256SUMS` per artifact | Verification, and a basis for update deltas |
+| `-ffile-prefix-map` on native third-party builds | The artifact must not depend on where it was compiled |
+| `tools/check-engine-reproducibility.sh` | Proves the inference engine builds identically twice |
 
 0.x target: byte-identical rootfs tarball across two runs on the same host with the same
 snapshot pin. Cross-host bit-reproducibility is a 1.x goal.
+
+The inference engine is the one component built from third-party source rather than
+installed from a pinned package, so it gets its own check:
+
+```bash
+make -C build TARGET=amd64-qemu-ubuntu engine-repro-check
+```
+
+It clones the pinned llama.cpp tag **twice** and compiles it twice. Two independent clones
+rather than two builds from one checkout, because a clone is how anyone else obtains the
+source and it is the harder test: `git clone` resets every mtime and lays the tree out in
+fresh directories, so a build that depends on either reproduces happily from a single
+working tree while failing the property that matters.
 
 ## 5. Usage
 

@@ -4,6 +4,7 @@
 #   make TARGET=amd64-qemu rootfs       stages 10..35
 #   make TARGET=amd64-qemu image        stages 10..50
 #   make TARGET=amd64-qemu AI_ENGINE=llama.cpp image     ... with local inference
+#   make TARGET=amd64-qemu engine-repro-check            engine builds twice, identically?
 #   make TARGET=amd64-qemu boot-test    stage 60 (QEMU boot, TCG-safe timeouts)
 #   make TARGET=arm64-qemu image
 #   make list-targets
@@ -35,7 +36,8 @@ AI_ENGINE ?=
 export SOURCE_DATE_EPOCH OUT TARGET RECIPE REPO_ROOT BUILD_DIR TARGET_OUT AI_ENGINE
 
 .PHONY: help probe list-targets check-recipe rootfs image boot-test verify clean distclean \
-        stage-10 stage-20 stage-30 stage-35 stage-40 stage-50 stage-60 host-tools
+        stage-10 stage-20 stage-30 stage-35 stage-40 stage-50 stage-60 host-tools \
+        engine-repro-check
 
 help:
 	@sed -n '1,/^$$/p' $(firstword $(MAKEFILE_LIST)) | sed 's/^# \{0,1\}//'
@@ -47,6 +49,13 @@ list-targets:
 
 probe:
 	@$(REPO_ROOT)/tools/probe-env.sh
+
+# Builds the pinned engine twice from two independent clones and compares the hashes.
+# Not part of `image`: it needs network access and takes several minutes, and an image
+# build should not silently pay for it.
+engine-repro-check: check-recipe
+	@$(REPO_ROOT)/tools/check-engine-reproducibility.sh \
+	  --arch "$$(sed -n 's/^arch = "\(.*\)"/\1/p' $(RECIPE) | head -1)"
 
 check-recipe:
 	@test -f "$(RECIPE)" || { \

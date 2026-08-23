@@ -810,25 +810,65 @@ The regression test makes the race deterministic instead of hoping for it: the f
 writes 200 lines and exits at once, and the assertion is on the *last* line. Re-run 12
 times with eight spinners saturating the CPU: 0 failures.
 
-### Reproducibility: improved, measured, and still not there
+### Reproducibility: measured, and a correction
 
-CLAUDE.md §7 requires reproducible builds, so this was tested rather than assumed: build the
-same pinned commit twice, in different directories, and compare.
+CLAUDE.md §7 requires reproducible builds, so this was tested rather than assumed.
 
-They differed. Chasing it found that `-ffile-prefix-map` was needed and was not sufficient:
+One real defect was found and fixed. **The bundled browser chat UI is embedded in the
+binary, and its asset filenames are content hashes that change between builds** — 2.6 MB
+of a diff between two builds of the same commit, confirmed by reading the differing region
+of `.rodata` and finding `bundle.DUYuKz9T.js` against `bundle.diFjY-ze.js`. It is now built
+with `LLAMA_BUILD_UI=OFF`, which is right for three separate reasons: the engine is already
+started with `--no-webui`, an unauthenticated HTTP surface should not ship unused, and the
+binary lost 3.2 MB (17.3 MB → 14.1 MB). `-ffile-prefix-map` was added in the same pass so
+the artifact does not depend on where it was compiled.
 
-1. Absolute build paths were baked into the binary. Fixed with `-ffile-prefix-map`;
-   confirmed by finding zero occurrences of the build directory and 230 of the mapped
-   prefix.
-2. The bundled browser chat UI is embedded in the binary, and its asset filenames are
-   content hashes that change between builds — 2.6 MB of the diff. It is now built with
-   `LLAMA_BUILD_UI=OFF`, which is right for three separate reasons: the engine is already
-   started with `--no-webui`, an unauthenticated HTTP surface is not something to ship
-   unused, and the binary lost 3.2 MB (17.3 MB → 14.1 MB).
-3. **Something still differs.** Two builds now produce binaries of *identical size* and
-   different hashes. That source has not been identified, and the build is therefore **not
-   byte-reproducible**. The commit pin is verified — a moved tag is a hard failure — but a
-   rebuild cannot yet be checked against a published hash. Recorded as open.
+**The second finding was wrong, and it was mine.** This log previously recorded that a
+source of nondeterminism remained after those fixes. It does not. That conclusion came
+from comparing against a second build whose source tree I had produced with `cp -r`, and a
+`cp -r` copy — byte-identical in content and identical in file modes — deterministically
+yields a *different* engine binary. I measured my own test harness and reported it as a
+property of the build.
+
+The corrected result, from five builds:
+
+| Build | Source | Result |
+|---|---|---|
+| 1 | the canonical checkout | `ab5adad…` |
+| 2 | same checkout, different build directory | `ab5adad…` |
+| 3 | `cp -a` copy at a different path | `ab5adad…` |
+| 4 | fresh `git clone` of the pinned tag | `ab5adad…` |
+| 5 | second fresh `git clone`, via the new check | `ab5adad…` |
+
+So: **the engine build is reproducible on this host across independent clones**, which is
+the property that matters, since a clone is how anyone else obtains the source. Note the
+scope — all five ran on one machine. Cross-host reproducibility is untested and remains a
+1.x goal (`docs/build/BUILD-SYSTEM.md` §4).
+
+`tools/check-engine-reproducibility.sh` now makes this repeatable rather than a thing
+somebody checked once:
+
+```
+$ make -C build TARGET=amd64-qemu-ubuntu engine-repro-check
+  build one: ab5adadd37c06ffb4036eb60218421cf9d9d3a73fb0f0481efef4a28aa92088e
+  build two: ab5adadd37c06ffb4036eb60218421cf9d9d3a73fb0f0481efef4a28aa92088e
+REPRODUCIBLE
+```
+
+It clones twice on purpose. Two builds from one checkout is the easy case and would have
+passed throughout — including while the web UI was still making the binary
+irreproducible — so it would have proved nothing.
+
+**Left open: why a `cp -r` copy builds differently.** It is reproducible in its own right —
+two `cp -r` copies at different paths both produced `da02b5b…` — so there is a real cause
+and not a flake. The copies differ from the original in no file content and no file mode;
+only in timestamps and directory layout. But a fresh `git clone` also has fresh timestamps
+and fresh directories, and *that* reproduces, so timestamps alone do not explain it. The
+differing bytes are in `.text`, `.rodata` and `.data.rel.ro` while `.eh_frame` is
+identical, and no meaningful string differs — the signature of addresses being assigned
+differently, not of content changing. Recorded rather than chased: `cp -r` is on nobody's
+path to this source, and each hypothesis costs a fifteen-minute build. It is a curiosity
+with evidence attached, not a known defect in what ships.
 
 ### What this slice does not do
 
@@ -847,3 +887,5 @@ They differed. Chasing it found that `-ffile-prefix-map` was needed and was not 
   amd64 *and* an arm64 VM with tier-appropriate models. Inference has run on the host
   against both architectures' engines; it has not run on a booted VM, because there is no
   model on one.
+- **The arm64 engine has not been through the reproducibility check.** The check accepts
+  `--arch arm64` and the cross build works, but only amd64 has actually been run twice.
