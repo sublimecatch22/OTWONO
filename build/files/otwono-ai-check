@@ -1,0 +1,38 @@
+#!/bin/sh
+# OTWONO AI self check, run once at boot.
+#
+# Confirms otwono-aid is up and reports what this node could run. On every current build
+# the answer is "no local inference": no engine is linked. That is a PASS, and printing it
+# is the point — a node that quietly cannot do AI is worse than one that says so at boot.
+#
+# This is a file, not an inline ExecStart, for the reason recorded in
+# otwono-control-plane-check: an inline version shipped a quoting bug that only surfaced
+# minutes into a QEMU boot. As a file it is linted by shellcheck in CI.
+set -eu
+
+# Wait for the socket first. otwono-aid creates its catalog layout and *then* binds, so a
+# socket on disk means the layout is ready — Type=exec only tells systemd the binary was
+# exec'd, which is earlier than either. Without this the check races the daemon it checks.
+i=0
+while [ ! -S /run/otwono/ai.sock ] && [ "$i" -lt 60 ]; do
+    sleep 1
+    i=$((i + 1))
+done
+[ -S /run/otwono/ai.sock ] || { echo "OTWONO-AI-FAIL no socket at /run/otwono/ai.sock" >&2; exit 1; }
+
+STATUS=$(/usr/bin/otwono-aid --capabilities --model-dir /var/lib/otwono/models)
+
+tier=$(echo "$STATUS" | awk '/^tier/ {print $2}')
+infer=$(echo "$STATUS" | awk '/^local infer/ {print $3}')
+models=$(echo "$STATUS" | awk '/^models/ {print $2}')
+
+[ -n "$tier" ] || { echo "OTWONO-AI-FAIL no tier from otwono-aid" >&2; exit 1; }
+[ -n "$infer" ] || { echo "OTWONO-AI-FAIL no inference status from otwono-aid" >&2; exit 1; }
+
+# The catalog directories must exist, or ai.models.list reports an empty catalog for the
+# wrong reason and a later model install has nowhere to land.
+for d in /var/lib/otwono/models/manifests /var/lib/otwono/models/blobs; do
+    [ -d "$d" ] || { echo "OTWONO-AI-FAIL missing catalog directory $d" >&2; exit 1; }
+done
+
+echo "OTWONO-AI-OK tier=$tier local_inference=$infer models=$models"

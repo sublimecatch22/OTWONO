@@ -103,7 +103,7 @@ path, not yet kernel-enforced.
 
 ---
 
-## Phase 4 — Local AI runtime  ← *recommended next milestone*
+## Phase 4 — Local AI runtime  ← *in progress*
 
 1. `otwono-aid` with the backend abstraction and llama.cpp CPU first.
 2. Model catalog, signed manifests, content-addressed storage, tier gating.
@@ -114,6 +114,18 @@ path, not yet kernel-enforced.
 **Exit criterion:** the same `ai.infer` request served on an amd64 VM and an arm64 VM with
 tier-appropriate models, plus a test proving admission control refuses an oversized model
 instead of triggering the OOM killer.
+
+**Done so far (slice 1):** the manifest contract and its JSON Schema, the footprint
+arithmetic, admission control with every refusal exercised, backend selection as a pure
+function, the on-disk catalog, and `otwono-aid` serving `ai.capabilities`,
+`ai.models.list` and `ai.admit` over the control plane. Item 3 — the half of the exit
+criterion that does not need an engine — is met and tested on both architectures'
+fixture profiles.
+
+**Still open:** no inference engine is linked, so `ai.infer` refuses and the `ai.infer`
+half of the exit criterion is not met. Manifest signatures are carried and their absence
+enforced, but not verified. No model download, no embeddings, ASR or TTS, no GPU/NPU
+backend, no tiered assistant shapes.
 
 ---
 

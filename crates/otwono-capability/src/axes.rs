@@ -209,7 +209,7 @@ fn classify_power(r: &HardwareReport) -> PowerClass {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::*;
+    use crate::testing::*;
 
     #[test]
     fn memory_thresholds_sit_below_marketing_numbers() {

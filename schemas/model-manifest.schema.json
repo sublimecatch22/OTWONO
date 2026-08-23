@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://otwono.org/schemas/model-manifest-1.0.0.json",
+  "title": "OTWONO Model Manifest",
+  "description": "What a node needs to know about a model *before* it loads it: how much memory it will actually cost, which backends can run it, and who vouches for the weights. Admission control reads this and refuses rather than letting the OOM killer decide. The manifest is the contract; the weights are a separate content-addressed blob.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "id",
+    "family",
+    "parameters",
+    "quantization",
+    "format",
+    "blake3",
+    "size_bytes",
+    "min_tier",
+    "footprint",
+    "max_context",
+    "capabilities",
+    "license",
+    "backends"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$",
+      "description": "Stable catalog identifier, e.g. qwen3-4b-instruct-q4_k_m. Lowercase so it is safe as a path component on every filesystem we target."
+    },
+    "family": { "type": "string", "minLength": 1 },
+    "parameters": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Parameter count. Descriptive only — admission control uses `footprint`, because quantization makes parameter count a poor predictor of memory."
+    },
+    "quantization": { "type": "string", "minLength": 1 },
+    "format": { "type": "string", "enum": ["gguf", "onnx", "safetensors", "rknn"] },
+    "blake3": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Content address of the weights blob. BLAKE3 to match otwono-stored and the audit log."
+    },
+    "size_bytes": { "type": "integer", "minimum": 1 },
+    "min_tier": { "$ref": "#/$defs/tier" },
+    "footprint": { "$ref": "#/$defs/footprint" },
+    "max_context": { "type": "integer", "minimum": 1 },
+    "capabilities": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "enum": ["chat", "completion", "tools", "embedding", "vision", "asr", "tts"] }
+    },
+    "license": { "type": "string", "minLength": 1 },
+    "backends": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/backendId" },
+      "description": "Backends able to execute this format, most preferred first. A node intersects this with what it can actually run."
+    },
+    "signature": {
+      "$ref": "#/$defs/signature",
+      "description": "Absent means unsigned. An unsigned model is loadable only with an explicit opt-in and runs with reduced tool access: a model that can call tools is executable content."
+    }
+  },
+  "$defs": {
+    "tier": {
+      "type": "string",
+      "enum": ["T0_MICRO", "T1_EDGE", "T2_BALANCED", "T3_CAPABLE", "T4_WORKSTATION"]
+    },
+    "backendId": {
+      "type": "string",
+      "enum": [
+        "llama-cpp-cpu",
+        "llama-cpp-vulkan",
+        "llama-cpp-cuda",
+        "llama-cpp-rocm",
+        "onnx-runtime",
+        "whisper-cpp",
+        "piper",
+        "vllm"
+      ]
+    },
+    "footprint": {
+      "type": "object",
+      "description": "The inputs to the admission calculation. Every field is bytes of resident memory, not file size: a memory-mapped GGUF still has to be paged in to be used.",
+      "required": ["weights_bytes", "kv_per_1k_ctx_bytes"],
+      "additionalProperties": false,
+      "properties": {
+        "weights_bytes": { "type": "integer", "minimum": 1 },
+        "kv_per_1k_ctx_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "KV cache cost per 1024 tokens of context, per sequence. This is what makes a model that 'fits' fail at long context."
+        },
+        "overhead_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Fixed runtime cost beyond weights and KV: compute buffers, the backend's own allocations."
+        }
+      }
+    },
+    "signature": {
+      "type": "object",
+      "required": ["algorithm", "public_key", "signature"],
+      "additionalProperties": false,
+      "properties": {
+        "algorithm": { "type": "string", "enum": ["ed25519"] },
+        "public_key": { "type": "string", "description": "Base64 Ed25519 public key of the publisher." },
+        "signature": { "type": "string", "description": "Base64 signature over the domain-separated canonical manifest." }
+      }
+    }
+  }
+}

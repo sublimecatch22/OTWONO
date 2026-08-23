@@ -226,7 +226,7 @@ fn compose_tier(axes: &CapabilityAxes) -> (Tier, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::*;
+    use crate::testing::*;
 
     #[test]
     fn tier_names_round_trip() {
@@ -367,8 +367,14 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod test_support {
+/// Hardware fixtures other crates test against.
+///
+/// Public behind a feature rather than `#[cfg(test)]` because the machines these describe
+/// — a Pi Zero, a Pi 4, a Pi 5, a GPU workstation — are the cases every tier-aware
+/// subsystem has to get right, and each of them re-deriving its own idea of "a small
+/// board" is how the tiering stops being one contract (CLAUDE.md §2.6).
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
     use otwono_hal::*;
 
     pub const GIB: u64 = 1024 * 1024 * 1024;

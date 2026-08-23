@@ -17,6 +17,13 @@ BOOT_LOG="$TARGET_OUT/boot.log"
 
 [ -f "$IMAGE" ] || die "no image at $IMAGE; run stage 50 first"
 
+# e2fsck is needed to replay the journal on partitions the killed guest left dirty; debugfs
+# reads them afterwards. Declared here so a missing tool is a clear message rather than a
+# confusing extraction failure ten minutes into a TCG boot.
+for t in debugfs e2fsck partx sgdisk; do
+    command -v "$t" > /dev/null || die "missing required tool: $t"
+done
+
 log "verifying checksums"
 ( cd "$TARGET_OUT" && sha256sum -c SHA256SUMS ) || die "checksum mismatch"
 
@@ -52,14 +59,28 @@ rm -rf "$WORK"; mkdir -p "$WORK"
 
 # Pull a partition out of the image and dump one file from it. debugfs reads ext4 directly,
 # so this needs no loop device and no mount — the same constraint stage 50 builds under.
-dump_guest_file() { # partition-number guest-path output-path
-    local part="$1" guest="$2" out="$3" start sectors img
+#
+# The journal has to be replayed first. The boot harness kills QEMU rather than shutting
+# the guest down, so every filesystem the guest wrote is left dirty, and debugfs on a dirty
+# ext4 fails outright with a bitmap checksum mismatch instead of reading around it. This is
+# the same recovery a real machine performs after a hard power-off, run on the extracted
+# copy so the artifact is never touched. e2fsck exits 1 when it fixed something, which here
+# is the expected case, not a failure.
+extract_partition() { # partition-number -> path
+    local part="$1" img start sectors
     img="$WORK/p$part.img"
     if [ ! -f "$img" ]; then
         start=$(partx -g -o START -s --nr "$part" "$BOOT_IMAGE" | tr -d ' ')
         sectors=$(partx -g -o SECTORS -s --nr "$part" "$BOOT_IMAGE" | tr -d ' ')
         dd if="$BOOT_IMAGE" of="$img" bs=512 skip="$start" count="$sectors" status=none
+        e2fsck -fy "$img" > "$WORK/fsck-p$part.log" 2>&1 || true
     fi
+    echo "$img"
+}
+
+dump_guest_file() { # partition-number guest-path output-path
+    local part="$1" guest="$2" out="$3" img
+    img=$(extract_partition "$part")
     rm -f "$out"
     debugfs -R "dump $guest $out" "$img" 2>/dev/null || true
     [ -s "$out" ]
@@ -127,6 +148,9 @@ fi
 log "verifying the release image carries no first-boot state"
 PRISTINE_WORK="$TARGET_OUT/pristine-check"
 rm -rf "$PRISTINE_WORK"; mkdir -p "$PRISTINE_WORK"
+# No fsck here, deliberately: this reads the *artifact*, which was never booted and must
+# still be clean. If it ever needs a journal replay, something wrote to it and that is the
+# defect this block exists to catch.
 check_absent() { # partition-number guest-path description
     local part="$1" guest="$2" what="$3" start sectors img out
     img="$PRISTINE_WORK/p$part.img"

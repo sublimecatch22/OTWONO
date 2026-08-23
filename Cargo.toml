@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/otwono-hal",
     "crates/otwono-capability",
+    "crates/otwono-ai",
     "crates/otwono-hwctl",
     "crates/otwono-identity",
     "crates/otwono-net",
@@ -11,6 +12,7 @@ members = [
     "crates/otwono-permd",
     "crates/otwono-hwd",
     "crates/otwono-idd",
+    "crates/otwono-aid",
     "tests/schema",
     "tests/control-plane",
 ]
@@ -29,6 +31,7 @@ serde_json = "1"
 toml = "0.8"
 otwono-hal = { path = "crates/otwono-hal" }
 otwono-capability = { path = "crates/otwono-capability" }
+otwono-ai = { path = "crates/otwono-ai" }
 otwono-identity = { path = "crates/otwono-identity" }
 otwono-net = { path = "crates/otwono-net" }
 otwono-proto = { path = "crates/otwono-proto" }

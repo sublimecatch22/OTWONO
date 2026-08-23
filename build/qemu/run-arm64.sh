@@ -20,7 +20,7 @@ REQUIRED=()
 if [ -n "${OTWONO_BOOT_EXPECT:-}" ]; then
     REQUIRED=("$OTWONO_BOOT_EXPECT")
 else
-    REQUIRED=("otwono login:" "OTWONO-CAPABILITY-OK" "OTWONO-CONTROL-PLANE-OK" "OTWONO-MESH-OK")
+    REQUIRED=("otwono login:" "OTWONO-CAPABILITY-OK" "OTWONO-CONTROL-PLANE-OK" "OTWONO-MESH-OK" "OTWONO-AI-OK")
 fi
 # Patterns that mean the boot definitively failed; matching one aborts early rather
 # than burning the whole timeout under TCG.

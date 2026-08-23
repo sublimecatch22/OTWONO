@@ -1,6 +1,22 @@
 # AI Runtime Abstraction
 
-**Status:** `SPECIFIED`. No implementation yet.
+**Status:** partly `IMPLEMENTED`, mostly `SPECIFIED`.
+
+* **Implemented and unit tested:** the model manifest and its JSON Schema
+  (`schemas/model-manifest.schema.json`), the footprint arithmetic, **admission control**
+  including every refusal in §4, backend *selection* as a pure function, and the on-disk
+  catalog. In `crates/otwono-ai`, exercised against the fixture machines in
+  `otwono-capability`'s `testing` module.
+* **Implemented and exercised over sockets:** `ai.capabilities`, `ai.models.list` and
+  `ai.admit` in `otwono-aid`, guarded by the `ai.read` capability.
+* **Not implemented — no inference happens.** No engine is linked into any build.
+  `installed_backends()` returns an empty set, `ai.capabilities` reports
+  `local_inference_available: false`, and `ai.infer` refuses. Everything in §3 below
+  describes backends we intend to integrate, not backends that are present.
+* **Not implemented:** `ai.models.pull`, `ai.embed`, `ai.transcribe`, `ai.synthesize`,
+  `ai.vision`, `ai.session.*`, manifest signature *verification* (the field is carried and
+  its absence is enforced; the signature itself is not yet checked), remote inference over
+  ONM, and every tiered assistant shape in §6.
 
 ## 1. The problem
 
@@ -15,9 +31,11 @@ must not care.
 
 | Method | Purpose |
 |---|---|
-| `ai.capabilities` | What this node can do right now, given its tier and loaded models |
-| `ai.models.list` / `ai.models.pull` / `ai.models.remove` | Catalog management |
-| `ai.infer` | Text completion / chat, streaming |
+| `ai.capabilities` | What this node can do right now, given its tier and loaded models — **implemented** |
+| `ai.models.list` | The catalog, each entry with whether this machine can run it and why not — **implemented** |
+| `ai.admit` | Dry run: would this model load, at what cost, and if not what context would fit — **implemented** |
+| `ai.models.pull` / `ai.models.remove` | Catalog management — specified |
+| `ai.infer` | Text completion / chat, streaming — **refuses: no engine linked** |
 | `ai.embed` | Embeddings for RAG |
 | `ai.transcribe` | Speech to text |
 | `ai.synthesize` | Text to speech |
@@ -26,6 +44,11 @@ must not care.
 
 Every method returns a typed error. `ModelTooLargeForTier`, `NoBackendAvailable`, and
 `InsufficientMemory` are ordinary, expected results on small hardware — not exceptions.
+
+That is literal, not rhetorical: `ai.admit` returns a **successful call reporting
+`admissible: false`**, with the numbers and a suggested smaller context, rather than an RPC
+error. Browsing a catalog on a Pi should not mean handling an exception on every second
+entry.
 
 ## 3. Backends
 
@@ -64,7 +87,23 @@ if required > available: refuse with ModelTooLargeForTier and suggest an alterna
 ```
 
 The reserve keeps the desktop, the network daemon, and the user's actual work alive. It is
-tier-dependent and configurable, and it is never zero.
+tier-dependent and configurable, and it is never zero — `Reserve::FLOOR` is 256 MiB and
+`Reserve::custom` clamps to it. A configurable reserve that can be set to zero is not a
+safety mechanism, it is a footgun with a dial on it.
+
+Details the implementation pins down, each with a test:
+
+- **The default context is the model's maximum, not its minimum.** Admitting on the
+  strength of a short first turn is how a session gets killed three messages later.
+- **A partial KV block is charged in full.** Rounding down under-counts.
+- **KV is charged per sequence**; weights and overhead are shared.
+- **Arithmetic saturates.** A manifest is external data, and an overflow would wrap a
+  colossal model into a small number and admit it.
+- **`vram_bytes: None` means undetectable, not zero.** An offloading backend on a card
+  reporting no figure is refused rather than guessed at — guessing either way risks the
+  exact OOM this exists to prevent.
+- **A refusal suggests the largest context that would fit**, or says nothing fits. A
+  refusal a user cannot act on is barely better than a crash.
 
 ## 5. Model catalog
 

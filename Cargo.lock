@@ -853,6 +853,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
+name = "otwono-ai"
+version = "0.1.0"
+dependencies = [
+ "otwono-capability",
+ "otwono-hal",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "otwono-aid"
+version = "0.1.0"
+dependencies = [
+ "otwono-ai",
+ "otwono-capability",
+ "otwono-proto",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "otwono-capability"
 version = "0.1.0"
 dependencies = [
@@ -867,7 +888,10 @@ name = "otwono-control-plane-tests"
 version = "0.1.0"
 dependencies = [
  "data-encoding",
+ "otwono-ai",
+ "otwono-aid",
  "otwono-capability",
+ "otwono-hal",
  "otwono-hwd",
  "otwono-idd",
  "otwono-identity",
@@ -987,6 +1011,7 @@ name = "otwono-schema-tests"
 version = "0.1.0"
 dependencies = [
  "jsonschema",
+ "otwono-ai",
  "otwono-capability",
  "otwono-hal",
  "serde_json",

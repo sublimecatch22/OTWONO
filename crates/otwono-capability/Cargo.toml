@@ -12,3 +12,8 @@ otwono-hal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
+
+[features]
+# Exposes the hardware fixtures in `testing` to other crates' tests. Never enabled in a
+# shipped binary: it is dev-dependency surface, not product surface.
+testing = []

@@ -1,0 +1,17 @@
+[package]
+name = "otwono-ai"
+description = "OTWONO AI runtime contracts: model manifests, admission control, and backend selection."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+otwono-capability = { workspace = true }
+otwono-hal = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+otwono-capability = { workspace = true, features = ["testing"] }

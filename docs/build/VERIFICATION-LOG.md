@@ -469,3 +469,89 @@ worked every time in this project:
 - **arm64 untested for this change.** The workspace builds for it; the two-node test has
   only been run on amd64.
 - **Nothing on real hardware.**
+
+---
+
+## Phase 4 slice 1 — admission control, on both architectures
+
+The half of the Phase 4 exit criterion that does not need an inference engine: a model
+catalog, a manifest contract, and a refusal path that is exercised rather than assumed.
+**No engine is linked, and `ai.infer` says so.**
+
+### Boot verification, both targets
+
+| Target | Result |
+|---|---|
+| `make TARGET=amd64-qemu-ubuntu verify` | PASS |
+| `make TARGET=arm64-qemu-ubuntu verify` | PASS |
+| `make TARGET=amd64-qemu-ubuntu two-node-test` | PASS |
+
+Both guests emit, from `otwono-aid` running under its own systemd unit:
+
+```
+OTWONO-AI-OK tier=T0_MICRO local_inference=unavailable models=0
+```
+
+`local_inference=unavailable` is the honest state of every build today, and it is asserted
+at boot rather than discovered at first use. The audit record count per boot rose from 3 to
+6, which is the visible trace of `otwono-aid` asking the broker for `hw.read` — the
+capability tier reaching it through the control plane rather than a second probe.
+
+The mesh is unaffected:
+
+```
+node A identity: otw1:y71d-a858-4h1d-vesa  addr 169.254.33.121/16   connected 1
+node B identity: otw1:d8na-bsev-87xh-jnm1  addr 169.254.156.92/16   connected 1
+PASS: two nodes discovered and mutually authenticated
+```
+
+### Workspace
+
+| Command | Result |
+|---|---|
+| `cargo test --workspace` | **332 tests pass** (268 before) |
+| `clippy -D warnings`, `fmt --check`, `shellcheck -S warning` | clean |
+
+### Three defects this found
+
+**12. `otwono-aid` was not staged into the image.** Stage 05 carries an explicit binary
+list and the new daemon was not on it, so the unit existed and the binary did not. Caught
+by requiring `OTWONO-AI-OK` in the boot harness before believing the daemon worked — the
+same discipline that has caught every other "it builds, therefore it runs" assumption in
+this project.
+
+**13. The AI daemon would have computed a different tier than the hardware daemon.** It
+probed hardware itself, and its unit runs with `PrivateNetwork=yes` — so it would have
+classified the network axis from an empty namespace and disagreed with `otwono-hwd` about
+the same machine. CLAUDE.md §2.6 puts that decision in one place; two processes deriving it
+independently is exactly how they drift.
+
+Fixed by having `otwono-aid` fetch the profile from `otwono-hwd` over the brokered control
+plane and fail closed if it cannot. That also *keeps* `PrivateNetwork=yes` valid for the
+daemon, which is a security improvement rather than a concession: it now reads no hardware
+and downloads nothing.
+
+**14. Artifact extraction could not read a dirty filesystem.** The boot harness kills QEMU
+rather than shutting the guest down, so every partition the guest wrote is left dirty.
+`debugfs` on a dirty ext4 fails outright with a bitmap checksum mismatch instead of reading
+around it. This had been latent: it only surfaced once `otwono-aid` began creating its
+catalog directories at startup, leaving more uncommitted metadata at the moment of the
+kill. Stage 60 now replays the journal with `e2fsck -fy` on the extracted *copy* — the same
+recovery a real machine performs after a hard power-off. The pristine-artifact check
+deliberately does **not** fsck: if the release image ever needs a journal replay, something
+wrote to it, and that is the defect that check exists to catch.
+
+### What slice 1 has *not* done
+
+- **No inference.** No engine is linked, `installed_backends()` is empty, and `ai.infer`
+  returns `NoBackendAvailable`. Nothing here has run a model. The `ai.infer` half of the
+  Phase 4 exit criterion is not met.
+- **Signatures are carried, not verified.** A manifest's `signature` field is parsed and
+  its *absence* is enforced (unsigned models need an explicit opt-in, and an unsigned
+  tool-capable model is flagged as executable content). The signature itself is not checked
+  against a publisher key.
+- **No model download, no embeddings, ASR, TTS or vision, no sessions, no GPU/NPU backend,
+  no tiered assistant shapes, no remote inference over ONM.**
+- **Admission is tested against fixture profiles, not against real memory pressure.** The
+  arithmetic and every refusal are unit-tested; no machine has yet been pushed to the point
+  where the reserve is what saved it.

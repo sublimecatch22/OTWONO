@@ -6,7 +6,7 @@ networking, local AI, distributed services, and offline-first capabilities.
 Runs on **x86_64/AMD64** computers and **ARM64** single-board computers. Same operating
 system, same subsystems, same interfaces — the capabilities scale to the hardware.
 
-> **Project status: Phase 3 complete.** Both images boot under QEMU, and the
+> **Project status: Phase 3 complete; Phase 4 started.** Both images boot under QEMU, and the
 > **permission broker and hardware daemon now run on both booted systems**: at first boot the
 > guest requests a capability, calls the hardware daemon with it, and the broker writes a
 > hash-chained audit record — all recovered from the image and verified on the host
@@ -14,8 +14,10 @@ system, same subsystems, same interfaces — the capabilities scale to the hardw
 > DHCP server, they discover each other over mDNS and each authenticates the other's
 > cryptographic NodeID — and since ADR-0010 the daemon that talks to the network no longer
 > holds the key its NodeID names. Nothing has run on real hardware yet; there is no radio
-> link, no routing, no AI runtime, and the daemons still run as root pending user
-> separation.
+> link and no routing. **The AI runtime can now say what a node could run** — model
+> catalog, admission control, and a refusal path that is tested rather than assumed — but
+> no inference engine is linked, so `ai.infer` refuses and nothing here has run a model.
+> The daemons still run as root pending user separation.
 >
 > Every document and subsystem carries an explicit status (`SPECIFIED` / `IMPLEMENTED` /
 > `VERIFIED`), and nothing here claims to work that has not been run — see

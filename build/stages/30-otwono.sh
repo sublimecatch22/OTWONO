@@ -30,6 +30,10 @@ install -m 0644 "$REPO_ROOT"/schemas/*.json "$ROOTFS/usr/share/otwono/schemas/"
 log "creating the OTWONO state directories"
 install -d -m 0755 "$ROOTFS/etc/otwono" "$ROOTFS/etc/otwono/policy.d"
 install -d -m 0700 "$ROOTFS/var/lib/otwono" "$ROOTFS/var/lib/otwono/identity"
+# The model catalog. Manifests are public metadata; blobs are large and content-addressed.
+# Ships empty: models are never committed and never baked into an image (CLAUDE.md §9).
+install -d -m 0755 "$ROOTFS/var/lib/otwono/models" \
+    "$ROOTFS/var/lib/otwono/models/manifests" "$ROOTFS/var/lib/otwono/models/blobs"
 install -d -m 0755 "$ROOTFS/var/log/otwono"
 
 log "installing the first-boot capability report unit"
@@ -150,6 +154,18 @@ action = "id.bind_agreement"
 subjects = ["uid:0"]
 decision = "allow"
 ttl_seconds = 300
+
+# Reading the model catalog and asking whether a model would load. Both are read-only and
+# answer questions about this machine, not about the user's data.
+[[rule]]
+action = "ai.read"
+subjects = ["uid:0"]
+decision = "allow"
+ttl_seconds = 300
+
+# ai.infer is deliberately NOT granted. No inference backend is linked into this build, so
+# a rule here would grant a capability for something that cannot happen — and when an
+# engine does land, running a model is a decision an operator should make on purpose.
 POLICY
 
 log "installing the control-plane runtime directory"
@@ -441,7 +457,83 @@ LockPersonality=yes
 WantedBy=multi-user.target
 UNIT
 
-for unit in otwono-permd otwono-hwd otwono-idd otwono-netd otwono-control-plane-check otwono-mesh-check otwono-mesh-check.timer; do
+log "installing the AI daemon unit"
+# No inference backend is linked into this build, so this daemon answers questions about
+# what the node *could* run and refuses ai.infer. It is still worth running: the catalog
+# and the admission decision are what a UI needs to know whether to offer an assistant at
+# all, and getting a truthful "no" at boot is better than discovering it at first use.
+cat > "$ROOTFS/etc/systemd/system/otwono-aid.service" <<'UNIT'
+[Unit]
+Description=OTWONO AI daemon
+Documentation=file:/usr/share/doc/otwono/AI-RUNTIME.md
+After=otwono-permd.service otwono-hwd.service systemd-tmpfiles-setup.service
+# Hard requirements: this daemon does not probe hardware itself. It asks otwono-hwd for
+# the capability tier, brokered by otwono-permd, so that exactly one component decides how
+# big this machine is (CLAUDE.md §2.6). That is also what lets it keep PrivateNetwork.
+Requires=otwono-permd.service otwono-hwd.service
+RequiresMountsFor=/var/lib/otwono
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/otwono-aid --socket /run/otwono/ai.sock --perm-socket /run/otwono/perm.sock --hw-socket /run/otwono/hw.sock --model-dir /var/lib/otwono/models
+Restart=on-failure
+RestartSec=2
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# No business on the network: it reads no hardware itself and downloads nothing. Model
+# fetching is not implemented, and when it is it will be a brokered egress action.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=/run/otwono /var/lib/otwono
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+log "installing the AI self check"
+install -m 0755 "$BUILD_DIR/files/otwono-ai-check" "$ROOTFS/usr/lib/otwono/ai-check"
+cat > "$ROOTFS/etc/systemd/system/otwono-ai-check.service" <<'UNIT'
+[Unit]
+Description=OTWONO AI self check
+After=otwono-aid.service
+Requires=otwono-aid.service
+RequiresMountsFor=/var/lib/otwono
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/otwono/ai-check
+StandardOutput=journal+console
+StandardError=journal+console
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+for unit in otwono-permd otwono-hwd otwono-idd otwono-netd otwono-aid otwono-ai-check otwono-control-plane-check otwono-mesh-check otwono-mesh-check.timer; do
     # The list carries a .timer as well as services, so only append .service when the
     # entry does not already name a unit type.
     case "$unit" in
@@ -458,8 +550,9 @@ install -m 0644 "$REPO_ROOT/docs/hardware/CAPABILITY-TIERS.md" "$ROOTFS/usr/shar
 install -m 0644 "$REPO_ROOT/docs/security/SECURITY-MODEL.md" "$ROOTFS/usr/share/doc/otwono/"
 install -m 0644 "$REPO_ROOT/docs/network/NODE-IDENTITY.md" "$ROOTFS/usr/share/doc/otwono/"
 install -m 0644 "$REPO_ROOT/docs/network/NODE-NETWORK.md" "$ROOTFS/usr/share/doc/otwono/"
+install -m 0644 "$REPO_ROOT/docs/ai/AI-RUNTIME.md" "$ROOTFS/usr/share/doc/otwono/"
 install -m 0644 "$REPO_ROOT/README.md" "$ROOTFS/usr/share/doc/otwono/"
 
-manifest_add "otwono-layer" "binaries, schemas, policy, 6 units installed"
+manifest_add "otwono-layer" "binaries, schemas, policy, 8 units installed"
 stage_mark_complete 30-otwono
 stage_done

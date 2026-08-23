@@ -10,5 +10,6 @@ publish = false
 [dev-dependencies]
 otwono-hal = { path = "../../crates/otwono-hal" }
 otwono-capability = { path = "../../crates/otwono-capability" }
+otwono-ai = { path = "../../crates/otwono-ai" }
 serde_json = "1"
 jsonschema = { version = "0.26", default-features = false }

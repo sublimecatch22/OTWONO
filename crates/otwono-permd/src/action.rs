@@ -101,6 +101,13 @@ impl ActionRegistry {
                     false,
                 ),
                 ActionSpec::new(
+                    "ai.read",
+                    "List models and ask whether one would load on this node",
+                    BlastRadius::Read,
+                    false,
+                ),
+                ActionSpec::new("ai.infer", "Run local inference", BlastRadius::Reversible, false),
+                ActionSpec::new(
                     "net.read",
                     "List the peers this node has met",
                     BlastRadius::Read,
