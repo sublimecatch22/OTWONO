@@ -13,10 +13,13 @@
   `installed_backends()` returns an empty set, `ai.capabilities` reports
   `local_inference_available: false`, and `ai.infer` refuses. Everything in §3 below
   describes backends we intend to integrate, not backends that are present.
+* **Implemented and unit tested:** manifest signature verification against a configured
+  publisher trust store, and the out-of-process backend supervisor of §3 — crash, hang,
+  protocol-violation and oversized-output paths all covered against a fake backend that
+  misbehaves to order.
 * **Not implemented:** `ai.models.pull`, `ai.embed`, `ai.transcribe`, `ai.synthesize`,
-  `ai.vision`, `ai.session.*`, manifest signature *verification* (the field is carried and
-  its absence is enforced; the signature itself is not yet checked), remote inference over
-  ONM, and every tiered assistant shape in §6.
+  `ai.vision`, `ai.session.*`, remote inference over ONM, and every tiered assistant shape
+  in §6.
 
 ## 1. The problem
 
@@ -68,7 +71,12 @@ We integrate; we do not write an inference engine.
 Rules:
 
 - Backends run **out of process** and are supervised. A backend crash is a typed error,
-  never a hang and never a daemon restart.
+  never a hang and never a daemon restart. Implemented in `otwono-ai::supervisor`:
+  newline-delimited JSON over stdin/stdout (the same framing as ADR-0003), a `hello`
+  exchange so a wrapper script's error message is a protocol error rather than a timeout,
+  a deadline on every read, a cap on line length because a backend is a large C++ program
+  parsing untrusted files, and **process-group kill** so terminating a wrapper does not
+  orphan the engine it started.
 - Backend selection comes from the capability profile plus the model manifest. It is a
   pure function, and it is unit-testable against fixture profiles with no hardware present.
 - A backend that fails to load falls back down the list and records why, so `ai.capabilities`
@@ -132,6 +140,33 @@ Models are content-addressed blobs plus a signed manifest:
   with reduced tool access, because a model that can call tools is executable content.
 - The catalog is tier-filtered by default: a T1 node is not offered a 32B model it cannot
   run. It may still be shown, greyed, with the reason.
+
+### What a signature covers, and the three outcomes
+
+A signature covers the manifest with its own `signature` field removed, serialized as JSON
+with object keys sorted and no insignificant whitespace, prefixed with
+`otwono-model-manifest-v1:`. The canonicalizer is written out rather than delegated to
+`serde_json`'s map ordering: that ordering is a consequence of a feature flag any
+transitive dependency could flip, and the meaning of every signature must not depend on it.
+
+Verification has **three** outcomes, deliberately not two:
+
+| Outcome | Meaning | Loadable? |
+|---|---|---|
+| Trusted | Signature verifies, publisher is in the trust store | Yes |
+| Unsigned | No signature at all | Only with an explicit opt-in |
+| Untrusted publisher | Signature verifies, signer unknown to this node | Only with an explicit opt-in |
+| **Bad signature** | Signature does not verify | **Never** |
+
+Collapsing the last into "unsigned" would be a real weakness: the opt-in means *"I know
+where this came from"*, and it must never silently cover *"somebody changed this in
+transit"*. Adding a key to the trust store is a sensible response to an unknown publisher;
+it is never the fix for a broken signature.
+
+The trust store is `/etc/otwono/publishers.d/*.toml`. It **ships empty**, and empty means
+trust nobody. No default publisher key is baked into the image: shipping one would mean
+every OTWONO node automatically trusts whoever holds it, which is the node operator's
+decision and not the image builder's.
 
 ## 6. Tiered assistant behaviour
 

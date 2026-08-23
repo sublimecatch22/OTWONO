@@ -25,10 +25,14 @@ pub mod admission;
 pub mod backend;
 pub mod catalog;
 pub mod manifest;
+pub mod signature;
+pub mod supervisor;
 
 pub use admission::{admit, Admission, AdmissionError, AdmissionRequest, Reserve};
 pub use backend::{installed_backends, select_backend, BackendId, BackendSelection, SelectionError};
 pub use catalog::{Catalog, CatalogEntry, CatalogError, CatalogProblem, DEFAULT_MODEL_DIR};
 pub use manifest::{Footprint, ManifestError, ModelCapability, ModelFormat, ModelManifest, Signature};
+pub use signature::{PublisherTrust, SignatureError, SignatureStatus, TrustError};
+pub use supervisor::{BackendError, BackendHello, BackendProcess, PROTOCOL_VERSION};
 
 pub const SCHEMA_VERSION: &str = "1.0.0";

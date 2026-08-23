@@ -5,7 +5,7 @@
 
 #![forbid(unsafe_code)]
 
-use otwono_ai::{Catalog, DEFAULT_MODEL_DIR};
+use otwono_ai::{Catalog, PublisherTrust, DEFAULT_MODEL_DIR};
 use otwono_aid::AiService;
 use otwono_capability::CapabilityProfile;
 use otwono_proto::{Client, Server, Shutdown};
@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Where trusted model publishers are configured.
+const DEFAULT_PUBLISHER_DIR: &str = "/etc/otwono/publishers.d";
 
 const USAGE: &str = "\
 otwono-aid — OTWONO AI daemon
@@ -25,6 +28,7 @@ OPTIONS:
     --perm-socket <PATH>   Permission broker socket (default $OTWONO_SOCKET_DIR/perm.sock)
     --model-dir <PATH>     Model catalog directory (default /var/lib/otwono/models)
     --hw-socket <PATH>     Hardware daemon socket (default $OTWONO_SOCKET_DIR/hw.sock)
+    --publishers <PATH>    Trusted model publishers (default /etc/otwono/publishers.d)
     --capabilities         Print what this node can do and exit
     -h, --help             Show this message
 
@@ -67,6 +71,7 @@ fn run(args: &[String]) -> Result<String, Error> {
     let mut perm_socket: Option<PathBuf> = None;
     let mut model_dir = PathBuf::from(DEFAULT_MODEL_DIR);
     let mut hw_socket: Option<PathBuf> = None;
+    let mut publisher_dir = PathBuf::from(DEFAULT_PUBLISHER_DIR);
     let mut capabilities_only = false;
 
     let mut it = args.iter();
@@ -76,6 +81,7 @@ fn run(args: &[String]) -> Result<String, Error> {
             "--perm-socket" => perm_socket = Some(next_path(&mut it, "--perm-socket")?),
             "--model-dir" => model_dir = next_path(&mut it, "--model-dir")?,
             "--hw-socket" => hw_socket = Some(next_path(&mut it, "--hw-socket")?),
+            "--publishers" => publisher_dir = next_path(&mut it, "--publishers")?,
             "--capabilities" => capabilities_only = true,
             "-h" | "--help" => return Ok(USAGE.to_string()),
             other => return Err(Error::Usage(format!("unknown option {other}"))),
@@ -94,6 +100,11 @@ fn run(args: &[String]) -> Result<String, Error> {
     let hw_socket = hw_socket.unwrap_or_else(|| otwono_proto::socket_path("hw"));
     let profile = fetch_profile(&hw_socket, &perm_socket)?;
     let catalog = Catalog::new(&model_dir);
+    // A malformed trust store is a startup failure, not a silent fallback to trusting
+    // nobody: an operator who fat-fingers a publisher key should be told, not quietly left
+    // with a node that refuses every signed model for a reason it never reports.
+    let trust = PublisherTrust::load_dir(&publisher_dir)
+        .map_err(|e| Error::Startup(format!("publisher trust store: {e}")))?;
 
     if capabilities_only {
         let backends = otwono_ai::installed_backends();
@@ -101,7 +112,7 @@ fn run(args: &[String]) -> Result<String, Error> {
             .list()
             .map_err(|e| Error::Startup(format!("cannot read the model catalog: {e}")))?;
         return Ok(format!(
-            "tier         {}\naccelerator  {}\nbackends     {}\nlocal infer  {}\nmodels       {} ({} unusable manifest(s))\ncatalog      {}\n",
+            "tier         {}\naccelerator  {}\nbackends     {}\nlocal infer  {}\nmodels       {} ({} unusable manifest(s))\npublishers   {}\ncatalog      {}\n",
             profile.tier.as_str(),
             profile.axes.accelerator.as_str(),
             if backends.is_empty() {
@@ -116,6 +127,7 @@ fn run(args: &[String]) -> Result<String, Error> {
             if backends.is_empty() { "unavailable" } else { "available" },
             entries.len(),
             problems.len(),
+            trust.len(),
             model_dir.display(),
         ));
     }
@@ -137,7 +149,7 @@ fn run(args: &[String]) -> Result<String, Error> {
 
     server
         .serve(
-            Arc::new(AiService::new(catalog, profile, perm_socket)),
+            Arc::new(AiService::new(catalog, profile, trust, perm_socket)),
             Shutdown::new(),
         )
         .map_err(|e| Error::Startup(format!("serve failed: {e}")))?;

@@ -5,7 +5,8 @@
 //! a refusal comes back as a *successful call reporting a refusal* rather than an RPC
 //! error, and that `ai.infer` tells the truth about there being no engine.
 
-use otwono_ai::manifest::{Footprint, ModelCapability, ModelFormat, ModelManifest, Signature};
+use otwono_ai::manifest::{Footprint, ModelCapability, ModelFormat, ModelManifest};
+use otwono_ai::signature::testing::sign;
 use otwono_ai::{BackendId, Catalog};
 use otwono_aid::AiService;
 use otwono_capability::{classify, testing::report_pi4_4gb, Tier};
@@ -33,8 +34,13 @@ struct Harness {
     shutdown: Shutdown,
 }
 
+/// Test publisher seeds. Two, so "signed by someone we trust" and "signed by a stranger"
+/// are both reachable — they are different outcomes and the tests below rely on it.
+const TRUSTED_SEED: u8 = 11;
+const STRANGER_SEED: u8 = 22;
+
 fn manifest(id: &str, weights: u64, min_tier: Tier, signed: bool) -> ModelManifest {
-    ModelManifest {
+    let mut m = ModelManifest {
         schema_version: otwono_ai::manifest::SCHEMA_VERSION.to_string(),
         id: id.to_string(),
         family: "test".into(),
@@ -53,12 +59,14 @@ fn manifest(id: &str, weights: u64, min_tier: Tier, signed: bool) -> ModelManife
         capabilities: vec![ModelCapability::Chat],
         license: "apache-2.0".into(),
         backends: vec![BackendId::LlamaCppCpu],
-        signature: signed.then(|| Signature {
-            algorithm: "ed25519".into(),
-            public_key: "AA==".into(),
-            signature: "AA==".into(),
-        }),
+        signature: None,
+    };
+    if signed {
+        // Signed for real. A placeholder signature would make every test below pass for
+        // the wrong reason once verification became part of the admission path.
+        sign(&mut m, TRUSTED_SEED);
     }
+    m
 }
 
 impl Harness {
@@ -71,11 +79,15 @@ impl Harness {
 
         // A Pi 4, which classifies T1_EDGE: big enough for a small model, not for a
         // large one. The interesting machine, because both answers are reachable on it.
+        let mut stranger = manifest("stranger-1b", 700 * MIB, Tier::T0Micro, false);
+        sign(&mut stranger, STRANGER_SEED);
+
         for m in [
             manifest("fits-1b", 700 * MIB, Tier::T0Micro, true),
             manifest("too-big-70b", 40 * GIB, Tier::T0Micro, true),
             manifest("needs-workstation", 700 * MIB, Tier::T4Workstation, true),
             manifest("unsigned-1b", 700 * MIB, Tier::T0Micro, false),
+            stranger,
         ] {
             std::fs::write(
                 dir.join("models/manifests").join(format!("{}.json", m.id)),
@@ -100,9 +112,14 @@ impl Harness {
         let s = shutdown.clone();
         std::thread::spawn(move || server.serve(broker, s));
 
+        // Trust exactly one publisher, so trusted / unknown / unsigned are all reachable.
+        let mut probe = manifest("probe", 1, Tier::T0Micro, true);
+        let trust = sign(&mut probe, TRUSTED_SEED);
+
         let service = Arc::new(AiService::new(
             Catalog::new(dir.join("models")),
             classify(&report_pi4_4gb()),
+            trust,
             perm_socket.clone(),
         ));
         let server = Server::bind(&ai_socket).unwrap();
@@ -182,7 +199,7 @@ fn every_model_is_listed_whether_or_not_it_can_run_here() {
     let h = Harness::start("list");
     let value = h.call("ai.models.list", json!({}), "ai.read");
     let models = value["models"].as_array().unwrap();
-    assert_eq!(models.len(), 4, "{models:#?}");
+    assert_eq!(models.len(), 5, "{models:#?}");
     assert!(value["problems"].as_array().unwrap().is_empty());
 
     for m in models {

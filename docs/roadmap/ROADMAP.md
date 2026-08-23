@@ -122,10 +122,14 @@ function, the on-disk catalog, and `otwono-aid` serving `ai.capabilities`,
 criterion that does not need an engine — is met and tested on both architectures'
 fixture profiles.
 
+**Done (slice 2):** manifest signature verification against a `/etc/otwono/publishers.d`
+trust store that ships empty, with trusted / unsigned / untrusted-publisher / tampered kept
+as four distinct outcomes; and the out-of-process backend supervisor, with its crash, hang,
+protocol and flooding paths tested against a fake backend.
+
 **Still open:** no inference engine is linked, so `ai.infer` refuses and the `ai.infer`
-half of the exit criterion is not met. Manifest signatures are carried and their absence
-enforced, but not verified. No model download, no embeddings, ASR or TTS, no GPU/NPU
-backend, no tiered assistant shapes.
+half of the exit criterion is not met. No model download, no embeddings, ASR or TTS, no
+GPU/NPU backend, no tiered assistant shapes.
 
 ---
 

@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::backend::{select_backend, BackendId, BackendSelection, SelectionError};
 use crate::manifest::{ManifestError, ModelManifest};
+use crate::signature::{PublisherTrust, SignatureError, SignatureStatus};
 
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
@@ -35,10 +36,13 @@ pub struct AdmissionRequest {
     /// Concurrent sequences sharing the weights.
     #[serde(default = "one")]
     pub sequences: u32,
-    /// Permit a model whose manifest carries no signature.
+    /// Permit a model whose manifest carries no signature, or one signed by a publisher
+    /// this node does not trust.
     ///
     /// Explicit because an unsigned model that can call tools is executable content from
-    /// an unverified source (`docs/ai/AI-RUNTIME.md` §5).
+    /// an unverified source (`docs/ai/AI-RUNTIME.md` §5). It does **not** permit a *broken*
+    /// signature: a manifest that has been altered since signing is refused whatever this
+    /// is set to.
     #[serde(default)]
     pub allow_unsigned: bool,
 }
@@ -128,15 +132,11 @@ pub fn admit(
     profile: &CapabilityProfile,
     request: &AdmissionRequest,
     available_backends: &[BackendId],
+    trust: &PublisherTrust,
 ) -> Result<Admission, AdmissionError> {
     manifest.validate().map_err(AdmissionError::Manifest)?;
 
-    if !request.allow_unsigned && !manifest.is_signed() {
-        return Err(AdmissionError::UnsignedModel {
-            model_id: manifest.id.clone(),
-            tool_capable: manifest.is_unsigned_and_tool_capable(),
-        });
-    }
+    let provenance = check_provenance(manifest, request, trust)?;
 
     if profile.tier < manifest.min_tier {
         return Err(AdmissionError::ModelTooLargeForTier {
@@ -190,7 +190,7 @@ pub fn admit(
         });
     }
 
-    let mut warnings = Vec::new();
+    let mut warnings = provenance;
     // Fitting with almost nothing to spare is not the same as fitting. Say so rather than
     // letting the user discover it when the machine starts swapping.
     if budget > 0 && required * 10 > budget * 9 {
@@ -198,13 +198,6 @@ pub fn admit(
             "this load uses {}% of the model budget; the node will have little headroom",
             required.saturating_mul(100) / budget.max(1)
         ));
-    }
-    if manifest.is_unsigned_and_tool_capable() {
-        warnings.push(
-            "unsigned model with tool access: it is executable content from an unverified \
-             source, and tool permissions should be restricted accordingly"
-                .to_string(),
-        );
     }
 
     Ok(Admission {
@@ -218,6 +211,67 @@ pub fn admit(
         pool,
         warnings,
     })
+}
+
+/// Decide whether this manifest's provenance is acceptable, returning any warnings.
+///
+/// Three outcomes, kept apart on purpose:
+///
+/// * **Trusted** — signature verifies and the publisher is known. Nothing to say.
+/// * **Unsigned or untrusted publisher** — refused unless the caller opted in. Opting in is
+///   a reasonable thing for a user to do with a model they fetched themselves.
+/// * **Broken signature** — always refused. `allow_unsigned` does not cover it, because a
+///   manifest altered since signing is not an unsigned manifest, it is a tampered one, and
+///   an opt-in meant for "I know where this came from" must not silently cover "somebody
+///   changed this in transit".
+fn check_provenance(
+    manifest: &ModelManifest,
+    request: &AdmissionRequest,
+    trust: &PublisherTrust,
+) -> Result<Vec<String>, AdmissionError> {
+    match manifest.verify_signature(trust) {
+        Ok(SignatureStatus::Trusted { .. }) => Ok(Vec::new()),
+        Ok(SignatureStatus::Unsigned) => {
+            if request.allow_unsigned {
+                let mut warnings = vec![format!(
+                    "{} is unsigned; nobody vouches for these weights",
+                    manifest.id
+                )];
+                if manifest.supports(crate::manifest::ModelCapability::Tools) {
+                    warnings.push(
+                        "unsigned model with tool access: it is executable content from an \
+                         unverified source, and tool permissions should be restricted \
+                         accordingly"
+                            .to_string(),
+                    );
+                }
+                Ok(warnings)
+            } else {
+                Err(AdmissionError::UnsignedModel {
+                    model_id: manifest.id.clone(),
+                    tool_capable: manifest.is_unsigned_and_tool_capable(),
+                })
+            }
+        }
+        Err(SignatureError::UntrustedPublisher { public_key }) => {
+            if request.allow_unsigned {
+                Ok(vec![format!(
+                    "{} is signed by a publisher this node does not trust; the signature is \
+                     intact but its author is unknown",
+                    manifest.id
+                )])
+            } else {
+                Err(AdmissionError::UntrustedPublisher {
+                    model_id: manifest.id.clone(),
+                    public_key,
+                })
+            }
+        }
+        Err(e) => Err(AdmissionError::BadSignature {
+            model_id: manifest.id.clone(),
+            reason: e,
+        }),
+    }
 }
 
 /// Total VRAM across accelerators that report it.
@@ -245,6 +299,7 @@ pub fn largest_admissible_context(
     profile: &CapabilityProfile,
     request: &AdmissionRequest,
     available_backends: &[BackendId],
+    trust: &PublisherTrust,
 ) -> Option<u32> {
     let mut best = None;
     // Powers of two from 1k up to the model's maximum: the granularity a caller would
@@ -255,7 +310,7 @@ pub fn largest_admissible_context(
             context_tokens: Some(ctx),
             ..request.clone()
         };
-        if admit(manifest, profile, &probe, available_backends).is_ok() {
+        if admit(manifest, profile, &probe, available_backends, trust).is_ok() {
             best = Some(ctx);
         } else {
             break;
@@ -292,6 +347,16 @@ pub enum AdmissionError {
     UnsignedModel {
         model_id: String,
         tool_capable: bool,
+    },
+    /// The signature is intact but the publisher is unknown to this node.
+    UntrustedPublisher {
+        model_id: String,
+        public_key: String,
+    },
+    /// The signature does not verify. Never opt-in-able.
+    BadSignature {
+        model_id: String,
+        reason: SignatureError,
     },
     /// An offloading backend on a device whose VRAM could not be read.
     UnknownAcceleratorMemory {
@@ -365,6 +430,14 @@ impl std::fmt::Display for AdmissionError {
                 }
                 write!(f, "; loading it requires an explicit opt-in")
             }
+            AdmissionError::UntrustedPublisher { model_id, .. } => write!(
+                f,
+                "{model_id} is signed by a publisher this node does not trust; loading it \
+                 requires an explicit opt-in, or add the key to /etc/otwono/publishers.d"
+            ),
+            AdmissionError::BadSignature { model_id, reason } => {
+                write!(f, "{model_id}: {reason}")
+            }
             AdmissionError::UnknownAcceleratorMemory { backend } => write!(
                 f,
                 "{} offloads to the accelerator, but this machine reports no usable VRAM figure; \
@@ -381,17 +454,34 @@ impl std::error::Error for AdmissionError {}
 mod tests {
     use super::*;
     use crate::manifest::fixtures::*;
-    use crate::manifest::{ModelCapability, Signature};
+    use crate::manifest::ModelCapability;
+    use crate::signature::testing::sign;
     use otwono_capability::classify;
     use otwono_capability::testing::{report_pi4_4gb, report_pi5_16gb, report_pi_zero, report_workstation};
 
-    fn signed(mut m: ModelManifest) -> ModelManifest {
-        m.signature = Some(Signature {
-            algorithm: "ed25519".into(),
-            public_key: "AA==".into(),
-            signature: "AA==".into(),
-        });
-        m
+    /// Sign a manifest and remember the trust store that accepts it.
+    ///
+    /// Tests now sign for real rather than pasting a placeholder: an admission test whose
+    /// signature was never checked would stop proving anything the moment verification
+    /// became part of the path.
+    fn signed(mut m: ModelManifest) -> (ModelManifest, PublisherTrust) {
+        let trust = sign(&mut m, 42);
+        (m, trust)
+    }
+
+    /// Sign, then admit. Keeps the signing detail out of tests that are about memory.
+    fn admit_signed(
+        manifest: ModelManifest,
+        profile: &CapabilityProfile,
+        request: &AdmissionRequest,
+        backends: &[BackendId],
+    ) -> Result<Admission, AdmissionError> {
+        let (m, trust) = signed(manifest);
+        admit(&m, profile, request, backends, &trust)
+    }
+
+    fn trust_none() -> PublisherTrust {
+        PublisherTrust::empty()
     }
 
     fn cpu() -> Vec<BackendId> {
@@ -413,7 +503,7 @@ mod tests {
 
     #[test]
     fn a_small_model_is_admitted_on_a_capable_board() {
-        let a = admit(&signed(tiny()), &pi5(), &AdmissionRequest::default(), &cpu())
+        let a = admit_signed(tiny(), &pi5(), &AdmissionRequest::default(), &cpu())
             .expect("a 1B model must run on a 16 GiB Pi 5");
         assert_eq!(a.pool, MemoryPool::SystemRam);
         assert_eq!(a.selection.backend, BackendId::LlamaCppCpu);
@@ -424,7 +514,7 @@ mod tests {
     fn the_tier_gate_refuses_before_any_memory_arithmetic() {
         // The exit criterion for Phase 4: ModelTooLargeForTier must be an observed result,
         // not a branch nobody reaches.
-        let err = admit(&signed(huge()), &pi_zero(), &AdmissionRequest::default(), &cpu()).unwrap_err();
+        let err = admit_signed(huge(), &pi_zero(), &AdmissionRequest::default(), &cpu()).unwrap_err();
         let AdmissionError::ModelTooLargeForTier {
             node_tier, min_tier, ..
         } = &err
@@ -441,10 +531,12 @@ mod tests {
     fn a_model_that_passes_the_tier_gate_can_still_be_refused_on_memory() {
         // Tier is a coarse guide; actual free memory is the binding constraint. A node
         // that trusted the tier alone would OOM here.
-        let mut m = signed(tiny());
+        let mut m = tiny();
         m.min_tier = Tier::T0Micro;
         m.footprint.weights_bytes = 4 * GIB;
-        let err = admit(&m, &pi4(), &AdmissionRequest::default(), &cpu()).unwrap_err();
+        // Signed last: the signature has to cover the manifest the test actually uses.
+        let trust = sign(&mut m, 42);
+        let err = admit(&m, &pi4(), &AdmissionRequest::default(), &cpu(), &trust).unwrap_err();
         assert!(
             matches!(err, AdmissionError::InsufficientMemory { .. }),
             "{err:?}"
@@ -458,14 +550,16 @@ mod tests {
         // and has nothing left to run the daemons that answer the request.
         let profile = pi5();
         let available = profile.hardware.memory.available_bytes;
-        let mut m = signed(tiny());
+        let mut m = tiny();
         m.min_tier = Tier::T0Micro;
         m.footprint = crate::manifest::Footprint {
             weights_bytes: available,
             kv_per_1k_ctx_bytes: 0,
             overhead_bytes: 0,
         };
-        let err = admit(&m, &profile, &AdmissionRequest::default(), &cpu()).unwrap_err();
+        // Signed last: the signature has to cover the manifest the test actually uses.
+        let trust = sign(&mut m, 42);
+        let err = admit(&m, &profile, &AdmissionRequest::default(), &cpu(), &trust).unwrap_err();
         assert!(
             matches!(err, AdmissionError::InsufficientMemory { .. }),
             "{err:?}"
@@ -487,10 +581,12 @@ mod tests {
         // The failure users actually hit: it loaded fine yesterday, then a long
         // conversation killed it.
         let profile = pi4();
-        let mut m = signed(tiny());
+        let mut m = tiny();
         m.min_tier = Tier::T0Micro;
         m.max_context = 131_072;
         m.footprint.kv_per_1k_ctx_bytes = 64 * MIB;
+        // Signed last: the signature has to cover the manifest the test actually uses.
+        let trust = sign(&mut m, 42);
 
         let short = AdmissionRequest {
             context_tokens: Some(2048),
@@ -500,9 +596,9 @@ mod tests {
             context_tokens: Some(131_072),
             ..Default::default()
         };
-        assert!(admit(&m, &profile, &short, &cpu()).is_ok());
+        assert!(admit(&m, &profile, &short, &cpu(), &trust).is_ok());
         assert!(matches!(
-            admit(&m, &profile, &long, &cpu()),
+            admit(&m, &profile, &long, &cpu(), &trust),
             Err(AdmissionError::InsufficientMemory { .. })
         ));
     }
@@ -511,21 +607,23 @@ mod tests {
     fn the_default_context_is_the_models_maximum_not_its_minimum() {
         // Admitting on the strength of a short first turn is how a session gets killed
         // three messages later.
-        let m = signed(medium());
-        let a = admit(&m, &workstation(), &AdmissionRequest::default(), &cpu()).unwrap();
+        let (m, trust) = signed(medium());
+        let a = admit(&m, &workstation(), &AdmissionRequest::default(), &cpu(), &trust).unwrap();
         assert_eq!(a.context_tokens, m.max_context);
     }
 
     #[test]
     fn a_refusal_suggests_the_largest_context_that_would_work() {
         let profile = pi4();
-        let mut m = signed(tiny());
+        let mut m = tiny();
         m.min_tier = Tier::T0Micro;
         m.max_context = 131_072;
         m.footprint.kv_per_1k_ctx_bytes = 64 * MIB;
-        assert!(admit(&m, &profile, &AdmissionRequest::default(), &cpu()).is_err());
+        // Signed last: the signature has to cover the manifest the test actually uses.
+        let trust = sign(&mut m, 42);
+        assert!(admit(&m, &profile, &AdmissionRequest::default(), &cpu(), &trust).is_err());
 
-        let best = largest_admissible_context(&m, &profile, &AdmissionRequest::default(), &cpu())
+        let best = largest_admissible_context(&m, &profile, &AdmissionRequest::default(), &cpu(), &trust)
             .expect("something must fit");
         assert!(best >= 1024 && best < m.max_context, "best {best}");
         let ok = AdmissionRequest {
@@ -533,31 +631,33 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            admit(&m, &profile, &ok, &cpu()).is_ok(),
+            admit(&m, &profile, &ok, &cpu(), &trust).is_ok(),
             "the suggestion must be real"
         );
     }
 
     #[test]
     fn a_model_that_never_fits_suggests_nothing_rather_than_lying() {
-        let mut m = signed(tiny());
+        let mut m = tiny();
         m.min_tier = Tier::T0Micro;
         m.footprint.weights_bytes = 512 * GIB;
+        // Signed last: the signature has to cover the manifest the test actually uses.
+        let trust = sign(&mut m, 42);
         assert_eq!(
-            largest_admissible_context(&m, &pi5(), &AdmissionRequest::default(), &cpu()),
+            largest_admissible_context(&m, &pi5(), &AdmissionRequest::default(), &cpu(), &trust),
             None
         );
     }
 
     #[test]
     fn asking_for_more_context_than_the_model_has_is_its_own_error() {
-        let m = signed(tiny());
+        let (m, trust) = signed(tiny());
         let req = AdmissionRequest {
             context_tokens: Some(m.max_context + 1),
             ..Default::default()
         };
         assert!(matches!(
-            admit(&m, &workstation(), &req, &cpu()),
+            admit(&m, &workstation(), &req, &cpu(), &trust),
             Err(AdmissionError::ContextTooLong { .. })
         ));
     }
@@ -565,25 +665,27 @@ mod tests {
     #[test]
     fn an_unsigned_model_is_refused_until_the_caller_opts_in() {
         let m = tiny(); // unsigned
-        let err = admit(&m, &pi5(), &AdmissionRequest::default(), &cpu()).unwrap_err();
+        let trust = trust_none();
+        let err = admit(&m, &pi5(), &AdmissionRequest::default(), &cpu(), &trust).unwrap_err();
         assert!(matches!(err, AdmissionError::UnsignedModel { .. }), "{err:?}");
 
         let opt_in = AdmissionRequest {
             allow_unsigned: true,
             ..Default::default()
         };
-        assert!(admit(&m, &pi5(), &opt_in, &cpu()).is_ok());
+        assert!(admit(&m, &pi5(), &opt_in, &cpu(), &trust).is_ok());
     }
 
     #[test]
     fn an_unsigned_tool_capable_model_is_admitted_with_a_warning_not_silently() {
         let mut m = tiny();
         m.capabilities.push(ModelCapability::Tools);
+        let trust = trust_none();
         let opt_in = AdmissionRequest {
             allow_unsigned: true,
             ..Default::default()
         };
-        let a = admit(&m, &pi5(), &opt_in, &cpu()).unwrap();
+        let a = admit(&m, &pi5(), &opt_in, &cpu(), &trust).unwrap();
         assert!(
             a.warnings.iter().any(|w| w.contains("executable content")),
             "{:?}",
@@ -592,14 +694,104 @@ mod tests {
     }
 
     #[test]
+    fn a_tampered_manifest_is_refused_even_with_allow_unsigned() {
+        // The distinction that matters most in this module. `allow_unsigned` means "I know
+        // where this came from"; it must never silently cover "somebody changed this in
+        // transit". A broken signature has no opt-in.
+        let mut m = tiny();
+        m.min_tier = Tier::T0Micro;
+        let trust = sign(&mut m, 42);
+        m.footprint.weights_bytes = 1; // altered after signing
+
+        for allow in [false, true] {
+            let req = AdmissionRequest {
+                allow_unsigned: allow,
+                ..Default::default()
+            };
+            let err = admit(&m, &pi5(), &req, &cpu(), &trust).unwrap_err();
+            assert!(
+                matches!(err, AdmissionError::BadSignature { .. }),
+                "allow_unsigned={allow} must not excuse tampering, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_valid_signature_from_an_unknown_publisher_is_opt_in_able() {
+        // Intact but unknown is a different situation from tampered, and a user who
+        // fetched a model themselves should be able to proceed.
+        let mut m = tiny();
+        m.min_tier = Tier::T0Micro;
+        let _theirs = sign(&mut m, 7);
+
+        let err = admit(&m, &pi5(), &AdmissionRequest::default(), &cpu(), &trust_none()).unwrap_err();
+        assert!(
+            matches!(err, AdmissionError::UntrustedPublisher { .. }),
+            "{err:?}"
+        );
+
+        let opt_in = AdmissionRequest {
+            allow_unsigned: true,
+            ..Default::default()
+        };
+        let a = admit(&m, &pi5(), &opt_in, &cpu(), &trust_none()).unwrap();
+        assert!(
+            a.warnings.iter().any(|w| w.contains("does not trust")),
+            "the admission must carry the caveat: {:?}",
+            a.warnings
+        );
+    }
+
+    #[test]
+    fn a_trusted_signature_admits_with_no_provenance_warning() {
+        let a = admit_signed(tiny(), &pi5(), &AdmissionRequest::default(), &cpu()).unwrap();
+        assert!(
+            !a.warnings
+                .iter()
+                .any(|w| w.contains("unsigned") || w.contains("trust")),
+            "nothing to warn about: {:?}",
+            a.warnings
+        );
+    }
+
+    #[test]
+    fn an_unsigned_admission_says_so_in_its_warnings() {
+        // Admitted is not the same as vouched for, and the record should show which.
+        let opt_in = AdmissionRequest {
+            allow_unsigned: true,
+            ..Default::default()
+        };
+        let a = admit(&tiny(), &pi5(), &opt_in, &cpu(), &trust_none()).unwrap();
+        assert!(
+            a.warnings.iter().any(|w| w.contains("nobody vouches")),
+            "{:?}",
+            a.warnings
+        );
+    }
+
+    #[test]
+    fn provenance_is_checked_before_anything_expensive() {
+        // A model too big for the tier *and* tampered with should report the tampering:
+        // the cheap, security-relevant check comes first.
+        let mut m = huge();
+        let trust = sign(&mut m, 42);
+        m.parameters += 1;
+        let err = admit(&m, &pi_zero(), &AdmissionRequest::default(), &cpu(), &trust).unwrap_err();
+        assert!(matches!(err, AdmissionError::BadSignature { .. }), "{err:?}");
+    }
+
+    #[test]
     fn a_gpu_model_is_charged_against_vram_not_system_ram() {
-        let mut m = signed(medium());
+        let mut m = medium();
         m.backends = vec![BackendId::LlamaCppCuda];
+        // Signed last: the signature has to cover the manifest the test actually uses.
+        let trust = sign(&mut m, 42);
         let a = admit(
             &m,
             &workstation(),
             &AdmissionRequest::default(),
             &[BackendId::LlamaCppCuda],
+            &trust,
         )
         .unwrap();
         assert_eq!(a.pool, MemoryPool::AcceleratorVram);
@@ -618,13 +810,16 @@ mod tests {
             a.vram_bytes = None;
         }
         let profile = classify(&report);
-        let mut m = signed(medium());
+        let mut m = medium();
         m.backends = vec![BackendId::LlamaCppCuda];
+        // Signed last: the signature has to cover the manifest the test actually uses.
+        let trust = sign(&mut m, 42);
         let err = admit(
             &m,
             &profile,
             &AdmissionRequest::default(),
             &[BackendId::LlamaCppCuda],
+            &trust,
         )
         .unwrap_err();
         assert!(
@@ -638,7 +833,7 @@ mod tests {
     fn with_no_backend_installed_nothing_is_admitted_anywhere() {
         // Today's honest state on every machine.
         for profile in [pi_zero(), pi4(), pi5(), workstation()] {
-            let err = admit(&signed(tiny()), &profile, &AdmissionRequest::default(), &[]);
+            let err = admit_signed(tiny(), &profile, &AdmissionRequest::default(), &[]);
             assert!(
                 matches!(err, Err(AdmissionError::NoBackendAvailable(_))) || err.is_err(),
                 "{err:?}"
@@ -650,14 +845,16 @@ mod tests {
     fn a_tight_fit_is_admitted_but_flagged() {
         let profile = pi4();
         let budget = profile.hardware.memory.available_bytes - Reserve::for_tier(profile.tier).bytes;
-        let mut m = signed(tiny());
+        let mut m = tiny();
         m.min_tier = Tier::T0Micro;
         m.footprint = crate::manifest::Footprint {
             weights_bytes: budget - MIB,
             kv_per_1k_ctx_bytes: 0,
             overhead_bytes: 0,
         };
-        let a = admit(&m, &profile, &AdmissionRequest::default(), &cpu()).unwrap();
+        // Signed last: the signature has to cover the manifest the test actually uses.
+        let trust = sign(&mut m, 42);
+        let a = admit(&m, &profile, &AdmissionRequest::default(), &cpu(), &trust).unwrap();
         assert!(
             a.warnings.iter().any(|w| w.contains("headroom")),
             "{:?}",
@@ -667,10 +864,12 @@ mod tests {
 
     #[test]
     fn a_malformed_manifest_is_refused_before_anything_else_is_considered() {
-        let mut m = signed(tiny());
+        let mut m = tiny();
         m.footprint.weights_bytes = 0;
+        // Signed last: the signature has to cover the manifest the test actually uses.
+        let trust = sign(&mut m, 42);
         assert!(matches!(
-            admit(&m, &workstation(), &AdmissionRequest::default(), &cpu()),
+            admit(&m, &workstation(), &AdmissionRequest::default(), &cpu(), &trust),
             Err(AdmissionError::Manifest(_))
         ));
     }
@@ -678,10 +877,12 @@ mod tests {
     #[test]
     fn concurrent_sequences_are_charged_and_can_tip_a_fit_into_a_refusal() {
         let profile = pi5();
-        let mut m = signed(tiny());
+        let mut m = tiny();
         m.min_tier = Tier::T0Micro;
         m.max_context = 8192;
         m.footprint.kv_per_1k_ctx_bytes = 512 * MIB;
+        // Signed last: the signature has to cover the manifest the test actually uses.
+        let trust = sign(&mut m, 42);
         let single = AdmissionRequest {
             sequences: 1,
             ..Default::default()
@@ -690,9 +891,9 @@ mod tests {
             sequences: 8,
             ..Default::default()
         };
-        assert!(admit(&m, &profile, &single, &cpu()).is_ok());
+        assert!(admit(&m, &profile, &single, &cpu(), &trust).is_ok());
         assert!(matches!(
-            admit(&m, &profile, &many, &cpu()),
+            admit(&m, &profile, &many, &cpu(), &trust),
             Err(AdmissionError::InsufficientMemory { .. })
         ));
     }
@@ -700,9 +901,11 @@ mod tests {
     #[test]
     fn every_refusal_names_the_model_and_a_number() {
         // A refusal a user cannot act on is barely better than a crash.
-        let mut m = signed(huge());
+        let mut m = huge();
         m.min_tier = Tier::T0Micro;
-        let err = admit(&m, &pi4(), &AdmissionRequest::default(), &cpu()).unwrap_err();
+        // Signed last: the signature has to cover the manifest the test actually uses.
+        let trust = sign(&mut m, 42);
+        let err = admit(&m, &pi4(), &AdmissionRequest::default(), &cpu(), &trust).unwrap_err();
         let text = err.to_string();
         assert!(text.contains("huge-70b-q4"), "{text}");
         assert!(text.contains("GiB"), "{text}");

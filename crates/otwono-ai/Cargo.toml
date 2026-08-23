@@ -9,9 +9,20 @@ repository.workspace = true
 
 [dependencies]
 otwono-capability = { workspace = true }
+# For Ed25519 verification. One signature primitive in the system, not two (CLAUDE.md §2.3).
+otwono-identity = { workspace = true }
 otwono-hal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
+data-encoding = "2"
+# For killing a backend's whole process group without unsafe.
+rustix = { version = "0.38", features = ["process"] }
 
 [dev-dependencies]
 otwono-capability = { workspace = true, features = ["testing"] }
+
+[features]
+# Exposes `signature::testing` so other crates' tests can produce genuinely signed
+# manifests. Never enabled in a shipped binary.
+testing = []

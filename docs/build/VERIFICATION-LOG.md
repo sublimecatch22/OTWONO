@@ -555,3 +555,101 @@ wrote to it, and that is the defect that check exists to catch.
 - **Admission is tested against fixture profiles, not against real memory pressure.** The
   arithmetic and every refusal are unit-tested; no machine has yet been pushed to the point
   where the reserve is what saved it.
+
+---
+
+## Phase 4 slice 2 — provenance, and a backend that cannot hang the daemon
+
+Two things that had to be in place *before* an inference engine, not after: the check that
+decides whether a model may be loaded at all, and the supervision contract the engine will
+run behind.
+
+### Boot verification, both targets
+
+| Target | Result |
+|---|---|
+| `make TARGET=amd64-qemu-ubuntu verify` | PASS |
+| `make TARGET=arm64-qemu-ubuntu verify` | PASS |
+
+```
+OTWONO-AI-OK tier=T0_MICRO local_inference=unavailable models=0 publishers=0
+```
+
+`publishers=0` is the shipped default and is deliberate. No publisher key is baked into the
+image: shipping one would mean every OTWONO node automatically trusts whoever holds it,
+which is the node operator's decision and not the image builder's.
+
+### Workspace
+
+| Command | Result |
+|---|---|
+| `cargo test --workspace` | **365 tests pass** (332 before) |
+| `clippy -D warnings`, `fmt --check`, `shellcheck -S warning` | clean |
+
+### Four provenance outcomes, not two
+
+| Outcome | Loadable |
+|---|---|
+| Signature verifies, publisher trusted | yes |
+| No signature | only with an explicit opt-in |
+| Signature verifies, publisher unknown | only with an explicit opt-in |
+| **Signature does not verify** | **never** |
+
+The last row is the point. `allow_unsigned` means *"I know where this came from"*; it must
+never silently cover *"somebody changed this in transit"*. There is a test asserting a
+tampered manifest is refused with `allow_unsigned` both false and true.
+
+The canonicalizer is written out rather than delegated to `serde_json`'s key ordering.
+`serde_json` sorts keys today only because `preserve_order` is off, and any transitive
+dependency can turn that on. The meaning of every signature must not depend on a feature
+flag nobody is watching.
+
+### Supervision, proved against a backend that misbehaves to order
+
+Thirteen tests run a shell script as the "backend" and make it hang, die with a status,
+die by signal, emit garbage instead of a hello, claim a future protocol version, flood a
+single line past the cap, and answer non-JSON. A process boundary is the whole subject, so
+an in-process double would have proved nothing — it cannot hang in a blocking read or be
+killed by a signal.
+
+### Two defects this found, both in code written the same hour
+
+**15. The supervisor could hang inside the code meant to prevent hanging.** The first
+version spawned a reader thread per read and joined it. On timeout it killed the child —
+but the fake backend's `sleep` grandchild survived, inherited stdout, and held the pipe
+open, so the join never returned. The test suite wedged, and three `sleep 600` processes
+were still running afterwards.
+
+Fixed two ways, both necessary. One long-lived reader thread feeding a channel, so nothing
+is ever joined; and `process_group(0)` at spawn with a group-wide kill on terminate, so the
+whole backend subtree dies. The second matters beyond the test: a real backend is a wrapper
+script around an engine, and killing only the wrapper leaves the engine holding gigabytes.
+
+**16. A zombie is not a running process, and the test could not tell.** The subtree-kill
+test checked `/proc/<pid>` for existence. When the wrapper dies its children are reparented,
+and whether they are reaped promptly is up to whatever PID 1 is — inside a container, often
+nothing. The `/proc` entry lingers on a killed process, so the test flaked. It now reads the
+process state and treats `Z` as dead, which is the honest reading: the property under test
+is that the process was killed, not that somebody collected its exit status.
+
+Both were caught by tests written in the same change as the code, which is the only reason
+they were caught at all — neither would have shown up until a real engine hung in
+production.
+
+### One thing worth recording about the test fixtures
+
+Turning on verification broke the integration fixtures, which carried a placeholder
+`"AA=="` signature. That is the correct failure: a test that pastes a fake signature stops
+proving anything the moment verification joins the path. They now sign for real, via a
+`testing` feature on `otwono-ai`, with two publisher keys so *trusted* and *unknown signer*
+are both reachable.
+
+### What slice 2 has *not* done
+
+- **Still no inference.** `installed_backends()` is empty and `ai.infer` refuses. The
+  supervisor has never run an inference engine — only shell scripts pretending to be one.
+- **The `hello` protocol is asserted, not negotiated.** One version, no capability
+  exchange, no streaming. Streaming is what real inference needs and it is not here.
+- **No publisher key is distributed.** The trust store works; nothing populates it.
+- **Signature verification has not been exercised on a booted node with a real signed
+  model,** because there are no models. Only `publishers=0` has been observed on hardware.

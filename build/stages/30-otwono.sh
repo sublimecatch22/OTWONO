@@ -28,7 +28,8 @@ install -d -m 0755 "$ROOTFS/usr/share/otwono/schemas"
 install -m 0644 "$REPO_ROOT"/schemas/*.json "$ROOTFS/usr/share/otwono/schemas/"
 
 log "creating the OTWONO state directories"
-install -d -m 0755 "$ROOTFS/etc/otwono" "$ROOTFS/etc/otwono/policy.d"
+install -d -m 0755 "$ROOTFS/etc/otwono" "$ROOTFS/etc/otwono/policy.d" \
+    "$ROOTFS/etc/otwono/publishers.d"
 install -d -m 0700 "$ROOTFS/var/lib/otwono" "$ROOTFS/var/lib/otwono/identity"
 # The model catalog. Manifests are public metadata; blobs are large and content-addressed.
 # Ships empty: models are never committed and never baked into an image (CLAUDE.md §9).
@@ -167,6 +168,29 @@ ttl_seconds = 300
 # a rule here would grant a capability for something that cannot happen — and when an
 # engine does land, running a model is a decision an operator should make on purpose.
 POLICY
+
+log "installing the model publisher trust store"
+# Ships empty, and empty means trust nobody. A model signed by a publisher this node has
+# not been told about is refused unless the caller explicitly opts in — the same treatment
+# as an unsigned one. A *broken* signature is refused either way.
+#
+# No default publisher key is baked in. Shipping one would mean every OTWONO node
+# automatically trusts whoever holds it, which is a decision for the person running the
+# node, not for whoever built the image.
+cat > "$ROOTFS/etc/otwono/publishers.d/README" <<'READMEEOF'
+Trusted model publishers.
+
+Drop a .toml file here to trust a publisher's Ed25519 signing key:
+
+    [[publisher]]
+    name = "Example model catalog"
+    public_key = "<base64 Ed25519 public key>"
+
+Empty means trust nobody, which is the shipped default. Models signed by an unknown
+publisher, and unsigned models, both require an explicit opt-in to load. A model whose
+signature does not verify is refused regardless: it has been altered since it was signed.
+READMEEOF
+chmod 0644 "$ROOTFS/etc/otwono/publishers.d/README"
 
 log "installing the control-plane runtime directory"
 install -d -m 0755 "$ROOTFS/usr/lib/tmpfiles.d"
@@ -475,7 +499,7 @@ RequiresMountsFor=/var/lib/otwono
 
 [Service]
 Type=exec
-ExecStart=/usr/bin/otwono-aid --socket /run/otwono/ai.sock --perm-socket /run/otwono/perm.sock --hw-socket /run/otwono/hw.sock --model-dir /var/lib/otwono/models
+ExecStart=/usr/bin/otwono-aid --socket /run/otwono/ai.sock --perm-socket /run/otwono/perm.sock --hw-socket /run/otwono/hw.sock --model-dir /var/lib/otwono/models --publishers /etc/otwono/publishers.d
 Restart=on-failure
 RestartSec=2
 

@@ -20,11 +20,13 @@ while [ ! -S /run/otwono/ai.sock ] && [ "$i" -lt 60 ]; do
 done
 [ -S /run/otwono/ai.sock ] || { echo "OTWONO-AI-FAIL no socket at /run/otwono/ai.sock" >&2; exit 1; }
 
-STATUS=$(/usr/bin/otwono-aid --capabilities --model-dir /var/lib/otwono/models)
+STATUS=$(/usr/bin/otwono-aid --capabilities --model-dir /var/lib/otwono/models \
+    --publishers /etc/otwono/publishers.d)
 
 tier=$(echo "$STATUS" | awk '/^tier/ {print $2}')
 infer=$(echo "$STATUS" | awk '/^local infer/ {print $3}')
 models=$(echo "$STATUS" | awk '/^models/ {print $2}')
+publishers=$(echo "$STATUS" | awk '/^publishers/ {print $2}')
 
 [ -n "$tier" ] || { echo "OTWONO-AI-FAIL no tier from otwono-aid" >&2; exit 1; }
 [ -n "$infer" ] || { echo "OTWONO-AI-FAIL no inference status from otwono-aid" >&2; exit 1; }
@@ -35,4 +37,12 @@ for d in /var/lib/otwono/models/manifests /var/lib/otwono/models/blobs; do
     [ -d "$d" ] || { echo "OTWONO-AI-FAIL missing catalog directory $d" >&2; exit 1; }
 done
 
-echo "OTWONO-AI-OK tier=$tier local_inference=$infer models=$models"
+# The trust store must be readable. Empty is fine and is the shipped default; unreadable
+# is not, because it would silently become "trust nobody" for the wrong reason.
+[ -d /etc/otwono/publishers.d ] || {
+    echo "OTWONO-AI-FAIL missing publisher trust store /etc/otwono/publishers.d" >&2
+    exit 1
+}
+[ -n "$publishers" ] || { echo "OTWONO-AI-FAIL no publisher count from otwono-aid" >&2; exit 1; }
+
+echo "OTWONO-AI-OK tier=$tier local_inference=$infer models=$models publishers=$publishers"

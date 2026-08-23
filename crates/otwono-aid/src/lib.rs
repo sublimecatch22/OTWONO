@@ -5,7 +5,9 @@
 //!
 //! # STATUS
 //!
-//! `ai.capabilities`, `ai.models.list` and `ai.admit` are implemented and tested.
+//! `ai.capabilities`, `ai.models.list` and `ai.admit` are implemented and tested, as is
+//! model signature verification against a configured publisher trust store, and the
+//! out-of-process backend supervisor the engine will eventually run behind.
 //! **`ai.infer` is not implemented.** No inference engine is linked into this build, and
 //! the method says so with `NoBackendAvailable` rather than returning a plausible-looking
 //! answer. That is deliberate: a stubbed `ai.infer` would be a mock on the default code
@@ -24,7 +26,7 @@
 
 use otwono_ai::{
     admission::{largest_admissible_context, MemoryPool},
-    admit, installed_backends, AdmissionRequest, Catalog,
+    admit, installed_backends, AdmissionRequest, Catalog, PublisherTrust,
 };
 use otwono_capability::CapabilityProfile;
 use otwono_proto::{
@@ -42,6 +44,7 @@ pub const CAPABILITY_INFER: &str = "ai.infer";
 pub struct AiService {
     catalog: Catalog,
     profile: CapabilityProfile,
+    trust: PublisherTrust,
     perm_socket: PathBuf,
 }
 
@@ -57,10 +60,16 @@ struct AdmitParams {
 }
 
 impl AiService {
-    pub fn new(catalog: Catalog, profile: CapabilityProfile, perm_socket: PathBuf) -> Self {
+    pub fn new(
+        catalog: Catalog,
+        profile: CapabilityProfile,
+        trust: PublisherTrust,
+        perm_socket: PathBuf,
+    ) -> Self {
         AiService {
             catalog,
             profile,
+            trust,
             perm_socket,
         }
     }
@@ -94,6 +103,7 @@ impl AiService {
             "limiting_factor": self.profile.limiting_factor,
             "accelerator": self.profile.axes.accelerator.as_str(),
             "installed_backends": backends.iter().map(|b| b.as_str()).collect::<Vec<_>>(),
+            "trusted_publishers": self.trust.len(),
             // The honest headline. Anything reading this to decide whether to offer a
             // local assistant needs one boolean, and it must not be optimistic.
             "local_inference_available": !backends.is_empty(),
@@ -122,6 +132,7 @@ impl AiService {
                     &self.profile,
                     &AdmissionRequest::default(),
                     &backends,
+                    &self.trust,
                 );
                 json!({
                     "id": entry.manifest.id,
@@ -131,6 +142,18 @@ impl AiService {
                     "min_tier": entry.manifest.min_tier.as_str(),
                     "max_context": entry.manifest.max_context,
                     "signed": entry.manifest.is_signed(),
+                    "provenance": match entry.manifest.verify_signature(&self.trust) {
+                        Ok(otwono_ai::SignatureStatus::Trusted { name, .. }) => json!({
+                            "status": "trusted", "publisher": name
+                        }),
+                        Ok(otwono_ai::SignatureStatus::Unsigned) => json!({ "status": "unsigned" }),
+                        Err(otwono_ai::SignatureError::UntrustedPublisher { .. }) => {
+                            json!({ "status": "untrusted_publisher" })
+                        }
+                        // A broken signature is worth surfacing in a listing, not only at
+                        // load time: it means the manifest was altered after signing.
+                        Err(e) => json!({ "status": "bad_signature", "reason": e.to_string() }),
+                    },
                     "weights_present": entry.weights_present,
                     "admissible": verdict.is_ok(),
                     "reason": verdict.as_ref().err().map(|e| e.to_string()),
@@ -163,7 +186,7 @@ impl AiService {
         };
         let backends = installed_backends();
 
-        match admit(&entry.manifest, &self.profile, &request, &backends) {
+        match admit(&entry.manifest, &self.profile, &request, &backends, &self.trust) {
             Ok(a) => Ok(json!({
                 "admissible": true,
                 "model_id": a.model_id,
@@ -186,8 +209,13 @@ impl AiService {
                 "admissible": false,
                 "model_id": entry.manifest.id,
                 "reason": e.to_string(),
-                "largest_admissible_context":
-                    largest_admissible_context(&entry.manifest, &self.profile, &request, &backends),
+                "largest_admissible_context": largest_admissible_context(
+                    &entry.manifest,
+                    &self.profile,
+                    &request,
+                    &backends,
+                    &self.trust,
+                ),
             })),
         }
     }

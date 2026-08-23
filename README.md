@@ -15,8 +15,9 @@ system, same subsystems, same interfaces — the capabilities scale to the hardw
 > cryptographic NodeID — and since ADR-0010 the daemon that talks to the network no longer
 > holds the key its NodeID names. Nothing has run on real hardware yet; there is no radio
 > link and no routing. **The AI runtime can now say what a node could run** — model
-> catalog, admission control, and a refusal path that is tested rather than assumed — but
-> no inference engine is linked, so `ai.infer` refuses and nothing here has run a model.
+> catalog, admission control, signed-manifest verification, and a supervised out-of-process
+> backend contract, all tested rather than assumed — but no inference engine is linked, so
+> `ai.infer` refuses and nothing here has run a model.
 > The daemons still run as root pending user separation.
 >
 > Every document and subsystem carries an explicit status (`SPECIFIED` / `IMPLEMENTED` /
