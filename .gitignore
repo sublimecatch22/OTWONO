@@ -29,3 +29,7 @@ id_ed25519*
 *~
 .idea/
 .vscode/
+
+# Python bytecode from running tools/ scripts.
+__pycache__/
+*.pyc
