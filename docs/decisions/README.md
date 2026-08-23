@@ -26,3 +26,4 @@ Rules:
 | 0009 | Mount-free image assembly, and the kernel on the ESP | accepted |
 | 0010 | Split the node's two keys across two daemons | accepted |
 | 0011 | Drive llama.cpp as a supervised adapter process, not a linked library | accepted |
+| 0012 | Confine the inference engine with Landlock, applied by the adapter to itself | accepted |

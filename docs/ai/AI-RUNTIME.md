@@ -105,10 +105,12 @@ about this node's reserve. That is asserted directly: a test reads the engine's
 - **Streaming.** One request, one response. Interactive use wants tokens as they are
   produced, which needs several frames per request *and* a control plane that can carry
   them to the caller. `llama-server` can stream; the gap is ours.
-- **Sandboxing the engine.** It is a large C++ program parsing untrusted model files and it
-  runs with the adapter's privileges, confined only by `otwono-aid.service`'s hardening and
-  a `MemoryMax=80%` cgroup cap. A `bubblewrap` or Landlock confinement is the right answer
-  and is not written.
+- ~~**Sandboxing the engine.**~~ Done: the adapter confines itself with Landlock before
+  starting an engine (ADR-0012), so the engine can read the model store and the system
+  libraries and nothing else of the node's — not the identity key, not the audit log, not
+  the policy store. It fails closed on a kernel without Landlock. What is still missing is
+  PID and mount isolation and a seccomp filter; `/proc` and `/sys` stay readable because
+  ggml's CPU detection needs them.
 - **Any backend other than llama.cpp.** whisper.cpp, Piper, ONNX Runtime and vLLM each need
   their own adapter. The protocol is deliberately engine-neutral so that is additive work.
 - **GPU variants.** The discovery layout has directories for `vulkan`, `cuda` and `rocm`,
@@ -122,7 +124,9 @@ Rules:
   exchange so a wrapper script's error message is a protocol error rather than a timeout,
   a deadline on every read, a cap on line length because a backend is a large C++ program
   parsing untrusted files, and **process-group kill** so terminating a wrapper does not
-  orphan the engine it started.
+  orphan the engine it started. Since ADR-0012 the adapter also confines itself with
+  Landlock before starting an engine, so the engine inherits a filesystem boundary it
+  cannot escape.
 - Backend selection comes from the capability profile plus the model manifest. It is a
   pure function, and it is unit-testable against fixture profiles with no hardware present.
 - A backend that fails to load falls back down the list and records why, so `ai.capabilities`

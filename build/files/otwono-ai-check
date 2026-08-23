@@ -31,6 +31,17 @@ publishers=$(echo "$STATUS" | awk '/^publishers/ {print $2}')
 # Everything after the "backends" label, since there may be several separated by commas.
 backends=$(echo "$STATUS" | sed -n 's/^backends *//p' | tr -d ' ')
 
+# Whether the kernel will confine the inference engine (ADR-0012). Asked of the adapter,
+# because finding out means actually applying a Landlock ruleset and only the adapter
+# knows how; --probe does it in a process that exits immediately.
+ADAPTER=/usr/libexec/otwono/ai-backends/otwono-llama-backend
+if [ -x "$ADAPTER" ]; then
+    sandbox=$("$ADAPTER" --probe 2>/dev/null | sed -n 's/^landlock=//p')
+    [ -n "$sandbox" ] || sandbox=unknown
+else
+    sandbox=no-adapter
+fi
+
 [ -n "$tier" ] || { echo "OTWONO-AI-FAIL no tier from otwono-aid" >&2; exit 1; }
 [ -n "$infer" ] || { echo "OTWONO-AI-FAIL no inference status from otwono-aid" >&2; exit 1; }
 
@@ -61,4 +72,11 @@ esac
     exit 1
 }
 
-echo "OTWONO-AI-OK tier=$tier local_inference=$infer backends=$backends models=$models publishers=$publishers"
+# A node with an engine installed but no confinement is reported, not failed: the operator
+# may have chosen that deliberately with --allow-unconfined, and a boot check is the wrong
+# place to overrule them. Printing it is what makes the choice visible.
+if [ "$backends" != "none" ] && [ "$sandbox" != "full" ]; then
+    echo "OTWONO-AI-WARN inference engine present but sandbox=$sandbox" >&2
+fi
+
+echo "OTWONO-AI-OK tier=$tier local_inference=$infer backends=$backends sandbox=$sandbox models=$models publishers=$publishers"

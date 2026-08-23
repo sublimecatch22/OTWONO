@@ -41,6 +41,7 @@
 pub mod engine;
 pub mod http;
 pub mod protocol;
+pub mod sandbox;
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -71,6 +72,13 @@ pub struct Adapter {
     engine: Option<Engine>,
     engine_version: String,
     infer_timeout: Duration,
+    /// The confinement this process is already under, if any.
+    ///
+    /// Held so a load can be refused *before* the engine is started when the model sits
+    /// outside the sandbox. Without it the failure would arrive from inside the engine as
+    /// a permission error on a file it declines to say much about, and an operator would
+    /// reasonably suspect the model rather than the policy.
+    policy: Option<sandbox::Policy>,
 }
 
 impl Adapter {
@@ -81,7 +89,14 @@ impl Adapter {
             engine: None,
             engine_version,
             infer_timeout: DEFAULT_INFER_TIMEOUT,
+            policy: None,
         }
+    }
+
+    /// Tell the adapter which sandbox policy it is running under.
+    pub fn with_policy(mut self, policy: sandbox::Policy) -> Adapter {
+        self.policy = Some(policy);
+        self
     }
 
     pub fn with_infer_timeout(mut self, timeout: Duration) -> Adapter {
@@ -121,6 +136,16 @@ impl Adapter {
         }
         if p.sequences == 0 {
             return Err(RpcError::invalid_params("sequences must be at least 1"));
+        }
+        if let Some(policy) = &self.policy {
+            if !policy.permits_model(std::path::Path::new(&p.model_path)) {
+                return Err(RpcError::invalid_params(format!(
+                    "{} is outside the model store this backend may read ({}); \
+                     the sandbox would deny it (ADR-0012)",
+                    p.model_path,
+                    policy.model_dir.display()
+                )));
+            }
         }
 
         // Drop the old engine before starting the new one. Both resident at once would
@@ -328,6 +353,10 @@ mod tests {
             engine: None,
             engine_version: "test".to_string(),
             infer_timeout: Duration::from_secs(1),
+            // No policy: these tests exercise the adapter's own logic, and a policy would
+            // make every load fail the model-store check before reaching it. The check
+            // itself is covered in sandbox.rs and end to end.
+            policy: None,
         }
     }
 

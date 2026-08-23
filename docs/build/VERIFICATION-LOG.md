@@ -889,3 +889,105 @@ with evidence attached, not a known defect in what ships.
   model on one.
 - **The arm64 engine has not been through the reproducibility check.** The check accepts
   `--arch arm64` and the cross build works, but only amd64 has actually been run twice.
+
+---
+
+## Phase 4 slice 4 — the engine runs confined
+
+ADR-0011 bounded the blast radius of an engine *crash*. This bounds the blast radius of an
+engine *compromise*, which is a different problem and, with `ai.models.pull` coming, the
+more urgent one: `llama-server` exists to parse binary files that came from somewhere else,
+and it was running with reach into `/var/lib/otwono/identity` — the node's Ed25519 private
+key.
+
+The adapter now applies a Landlock ruleset **to itself** before it ever starts an engine.
+Landlock is inherited and cannot be undone, so the engine is confined by construction
+rather than by remembering to confine it.
+
+### Why the adapter restricts itself rather than the child
+
+The obvious place is between fork and exec, which in Rust means `Command::pre_exec` — and
+that is `unsafe`. Putting `unsafe` into the process that handles untrusted model files, in
+order to make it safer, is a poor trade. Restricting at startup avoids it entirely and
+confines the adapter too, which is strictly better: the adapter has no more business
+reading the node's private key than the engine does.
+
+The cost is that the policy must be fixed before any `backend.load` names a model, which is
+why the adapter is given a *model directory* and `--model-dir` is required rather than
+defaulted. A default would be a boundary nobody chose.
+
+### Verified on the kernel that ships, because the dev kernel has no Landlock
+
+This is the part worth being precise about. The OTWONO dev environment's kernel returns
+`ENOSYS` for `landlock_create_ruleset` — `securityfs` is not even mounted — so **enforcement
+cannot be demonstrated where this was written.** The images build their own kernel, so
+verification moved into QEMU:
+
+| Target | Boot line |
+|---|---|
+| `amd64-qemu-ubuntu`, `AI_ENGINE=llama.cpp` | `OTWONO-AI-OK … backends=llama-cpp-cpu sandbox=full models=0 publishers=0` |
+| `arm64-qemu-ubuntu`, `AI_ENGINE=llama.cpp` | `OTWONO-AI-OK … backends=llama-cpp-cpu sandbox=full models=0 publishers=0` |
+
+`sandbox=full` is the kernel's own answer, not ours: the boot check runs the adapter's
+`--probe`, which applies a ruleset and reports what was actually enforced.
+
+On the host, the confinement test **skips and says why** rather than passing quietly:
+
+```
+test the_running_engine_is_confined_by_the_kernel_not_only_by_the_adapter ...
+SKIPPED: this kernel does not enforce Landlock, so confinement cannot be demonstrated here.
+```
+
+### What the policy allows, and the point of what it does not
+
+Read-only: the engine's own directory, the system library paths, `/proc`, `/sys`, the model
+store. Writable: the runtime directory, and only that. Everything else is denied — and the
+list of "everything else" is the deliverable: `/var/lib/otwono/identity`, `/var/log/otwono`,
+`/etc/otwono`, `/root`, `/home`. There is a unit test that names each of those and fails if
+any ever appears in the rule table.
+
+The model store is readable and **not** writable, which matters more than it looks: an
+engine that could write the blob store could replace a signature-verified model with its
+own, and the next load would trust it.
+
+### Fails closed
+
+On a kernel that will not enforce Landlock the adapter refuses to start. `--allow-unconfined`
+overrides it, explicitly, with a warning on stderr at every start rather than once at
+install. A security boundary that silently degrades is not one.
+
+### Workspace
+
+| Command | Result |
+|---|---|
+| `cargo test --workspace` | **443 tests pass** (434 before) |
+| `clippy -D warnings`, `fmt --check`, `shellcheck -S warning` | clean |
+
+### One defect, and it was in the safety check itself
+
+**21. The availability probe answered "available" on a kernel with no Landlock at all.**
+The first version built a ruleset and treated success as support. Under the crate's
+best-effort compatibility mode, `create()` succeeds on a kernel whose
+`landlock_create_ruleset` returns `ENOSYS`; only `restrict_self` reveals that nothing was
+enforced. So the probe printed `landlock=available` on the very kernel that had just
+refused to confine anything — the wrong answer for the input that a fail-closed decision
+rests on, which is the worst place to be wrong.
+
+The crate keeps its own runtime ABI query private, deliberately, on the reasoning that
+policies should not vary with the kernel underneath them. So the probe now gets the
+authoritative answer the only way available: it *applies* a ruleset and reports what the
+kernel enforced, in a process that exits immediately afterwards. The tests ask the adapter
+rather than probing in-process, because probing in-process would confine the test runner
+for every test after it.
+
+### What this does not do
+
+- **No PID or mount namespace, and no seccomp filter.** A compromised engine can still burn
+  CPU and see what any process sees. bubblewrap would cover this; it costs a base-image
+  dependency and a fourth process in the chain, and is the obvious next step if it becomes
+  necessary.
+- **`/proc` and `/sys` are readable**, because ggml's CPU detection needs them. That is a
+  real widening and is stated in ADR-0012 rather than buried.
+- **Landlock governs new opens, not descriptors already open** when it is applied.
+- **The engine has still never been compromised in a test.** What is verified is that the
+  boundary exists and that the kernel enforces it, not that it survives an actual exploit.

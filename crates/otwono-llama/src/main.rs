@@ -21,6 +21,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use otwono_ai::supervisor::{BackendHello, PROTOCOL_VERSION};
+use otwono_llama::sandbox::{self, Enforcement, Policy};
 use otwono_llama::{Adapter, EngineConfig, ENGINE_NAME};
 use otwono_proto::message::{Request, RequestId, Response, RpcError};
 
@@ -32,10 +33,18 @@ USAGE:
 
 OPTIONS:
     --engine <PATH>         llama-server binary  [env: OTWONO_LLAMA_SERVER]
+    --model-dir <DIR>       the only directory models may be read from
     --runtime-dir <DIR>     directory for the engine socket (default: /run/otwono/ai)
     --startup-timeout <S>   seconds to wait for a model to load (default: 300)
     --infer-timeout <S>     seconds to wait for one completion (default: 600)
+    --allow-unconfined      run without Landlock confinement (see below)
+    --probe                 report whether this kernel can confine the engine, then exit
     -h, --help              print this
+
+The adapter confines itself with Landlock before starting an engine, so the engine can
+read the model store and nothing else of the node's (ADR-0012). On a kernel without
+Landlock it refuses to start rather than silently running an untrusted-file parser
+unconfined; --allow-unconfined overrides that, deliberately explicit and logged.
 ";
 
 const DEFAULT_RUNTIME_DIR: &str = "/run/otwono/ai";
@@ -52,16 +61,47 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    let config = parse_args(std::env::args().skip(1))?;
+    let (config, model_dir, allow_unconfined) = parse_args(std::env::args().skip(1))?;
     std::fs::create_dir_all(&config.runtime_dir)
         .map_err(|e| format!("cannot create {}: {e}", config.runtime_dir.display()))?;
+
+    // Before anything else, and before any engine exists. Landlock is inherited and
+    // irreversible, so confining here confines every engine this process will ever start
+    // — there is no ordering mistake available later.
+    let policy = Policy {
+        engine: config.binary.clone(),
+        model_dir: model_dir.clone(),
+        runtime_dir: config.runtime_dir.clone(),
+    };
+    let enforcement = sandbox::restrict(&policy).map_err(|e| e.to_string())?;
+    match enforcement {
+        Enforcement::None if !allow_unconfined => {
+            return Err(
+                "this kernel does not enforce Landlock, so the inference engine cannot be \
+                 confined. Refusing to run a parser of untrusted model files unconfined; \
+                 pass --allow-unconfined to override. Check with --probe."
+                    .to_string(),
+            )
+        }
+        // Reported on stderr, which the supervisor captures: an operator who overrode the
+        // refusal should see it in the journal every time, not once at install.
+        Enforcement::None => {
+            eprintln!("otwono-llama-backend: WARNING running unconfined, --allow-unconfined was given")
+        }
+        Enforcement::Partial => {
+            eprintln!("otwono-llama-backend: Landlock only partially enforced on this kernel")
+        }
+        Enforcement::Full => {}
+    }
 
     let infer_timeout = std::env::var("OTWONO_LLAMA_INFER_TIMEOUT")
         .ok()
         .and_then(|v| v.parse().ok())
         .map(Duration::from_secs)
         .unwrap_or(otwono_llama::DEFAULT_INFER_TIMEOUT);
-    let mut adapter = Adapter::new(config).with_infer_timeout(infer_timeout);
+    let mut adapter = Adapter::new(config)
+        .with_infer_timeout(infer_timeout)
+        .with_policy(policy);
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -75,6 +115,7 @@ fn run() -> Result<(), String> {
         engine: ENGINE_NAME.to_string(),
         version: adapter.engine_version().to_string(),
     };
+    let _ = enforcement;
     write_line(&mut out, &serde_json::to_value(&hello).expect("hello serializes"))?;
 
     let stdin = std::io::stdin();
@@ -110,10 +151,14 @@ fn write_line(out: &mut impl Write, value: &serde_json::Value) -> Result<(), Str
         .map_err(|e| format!("cannot write to stdout: {e}"))
 }
 
-fn parse_args(args: impl Iterator<Item = String>) -> Result<EngineConfig, String> {
+type Parsed = (EngineConfig, PathBuf, bool);
+
+fn parse_args(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
     let mut binary = std::env::var("OTWONO_LLAMA_SERVER").ok().map(PathBuf::from);
+    let mut model_dir: Option<PathBuf> = None;
     let mut runtime_dir = PathBuf::from(DEFAULT_RUNTIME_DIR);
     let mut startup_timeout = Duration::from_secs(DEFAULT_STARTUP_TIMEOUT_SECS);
+    let mut allow_unconfined = false;
     let mut extra_args = Vec::new();
 
     let mut args = args.peekable();
@@ -124,7 +169,17 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<EngineConfig, String
                 std::process::exit(0);
             }
             "--engine" => binary = Some(PathBuf::from(next(&mut args, "--engine")?)),
+            "--model-dir" => model_dir = Some(PathBuf::from(next(&mut args, "--model-dir")?)),
             "--runtime-dir" => runtime_dir = PathBuf::from(next(&mut args, "--runtime-dir")?),
+            "--allow-unconfined" => allow_unconfined = true,
+            "--probe" => {
+                // Answerable without an engine or a model, because the boot-time check runs
+                // it on a node that has neither yet. It confines this process to find out,
+                // which is why it exits immediately afterwards.
+                let enforcement = sandbox::probe_by_restricting_this_process();
+                println!("landlock={}", enforcement.as_str());
+                std::process::exit(if enforcement.is_confined() { 0 } else { 1 });
+            }
             "--startup-timeout" => {
                 startup_timeout = Duration::from_secs(seconds(&mut args, "--startup-timeout")?)
             }
@@ -143,12 +198,19 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<EngineConfig, String
     }
 
     let binary = binary.ok_or_else(|| format!("--engine is required\n\n{USAGE}"))?;
-    Ok(EngineConfig {
-        binary,
-        runtime_dir,
-        startup_timeout,
-        extra_args,
-    })
+    // Required, not defaulted: it is the boundary of what the engine may read, and a
+    // default would be a boundary nobody chose.
+    let model_dir = model_dir.ok_or_else(|| format!("--model-dir is required\n\n{USAGE}"))?;
+    Ok((
+        EngineConfig {
+            binary,
+            runtime_dir,
+            startup_timeout,
+            extra_args,
+        },
+        model_dir,
+        allow_unconfined,
+    ))
 }
 
 fn next(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {

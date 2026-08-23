@@ -458,6 +458,11 @@ impl AiService {
         command
             .arg("--engine")
             .arg(&install.engine)
+            // The blob store, and nothing above it. This is the boundary the adapter
+            // confines itself to with Landlock (ADR-0012), so passing the catalog root
+            // instead would hand the engine the manifests as well for no reason.
+            .arg("--model-dir")
+            .arg(self.catalog.blob_dir())
             .arg("--runtime-dir")
             .arg(&self.backend_runtime_dir);
         let process =

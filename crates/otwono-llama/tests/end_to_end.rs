@@ -37,13 +37,20 @@ const INFER_TIMEOUT: Duration = Duration::from_secs(180);
 
 struct Fixture {
     server: PathBuf,
+    /// The model, inside `model_dir`.
     model: PathBuf,
+    model_dir: PathBuf,
     runtime_dir: PathBuf,
+    /// A file outside every allowed path, standing in for everything on the node the
+    /// engine has no business reading.
+    secret: PathBuf,
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.runtime_dir);
+        let _ = std::fs::remove_dir_all(&self.model_dir);
+        let _ = std::fs::remove_file(&self.secret);
     }
 }
 
@@ -61,22 +68,47 @@ fn fixture(tag: &str) -> Option<Fixture> {
     };
     // Short, because the engine's socket lives here and sun_path is 108 bytes.
     let runtime_dir = PathBuf::from(format!("/tmp/otwono-e2e-{tag}-{}", std::process::id()));
+    let model_dir = PathBuf::from(format!("/tmp/otwono-mdl-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&runtime_dir).expect("create runtime dir");
+    std::fs::create_dir_all(&model_dir).expect("create model dir");
+
+    let staged = model_dir.join("model.gguf");
+    std::fs::copy(&model, &staged).expect("stage the model inside the model directory");
+
+    // Deliberately outside every path the policy allows.
+    let secret = PathBuf::from(format!("/tmp/otwono-secret-{tag}-{}", std::process::id()));
+    std::fs::write(&secret, b"this stands in for the node identity key").expect("write secret");
+
     Some(Fixture {
         server: PathBuf::from(server),
-        model: PathBuf::from(model),
+        model: staged,
+        model_dir,
         runtime_dir,
+        secret,
     })
 }
 
 /// Spawn the adapter under the real supervisor, exactly as `otwono-aid` does.
+///
+/// The model is copied into a dedicated directory that becomes the adapter's `--model-dir`,
+/// because that directory is also the Landlock boundary: the engine may read models from
+/// there and from nowhere else on the machine.
 fn spawn(f: &Fixture) -> BackendProcess {
     let mut command = Command::new(env!("CARGO_BIN_EXE_otwono-llama-backend"));
     command
         .arg("--engine")
         .arg(&f.server)
+        .arg("--model-dir")
+        .arg(&f.model_dir)
         .arg("--runtime-dir")
         .arg(&f.runtime_dir);
+    if !landlock_enforced() {
+        // The adapter fails closed on a kernel that cannot confine it, which is the point.
+        // These tests still have work to do on such a kernel, so they opt out explicitly
+        // and the assertions that depend on confinement skip themselves — see
+        // `the_running_engine_is_confined_by_the_kernel_not_only_by_the_adapter`.
+        command.arg("--allow-unconfined");
+    }
     BackendProcess::spawn("llama-cpp-cpu", &mut command, HELLO_TIMEOUT).expect("adapter says hello")
 }
 
@@ -266,7 +298,7 @@ fn a_model_file_that_is_not_a_model_fails_the_load_with_the_engines_own_reason()
     let Some(f) = fixture("badmodel") else { return };
     let mut backend = spawn(&f);
 
-    let junk = f.runtime_dir.join("not-a-model.gguf");
+    let junk = f.model_dir.join("not-a-model.gguf");
     std::fs::write(&junk, b"this is not a GGUF file").unwrap();
 
     let response = call(
@@ -315,6 +347,19 @@ fn the_engine_dies_with_the_adapter() {
     panic!("llama-server {engine_pid} survived the adapter it was started by");
 }
 
+/// Whether this kernel enforces Landlock.
+///
+/// Asked of the adapter rather than answered in-process: finding out requires actually
+/// restricting a process, and doing that here would confine the test runner for every test
+/// after it.
+fn landlock_enforced() -> bool {
+    Command::new(env!("CARGO_BIN_EXE_otwono-llama-backend"))
+        .arg("--probe")
+        .output() // not status(): its stdout would land in every test's output
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Whether a pid is a live process.
 ///
 /// A zombie is not alive: its parent died with it and nothing has reaped it yet, which
@@ -329,4 +374,82 @@ fn is_alive(pid: i32) -> bool {
         return false;
     };
     !after_comm.trim_start().starts_with('Z')
+}
+
+#[test]
+fn the_engine_cannot_read_a_model_outside_the_store_even_though_the_file_exists() {
+    // The sandbox, proven rather than asserted. The file is real, readable by this test
+    // process, and named by an absolute path -- and the engine still cannot have it.
+    let Some(f) = fixture("sandbox") else { return };
+    let mut backend = spawn(&f);
+
+    // Sanity: the test process itself can read it, so a failure below is confinement and
+    // not a missing file.
+    assert!(
+        std::fs::read(&f.secret).is_ok(),
+        "the test fixture should be readable here"
+    );
+
+    let response = call(
+        &mut backend,
+        1,
+        METHOD_LOAD,
+        json!({"model_path": f.secret.display().to_string(), "context_tokens": 512}),
+        LOAD_TIMEOUT,
+    );
+    let message = response["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("outside the model store"),
+        "a model outside the store should be refused by name: {response}"
+    );
+    println!("refused with: {message}");
+
+    // And the adapter is still usable: a refusal is not a session-ending event.
+    let loaded = ok(
+        &mut backend,
+        2,
+        METHOD_LOAD,
+        json!({"model_path": f.model.display().to_string(), "context_tokens": 512, "threads": 2}),
+        LOAD_TIMEOUT,
+    );
+    assert!(loaded["engine_pid"].as_u64().unwrap_or(0) > 0, "{loaded}");
+}
+
+#[test]
+fn the_running_engine_is_confined_by_the_kernel_not_only_by_the_adapter() {
+    // The check above is the adapter refusing. This one asks whether the *kernel* would
+    // have stopped it anyway -- which is the difference between a policy and a boundary.
+    // Landlock is inherited, so the engine's own view of the filesystem is what matters,
+    // and /proc/<pid>/root lets the test look at it from outside.
+    let Some(f) = fixture("confined") else { return };
+    if !landlock_enforced() {
+        println!(
+            "SKIPPED: this kernel does not enforce Landlock, so confinement cannot be \
+             demonstrated here. The built images ship their own kernel; the boot check \
+             reports sandbox= on a booted node."
+        );
+        return;
+    }
+    let mut backend = spawn(&f);
+    let loaded = ok(
+        &mut backend,
+        1,
+        METHOD_LOAD,
+        json!({"model_path": f.model.display().to_string(), "context_tokens": 512, "threads": 2}),
+        LOAD_TIMEOUT,
+    );
+    let pid = loaded["engine_pid"].as_u64().unwrap() as i32;
+
+    // The kernel records a non-zero Landlock domain id for a confined process. Zero, or a
+    // missing field, means nothing is confining it.
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).expect("read engine status");
+    let landlock: Vec<&str> = status
+        .lines()
+        .filter(|l| l.to_ascii_lowercase().starts_with("landlock"))
+        .collect();
+    println!("engine {pid} landlock status: {landlock:?}");
+    assert!(
+        !landlock.is_empty(),
+        "the kernel reports no Landlock domain for the engine; it is not confined:\n{status}"
+    );
 }

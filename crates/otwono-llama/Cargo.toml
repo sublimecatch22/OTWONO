@@ -17,6 +17,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # For killing the engine's whole process group without unsafe.
 rustix = { version = "0.38", features = ["process"] }
+# Kernel-enforced filesystem confinement for the engine (ADR-0012). Chosen partly because
+# it is applied by an ordinary syscall from safe Rust: the alternative, dropping privileges
+# in a pre_exec hook, would require unsafe in a process that handles untrusted model files.
+landlock = "0.4"
 
 [[bin]]
 name = "otwono-llama-backend"

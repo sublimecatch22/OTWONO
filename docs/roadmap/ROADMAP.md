@@ -137,10 +137,16 @@ Build stage 35 produces the engine for either architecture from a pinned upstrea
 verified against the commit that tag pointed at; it is opt-in (`AI_ENGINE=llama.cpp`)
 because the engine is 17 MiB per architecture and a ten-minute build.
 
+**Done (slice 4):** the engine is confined. The adapter applies a Landlock ruleset to
+itself before starting `llama-server` (ADR-0012), so the engine may read the model store
+and the system libraries and nothing else — in particular not `/var/lib/otwono/identity`.
+It fails closed on a kernel that will not enforce it. Both booted images report
+`sandbox=full`.
+
 **Still open:** the exit criterion is **not met**. `ai.infer` has been served on the host
 against a synthetic model, not on a booted amd64 *and* arm64 VM with tier-appropriate
 models — there is no model distribution, so no VM has a model to run. Also missing:
-streaming, any sandbox around the engine beyond the daemon's own hardening, model download,
+streaming, PID/mount isolation and a seccomp filter around the engine, model download,
 embeddings, ASR and TTS, GPU/NPU backends, and the tiered assistant shapes.
 
 ---

@@ -68,10 +68,9 @@ inherit upstream's HTTP response shape, which changes — `stop_type` replaced t
 fields between releases, and the adapter now reads both.
 
 **Also bad, and worth naming.** The engine is a large C++ program parsing untrusted model
-files, and it runs with the adapter's privileges. Nothing here sandboxes it beyond what
-`otwono-aid.service` already imposes on the tree. That is a gap, not a solved problem; the
-right answer is a `bubblewrap` or Landlock confinement around the engine, and it is not
-written yet.
+files, and it runs with the adapter's privileges. Nothing *in this ADR* sandboxes it beyond
+what `otwono-aid.service` already imposes on the tree. That gap is closed by ADR-0012,
+which has the adapter confine itself with Landlock before starting an engine.
 
 ## Alternatives rejected
 
