@@ -19,7 +19,10 @@
 pub mod content;
 pub mod signer;
 
-pub use content::{fetch_object, serve_session, ContentResponder, FetchedObject};
+pub use content::{
+    fetch_object, fetch_object_from_peers, serve_session, ContentResponder, FanOutReport, FetchedObject,
+    PeerSource,
+};
 pub use signer::{BindError, BrokeredSigner};
 
 use otwono_identity::{NodeId, SessionSigner};
@@ -213,6 +216,56 @@ impl NetState {
         }
         self.exchange_hello(&mut channel, true)?;
         content::fetch_object(&mut channel, content_id, &properties).map_err(|e| e.to_string())
+    }
+
+    /// Fetch one object from several peers at once (ADR-0015).
+    ///
+    /// A candidate that cannot be dialled or cannot be authenticated is dropped here rather
+    /// than carried into the transfer: a peer this node cannot prove the identity of is not
+    /// a peer, whatever it is serving.
+    pub fn fetch_from_peers(
+        &self,
+        candidates: &[Candidate],
+        content_id: &str,
+    ) -> Result<(FetchedObject, FanOutReport), String> {
+        let mut sources = Vec::new();
+        let mut unreachable = Vec::new();
+        for candidate in candidates {
+            match self.open_content_channel(candidate) {
+                Ok(source) => sources.push(source),
+                Err(e) => unreachable.push(format!("{}: {e}", candidate.address)),
+            }
+        }
+        if sources.is_empty() {
+            return Err(format!(
+                "no candidate could be reached and authenticated: {}",
+                unreachable.join("; ")
+            ));
+        }
+        content::fetch_object_from_peers(sources, content_id).map_err(|e| e.to_string())
+    }
+
+    fn open_content_channel(&self, candidate: &Candidate) -> Result<content::PeerSource<TcpLink>, String> {
+        let link = TcpLink::connect(candidate.address, content::FETCH_TIMEOUT)
+            .map_err(|e| format!("connect: {e}"))?;
+        link.set_timeout(Some(content::FETCH_TIMEOUT))
+            .map_err(|e| e.to_string())?;
+        let properties = link.properties();
+        let mut channel = SecureChannel::initiate(link, self.signer.as_ref()).map_err(|e| e.to_string())?;
+        let proved = channel.peer().node_id;
+        if proved != candidate.claimed_node_id {
+            return Err(format!(
+                "advertised {} but authenticated as {}",
+                candidate.claimed_node_id.fingerprint(),
+                proved.fingerprint()
+            ));
+        }
+        self.exchange_hello(&mut channel, true)?;
+        Ok(content::PeerSource {
+            name: proved.fingerprint(),
+            channel,
+            link: properties,
+        })
     }
 
     fn exchange_hello<L: LinkAdapter>(
@@ -461,14 +514,24 @@ impl Service for NetService {
             }
             "net.fetch" => {
                 self.authorize(ctx, CAPABILITY_CONTENT)?;
-                let candidate = Self::candidate(&params)?;
                 let content_id = params
                     .get("content_id")
                     .and_then(Value::as_str)
                     .ok_or_else(|| RpcError::invalid_params("net.fetch needs a content_id"))?;
-                let fetched = self
+                // One peer or several. Several is the point of ADR-0015 — every holder of a
+                // chunk is as good as any other, so a dense neighbourhood transfers faster —
+                // and one peer is just the degenerate case of it.
+                let candidates: Vec<Candidate> = match params.get("peers").and_then(Value::as_array) {
+                    Some(list) => list.iter().map(Self::candidate).collect::<Result<_, _>>()?,
+                    None => vec![Self::candidate(&params)?],
+                };
+                if candidates.is_empty() {
+                    return Err(RpcError::invalid_params("net.fetch needs at least one peer"));
+                }
+                let names: Vec<String> = candidates.iter().map(|c| c.claimed_node_id.to_text()).collect();
+                let (fetched, report) = self
                     .state
-                    .fetch_from(&candidate, content_id)
+                    .fetch_from_peers(&candidates, content_id)
                     .map_err(|e| RpcError::new(otwono_proto::code::UNAVAILABLE, e))?;
 
                 // Never by default. Caching a peer's content is storing bytes the operator
@@ -491,7 +554,11 @@ impl Service for NetService {
                     "visibility": fetched.visibility,
                     "chunking": fetched.chunking,
                     "size_bytes": fetched.bytes.len(),
-                    "from": candidate.claimed_node_id.to_text(),
+                    "asked": names,
+                    "manifest_from": report.manifest_from,
+                    "chunks_from": report.chunks_from,
+                    "peers_that_served": report.peers_that_served(),
+                    "dropped": report.dropped,
                     "cached": cached,
                     "data": data_encoding::BASE64.encode(&fetched.bytes),
                 }))

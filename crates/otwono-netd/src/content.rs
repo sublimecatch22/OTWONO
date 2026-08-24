@@ -32,17 +32,21 @@ use otwono_proto::{code, Client};
 use otwono_store::{ChunkRef, ContentId};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// The labels this daemon will put on a link. Anything else — `private`, `shared`, a typo,
 /// a label from a future version — is refused.
 pub const SERVABLE_LABELS: [&str; 2] = ["public", "replicated"];
 
-/// Largest object one `net.fetch` will assemble in memory. Matches `store.put`'s inline
-/// cap, because an object this daemon cannot hand to the store is one it should not have
-/// spent a peer's bandwidth on.
-pub const MAX_FETCH_BYTES: u64 = 32 * 1024 * 1024;
+/// Largest object one `net.fetch` will assemble.
+///
+/// The same ceiling as `store.put`'s inline cap, and for the same reason: the reply carries
+/// the object base64-encoded on one control-plane line, so an object this daemon cannot hand
+/// back is one it should not have spent a peer's bandwidth fetching. That ceiling comes from
+/// the transport (`otwono_proto::MAX_LINE_BYTES`), not from anything about content — see the
+/// note on `otwono_stored::MAX_INLINE_BYTES`. A streaming interface is what lifts both.
+pub const MAX_FETCH_BYTES: u64 = otwono_stored::MAX_INLINE_BYTES as u64;
 
 /// Ceiling on an object's chunk count, so a peer cannot make this daemon allocate a list
 /// before it has sent anything.
@@ -336,8 +340,12 @@ pub fn fetch_object<L: LinkAdapter>(
     let mut budget = MAX_ROUND_TRIPS;
     let (header, entries) = fetch_manifest(channel, content_id, link, &mut budget)?;
 
+    // Before any chunk is asked for: the declared chunk list must hash to the id that was
+    // requested. A peer with a substituted manifest is caught here rather than after a
+    // gigabyte of perfectly-verifying wrong chunks.
+    verified_refs(content_id, &entries)?;
+
     let mut bytes = Vec::with_capacity(header.size_bytes.min(MAX_FETCH_BYTES) as usize);
-    let mut refs = Vec::with_capacity(entries.len());
     for entry in &entries {
         let chunk = fetch_chunk(channel, content_id, entry, link, &mut budget)?;
         let got = ChunkRef::of(&chunk);
@@ -348,16 +356,6 @@ pub fn fetch_object<L: LinkAdapter>(
             });
         }
         bytes.extend_from_slice(&chunk);
-        refs.push(got);
-    }
-
-    // The last check: the chunks the peer served must be the object that was asked for.
-    let derived = ContentId::of(&refs).to_hex();
-    if derived != content_id {
-        return Err(ProtocolError::ObjectIdMismatch {
-            expected: content_id.to_string(),
-            actual: derived,
-        });
     }
 
     Ok(FetchedObject {
@@ -366,6 +364,40 @@ pub fn fetch_object<L: LinkAdapter>(
         chunking: header.chunking,
         bytes,
     })
+}
+
+/// Turn a manifest's declared chunk list into refs, and check it describes the object that
+/// was asked for.
+///
+/// **This is checkable before a single chunk is fetched**, because a `ContentId` is the
+/// BLAKE3 of the chunk list itself. The first version of this module only noticed a
+/// substituted manifest after reassembling everything — every chunk verified against the
+/// digest the liar had declared, so nothing failed until the final comparison. A peer could
+/// therefore make this node download a gigabyte before being caught.
+///
+/// Checking here closes that, and it is what makes fan-out safe: once the manifest is known
+/// authentic, any peer may serve any chunk and be verified against it independently.
+fn verified_refs(content_id: &str, entries: &[ChunkEntry]) -> Result<Vec<ChunkRef>, ProtocolError> {
+    let mut refs = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let digest: [u8; 32] = data_encoding::HEXLOWER
+            .decode(entry.blake3.as_bytes())
+            .ok()
+            .and_then(|v| v.try_into().ok())
+            .ok_or(ProtocolError::NotHex { field: "blake3" })?;
+        refs.push(ChunkRef {
+            digest,
+            length: entry.length,
+        });
+    }
+    let derived = ContentId::of(&refs).to_hex();
+    if derived != content_id {
+        return Err(ProtocolError::ObjectIdMismatch {
+            expected: content_id.to_string(),
+            actual: derived,
+        });
+    }
+    Ok(refs)
 }
 
 /// Every window of the chunk list, checked as it arrives.
@@ -534,6 +566,196 @@ fn fetch_chunk<L: LinkAdapter>(
         got.extend_from_slice(&data);
     }
     Ok(got)
+}
+
+/// One peer, ready to be asked for chunks.
+pub struct PeerSource<L: LinkAdapter> {
+    /// How this peer is named in the report. A NodeID fingerprint on a real node.
+    pub name: String,
+    pub channel: SecureChannel<L>,
+    pub link: LinkProperties,
+}
+
+/// Who served what, after a fan-out fetch.
+///
+/// Worth returning rather than logging: ADR-0015's central claim is that a dense
+/// neighbourhood transfers faster because every holder is as good as any other, and this is
+/// the only thing that shows whether that actually happened on a given fetch.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FanOutReport {
+    /// Which peer the (verified) chunk list came from.
+    pub manifest_from: String,
+    /// Chunks successfully served, per peer.
+    pub chunks_from: std::collections::BTreeMap<String, usize>,
+    /// Failures per peer: a refusal, a bad digest, or a dead link.
+    pub demerits: std::collections::BTreeMap<String, usize>,
+    /// Peers dropped mid-transfer for failing too often.
+    pub dropped: Vec<String>,
+}
+
+impl FanOutReport {
+    pub fn peers_that_served(&self) -> usize {
+        self.chunks_from.values().filter(|n| **n > 0).count()
+    }
+}
+
+/// How many failures a peer gets before this transfer stops asking it.
+///
+/// Per transfer, not remembered. A peer that is merely slow or has been evicting things is
+/// not an enemy, and a persistent judgement about neighbours is the beginning of the
+/// reputation system ADR-0015 declined to build (OQ-17).
+pub const MAX_PEER_FAILURES: usize = 3;
+
+/// Fetch one object from several peers at once, verifying every chunk on arrival.
+///
+/// The mechanism ADR-0015 is about. Once the manifest is known authentic — it hashes to the
+/// id that was asked for, checked before any chunk is requested — **any** holder of a chunk
+/// is as good as any other, because the digest is checked at this end. So the chunks are
+/// spread across every reachable peer, and a peer that lies or refuses simply loses its
+/// share of the work.
+///
+/// A peer that serves rubbish wastes this node's bandwidth and cannot corrupt its data.
+/// That is the whole security argument, and it is one hash long.
+///
+/// One thread per peer, one request outstanding per peer. There is no pipelining, so the
+/// speedup is in parallelism across peers rather than depth per peer — which is the axis
+/// that gets better as a street gets denser, and the one this is for.
+pub fn fetch_object_from_peers<L: LinkAdapter + Send + 'static>(
+    peers: Vec<PeerSource<L>>,
+    content_id: &str,
+) -> Result<(FetchedObject, FanOutReport), ProtocolError> {
+    if !content::is_hex_digest(content_id) {
+        return Err(ProtocolError::NotHex { field: "content_id" });
+    }
+    if peers.is_empty() {
+        return Err(ProtocolError::NotAvailable(content_id.to_string()));
+    }
+
+    let mut report = FanOutReport::default();
+    let mut peers = peers;
+
+    // The manifest, from whichever peer can produce an authentic one. Sequential: it is one
+    // small exchange, and asking everyone at once to save a round trip on a LAN is not worth
+    // the shape it would impose on the rest of this function.
+    let mut header = None;
+    let mut entries = Vec::new();
+    let mut refs = Vec::new();
+    let mut usable = Vec::new();
+    for mut peer in peers.drain(..) {
+        if header.is_some() {
+            usable.push(peer);
+            continue;
+        }
+        let mut budget = MAX_ROUND_TRIPS;
+        match fetch_manifest(&mut peer.channel, content_id, &peer.link, &mut budget)
+            .and_then(|(h, e)| verified_refs(content_id, &e).map(|r| (h, e, r)))
+        {
+            Ok((h, e, r)) => {
+                report.manifest_from = peer.name.clone();
+                header = Some(h);
+                entries = e;
+                refs = r;
+                usable.push(peer);
+            }
+            Err(_) => {
+                // Not fatal and not interesting: a peer that does not have the object is the
+                // ordinary case, and one that lied about it has just been caught for free.
+                *report.demerits.entry(peer.name.clone()).or_insert(0) += 1;
+                usable.push(peer);
+            }
+        }
+    }
+    let Some(header) = header else {
+        return Err(ProtocolError::NotAvailable(content_id.to_string()));
+    };
+
+    let total: u64 = refs.iter().map(|r| r.length as u64).sum();
+    if total > MAX_FETCH_BYTES {
+        return Err(ProtocolError::TooLarge {
+            field: "size_bytes",
+            asked: total,
+            ceiling: MAX_FETCH_BYTES,
+        });
+    }
+
+    let queue: Arc<Mutex<std::collections::VecDeque<usize>>> =
+        Arc::new(Mutex::new((0..entries.len()).collect()));
+    let slots: Arc<Mutex<Vec<Option<Vec<u8>>>>> = Arc::new(Mutex::new(vec![None; entries.len()]));
+    let entries = Arc::new(entries);
+    let id = content_id.to_string();
+
+    let mut workers = Vec::new();
+    for mut peer in usable {
+        let queue = Arc::clone(&queue);
+        let slots = Arc::clone(&slots);
+        let entries = Arc::clone(&entries);
+        let id = id.clone();
+        workers.push(std::thread::spawn(move || {
+            let mut served = 0usize;
+            let mut failed = 0usize;
+            let mut budget = MAX_ROUND_TRIPS;
+            loop {
+                if failed >= MAX_PEER_FAILURES {
+                    break;
+                }
+                let Some(index) = queue.lock().expect("fan-out queue poisoned").pop_front() else {
+                    break;
+                };
+                let entry = &entries[index];
+                match fetch_chunk(&mut peer.channel, &id, entry, &peer.link, &mut budget) {
+                    Ok(bytes) if ChunkRef::of(&bytes).hex() == entry.blake3 => {
+                        slots.lock().expect("fan-out slots poisoned")[index] = Some(bytes);
+                        served += 1;
+                    }
+                    // A wrong digest and a refusal are the same event here: this peer did
+                    // not supply this chunk. Put it back for someone else.
+                    _ => {
+                        failed += 1;
+                        queue.lock().expect("fan-out queue poisoned").push_back(index);
+                    }
+                }
+            }
+            (peer.name, served, failed)
+        }));
+    }
+
+    for worker in workers {
+        let (name, served, failed) = worker
+            .join()
+            .map_err(|_| ProtocolError::Malformed("a fan-out worker panicked".into()))?;
+        report.chunks_from.insert(name.clone(), served);
+        if failed > 0 {
+            *report.demerits.entry(name.clone()).or_insert(0) += failed;
+        }
+        if failed >= MAX_PEER_FAILURES {
+            report.dropped.push(name);
+        }
+    }
+
+    let slots = Arc::try_unwrap(slots)
+        .map_err(|_| ProtocolError::Malformed("fan-out slots outlived their workers".into()))?
+        .into_inner()
+        .expect("fan-out slots poisoned");
+    let mut bytes = Vec::with_capacity(total as usize);
+    for (index, slot) in slots.into_iter().enumerate() {
+        // No peer could supply this chunk. Report it as the object not being available
+        // rather than naming the chunk: a partial object is not a smaller answer.
+        let Some(chunk) = slot else {
+            let _ = index;
+            return Err(ProtocolError::NotAvailable(id));
+        };
+        bytes.extend_from_slice(&chunk);
+    }
+
+    Ok((
+        FetchedObject {
+            content_id: id,
+            visibility: header.visibility,
+            chunking: header.chunking,
+            bytes,
+        },
+        report,
+    ))
 }
 
 fn round_trip<L: LinkAdapter>(

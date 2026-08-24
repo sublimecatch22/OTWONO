@@ -48,9 +48,28 @@ pub const CAPABILITY_SERVE: &str = "store.serve";
 pub const CAPABILITY_CACHE_READ: &str = "cache.read";
 pub const CAPABILITY_CACHE_WRITE: &str = "cache.write";
 
-/// A cap on one `store.put`, so a caller cannot exhaust memory through the control plane.
-/// Larger objects are a streaming interface this daemon does not have yet.
-pub const MAX_INLINE_BYTES: usize = 32 * 1024 * 1024;
+/// A cap on one inline object, in **raw** bytes before base64.
+///
+/// Derived from the transport, not chosen: the control plane is newline-delimited JSON with
+/// a 1 MiB line limit (`otwono_proto::MAX_LINE_BYTES`), and base64 costs four characters per
+/// three bytes. An earlier version of this constant said 32 MiB, which was a number no
+/// caller could ever reach — the server closed the connection on the over-long line and the
+/// caller saw a broken pipe rather than a limit. A cap that the transport makes unreachable
+/// is not a cap, it is a misleading comment.
+///
+/// Lifting this needs a streaming interface (a file descriptor passed over the socket, or a
+/// chunk-at-a-time method), which this daemon does not have. Until then it is the real
+/// ceiling on `store.put`, `store.get`, `cache.put`, `cache.get` and the inline `store.serve`.
+pub const MAX_INLINE_BYTES: usize = 640 * 1024;
+
+/// Room left for the JSON-RPC envelope around a base64 body on one line.
+const ENVELOPE_RESERVE: usize = 8 * 1024;
+
+/// The arithmetic behind [`MAX_INLINE_BYTES`], asserted rather than trusted.
+const _: () = assert!(
+    MAX_INLINE_BYTES.div_ceil(3) * 4 + ENVELOPE_RESERVE <= otwono_proto::MAX_LINE_BYTES,
+    "MAX_INLINE_BYTES base64s to more than one control-plane line"
+);
 
 /// Largest manifest window one `store.serve_manifest` will build. A page is assembled in
 /// memory, so an unbounded request would be an allocation a peer chooses. Matches the

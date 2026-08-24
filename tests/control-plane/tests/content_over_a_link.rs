@@ -257,7 +257,7 @@ fn payload(len: usize, seed: u64) -> Vec<u8> {
 #[test]
 fn a_public_object_crosses_a_real_link_byte_for_byte() {
     let h = Harness::start("public");
-    let bytes = payload(700 * 1024, 0xC0FFEE);
+    let bytes = payload(600 * 1024, 0xC0FFEE);
     let id = h.put(&bytes, "public");
 
     let got = h.fetch(&id).expect("a public object must be servable");

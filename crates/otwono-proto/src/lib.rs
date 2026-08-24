@@ -35,7 +35,9 @@ pub use client::Client;
 pub use message::{
     code, MethodDescription, Request, RequestId, Response, RpcError, ServiceDescription, JSONRPC_VERSION,
 };
-pub use server::{required_capability, unknown_method, CallContext, PeerIdentity, Server, Service, Shutdown};
+pub use server::{
+    required_capability, unknown_method, CallContext, PeerIdentity, Server, Service, Shutdown, MAX_LINE_BYTES,
+};
 
 /// Default directory for control-plane sockets. Overridable so tests (and a developer
 /// running two stacks side by side) never touch the real one.

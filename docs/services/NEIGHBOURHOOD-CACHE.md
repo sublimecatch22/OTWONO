@@ -85,6 +85,16 @@ the audit log and the spool applies here too.
 
 ## 4. Fetching
 
+**STATUS: IMPLEMENTED** — `otwono_netd::content::fetch_object_from_peers`, with one caveat
+worth stating up front: step 2's "ask peers which chunks they hold" is not a want-list
+exchange. Every peer is simply asked for chunks off a shared queue and a peer that does not
+have one loses that attempt. On a LAN that is cheaper than a round of negotiation; on a
+constrained link it is not, and it wants revisiting with OQ-23.
+
+Ordering within the object is not rarest-first either — it is whatever the queue hands out.
+Rarest-first matters when peers are also downloading from each other, which is a swarm and
+not what this is.
+
 1. Resolve the object to a chunk list (from its signed manifest).
 2. Ask reachable peers which of those chunks they hold — LAN peers first, then the wider
    overlay, then origin.
@@ -95,6 +105,13 @@ the audit log and the spool applies here too.
 
 A peer that lies wastes our bandwidth. It cannot corrupt our data, and it does not have to
 be trusted to be useful — that is the entire security argument, and it is one hash long.
+
+**The manifest is checked before any chunk is requested.** A `ContentId` is the BLAKE3 of
+the chunk list itself, so a substituted manifest is detectable immediately — and once it is
+known authentic, *any* peer may serve *any* chunk and be verified against it independently.
+That is what makes step 3 safe, and the first implementation got it wrong: it only compared
+at reassembly, so a lying peer could make a node download the whole object before being
+caught.
 
 ### Ordering that matters
 
@@ -148,8 +165,8 @@ Per CLAUDE.md §2.3, the mechanisms here are well-trodden and the adapter layer 
 
 | Criterion | State |
 |---|---|
-| A chunk that fails its hash never reaches a caller | **partly** — `Store::get_chunk` verifies on read and `fetch_object` verifies on arrival from a peer (ADR-0017), both tested; nothing yet serves a *cached* chunk to a caller, so the cache's own path is untested |
-| A fetch with three peers holding disjoint pieces completes and is byte-identical to origin | **not met** — the fetch is single-peer; fan-out is not built |
+| A chunk that fails its hash never reaches a caller | **met** — `a_peer_serving_rubbish_wastes_bandwidth_and_cannot_corrupt_the_result`: a peer declaring the true chunk list and serving garbage for every chunk is demerited, dropped, and cannot affect the assembled object |
+| A fetch with three peers holding disjoint pieces completes and is byte-identical to origin | **met** — `three_peers_holding_disjoint_pieces_complete_a_fetch`. The peers are genuinely partial: each store gets the whole object and then has two thirds of its chunk *files* deleted, and the test first asserts that no single peer can serve it alone |
 | A `PRIVATE` object cannot be placed in the cache by any code path | **met** — `cache::tests::private_content_cannot_enter_the_cache_by_any_path`, asserted negatively and with nothing reaching the disk |
 | The cache respects its size cap under sustained pressure and evicts rather than filling the disk | **met** — twenty 64 KiB inserts into a 256 KiB budget, budget asserted after each |
 | A T0 node with 512 MiB participates usefully rather than thrashing | **partly** — the 512 MiB default is asserted; "usefully rather than thrashing" needs a real T0 board |

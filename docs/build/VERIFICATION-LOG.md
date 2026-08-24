@@ -2330,3 +2330,99 @@ stranger get no benefit of the doubt.
 - **A peer's requests never refresh the cache**, so this node keeps what its own household
   fetched in preference to what the street keeps asking for. That is slightly backwards for
   a neighbourhood cache and is the safe direction; it wants revisiting once fan-out exists.
+
+---
+
+## Phase 6 slice 3 — fan-out, and the claim ADR-0015 was actually about
+
+**Date:** 2026-08-24 · **Where:** OTWONO Cloud dev environment (no `/dev/kvm`)
+
+`fetch_object_from_peers`: one thread per peer, a shared queue of chunks, every chunk
+verified on arrival. This is the thing the last two slices kept listing as unimplemented.
+
+### Workspace
+
+```
+cargo test --workspace     737 passed, 0 failed   (was 730)
+cargo clippy --workspace --all-targets -- -D warnings   clean
+cargo fmt --all --check    clean
+aarch64 cross-build        links
+```
+
+### Defect 34: a manifest was only checked after the whole object had been downloaded
+
+Found by design review while writing fan-out, not by a test. `fetch_object` verified the
+assembled chunk list against the requested id *at the end*. A peer serving a manifest for
+different content therefore passed every per-chunk check — each chunk matched the digest the
+liar had declared — and failed only at reassembly. A hostile peer could make a node download
+a whole object before being caught.
+
+The fix is one line of insight: a `ContentId` **is** the BLAKE3 of the chunk list, so the
+manifest is self-verifying and checkable before a single chunk is requested.
+`a_substituted_manifest_is_caught_before_a_single_chunk_is_fetched` counts the hostile
+peer's chunk requests and asserts zero.
+
+That check is also what makes fan-out safe at all: once the manifest is known authentic, any
+peer may serve any chunk and be verified against it independently. Without it there would be
+no basis for trusting a chunk that came from a different peer than the manifest did.
+
+### Defect 35: a cap the transport made unreachable
+
+`MAX_INLINE_BYTES` said 32 MiB. The control plane is newline-delimited JSON with a 1 MiB
+line limit, and base64 costs four characters per three bytes, so every object over roughly
+768 KiB was refused by the *server's line reader* — which closes the connection, so the
+caller saw `BrokenPipe` rather than a limit.
+
+Found because the three-peer test used a 900 KiB fixture and could not put it in a store.
+
+Now 640 KiB, derived from `otwono_proto::MAX_LINE_BYTES` with a `const` assertion that the
+base64 plus an envelope reserve fits one line, and pinned by
+`the_inline_cap_is_a_size_that_actually_fits_the_control_plane`, which round-trips exactly
+the cap over a real socket and asserts one byte over comes back as a readable error rather
+than a closed connection. `MAX_FETCH_BYTES` now derives from the same constant, because a
+`net.fetch` reply carries its object on that same line — otherwise every fetch over 768 KiB
+would have failed at the reply.
+
+A cap the transport makes unreachable is not a cap; it is a misleading comment.
+
+### The three-peer criterion, met honestly
+
+`NEIGHBOURHOOD-CACHE.md` §8 asks for "a fetch with three peers holding disjoint pieces". The
+peers here are genuinely partial: each store is given the whole object and then has two
+thirds of its chunk *files* deleted from disk, so `store.serve_chunk` really fails for what
+each is missing. The test asserts first that **no single peer can serve the object alone**,
+then that the three together produce a byte-identical result, and that all three actually
+contributed.
+
+### A peer that lies is a peer that wastes bandwidth
+
+`a_peer_serving_rubbish_wastes_bandwidth_and_cannot_corrupt_the_result` builds the harder
+hostile peer: it declares the *true* chunk list, so the manifest check passes, and then
+serves `0xAA` of the right length for every chunk. It is demerited three times, dropped, and
+the honest peer covers everything. The assembled object is byte-identical.
+
+That is ADR-0015's entire security argument, and it is one hash long.
+
+### Demerits are per transfer and are forgotten
+
+`MAX_PEER_FAILURES = 3`, counted within one fetch and not remembered. A peer that is merely
+slow, or that has been evicting things, is not an enemy — and a persistent judgement about
+neighbours is the beginning of the reputation system ADR-0015 declined to build (OQ-17).
+
+### What this does not prove
+
+- **No speedup has been measured.** The claim is that density makes transfers faster; what
+  is demonstrated is that density makes them *possible* where no single peer has everything,
+  and that the work spreads. Timing needs more than one machine and a real network.
+- **There is no want-list.** Peers are asked for chunks off a shared queue and a peer that
+  does not have one loses that attempt. Cheaper than negotiation on a LAN, wrong on a
+  constrained link.
+- **No pipelining.** One request outstanding per peer, so the parallelism is across peers
+  and not within one. That is the axis that improves as a street gets denser, which is the
+  one this is for, but it leaves throughput on the table against a single fast peer.
+- **`net.fetch` with several peers is not exercised over TCP.** The fan-out tests use
+  in-memory links; the control-plane method accepting a `peers` array is compiled and not
+  called from a test.
+- **Objects are still capped at 640 KiB** through the control plane, which is small for
+  "media" in any sense. A streaming interface is what lifts it and does not exist.
+- **Nothing has booted.**

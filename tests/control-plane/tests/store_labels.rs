@@ -520,3 +520,45 @@ fn describe_is_open_and_names_the_capability_each_method_needs() {
         assert_eq!(m["capability"], cap, "{name}");
     }
 }
+
+#[test]
+fn the_inline_cap_is_a_size_that_actually_fits_the_control_plane() {
+    // Defect 34: MAX_INLINE_BYTES said 32 MiB while the control plane's line limit is 1 MiB,
+    // so every object over ~768 KiB failed as a broken pipe rather than as a limit. A cap
+    // the transport makes unreachable is not a cap.
+    //
+    // Both edges, over a real socket: exactly the cap round-trips, and one byte over comes
+    // back as a readable error rather than a closed connection.
+    let h = Harness::start("inlinecap");
+    let at_cap = vec![0x5Au8; otwono_stored::MAX_INLINE_BYTES];
+    let put = h
+        .call(
+            "store.put",
+            json!({ "data": data_encoding::BASE64.encode(&at_cap), "visibility": "private" }),
+            "store.write",
+        )
+        .expect("an object of exactly MAX_INLINE_BYTES must fit one control-plane line");
+    let id = put["content_id"].as_str().unwrap().to_string();
+
+    let got = h
+        .call("store.get", json!({ "content_id": id }), "store.read")
+        .expect("and must come back the same way");
+    assert_eq!(
+        data_encoding::BASE64
+            .decode(got["data"].as_str().unwrap().as_bytes())
+            .unwrap()
+            .len(),
+        otwono_stored::MAX_INLINE_BYTES
+    );
+
+    let over = vec![0x5Au8; otwono_stored::MAX_INLINE_BYTES + 1];
+    let err = h
+        .call(
+            "store.put",
+            json!({ "data": data_encoding::BASE64.encode(&over), "visibility": "private" }),
+            "store.write",
+        )
+        .expect_err("one byte over the cap must be refused");
+    assert_eq!(err.code, code::INVALID_PARAMS);
+    assert!(err.message.contains("inline cap"), "{}", err.message);
+}
