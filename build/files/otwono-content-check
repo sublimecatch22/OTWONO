@@ -63,14 +63,27 @@ case "$stat_out" in
 esac
 
 # --- 5. The neighbourhood cache ---------------------------------------------------------
-# Its budget comes from the capability profile and nowhere else, so this also proves the
-# otwono-stored -> otwono-hwd lookup ran on a real boot.
-cache=$(otwono-storectl cache-status) || fail "cache.status refused"
-budget=$(echo "$cache" | awk '/^budget/ {print $2}')
-[ -n "$budget" ] || fail "cache.status reported no budget"
-[ "$budget" -gt 0 ] || fail "the cache budget is zero; the capability profile lookup failed"
-
-otwono-storectl cache-purge >/dev/null || fail "cache.purge refused"
+# Its size comes from the capability profile and nowhere else, so this exercises the
+# otwono-stored -> otwono-hwd lookup on a real boot.
+#
+# Two outcomes are correct and this must accept both. A machine with room gets a budget and
+# a working cache. A machine whose storage axis is Constrained gets a budget of zero, and
+# otwono-stored then opens no cache at all and says so -- which is the intended behaviour on
+# a small board, not a failure. The first version of this check asserted budget > 0 and
+# would have failed on exactly the T0 hardware this project exists for.
+#
+# What would be wrong is silence, a crash, or an answer that is neither.
+if cache=$(otwono-storectl cache-status 2>&1); then
+    budget=$(echo "$cache" | awk '/^budget/ {print $2}')
+    [ -n "$budget" ] || fail "cache.status answered without a budget: $cache"
+    otwono-storectl cache-purge >/dev/null || fail "cache.purge refused"
+    cache_state="budget=$budget"
+else
+    case "$cache" in
+        *"no neighbourhood cache"*) cache_state="none (profile set the budget to zero)" ;;
+        *) fail "cache.status failed for an unexpected reason: $cache" ;;
+    esac
+fi
 
 rm -rf "$WORK"
-echo "OTWONO-CONTENT-OK id=$id large=$large_id cache_budget=$budget"
+echo "OTWONO-CONTENT-OK id=$id large=$large_id cache=$cache_state"

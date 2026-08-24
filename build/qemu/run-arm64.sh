@@ -20,7 +20,7 @@ REQUIRED=()
 if [ -n "${OTWONO_BOOT_EXPECT:-}" ]; then
     REQUIRED=("$OTWONO_BOOT_EXPECT")
 else
-    REQUIRED=("otwono login:" "OTWONO-CAPABILITY-OK" "OTWONO-CONTROL-PLANE-OK" "OTWONO-MESH-OK" "OTWONO-AI-OK")
+    REQUIRED=("otwono login:" "OTWONO-CAPABILITY-OK" "OTWONO-CONTROL-PLANE-OK" "OTWONO-CONTENT-OK" "OTWONO-MESH-OK" "OTWONO-AI-OK")
 fi
 # Additional markers, appended rather than replacing the list. OTWONO_BOOT_EXPECT swaps the
 # whole set, which is right for a one-off probe and wrong for "this image also does X":

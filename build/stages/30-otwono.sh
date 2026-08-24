@@ -204,19 +204,50 @@ ttl_seconds = 300
 # source to /etc/otwono/fetch.d, and granting net.fetch here. Either one alone does
 # nothing, which is the intended shape.
 
-# store.write, store.read, store.serve and net.content are all ungranted, so a shipped node
-# meshes and authenticates but neither stores nor serves anything. That is not an oversight
-# about PUBLIC content: nothing can *be* labelled public without store.write, so granting
-# store.serve alone would widen the boundary for a store that is necessarily empty. An
-# operator turns the content store on by granting store.write and store.serve together, and
-# net.content separately if this node should also fetch from peers (ADR-0017).
+# The node's own store, for the node's own operator. Reading and writing it moves nothing
+# off the machine: the network boundary is store.serve, and that is granted below to
+# nobody. An earlier version of this file withheld these too, which sounded conservative
+# and was not -- it shipped a content store that refused every operation, so the subsystem
+# was unusable out of the box and the boot-time content check could not run at all. That
+# was discovered by booting an image, which is the only thing that would have found it.
 #
-# cache.read and cache.write are ungranted for a further reason of their own. Holding is
-# publishing: a node that caches for its neighbours tells them what it holds, and what a
-# household reads is partly inferable from what its node serves (ADR-0015). That is a cost
-# an operator agrees to, not a default. cache.write is separate from store.write precisely
-# so it can be granted alone -- a node may contribute to the street without otwono-netd
-# gaining any way to write the user's own store.
+# store.demote is included: it only ever makes an object *more* restrictive. Widening is
+# label.promote, which is a separate action and always confirms.
+[[rule]]
+action = "store.read"
+subjects = ["uid:0"]
+decision = "allow"
+ttl_seconds = 300
+
+[[rule]]
+action = "store.write"
+subjects = ["uid:0"]
+decision = "allow"
+ttl_seconds = 300
+
+# The neighbourhood cache's local accounting: what this node holds for its neighbours, how
+# much room is left, and the purge that empties it. Local operations on local state -- and
+# nothing can *enter* the cache without net.content, which is not granted, so a stock node's
+# cache stays empty however these are used.
+[[rule]]
+action = "cache.read"
+subjects = ["uid:0"]
+decision = "allow"
+ttl_seconds = 300
+
+[[rule]]
+action = "cache.write"
+subjects = ["uid:0"]
+decision = "allow"
+ttl_seconds = 300
+
+# store.serve and net.content are deliberately NOT granted, and they are the two that
+# matter. store.serve is the network boundary: it is what otwono-netd calls to hand an
+# object to a peer, and granting it is the decision to let this node serve the street.
+# net.content is the other direction, fetching from peers -- and holding is publishing, so a
+# node that fetches and caches tells its neighbours what it holds, and what a household
+# reads is partly inferable from what its node serves (ADR-0015). Both are costs an operator
+# agrees to, not defaults.
 POLICY
 
 log "installing the model publisher trust store"
