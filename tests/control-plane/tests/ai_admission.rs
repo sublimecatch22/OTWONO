@@ -17,6 +17,7 @@ use otwono_permd::{ActionRegistry, AuditLog, Broker, Policy};
 use otwono_proto::{code, Client, Server, Shutdown};
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -348,13 +349,30 @@ fn model_for(body: &[u8]) -> ModelManifest {
     m
 }
 
+/// Digest `body` by the same code path the installer uses.
+///
+/// Going through `hash_file` rather than hashing the buffer directly is deliberate: the
+/// manifest's digest and the installer's must be produced by one implementation, or a bug
+/// in that implementation would agree with itself and the test would prove nothing.
+///
+/// The scratch path is unique per call, and that is load-bearing. It used to be keyed on
+/// `(pid, body.len())` — but every test in this binary shares a pid, and three tests here
+/// use the same 27-byte body, so all three named the same file and ran as concurrent
+/// threads. `fs::write` truncates before it writes, so a racing `hash_file` read zero bytes
+/// and returned the digest of the empty string. The manifest then claimed a digest the
+/// weights could not have, and the install was correctly refused. CI found it; this machine
+/// passed it hundreds of times.
 fn blake3_hex(body: &[u8]) -> String {
-    otwono_ai::hash_file(&{
-        let p = std::env::temp_dir().join(format!("otw-h-{}-{}", std::process::id(), body.len()));
-        std::fs::write(&p, body).unwrap();
-        p
-    })
-    .unwrap()
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "otw-h-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&path, body).unwrap();
+    let hex = otwono_ai::hash_file(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    hex
 }
 
 /// Write a manifest and a blob to disk and return their paths.

@@ -1540,3 +1540,63 @@ TLS client needs is permitted, so this unit does not repeat that mistake.
 - **No proxy configuration ships.** TLS was exercised through this environment's proxy via
   `ureq`'s reading of the standard environment variables. No node sets them, and nothing
   here manages them.
+
+---
+
+## Defect 30: three tests, one scratch file, and the digest of nothing
+
+CI went red on `c9d5b30` — a documentation-only commit that changed no code. The failure was
+real, pre-existing, and intermittent: the previous head had been green, and
+`cargo test --workspace` passed here twice on the same tree.
+
+```
+---- verifying_a_model_reports_a_mismatch_as_a_result_rather_than_an_error ----
+ai.models.install refused: the weights do not match the manifest:
+  expected blake3 af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262,
+  got      138808f4337b2ceb3ac0661641a853cf9d0d1c15f10b9a9dd51cb27c6002455a
+```
+
+`af1349b9…` is the BLAKE3 of the empty string, which is what made this quick to place: the
+manifest was claiming the digest of a file with nothing in it.
+
+**Root cause.** The test helper hashed a buffer by writing it to a scratch file and calling
+the production `hash_file`. The scratch path was `otw-h-{pid}-{body.len()}`. Every test in a
+`cargo test` binary shares a pid, and three tests in that file use the same 27-byte body, so
+all three named **the same file** and ran as concurrent threads. `fs::write` is
+create-truncate-then-write, so between the truncate and the write the file is empty — and a
+racing `hash_file` read zero bytes.
+
+Nothing was wrong with the code under test. The installer refused a manifest whose digest
+the weights could not have, which is exactly its job.
+
+**Reproduced before fixing**, six spinners saturating the CPU, the test binary at
+`--test-threads 8`:
+
+```
+40 runs → 1 failure, byte-identical error including both digests
+```
+
+**Fixed** by making the scratch path unique per call with a process-wide atomic counter, and
+removing the file afterwards. Hashing still goes through `hash_file` rather than hashing the
+buffer directly — that is deliberate, because the manifest's digest and the installer's must
+come from one implementation, or a bug in it would agree with itself and the test would
+prove nothing.
+
+**Same reproduction after the fix:** 60 runs under the same load, 0 failures.
+
+**Audited the rest of the suite** for the same shape. Every other `temp_dir().join(...)` in
+the workspace is either tagged per test or sits inside a single `#[test]` with one call
+site. This was the only helper shared by several tests that built a name which was not
+unique.
+
+### The pattern, now four for four
+
+This is the fourth defect in this project that appeared only somewhere other than a quiet
+developer machine — after the systemd syscall filter, the boot check measuring the wrong
+process, and the `ETXTBSY` exec race. Three of the four were in test code rather than
+product code, which is its own lesson: a test that races is a test that will eventually lie
+in whichever direction is least convenient.
+
+It also cost nothing to find and would have cost a great deal to find later. A docs-only
+commit turning CI red is a gift — the alternative is the same race surfacing during a
+release.
