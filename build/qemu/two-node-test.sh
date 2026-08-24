@@ -19,6 +19,9 @@
 set -euo pipefail
 
 IMAGE=""; ARCH="amd64"; OUT=""; TIMEOUT="${OTWONO_TWO_NODE_TIMEOUT:-900}"
+# Separate from the mesh timeout: the content check only starts working once a peer exists,
+# so this is measured from mesh formation and not from boot.
+CONTENT_TIMEOUT="${OTWONO_CONTENT_TIMEOUT:-300}"
 usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 while [ $# -gt 0 ]; do
@@ -239,15 +242,32 @@ fi
 # On an image built with MESH_CONTENT_SMOKE=1 the check is present, so its success marker is
 # required rather than merely welcome. On a plain image it is absent and this is skipped:
 # requiring it everywhere would fail every release-image run for the wrong reason.
+#
+# It has to be *waited* for. The content check polls for a peer and only then does its
+# fetches, so it finishes seconds after the mesh forms -- and this harness tears the VMs
+# down the moment it does. Asserting at that instant passed once by timing luck and failed
+# the next run with the check still mid-retry, having printed nothing at all.
 if [ "${MESH_CONTENT_SMOKE:-0}" != 0 ]; then
-    for n in a b; do
-        grep -qa "OTWONO-MESH-CONTENT-OK" "$OUT/node-$n.log" || {
-            echo "FAIL: node $n never reported OTWONO-MESH-CONTENT-OK" >&2
-            echo "      (the image was built with MESH_CONTENT_SMOKE, so the check is there)" >&2
-            exit 1
-        }
+    echo "waiting for both nodes to exchange content (up to ${CONTENT_TIMEOUT}s)"
+    deadline=$(( $(date +%s) + CONTENT_TIMEOUT ))
+    content=timeout
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if grep -qa "OTWONO-MESH-CONTENT-FAIL" "$OUT/node-a.log" "$OUT/node-b.log" 2>/dev/null; then
+            content=fail; break
+        fi
+        if grep -qa "OTWONO-MESH-CONTENT-OK" "$OUT/node-a.log" 2>/dev/null \
+            && grep -qa "OTWONO-MESH-CONTENT-OK" "$OUT/node-b.log" 2>/dev/null; then
+            content=pass; break
+        fi
+        sleep 5
     done
+    if [ "$content" != pass ]; then
+        echo "FAIL: the two nodes did not exchange content ($content)" >&2
+        grep -ha "OTWONO-MESH-CONTENT-" "$OUT/node-a.log" "$OUT/node-b.log" >&2 || true
+        exit 1
+    fi
     echo "content: both nodes served a public object and refused a private one"
+    grep -hoa "OTWONO-MESH-CONTENT-OK.*" "$OUT/node-a.log" | tail -1 | tr -d '\r'
 fi
 
 echo "PASS: two nodes discovered and mutually authenticated"

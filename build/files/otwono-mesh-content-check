@@ -30,8 +30,29 @@ rm -rf "$WORK"; mkdir -p "$WORK"; chmod 0700 "$WORK"
 printf '%s' "$PUBLIC_TEXT" > "$WORK/public.txt"
 printf '%s' "$PRIVATE_TEXT" > "$WORK/private.txt"
 
+# A second public object, big enough to be several chunks. The 68-byte one above fits in a
+# single chunk and a single range, so on its own it proves the protocol only at its smallest
+# -- ADR-0017's manifest pagination and ranged chunk fetch never get exercised on a wire.
+# 300 KiB is roughly five chunks at ADR-0016's 64 KiB average, and each chunk is larger than
+# one reply can carry, so at least one takes several round trips.
+#
+# Deterministic bytes, not /dev/urandom: both nodes must derive the same content id, and
+# they cannot if the contents differ.
+awk 'BEGIN { s = ""; for (i = 0; i < 10000; i++) s = s "otwono-mesh-large-object-fixture-" i "\n"; printf "%s", s }' \
+    > "$WORK/large.bin"
+
 pub_id=$(otwono-storectl put --file "$WORK/public.txt" --visibility public | awk '{print $1}') \
     || fail "could not store the public object"
+big_id=$(otwono-storectl put --file "$WORK/large.bin" --visibility public | awk '{print $1}') \
+    || fail "could not store the large public object"
+[ -n "$big_id" ] || fail "the large put returned no content id"
+
+# Asserted, not assumed: if the fixture ever shrinks below one chunk this test quietly stops
+# proving the thing it exists for.
+big_chunks=$(otwono-storectl stat "$big_id" | awk '{print $4}')
+[ -n "$big_chunks" ] || fail "store.stat did not report a chunk count"
+[ "$big_chunks" -gt 1 ] \
+    || fail "the large fixture is $big_chunks chunk(s); it must span several to test ranging"
 prv_id=$(otwono-storectl put --file "$WORK/private.txt" --visibility private | awk '{print $1}') \
     || fail "could not store the private object"
 [ -n "$pub_id" ] && [ -n "$prv_id" ] || fail "a put returned no content id"
@@ -53,6 +74,15 @@ done
 [ -n "$got" ] || fail "no peer served the public object within 600s"
 echo "$got" | grep -q "$pub_id" || fail "the peer served something else: $got"
 
+# The same, for an object that spans several chunks. This is what puts ADR-0017's manifest
+# pagination and ranged chunk fetch on a real wire rather than an in-memory link.
+big=$(otwono-netd --fetch "$big_id" --socket /run/otwono/net.sock 2>&1) \
+    || fail "a multi-chunk object would not cross the link: $big"
+echo "$big" | grep -q "$big_id" || fail "the peer served the wrong large object: $big"
+big_size=$(wc -c < "$WORK/large.bin")
+echo "$big" | grep -q " $big_size bytes " \
+    || fail "the large object arrived at the wrong size (wanted $big_size): $big"
+
 # --- the negative case, which is the point ----------------------------------------------
 # A PRIVATE object must not cross. The peer holds it -- both nodes stored it -- and refuses.
 if otwono-netd --fetch "$prv_id" --socket /run/otwono/net.sock > "$WORK/leak" 2>&1; then
@@ -70,5 +100,16 @@ if ! cmp -s "$WORK/leak.norm" "$WORK/absent.norm"; then
     fail "refused and absent differ, so a peer can tell what this node holds"
 fi
 
+# The neighbourhood cache, which on these nodes exists only because the test image overrides
+# the storage axis. Reported rather than asserted beyond being answerable: what matters here
+# is that a node with a real budget opens a real cache and can be asked about it.
+cache_state=none
+if cache=$(otwono-storectl cache-status 2>&1); then
+    cache_state=$(echo "$cache" | awk '/^budget/ {print $2}')
+    [ -n "$cache_state" ] || fail "cache.status answered without a budget: $cache"
+    [ "$cache_state" -gt 0 ] \
+        || fail "the override did not give this node a cache budget: $cache"
+fi
+
 rm -rf "$WORK"
-echo "OTWONO-MESH-CONTENT-OK public=$pub_id private_refused=$prv_id"
+echo "OTWONO-MESH-CONTENT-OK public=$pub_id large=$big_id private_refused=$prv_id cache_budget=$cache_state"

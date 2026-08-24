@@ -60,6 +60,31 @@ ttl_seconds = 300
 POLICY
 chmod 0644 "$ROOTFS/etc/otwono/policy.d/91-mesh-content-smoke.toml"
 
+# The VMs have about 1.5 GiB of data partition, and classify_storage calls anything under
+# 16 GiB Constrained -- correctly, for a real board. A Constrained node's neighbourhood cache
+# budget is zero, so otwono-stored opens no cache and the cache has never run on a booted
+# node at all. Growing the image past 22 GiB to change that would make every build and boot
+# far slower for one axis.
+#
+# So the test image overrides the axis instead, which is what overrides are for: an operator
+# saying they know better than the probe. The detected value is preserved in the profile, so
+# the check can still see that the machine really is small. This also gives the override
+# mechanism its first boot-time exercise.
+log "installing the capability override that gives this test node a cache"
+cat > "$ROOTFS/etc/otwono/capability.override.toml" <<'OVERRIDE'
+# BUILT FOR TESTING. Installed only by build stage 37 (MESH_CONTENT_SMOKE=1).
+#
+# These VMs have a small data partition and are correctly classified as storage-constrained,
+# which sets the neighbourhood cache budget to zero. That is right for a real board and
+# leaves the cache untested on a booted node, so this claims more storage than there is.
+#
+# The detected value is kept in the capability profile alongside the forced one. If you are
+# reading this on a machine you care about, delete it.
+[axes]
+storage = "standard"
+OVERRIDE
+chmod 0644 "$ROOTFS/etc/otwono/capability.override.toml"
+
 log "installing the mesh content check"
 install -m 0755 "$BUILD_DIR/files/otwono-mesh-content-check" \
     "$ROOTFS/usr/lib/otwono/mesh-content-check"

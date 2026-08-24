@@ -2930,13 +2930,61 @@ shellcheck -S warning ...  clean
 | Derived content inherits the most restrictive label | host-side only |
 | Demotion stops future serving | host-side only |
 
+### Defect 44: an assertion that passed by timing luck
+
+The harness assertion added straight after that run — "require `OTWONO-MESH-CONTENT-OK` from
+both nodes when `MESH_CONTENT_SMOKE` is set" — checked for the marker at the *instant* the
+mesh formed and then tore the VMs down. The content check polls for a peer and only then
+does its fetches, so it finishes seconds later.
+
+It passed the first time and failed the next, with the check still mid-retry having printed
+nothing at all. Both runs were the same code.
+
+Which also means the run recorded above was itself lucky: the markers quoted from it are
+real and were read from the guest consoles, but the harness was not reliably waiting for
+them. The observation was sound; the mechanism to reproduce it was not. The harness now
+waits for the markers with its own timeout, measured from mesh formation rather than boot.
+
+Third instance on this branch of the same shape — defect 38 (a test passing on thread
+scheduling), defect 43 (a mesh passing on `HashSet` ordering), and now a harness passing on
+teardown timing. All three looked green.
+
+### The follow-up run: a multi-chunk object, and a cache that exists
+
+```
+waiting for both nodes to exchange content (up to 300s)
+content: both nodes served a public object and refused a private one
+OTWONO-MESH-CONTENT-OK public=45df7afd... large=f8463333...
+                       private_refused=fdadceae... cache_budget=536870912
+PASS: two nodes discovered and mutually authenticated
+```
+
+Two additions, both closing gaps named in the entry above.
+
+**A 378 890-byte object crossed the link.** The 68-byte one fits a single chunk and a single
+range, so on its own it proved ADR-0017 only at its smallest — the ranged chunk fetch never
+ran on a wire. The check now also moves a multi-chunk object and **asserts** the chunk count
+is above one via `store.stat` first, so a shrinking fixture cannot quietly stop testing the
+thing it exists for.
+
+**The neighbourhood cache ran on a booted node for the first time**, reporting a 512 MiB
+budget. These VMs have ~1.5 GiB of data partition and `classify_storage` calls anything
+under 16 GiB `Constrained` — correctly, for a real board — which sets the cache budget to
+zero. Growing the image past 22 GiB to change that would make every build and boot far
+slower for one axis, so the test image installs a `capability.override.toml` claiming more
+storage than there is. That is what overrides are for, the detected value is still preserved
+in the profile, and it gives the override mechanism its own first boot-time exercise.
+
 ### What this does not prove
 
 - **Two nodes, not three.** Fan-out's whole claim is that a fetch draws from *several* peers.
   That remains host-side, on in-memory links.
-- **One object each, one direction that matters.** The public object is 68 bytes. Nothing
-  large crossed a real link, so ADR-0018's file handoff and the ranged chunk protocol are
-  exercised on a wire only at their smallest.
+- **Nothing above the inline cap crossed a link.** The large object is 378 KB, under the
+  640 KiB control-plane limit, so it went inline. ADR-0018's file handoff — `to_file`, the
+  export directory, the chowned handover — has still never run between two machines.
+- **The cache exists but did nothing.** Its budget is non-zero and `cache.status` answers;
+  nothing was cached for a neighbour, because `net.fetch` only caches when asked and the
+  check does not ask.
 - **`SHARED` is still refused rather than authorized**, so the label that needs per-recipient
   key wrapping has still never been served to anybody.
 - **amd64 only.** arm64 has not been run two-node with any of this.
