@@ -1210,13 +1210,16 @@ dependencies = [
 name = "otwono-schema-tests"
 version = "0.1.0"
 dependencies = [
+ "data-encoding",
  "jsonschema",
  "otwono-ai",
  "otwono-capability",
  "otwono-fetch",
  "otwono-hal",
  "otwono-llama",
+ "otwono-net",
  "otwono-store",
+ "serde",
  "serde_json",
  "toml",
 ]

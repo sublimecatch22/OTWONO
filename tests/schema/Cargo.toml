@@ -14,6 +14,9 @@ otwono-llama = { path = "../../crates/otwono-llama" }
 otwono-ai = { path = "../../crates/otwono-ai" }
 otwono-fetch = { path = "../../crates/otwono-fetch" }
 otwono-store = { path = "../../crates/otwono-store" }
+otwono-net = { path = "../../crates/otwono-net" }
+data-encoding = "2"
+serde = "1"
 serde_json = "1"
 toml = "0.8"
 jsonschema = { version = "0.26", default-features = false }

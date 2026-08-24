@@ -31,3 +31,4 @@ Rules:
 | 0014 | One brokered fetch daemon for outbound HTTPS; the mesh keeps its own transport | accepted |
 | 0015 | A content-addressed neighbourhood cache, not a ledger | accepted |
 | 0016 | Content-defined chunking with FastCDC at 16/64/256 KiB | accepted |
+| 0017 | The ONM content-fetch protocol: ranged, object-scoped, verified per chunk | accepted |
