@@ -2666,3 +2666,146 @@ Cleared `target/aarch64-unknown-linux-gnu` and stale temp directories; 11 GB fre
 - **The largest object tested is 8 MiB.** Nothing has been fetched at a size where holding it
   in memory would actually have failed, so the memory claim rests on the code shape rather
   than on an observation.
+
+---
+
+## Phase 6 slice 6 — the first boot of the content subsystems, and what it cost
+
+**Date:** 2026-08-24 · **Where:** OTWONO Cloud dev environment (no `/dev/kvm`, TCG only)
+
+Every entry since Phase 5 has ended with "nothing has booted". This is the boot. It took
+three attempts and found four defects, none of which any amount of host-side testing was
+going to find.
+
+### The boot
+
+```
+$ make -C build TARGET=amd64-qemu-ubuntu image
+$ make -C build TARGET=amd64-qemu-ubuntu boot-test
+  matched: otwono login:
+  matched: OTWONO-CAPABILITY-OK
+  matched: OTWONO-CONTROL-PLANE-OK
+  matched: OTWONO-CONTENT-OK
+  matched: OTWONO-MESH-OK
+  matched: OTWONO-AI-OK
+```
+
+From the guest console:
+
+```
+OTWONO-CAPABILITY-OK    tier=T0_MICRO profile=/var/lib/otwono/capability-profile.json bytes=4324
+OTWONO-CONTROL-PLANE-OK tier=T0_MICRO audit_records=3
+OTWONO-CONTENT-OK       id=ba2f8dfb... large=b62951ff... cache=none (profile set the budget to zero)
+OTWONO-MESH-OK          node=otw1:t20d-713r-gy6q-31xz addr=10.0.2.15/24 known=0 connected=0
+OTWONO-AI-OK            tier=T0_MICRO local_inference=available backends=llama-cpp-cpu sandbox=full
+```
+
+Image: 8192 MiB apparent, 442 MiB on disk, 345 MiB of rootfs content. **No unit failed to
+start** — which is itself the check on defect 39, because two of them could not have started
+at all before it.
+
+### What `OTWONO-CONTENT-OK` actually proves
+
+Run on the booted node, through the real daemons, sockets, policy and units:
+
+- a small object stored and read back byte for byte over the control plane;
+- the chunk store on disk searched for the object's plaintext and **not** containing it —
+  encryption at rest, checked on a running node rather than in a unit test;
+- an object over the control plane's line limit **refused** by `store.put` and accepted by
+  `store.import`, then `store.export`ed and compared byte for byte against the original
+  (ADR-0018's whole point, on a real filesystem with a real uid);
+- a `PRIVATE` object reported as private by `store.stat`;
+- the neighbourhood cache reporting its state, which also exercises the
+  `otwono-stored` → `otwono-hwd` capability-profile lookup at startup.
+
+### Defect 39: two daemons had units and no binaries
+
+Found by reading `05-host-tools.sh` while writing the check. `otwono-fetchd` and
+`otwono-stored` had systemd units with `ExecStart=/usr/bin/...` and were never staged into
+the rootfs. Any image built since ADR-0014 would have shipped two services failing at
+"executable not found".
+
+The list is in one file and the units in another, and nothing compared them. Stage 30 now
+extracts every `ExecStart` from the units it just wrote and fails the build if one names a
+binary that is not in the image. A list kept in step by hand is a list that drifts.
+
+### Defect 40: the boot test passed while a check inside it failed
+
+The first boot printed `OTWONO-CONTENT-FAIL store.put refused` and the run reported
+**success**, because `OTWONO-CONTENT-OK` was not in the runners' `REQUIRED` list.
+
+This is the worst of the four. A boot test whose pass does not depend on a check is a boot
+test that tells you what you want to hear, and it had been that way for as long as the check
+existed. Both runners now require it, and the second boot correctly failed (exit 2) with
+`OTWONO-CONTENT-OK` unmatched.
+
+### Defect 41: the shipped policy made the content store unusable
+
+`store.put` was refused with `no rule matched; default is deny`. The comment in stage 30
+saying those capabilities were withheld deliberately was mine, and it was wrong: withholding
+every store capability is not conservative, it ships a content store that refuses every
+operation.
+
+The distinction that should have been drawn: `store.read`, `store.write`, `cache.read` and
+`cache.write` move nothing off the machine and are now granted to `uid:0`, like `hw.read`
+and `net.read` already were. `store.serve` and `net.content` stay ungranted, because those
+two *are* the boundary — serving the street, and holding is publishing (ADR-0015).
+`store.demote` rides with `store.write` because it only ever makes an object more
+restrictive; widening is `label.promote`, separate and always confirming.
+
+### Defect 42: the check asserted something false about the hardware this project is for
+
+It required a cache budget above zero. The boot VM probes as `storage=constrained`, so the
+capability policy engine correctly gives it a budget of **zero** and `otwono-stored` opens no
+cache at all — the intended behaviour on a small board. The assertion would have failed on
+exactly the T0 hardware OTWONO exists to run on.
+
+Both outcomes are now accepted: a working cache, or an explicit "no cache, the profile set
+the budget to zero". Only silence or an unexpected error fails.
+
+### And one parse bug of my own
+
+The third attempt failed with `store.export named a file that is not there: ->`. The check
+took a fixed awk column out of `otwono-storectl export`'s human-readable line and got the
+arrow rather than the path. Now it takes the last field of the line carrying the arrow, and
+— more importantly — asserts the result is an absolute path, so a parse that goes wrong says
+so instead of blaming the daemon.
+
+### `otwono-storectl`
+
+New, and the reason the check can exist: `CLAUDE.md` §4.3 says every daemon gets a
+`otwono-<name>ctl`, the store had none, and a shell check would otherwise have needed
+`socat` in the base image. `put`/`get` carry bytes inline; `import`/`export` move a file and
+send only a path. Two commands rather than one that guesses by size, because an export
+leaves plaintext on disk for the caller to unlink and a command that silently sometimes does
+that surprises somebody.
+
+### Workspace
+
+```
+cargo test --workspace     775 passed, 0 failed   (was 767)
+cargo clippy --workspace --all-targets -- -D warnings   clean
+cargo fmt --all --check    clean
+shellcheck -S warning ...  clean
+```
+
+CI also caught a `cargo fmt` failure on the new crate at `21ffec2`: I ran its own tests,
+cleared `target/debug` to satisfy the image build's disk check, and committed without
+formatting — having written in that commit's own message that the full suite had not been
+re-run. The risk was named and taken and it did not pay.
+
+### What this does not prove
+
+- **One architecture, one tier.** amd64 under TCG, probing as `T0_MICRO` with constrained
+  storage. arm64 has not been booted with these changes, and no tier above T0 has been
+  booted at all — so the cache has never actually *run* on a booted node, only correctly
+  reported its own absence.
+- **No peer.** `OTWONO-MESH-OK` says `known=0 connected=0`. The content-fetch protocol,
+  fan-out and the label boundary on a link are still proven only host-side; the two-VM
+  harness in `build/qemu/` has not been run against these changes.
+- **No real hardware.** No Raspberry Pi, no eMMC, no LoRa.
+- **The export reaper's ten-minute tick** still has nothing waiting for it, on a booted node
+  or anywhere else.
+- **The check is a smoke test, not a suite.** It proves these paths work once, on one node,
+  with one object each. The negative properties — a `PRIVATE` object never crossing a link,
+  a refusal being indistinguishable from a miss — remain host-side assertions.

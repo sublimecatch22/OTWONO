@@ -47,7 +47,15 @@ imported=$(otwono-storectl import --file "$WORK/large.bin" --visibility private)
 large_id=$(echo "$imported" | awk '{print $1}')
 
 exported=$(otwono-storectl export "$large_id") || fail "store.export refused"
-path=$(echo "$exported" | awk '{print $4}')
+# The line reads "<id> <n> bytes -> <path>", so the path is the last field of the line
+# carrying the arrow. Taking a fixed column got "->" itself, and the failure then read as a
+# missing file rather than as a parse error -- which is why the absolute-path check below
+# exists: a parse that goes wrong should say so, not blame the daemon.
+path=$(echo "$exported" | awk '/->/ {print $NF}')
+case "$path" in
+    /*) : ;;
+    *) fail "could not parse a path out of store.export's reply: $exported" ;;
+esac
 [ -f "$path" ] || fail "store.export named a file that is not there: $path"
 cmp -s "$WORK/large.bin" "$path" || fail "the exported file is not the object"
 rm -f "$path"
