@@ -31,7 +31,9 @@
 use otwono_proto::{
     unknown_method, CallContext, Client, MethodDescription, RpcError, Service, ServiceDescription,
 };
-use otwono_store::{Cache, CacheError, ContentId, Object, Store, StoreError, Visibility};
+use otwono_store::{
+    Cache, CacheError, ContentId, Handoff, HandoffError, Object, Store, StoreError, Visibility,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -79,6 +81,10 @@ pub const MAX_SERVE_CHUNKS: usize = 4096;
 
 pub struct StoreService {
     store: Store,
+    /// Where objects too large for one control-plane line are handed over as files
+    /// (ADR-0018). `None` on a daemon started without one, and then `store.export` and
+    /// `store.import` say so rather than silently capping at the inline size.
+    handoff: Option<Handoff>,
     /// The neighbourhood cache, when this machine contributes one. `None` on a machine
     /// whose capability profile set the budget to zero, or when no cache directory was
     /// configured — and then every cache method answers "not available" rather than
@@ -158,6 +164,25 @@ struct CachePinParams {
     pinned: bool,
 }
 
+/// Write an object out as a file for the caller (ADR-0018).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExportParams {
+    content_id: String,
+}
+
+/// Take an object in from a file the caller owns (ADR-0018).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportParams {
+    /// A path the caller owns. Opened with `O_NOFOLLOW` and checked on the descriptor.
+    path: String,
+    #[serde(default)]
+    visibility: Visibility,
+    #[serde(default)]
+    derived_from: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ServeParams {
     content_id: String,
@@ -184,9 +209,25 @@ impl StoreService {
     pub fn new(store: Store, perm_socket: PathBuf) -> Self {
         StoreService {
             store,
+            handoff: None,
             cache: None,
             perm_socket,
         }
+    }
+
+    /// Give this daemon somewhere to hand large objects over.
+    pub fn with_handoff(mut self, handoff: Handoff) -> Self {
+        self.handoff = Some(handoff);
+        self
+    }
+
+    fn handoff(&self) -> Result<&Handoff, RpcError> {
+        self.handoff.as_ref().ok_or_else(|| {
+            RpcError::unavailable(
+                "this daemon was started without an export directory, so objects larger than \
+                 the inline cap cannot be moved",
+            )
+        })
     }
 
     /// Give this daemon a neighbourhood cache to hold peers' content in.
@@ -223,6 +264,24 @@ impl StoreService {
             )
             .map_err(|e| RpcError::unavailable(format!("permission broker call failed: {e}")))?
             .map(|_| ())
+    }
+
+    /// Refuse an inline reply that would not fit one control-plane line.
+    ///
+    /// Checked here, before the bytes are read, so the caller gets a sentence naming the
+    /// method that *can* carry it. Without this the object is assembled, base64-ed, written
+    /// to the socket, and then refused by the caller's own reader -- which surfaces as a
+    /// transport error with nothing in it about what to do instead.
+    fn must_fit_inline(&self, object: &Object) -> Result<(), RpcError> {
+        if object.size_bytes > MAX_INLINE_BYTES as u64 {
+            return Err(RpcError::invalid_params(format!(
+                "{} is {} bytes, over the {MAX_INLINE_BYTES}-byte inline cap; use store.export, \
+                 which hands it over as a file (ADR-0018)",
+                object.content_id.to_hex(),
+                object.size_bytes
+            )));
+        }
+        Ok(())
     }
 
     fn parse_id(raw: &str) -> Result<ContentId, RpcError> {
@@ -266,6 +325,7 @@ impl StoreService {
             .store
             .get_object(&Self::parse_id(&p.content_id)?)
             .map_err(rpc)?;
+        self.must_fit_inline(&object)?;
         let bytes = self.store.read_object(&object).map_err(rpc)?;
         let mut out = record(&object);
         out["data"] = json!(data_encoding::BASE64.encode(&bytes));
@@ -463,6 +523,13 @@ impl StoreService {
         let id = Self::parse_id(&p.content_id)?;
 
         let (object, source) = self.servable(&id)?;
+        // A peer asking for something too large for one line is told the object is not
+        // available, like every other refusal here: the chunk-at-a-time methods are what a
+        // peer uses, and telling one that this node holds something too big to inline would
+        // be the disclosure the uniform refusal exists to prevent.
+        if object.size_bytes > MAX_INLINE_BYTES as u64 {
+            return Err(not_available(&id));
+        }
         let bytes = self.read_from(source, &object).map_err(|_| not_available(&id))?;
 
         let mut out = record(&object);
@@ -516,6 +583,7 @@ impl StoreService {
         let cache = self.cache()?;
         let id = Self::parse_id(&p.content_id)?;
         let object = cache.stat(&id).map_err(cache_rpc)?;
+        self.must_fit_inline(&object)?;
         let bytes = cache
             .get(&id, otwono_store::cache::now_unix_ms())
             .map_err(cache_rpc)?;
@@ -584,6 +652,83 @@ impl StoreService {
             "used_bytes": cache.used_bytes(),
             "note": "the cache is empty; nothing in the node's own store was touched",
         }))
+    }
+
+    /// Write an object out as a file the caller owns.
+    ///
+    /// The label does not gate this. `store.get` does not either: a label governs the
+    /// *network* boundary, and a caller on this node's own socket holding `store.read` is
+    /// the operator asking for their own data. What gates it is that the resulting file is
+    /// given to the uid the kernel says is on the other end of the socket, and to no one
+    /// else.
+    fn handle_export(&self, ctx: &CallContext, params: Value) -> Result<Value, RpcError> {
+        let p: ExportParams = serde_json::from_value(params)
+            .map_err(|e| RpcError::invalid_params(format!("store.export: {e}")))?;
+        let id = Self::parse_id(&p.content_id)?;
+        let object = self.store.get_object(&id).map_err(rpc)?;
+        let handoff = self.handoff()?;
+
+        // Streamed chunk by chunk. The point of this method is objects that do not fit in
+        // memory twice, and reading the whole thing to write the whole thing would keep the
+        // inline path's worst property while losing its simplicity.
+        let refs = object.chunk_refs();
+        let store = &self.store;
+        let exported = handoff
+            .export(ctx.peer.uid, object.size_bytes, move |file| {
+                use std::io::Write;
+                for r in &refs {
+                    let bytes = store
+                        .get_chunk(r)
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    file.write_all(&bytes)?;
+                }
+                Ok(())
+            })
+            .map_err(handoff_rpc)?;
+
+        let mut out = record(&object);
+        out["path"] = json!(exported.path.display().to_string());
+        out["owner_uid"] = json!(exported.owner_uid);
+        out["exported_bytes"] = json!(exported.size_bytes);
+        out["note"] = json!(
+            "this file is plaintext and yours; read it and unlink it. Anything left is \
+             reaped after an hour."
+        );
+        Ok(out)
+    }
+
+    /// Take an object in from a file the caller owns.
+    fn handle_import(&self, ctx: &CallContext, params: Value) -> Result<Value, RpcError> {
+        let p: ImportParams = serde_json::from_value(params)
+            .map_err(|e| RpcError::invalid_params(format!("store.import: {e}")))?;
+        // Opened and checked before anything else looks at the path, and never re-opened.
+        let mut file =
+            Handoff::open_owned(std::path::Path::new(&p.path), ctx.peer.uid).map_err(handoff_rpc)?;
+        let inputs: Vec<ContentId> = p
+            .derived_from
+            .iter()
+            .map(|s| Self::parse_id(s))
+            .collect::<Result<_, _>>()?;
+
+        let object = self
+            .store
+            .put_reader(&mut file, p.visibility, &inputs)
+            .map_err(rpc)?;
+        let mut out = record(&object);
+        out["imported_from"] = json!(p.path);
+        out["requested_visibility"] = json!(p.visibility.as_str());
+        out["derived_from"] = json!(p.derived_from);
+        Ok(out)
+    }
+}
+
+/// A handoff failure, translated for a caller.
+fn handoff_rpc(e: HandoffError) -> RpcError {
+    match e {
+        // The caller named something that is not theirs. One message for every reason.
+        HandoffError::NotYours { .. } => RpcError::invalid_params(e.to_string()),
+        HandoffError::NoSpace { .. } => RpcError::unavailable(e.to_string()),
+        HandoffError::Io { .. } => RpcError::internal(e.to_string()),
     }
 }
 
@@ -696,6 +841,16 @@ impl Service for StoreService {
                     CAPABILITY_CACHE_WRITE,
                 ),
                 MethodDescription::guarded(
+                    "store.export",
+                    "Write an object out as a file owned by the caller, for objects too large to inline",
+                    CAPABILITY_READ,
+                ),
+                MethodDescription::guarded(
+                    "store.import",
+                    "Take an object in from a file the caller owns",
+                    CAPABILITY_WRITE,
+                ),
+                MethodDescription::guarded(
                     "cache.purge",
                     "Empty the neighbourhood cache; the node's own store is untouched",
                     CAPABILITY_CACHE_WRITE,
@@ -749,6 +904,14 @@ impl Service for StoreService {
             "cache.pin" => {
                 self.authorize(ctx, CAPABILITY_CACHE_WRITE)?;
                 self.handle_cache_pin(params)
+            }
+            "store.export" => {
+                self.authorize(ctx, CAPABILITY_READ)?;
+                self.handle_export(ctx, params)
+            }
+            "store.import" => {
+                self.authorize(ctx, CAPABILITY_WRITE)?;
+                self.handle_import(ctx, params)
             }
             "cache.purge" => {
                 self.authorize(ctx, CAPABILITY_CACHE_WRITE)?;

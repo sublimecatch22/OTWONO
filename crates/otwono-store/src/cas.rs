@@ -330,6 +330,55 @@ impl Store {
         self.put_bytes(data, crate::Visibility::most_restrictive(labels))
     }
 
+    /// Chunk and store an object from a reader, never holding more than one chunk.
+    ///
+    /// The streaming counterpart of [`Store::put_derived`], and the reason `store.import`
+    /// exists: an object that arrives as a file may be far larger than this process's
+    /// memory, and reading it into a `Vec` to chunk it would defeat the point.
+    ///
+    /// The label is resolved **first**, from the inputs, so a missing input fails before any
+    /// bytes are written rather than after — the same rule as `put_derived`, applied in the
+    /// order that costs less when it is broken.
+    pub fn put_reader<R: std::io::Read>(
+        &self,
+        reader: R,
+        requested: crate::Visibility,
+        inputs: &[ContentId],
+    ) -> Result<Object, StoreError> {
+        let mut labels = vec![requested];
+        for id in inputs {
+            labels.push(self.get_object(id)?.visibility);
+        }
+        let visibility = crate::Visibility::most_restrictive(labels);
+
+        self.ensure_layout()?;
+        let mut failure = None;
+        let refs = crate::chunk::stream(reader, |_, bytes| {
+            match self.put_chunk(bytes) {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    // Carried out rather than flattened into a ChunkError, so a store
+                    // failure is still reported as a store failure and not as bad input.
+                    failure = Some(e);
+                    Err(crate::chunk::ChunkError::Io(std::io::Error::other(
+                        "the store could not write a chunk",
+                    )))
+                }
+            }
+        });
+        if let Some(e) = failure {
+            return Err(e);
+        }
+        let refs = refs.map_err(|e| StoreError::Io {
+            path: self.chunks_dir(),
+            reason: e.to_string(),
+        })?;
+
+        let object = Object::new(&refs, visibility);
+        self.put_object(&object)?;
+        Ok(object)
+    }
+
     /// Chunk and store bytes, returning the record.
     pub fn put_bytes(&self, data: &[u8], visibility: crate::Visibility) -> Result<Object, StoreError> {
         self.ensure_layout()?;

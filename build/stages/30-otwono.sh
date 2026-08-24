@@ -55,6 +55,12 @@ install -d -m 0700 "$ROOTFS/var/lib/otwono/store"
 # same reason as the spool -- these are a neighbour's bytes, encrypted with the node's
 # storage key, and no other user has business reading them.
 install -d -m 0700 "$ROOTFS/var/lib/otwono/cache"
+# Where objects too large for one control-plane line are handed over (ADR-0018). 0700 and
+# root-owned: between the daemon writing an export and the caller unlinking it, this holds
+# the PLAINTEXT of objects the store keeps encrypted. Each file is 0600 and chowned to the
+# caller that asked for it, so the directory being unlistable is what stops one user
+# enumerating another's exports.
+install -d -m 0700 "$ROOTFS/var/lib/otwono/export"
 install -d -m 0755 "$ROOTFS/var/log/otwono"
 
 log "installing the first-boot capability report unit"
@@ -659,7 +665,7 @@ RequiresMountsFor=/var/lib/otwono
 
 [Service]
 Type=exec
-ExecStart=/usr/bin/otwono-stored --socket /run/otwono/store.sock --perm-socket /run/otwono/perm.sock --store-dir /var/lib/otwono/store --key /var/lib/otwono/storage.key --cache-dir /var/lib/otwono/cache
+ExecStart=/usr/bin/otwono-stored --socket /run/otwono/store.sock --perm-socket /run/otwono/perm.sock --store-dir /var/lib/otwono/store --key /var/lib/otwono/storage.key --cache-dir /var/lib/otwono/cache --export-dir /var/lib/otwono/export
 Restart=on-failure
 RestartSec=2
 

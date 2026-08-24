@@ -2426,3 +2426,116 @@ neighbours is the beginning of the reputation system ADR-0015 declined to build 
 - **Objects are still capped at 640 KiB** through the control plane, which is small for
   "media" in any sense. A streaming interface is what lifts it and does not exist.
 - **Nothing has booted.**
+
+---
+
+## Phase 6 slice 4 — objects that do not fit on a line
+
+**Date:** 2026-08-24 · **Where:** OTWONO Cloud dev environment (no `/dev/kvm`)
+
+ADR-0018, `otwono_store::handoff`, `store.export` and `store.import`. The 640 KiB ceiling
+the last slice discovered was the binding constraint on everything the content path is for.
+
+### Workspace
+
+```
+cargo test --workspace     763 passed, 0 failed   (was 737)
+cargo clippy --workspace --all-targets -- -D warnings   clean
+cargo fmt --all --check    clean
+shellcheck -S warning ...  clean
+```
+
+### Defect 36: the line cap only bit on the way in
+
+Found by a test that was supposed to be checking something else. `an_object_far_larger_than_a_control_plane_line_round_trips_as_a_file` asserted that
+`store.get` would refuse an 8 MiB object. It did not refuse — it succeeded.
+
+The server has always capped request lines at `MAX_LINE_BYTES`, because callers are
+untrusted. `Client::call` used `read_line` with no bound at all. So whatever was on the far
+end of the socket chose how much memory its caller allocated.
+
+That is not academic here. The daemons that call each other over this plane include the two
+that parse hostile input — `otwono-netd` reads from peers, `otwono-aid` from model files —
+and a compromised one calling into another must not be able to exhaust it. The fix reads a
+byte at a time and stops *before* the allocation gets out of hand, because every buffered
+alternative allocates first and checks after.
+
+It also means the earlier claim that 640 KiB capped "the whole content path" was half right:
+it capped `store.put` and `cache.put` and did nothing to `store.get`. `MAX_FETCH_BYTES` was
+set from the reply size, which was over-cautious for the wrong stated reason. Both directions
+are now genuinely capped, and ADR-0018 carries the correction.
+
+### A refusal should name the way that works
+
+With the client capped, `store.get` on a large object failed as a transport error — correct,
+and useless to whoever called it. `must_fit_inline` now checks the object's recorded size
+*before* reading any bytes, so the caller gets `... over the 655360-byte inline cap; use
+store.export, which hands it over as a file`.
+
+`store.serve` is the exception: a peer asking for something too large gets the same
+`not_available` as every other refusal. Telling a stranger that this node holds an object too
+big to inline is exactly the disclosure the uniform refusal exists to prevent.
+
+### The import path is where a root daemon can be talked into things
+
+`store.import` takes a path from a caller and this daemon runs as root, which is the shape of
+a great many privilege-escalation bugs. Three things stop it:
+
+- `O_NOFOLLOW`, so a symlink at the final component is refused outright.
+- `fstat` on the **descriptor**, never a second look at the path. Checking a path and then
+  opening it is the classic time-of-check-to-time-of-use race; a descriptor already refers to
+  one inode and cannot be swapped.
+- `st_uid == ctx.peer.uid`, from `SO_PEERCRED`. That is what stops a caller pointing at
+  `/etc/shadow` through an intermediate symlinked directory, which `O_NOFOLLOW` alone would
+  not catch. A caller who is already root can read those files without this daemon's help, so
+  nothing is granted that was not already held.
+
+Every refusal reads identically — `<path> is not a regular file belonging to you` — for
+"is a directory", "belongs to someone else", "is a symlink" and "does not exist". A caller
+that could tell them apart would be learning about the filesystem through a root daemon.
+
+### What the tests actually assert
+
+| Property | Test |
+|---|---|
+| An 8 MiB object imports, exports, and is byte-identical | `an_object_far_larger_than_a_control_plane_line_round_trips_as_a_file` |
+| `store.get` refuses it by name and points at `store.export` | same test |
+| The store on disk is ciphertext and the export is plaintext | `an_exported_file_is_plaintext_while_the_store_on_disk_is_not` — greps every file under the store for a marker |
+| A symlink cannot make the daemon read what the caller does not own | `a_symlink_cannot_make_the_daemon_read_a_file_the_caller_does_not_own` |
+| A directory and a missing path are refused identically | `a_directory_and_a_missing_path_are_refused_the_same_way` |
+| Import cannot launder a label | `an_import_inherits_the_most_restrictive_label_of_its_inputs` |
+| Exports are 0600 in a 0700 directory | `an_exported_object_is_owned_by_the_caller_and_readable_by_nobody_else` |
+| A partial export leaves nothing behind | `handoff::tests::a_failed_write_leaves_nothing_behind` |
+| The reaper takes the abandoned and leaves the fresh | `handoff::tests::the_reaper_takes_the_abandoned_and_leaves_the_fresh` |
+| The client refuses an over-long reply | `client::bounded_line_tests::a_reply_over_the_cap_is_refused_rather_than_buffered` |
+
+### A process habit, for the fourth time
+
+A scripted multi-edit asserted its anchors and wrote at the end. One anchor did not match,
+the script raised, and **nothing was written** — but the shell reported the test failure that
+followed, not the traceback's meaning, and the obvious reading was "the fix did not work"
+rather than "the fix was never applied". Fourth occurrence in this project (defect 32 was the
+third).
+
+The habit that catches it, now used: one `sub(old, new, why)` helper that asserts exactly one
+occurrence per edit and names which edit failed, then a `grep` afterwards confirming the
+change is on disk. Cheap, and it turns a confusing test failure into a one-line message.
+
+### What this does not prove
+
+- **`store.import` streams; `net.fetch` does not.** `put_reader` chunks straight from the
+  descriptor and never holds more than one chunk, but `fetch_object_from_peers` still
+  assembles the whole object in RAM. A T0 board with 512 MiB cannot fetch a 2 GiB object
+  however the result is delivered (OQ-25).
+- **The reaper runs once, at startup.** Nothing sweeps a long-running daemon, so an
+  abandoned export lives until the next restart rather than an hour. That is a gap between
+  what `EXPORT_MAX_AGE` says and what happens.
+- **The export directory is unbounded** apart from the free-space floor. Nothing evicts from
+  it under pressure the way the cache does.
+- **`net.fetch` still returns bytes inline**, so a fetched object is still capped at 640 KiB
+  even though the store can now hold gigabytes. Exporting a fetch result is the obvious next
+  step and is not done.
+- **Nothing has booted.** Stage 30 creates `/var/lib/otwono/export` and passes
+  `--export-dir`; neither has run on a node.
+- **No object over 8 MiB has been tested**, and nothing has been tested against a genuinely
+  full disk.

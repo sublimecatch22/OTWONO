@@ -3,7 +3,10 @@
 #![forbid(unsafe_code)]
 
 use otwono_proto::{Server, Shutdown};
-use otwono_store::{Cache, StorageKey, Store, DEFAULT_CACHE_DIR, DEFAULT_KEY_PATH, DEFAULT_STORE_DIR};
+use otwono_store::{
+    Cache, Handoff, StorageKey, Store, DEFAULT_CACHE_DIR, DEFAULT_EXPORT_DIR, DEFAULT_KEY_PATH,
+    DEFAULT_STORE_DIR, EXPORT_MAX_AGE,
+};
 use otwono_stored::StoreService;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -23,6 +26,7 @@ OPTIONS:
     --cache-dir <PATH>     Neighbourhood cache (default /var/lib/otwono/cache)
     --cache-bytes <N>      Override the cache budget the capability profile chose
     --no-cache             Contribute no neighbourhood cache at all
+    --export-dir <PATH>    Where large objects are handed over (default /var/lib/otwono/export)
     -h, --help             Show this message
 
 THE NEIGHBOURHOOD CACHE:
@@ -36,6 +40,15 @@ THE NEIGHBOURHOOD CACHE:
     lookup entirely.
 
     Holding is publishing: serving a chunk tells your neighbours you hold it.
+
+LARGE OBJECTS:
+    The control plane is newline-delimited JSON with a 1 MiB line cap, so objects above
+    640 KiB move as files instead (ADR-0018). store.export writes one into the export
+    directory and gives it to the calling uid; store.import reads one back from a path the
+    caller owns.
+
+    An exported file is PLAINTEXT, even though the store is encrypted at rest. Read it and
+    unlink it. Anything left behind is reaped after an hour.
 
 EXIT CODES:
     0  clean shutdown
@@ -76,6 +89,7 @@ fn run(args: &[String]) -> Result<String, Error> {
     let mut cache_dir = PathBuf::from(DEFAULT_CACHE_DIR);
     let mut cache_bytes: Option<u64> = None;
     let mut want_cache = true;
+    let mut export_dir = PathBuf::from(DEFAULT_EXPORT_DIR);
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -95,6 +109,7 @@ fn run(args: &[String]) -> Result<String, Error> {
                 );
             }
             "--no-cache" => want_cache = false,
+            "--export-dir" => export_dir = next_path(&mut it, "--export-dir")?,
             "-h" | "--help" => return Ok(USAGE.to_string()),
             other => return Err(Error::Usage(format!("unknown option {other}"))),
         }
@@ -133,7 +148,23 @@ fn run(args: &[String]) -> Result<String, Error> {
         perm_socket.display()
     );
 
-    let mut service = StoreService::new(store, perm_socket.clone());
+    // Swept once at startup, before anything can add to it. A daemon that restarted while
+    // a caller held an export left plaintext behind, and the caller is not coming back for
+    // it -- its socket died with the old process.
+    let handoff = Handoff::new(&export_dir);
+    handoff
+        .ensure_layout()
+        .map_err(|e| Error::Startup(format!("export directory: {e}")))?;
+    match handoff.reap(EXPORT_MAX_AGE) {
+        Ok(0) => {}
+        Ok(n) => eprintln!(
+            "otwono-stored: reaped {n} abandoned export(s) from {}",
+            export_dir.display()
+        ),
+        Err(e) => eprintln!("otwono-stored: could not sweep {}: {e}", export_dir.display()),
+    }
+
+    let mut service = StoreService::new(store, perm_socket.clone()).with_handoff(handoff);
     if want_cache {
         // The budget is the capability policy engine's decision and nobody else's
         // (CLAUDE.md §2.6). An override is an operator saying so on purpose; absent one,
