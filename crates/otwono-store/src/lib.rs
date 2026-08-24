@@ -1,9 +1,11 @@
+pub mod cache;
 pub mod cas;
 pub mod chunk;
 pub mod crypt;
 pub mod label;
 pub mod object;
 
+pub use cache::{Cache, CacheEntry, CacheError, CacheIndex, DEFAULT_CACHE_DIR};
 pub use cas::{Store, StoreError, DEFAULT_STORE_DIR};
 pub use chunk::{ChunkRef, CHUNKING_VERSION};
 pub use crypt::{CryptError, StorageKey, DEFAULT_KEY_PATH};

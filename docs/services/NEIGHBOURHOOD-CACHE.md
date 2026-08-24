@@ -32,9 +32,28 @@ ADR-0015 for the full argument, including where something ledger-like *would* be
 ```
 /var/lib/otwono/cache/          0700, encrypted at rest, otwono-stored only
   chunks/<aa>/<bb>/<blake3>     one file per chunk, name is the hash
-  have.idx                      what this node holds, for answering peers
-  meta.db                       size accounting, last-access, pin flags
+  objects/<aa>/<hex>.json       one record per cached object
+  meta.json                     size accounting, last-access, pin flags, chunk refcounts
 ```
+
+**STATUS: IMPLEMENTED** — `crates/otwono-store/src/cache.rs`. Two deviations from the sketch
+above, both deliberate:
+
+- `have.idx` is not a separate file. What this node holds is the key set of `meta.json`'s
+  chunk refcounts, and a second index of the same fact is a second thing to keep in step.
+- `meta.db` is `meta.json`. It is read once at open and rewritten on change; a cache index a
+  person can read with `cat` is worth more here than one that is fast, and it avoids a
+  database dependency in the base image.
+
+The refcounts are not an optimization. Chunks are shared between objects by design, so
+evicting one object must not delete chunks another still needs — without counting, eviction
+silently corrupts whatever else referenced them.
+
+The cache is a **second `Store`**, rooted at a different directory rather than a flag on the
+first. `/var/lib/otwono/store` is the user's and nothing may evict it; everything in
+`/var/lib/otwono/cache` is disposable by definition. Two directories makes that structural
+instead of a boolean somebody has to remember to check, and eviction has no path to the
+user's data.
 
 | Property | Value |
 |---|---|
@@ -48,6 +67,11 @@ ADR-0015 for the full argument, including where something ledger-like *would* be
 
 The default comes from the capability policy engine and nowhere else (CLAUDE.md §2.6). An
 operator may raise or lower it; no subsystem may infer it.
+
+**STATUS: IMPLEMENTED** — `FeatureGates::neighbourhood_cache_bytes`, in the capability
+profile schema at `1.1.0`. A machine whose storage axis is `Constrained` gets zero whatever
+its tier says: a full disk is a broken node, so a machine with no room contributes nothing
+rather than contributing until it dies.
 
 | Tier | Default contribution | Rationale |
 |---|---|---|
@@ -119,5 +143,15 @@ Per CLAUDE.md §2.3, the mechanisms here are well-trodden and the adapter layer 
 - The cache respects its size cap under sustained pressure and evicts rather than filling
   the disk.
 - A T0 node with 512 MiB participates usefully rather than thrashing.
+
+### Where each stands
+
+| Criterion | State |
+|---|---|
+| A chunk that fails its hash never reaches a caller | **partly** — `Store::get_chunk` verifies on read and `fetch_object` verifies on arrival from a peer (ADR-0017), both tested; nothing yet serves a *cached* chunk to a caller, so the cache's own path is untested |
+| A fetch with three peers holding disjoint pieces completes and is byte-identical to origin | **not met** — the fetch is single-peer; fan-out is not built |
+| A `PRIVATE` object cannot be placed in the cache by any code path | **met** — `cache::tests::private_content_cannot_enter_the_cache_by_any_path`, asserted negatively and with nothing reaching the disk |
+| The cache respects its size cap under sustained pressure and evicts rather than filling the disk | **met** — twenty 64 KiB inserts into a 256 KiB budget, budget asserted after each |
+| A T0 node with 512 MiB participates usefully rather than thrashing | **partly** — the 512 MiB default is asserted; "usefully rather than thrashing" needs a real T0 board |
 
 Until each has a test and a log, this document describes an intention.

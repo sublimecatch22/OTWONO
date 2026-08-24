@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# statvfs, for the reserve floor that stops the cache filling the disk.
+rustix = { version = "0.38", features = ["fs"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # The hash used everywhere else in this system: the audit chain, the model store, the

@@ -41,7 +41,24 @@ pub struct FeatureGates {
     pub serve_ai_to_peers: bool,
     /// Hold replicas of other nodes' `REPLICATED` content.
     pub content_replication: bool,
+    /// Bytes this machine may contribute to the neighbourhood cache (ADR-0015).
+    ///
+    /// A default, not a setting: an operator raises or lowers it, and no subsystem may
+    /// infer its own (CLAUDE.md §2.6). Zero means "do not cache for peers at all", which is
+    /// what a machine with no room to spare gets whatever its tier says.
+    pub neighbourhood_cache_bytes: u64,
 }
+
+/// The tier defaults from `NEIGHBOURHOOD-CACHE.md` §3.
+///
+/// T0 is deliberately non-zero. An 8 GB eMMC has little to spare, but a node that
+/// contributes nothing is a node its neighbours cannot help either — 512 MiB is the
+/// smallest slice that still lets a street's caches overlap.
+pub const CACHE_BYTES_T0: u64 = 512 * 1024 * 1024;
+pub const CACHE_BYTES_T1: u64 = 4 * 1024 * 1024 * 1024;
+pub const CACHE_BYTES_T2: u64 = 32 * 1024 * 1024 * 1024;
+pub const CACHE_BYTES_T3: u64 = 128 * 1024 * 1024 * 1024;
+pub const CACHE_BYTES_T4: u64 = 128 * 1024 * 1024 * 1024;
 
 impl FeatureGates {
     pub fn for_tier(tier: Tier, axes: &CapabilityAxes) -> Self {
@@ -60,6 +77,7 @@ impl FeatureGates {
                 desktop: DesktopProfile::Headless,
                 serve_ai_to_peers: false,
                 content_replication: false,
+                neighbourhood_cache_bytes: CACHE_BYTES_T0,
             },
             Tier::T1Edge => FeatureGates {
                 local_llm: true,
@@ -80,6 +98,7 @@ impl FeatureGates {
                 desktop: DesktopProfile::Headless,
                 serve_ai_to_peers: false,
                 content_replication: false,
+                neighbourhood_cache_bytes: CACHE_BYTES_T1,
             },
             Tier::T2Balanced => FeatureGates {
                 local_llm: true,
@@ -101,6 +120,7 @@ impl FeatureGates {
                 desktop: DesktopProfile::Light,
                 serve_ai_to_peers: false,
                 content_replication: true,
+                neighbourhood_cache_bytes: CACHE_BYTES_T2,
             },
             Tier::T3Capable => FeatureGates {
                 local_llm: true,
@@ -127,6 +147,7 @@ impl FeatureGates {
                 desktop: DesktopProfile::Full,
                 serve_ai_to_peers: true,
                 content_replication: true,
+                neighbourhood_cache_bytes: CACHE_BYTES_T3,
             },
             Tier::T4Workstation => FeatureGates {
                 local_llm: true,
@@ -154,6 +175,7 @@ impl FeatureGates {
                 desktop: DesktopProfile::Full,
                 serve_ai_to_peers: true,
                 content_replication: true,
+                neighbourhood_cache_bytes: CACHE_BYTES_T4,
             },
         };
 
@@ -173,6 +195,10 @@ fn apply_axis_adjustments(g: &mut FeatureGates, axes: &CapabilityAxes) {
     if axes.storage <= StorageClass::Constrained {
         g.content_replication = false;
         g.eligible_node_roles.retain(|r| r != "cache" && r != "archive");
+        // And the cache goes with them. A full disk is a broken node
+        // (NEIGHBOURHOOD-CACHE.md §3), so a machine with no room contributes nothing rather
+        // than contributing until it dies.
+        g.neighbourhood_cache_bytes = 0;
     }
 
     // A gateway role requires the connectivity to be one.
@@ -210,6 +236,56 @@ mod tests {
             storage,
             network: net,
             power,
+        }
+    }
+
+    fn roomy() -> CapabilityAxes {
+        axes(
+            AcceleratorClass::GpuSmall,
+            StorageClass::Bulk,
+            NetworkClass::Lan,
+            PowerClass::Unconstrained,
+        )
+    }
+
+    #[test]
+    fn the_cache_budget_grows_with_the_tier() {
+        let a = roomy();
+        let budgets: Vec<u64> = [Tier::T0Micro, Tier::T1Edge, Tier::T2Balanced, Tier::T3Capable]
+            .iter()
+            .map(|t| FeatureGates::for_tier(*t, &a).neighbourhood_cache_bytes)
+            .collect();
+        assert_eq!(
+            budgets,
+            vec![CACHE_BYTES_T0, CACHE_BYTES_T1, CACHE_BYTES_T2, CACHE_BYTES_T3],
+            "the defaults must match NEIGHBOURHOOD-CACHE.md §3"
+        );
+        assert!(budgets.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn even_the_smallest_tier_contributes_something() {
+        // A node that contributes nothing is a node its neighbours cannot help either.
+        let g = FeatureGates::for_tier(Tier::T0Micro, &roomy());
+        assert_eq!(g.neighbourhood_cache_bytes, 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_machine_with_no_room_caches_nothing_whatever_its_tier() {
+        // A full disk is a broken node. Storage overrides the tier, in the one place that
+        // is allowed to decide this.
+        for tier in [Tier::T0Micro, Tier::T2Balanced, Tier::T4Workstation] {
+            let g = FeatureGates::for_tier(
+                tier,
+                &axes(
+                    AcceleratorClass::GpuSmall,
+                    StorageClass::Constrained,
+                    NetworkClass::Lan,
+                    PowerClass::Unconstrained,
+                ),
+            );
+            assert_eq!(g.neighbourhood_cache_bytes, 0, "{tier:?} on a constrained disk");
+            assert!(!g.content_replication);
         }
     }
 

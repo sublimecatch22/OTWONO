@@ -492,7 +492,13 @@ mod tests {
         ] {
             assert!(v.get(field).is_some(), "missing contract field {field}");
         }
-        assert_eq!(v["schema_version"], "1.0.0");
+        // Against the constant, not a literal: this test is here to catch a *missing*
+        // schema_version, and a hardcoded number turns every deliberate bump into a failure
+        // that says nothing.
+        assert_eq!(
+            v["schema_version"],
+            otwono_capability::CAPABILITY_PROFILE_SCHEMA_VERSION
+        );
     }
 
     #[test]

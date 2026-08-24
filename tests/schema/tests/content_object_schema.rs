@@ -20,7 +20,10 @@ fn validator() -> jsonschema::Validator {
 
 fn data(len: usize, seed: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(len);
-    let mut x = seed | 1;
+    // Mixed, not `seed | 1`: that maps 2 and 3 (and every other adjacent pair) to the same
+    // stream, so two "different" fixtures come out byte-identical. Cost one debugging round
+    // in the cache's LRU test.
+    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
     while out.len() < len {
         x ^= x << 13;
         x ^= x >> 7;

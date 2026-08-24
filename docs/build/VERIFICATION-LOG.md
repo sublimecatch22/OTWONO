@@ -2128,3 +2128,107 @@ give it away, and `fetch_object` rejects it with `ObjectIdMismatch`.
   waits on the identity daemon's agreement keys.
 - **No LoRa hardware was involved.** The `Trickle` numbers above are frame sizes measured
   against `BandwidthClass::max_reasonable_payload()`, not a radio.
+
+---
+
+## Phase 6 slice 1 — the neighbourhood cache, bounded and evicting
+
+**Date:** 2026-08-24 · **Where:** OTWONO Cloud dev environment (no `/dev/kvm`)
+
+`otwono-store::cache`, and the budget that governs it. ADR-0015 decided this design; this
+is the implementation of the local half. No daemon uses it yet.
+
+### Workspace
+
+```
+cargo test --workspace     718 passed, 0 failed   (was 697)
+cargo clippy --workspace --all-targets -- -D warnings   clean
+cargo fmt --all --check    clean
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+  cargo build --workspace --target aarch64-unknown-linux-gnu   links
+```
+
+Note on the cross-build: plain `cargo build --target aarch64-...` fails at link time on this
+machine because `cc` is the host linker. That is environment, not regression — CI sets
+`CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER` and so must any local check.
+
+### The cache is a second store, not a flag on the first
+
+`/var/lib/otwono/store` is the user's and nothing may evict it. `/var/lib/otwono/cache` is
+disposable by definition. Two directories makes that structural rather than a boolean
+somebody has to remember to check, and eviction has no path to the user's data. Both are
+`Store`s, so chunking, content addressing, encryption at rest and digest verification are
+the same code in both.
+
+### Refcounts are not an optimization
+
+Chunks are shared between objects by design. Evicting an object without counting references
+deletes chunks another cached object still needs, and the corruption surfaces later, at a
+read, somewhere else. `evicting_one_object_does_not_break_another_that_shares_its_chunks`
+builds two objects with genuinely overlapping chunk lists — asserted, not assumed — evicts
+the first, and reads the second back in full.
+
+### The budget is decided in one place
+
+`FeatureGates::neighbourhood_cache_bytes`, from `NEIGHBOURHOOD-CACHE.md` §3's table:
+512 MiB / 4 GiB / 32 GiB / 128 GiB. A machine whose storage axis is `Constrained` gets zero
+whatever its tier says, in the same `apply_axis_adjustments` that already strips the `cache`
+role from such a machine — one place, as CLAUDE.md §2.6 requires. The capability profile
+schema went to `1.1.0` for the new required field.
+
+That bump immediately failed `otwono-hwctl`'s contract test, which asserted the literal
+`"1.0.0"`. Correct behaviour from the test, wrong assertion: it exists to catch a *missing*
+`schema_version`, so it now compares against the constant and a deliberate bump no longer
+needs an edit.
+
+### Defect 33: a fixture generator that made two different seeds the same bytes
+
+The LRU test failed claiming the wrong object had been evicted. The cause was in the test
+helper, copied across five files:
+
+```rust
+let mut x = seed | 1;   // 2 | 1 == 3, and 3 | 1 == 3
+```
+
+Every adjacent pair of seeds produced one stream, so the LRU test's third object was
+silently its second re-inserted, and the sustained-pressure test was doing ten distinct
+inserts rather than twenty. Fixed in all five with a multiply by the golden-ratio constant
+before the `| 1`, and pinned by
+`the_fixture_generator_gives_distinct_seeds_distinct_bytes`, which walks 64 seeds through a
+`HashSet`.
+
+Worth naming because the failure mode is the dangerous one: a *weaker* test that still
+passes. The pressure test was green the whole time and proving half of what it claimed.
+
+### What the tests actually assert
+
+| Property | Test |
+|---|---|
+| `PRIVATE` and `SHARED` cannot enter the cache by any path | `private_content_cannot_enter_the_cache_by_any_path` — negative, and nothing reaches the disk |
+| A zero budget caches nothing | `a_zero_budget_caches_nothing` |
+| The budget holds under sustained pressure | `the_budget_holds_under_sustained_pressure` — 20 × 64 KiB into 256 KiB, checked after every insert |
+| Eviction is least-recently-used | `eviction_takes_the_least_recently_used` |
+| A pinned object is never evicted | `a_pinned_object_is_never_evicted` |
+| An insert only pinned objects block is refused, not forced | `an_insert_that_only_pinned_objects_block_is_refused_not_forced` |
+| A peer asking about an object does not keep it alive | `a_peer_reading_an_object_does_not_keep_it_alive` |
+| Evicting one object does not break another sharing its chunks | `evicting_one_object_does_not_break_another_that_shares_its_chunks` |
+| A purge leaves nothing, pinned included | `a_purge_leaves_nothing_behind_not_even_pinned_objects` |
+| The index survives a reopen, and a corrupt one opens empty | `the_index_survives_a_reopen`, `a_corrupt_index_reopens_empty_rather_than_refusing_to_start` |
+
+`stat()` deliberately does not count as a use. Answering a peer's `content.manifest` is not
+the operator using the object, and letting a peer keep something alive in this node's cache
+by asking about it would hand the eviction policy to strangers.
+
+### What this does not prove
+
+- **No daemon uses it.** `otwono-stored` does not open a cache, `net.fetch` does not put
+  what it fetched into one, and `store.serve_*` does not serve from one. That is the next
+  slice and it is what makes the cache do anything at all.
+- **Fan-out does not exist.** ADR-0015's central claim — that density makes transfers
+  faster because a fetch draws from every peer holding pieces — is unimplemented. The fetch
+  is single-peer. `NEIGHBOURHOOD-CACHE.md` §8's three-peer criterion is untouched.
+- **Nothing has booted**, and no `/var/lib/otwono/cache` is created by any build stage.
+- **The reserve floor is untested against a genuinely full disk.** `ensure_disk_room` calls
+  `statvfs` and refuses below 256 MiB free; that path has been read, not exercised.
+- **"Usefully rather than thrashing" on a T0 board** needs a T0 board. Only the 512 MiB
+  default is asserted.
