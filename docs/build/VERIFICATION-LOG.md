@@ -2619,6 +2619,28 @@ every ten minutes in both `otwono-stored` and `otwono-netd`. Each daemon has its
 directory: two daemons sweeping one directory means each reaper can delete the other's
 in-flight file.
 
+### Defect 38 was confirmed by CI, not by me
+
+Worth recording precisely, because it is the strongest instance yet of a pattern this log
+has been tracking.
+
+At `28921fb` — the commit *before* the fix — the full workspace passed locally: 763 passed,
+0 failed. CI on that same commit failed
+`three_peers_holding_disjoint_pieces_complete_a_fetch` with
+`NotAvailable("b068405774d747eac9c5aa486ba9d5b9f7c8c5073bbc4e358c65a8d8deb778b7")`.
+
+I had already found and fixed the bug locally by then, from a *different* test (the 8 MiB
+file fetch, which has ~130 chunks instead of ~7), and had written in the commit message that
+the three-peer test "passed only because seven chunks is few enough to get lucky". That was
+a claim about probability with no observation behind it. CI supplied the observation: on a
+different machine, with different thread scheduling, the luck ran out.
+
+Six defects on this branch have now appeared only under CI scheduling or only against a real
+server. The lesson is not "run CI more" — it is that a green local run of a test with
+threads in it is weak evidence, and that the assertions matter more than the pass. The fix
+added `assert!(report.dropped.is_empty())` and `assert!(report.demerits.is_empty())`, which
+fail deterministically on the old code rather than probabilistically.
+
 ### Disk
 
 The 8 MiB fixtures plus `target/` filled the dev environment's allowance mid-run, and

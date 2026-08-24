@@ -229,40 +229,47 @@ fn three_peers_holding_disjoint_pieces_complete_a_fetch() {
         let _ = serving.join();
     }
 
-    let mut sources = Vec::new();
-    let mut threads = Vec::new();
-    for (i, node) in nodes.iter().enumerate() {
-        let (peer, t) = source(&format!("peer-{i}"), node.responder());
-        sources.push(peer);
-        threads.push(t);
-    }
-    let (fetched, report) =
-        otwono_netd::fetch_object_from_peers(sources, &id).expect("three partial peers must suffice");
+    // Repeated, because the bug this test failed to catch was probabilistic: at 28921fb the
+    // single-run version passed locally and failed on CI, where the threads interleaved
+    // differently. Whether the fetch completes must be a property of the peers' holdings
+    // covering the object, not of who happened to pop which chunk first.
+    for round in 0..5 {
+        let mut sources = Vec::new();
+        let mut threads = Vec::new();
+        for (i, node) in nodes.iter().enumerate() {
+            let (peer, t) = source(&format!("peer-{i}"), node.responder());
+            sources.push(peer);
+            threads.push(t);
+        }
+        let (fetched, report) = otwono_netd::fetch_object_from_peers(sources, &id)
+            .unwrap_or_else(|e| panic!("three partial peers must suffice (round {round}): {e}"));
 
-    assert_eq!(fetched.bytes, bytes, "the assembled object is not byte-identical");
-    assert_eq!(fetched.content_id, id);
-    assert_eq!(
-        report.peers_that_served(),
-        3,
-        "the work did not actually spread: {report:?}"
-    );
-    assert!(
-        report.chunks_from.values().sum::<usize>() >= digests.len(),
-        "fewer chunks were served than the object has: {report:?}"
-    );
-    // The regression this guards: an honest peer holding a third of an object is refused
-    // about twice for every hit, because there is no want-list. Counting those refusals as
-    // failures dropped exactly the peers the fan-out exists to combine.
-    assert!(
-        report.dropped.is_empty(),
-        "an honest partial peer was treated as faulty: {report:?}"
-    );
-    assert!(
-        report.demerits.is_empty(),
-        "not having a chunk was counted against a peer: {report:?}"
-    );
-    for t in threads {
-        let _ = t.join();
+        assert_eq!(fetched.bytes, bytes, "the assembled object is not byte-identical");
+        assert_eq!(fetched.content_id, id);
+        assert_eq!(
+            report.peers_that_served(),
+            3,
+            "the work did not actually spread (round {round}): {report:?}"
+        );
+        assert!(
+            report.chunks_from.values().sum::<usize>() >= digests.len(),
+            "fewer chunks were served than the object has (round {round}): {report:?}"
+        );
+        // The regression this guards: an honest peer holding a third of an object is refused
+        // about twice for every hit, because there is no want-list. Counting those refusals
+        // as failures dropped exactly the peers the fan-out exists to combine. Unlike the
+        // completion assertion above, these two fail deterministically on the old code.
+        assert!(
+            report.dropped.is_empty(),
+            "an honest partial peer was treated as faulty (round {round}): {report:?}"
+        );
+        assert!(
+            report.demerits.is_empty(),
+            "not having a chunk was counted against a peer (round {round}): {report:?}"
+        );
+        for t in threads {
+            let _ = t.join();
+        }
     }
 }
 
