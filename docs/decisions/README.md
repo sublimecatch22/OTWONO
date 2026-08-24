@@ -30,3 +30,4 @@ Rules:
 | 0013 | Boot the Raspberry Pi 4 through U-Boot's UEFI, not vendor UEFI | accepted |
 | 0014 | One brokered fetch daemon for outbound HTTPS; the mesh keeps its own transport | accepted |
 | 0015 | A content-addressed neighbourhood cache, not a ledger | accepted |
+| 0016 | Content-defined chunking with FastCDC at 16/64/256 KiB | accepted |

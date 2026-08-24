@@ -1691,3 +1691,89 @@ download models" is a better state than the AI daemon refusing to start.
   genuine hardware.
 - **Tier-appropriate models remain OQ-6.** The mechanism to fetch one exists; which one to
   fetch, and under what licence, does not.
+
+---
+
+## Phase 5 slice 1 — chunking parameters, measured (ADR-0016)
+
+OQ-16 settled. It is the one parameter in the content store that is a network-wide
+compatibility constant: two nodes that chunk the same bytes differently produce
+different digests and cannot serve each other, and nothing reports an error — the swarm
+just never forms. So it was measured rather than defaulted.
+
+### Method
+
+`fastcdc` 5.0.0 (FastCDC v2020) with BLAKE3, over three inputs chosen to match what a
+node actually stores: 256 MiB of high-entropy data standing in for quantized weights, a
+57 MiB rootfs tar with real internal duplication, and 117 MiB of source and documentation
+text. Harness in the session scratch, x86_64, 4 cores.
+
+`after-insert` is the fraction of chunks still shared after 64 bytes are inserted near
+the front — the case content-defined chunking exists for. `fixed` is the same edit
+against fixed-size blocks of the same nominal size. Index cost assumes 48 bytes per
+entry: a 32-byte digest, an 8-byte offset, a 4-byte length and change.
+
+```
+
+=== /tmp/claude-0/-home-user-OTWONO/8cfe0a17-7dda-505f-a604-d135080a5451/scratchpad/cdc-in/model.bin  (256 MiB) ===
+params             chunks   mean KiB   index/GiB after-insert      fixed
+2/8/16 KiB          27835        9.4        5.1M       100.0%       0.0%
+4/16/64 KiB         13284       19.7        2.4M       100.0%       0.0%
+8/32/128 KiB         6661       39.4        1.2M       100.0%       0.0%
+16/64/256 KiB        3340       78.5        0.6M       100.0%       0.0%
+32/128/512 KiB       1674      156.6        0.3M        99.9%       0.0%
+64/256/1024 KiB       831      315.5        0.2M        99.9%       0.0%
+
+=== /tmp/claude-0/-home-user-OTWONO/8cfe0a17-7dda-505f-a604-d135080a5451/scratchpad/cdc-in/rootfs.tar  (57 MiB) ===
+params             chunks   mean KiB   index/GiB after-insert      fixed
+2/8/16 KiB           5979        9.8        4.9M       100.0%       2.4%
+4/16/64 KiB          2822       20.7        2.3M       100.0%       2.2%
+8/32/128 KiB         1462       40.0        1.2M        99.9%       1.7%
+16/64/256 KiB         733       79.8        0.6M        99.9%       1.1%
+32/128/512 KiB        364      160.7        0.3M        99.7%       0.7%
+64/256/1024 KiB       193      303.1        0.2M        99.5%       0.0%
+
+=== /tmp/claude-0/-home-user-OTWONO/8cfe0a17-7dda-505f-a604-d135080a5451/scratchpad/cdc-in/text.dat  (117 MiB) ===
+params             chunks   mean KiB   index/GiB after-insert      fixed
+2/8/16 KiB          12380        9.7        4.9M       100.0%       0.0%
+4/16/64 KiB          5667       21.2        2.3M       100.0%       0.0%
+8/32/128 KiB         2879       41.7        1.2M       100.0%       0.0%
+16/64/256 KiB        1383       86.8        0.6M        99.9%       0.0%
+32/128/512 KiB        792      151.6        0.3M        99.9%       0.0%
+64/256/1024 KiB       355      338.3        0.1M        99.7%       0.0%
+timeout: failed to run command ‘/tmp/claude-0/-home-user-OTWONO/8cfe0a17-7dda-505f-a604-d135080a5451/scratchpad/cdc/target/release/rate’: No such file or directory
+
+/tmp/claude-0/-home-user-OTWONO/8cfe0a17-7dda-505f-a604-d135080a5451/scratchpad/cdc-in/model.bin  (256 MiB)
+params              chunk MiB/s chunk+hash MiB/s
+4/16/64 KiB                1640             1035
+8/32/128 KiB               1763             1146
+16/64/256 KiB              1750             1191
+64/256/1024 KiB            1775             1252
+```
+
+### What the numbers decided
+
+- **Content-defined chunking is not optional.** CDC keeps 99.5–100% of its chunks across
+  an insertion; fixed-size blocking keeps **0–2.4%**. A store built on fixed blocks would
+  dedup byte-identical files and essentially nothing else.
+- **Boundary stability does not choose the parameters** — every set holds ≥99.5%.
+- **Neither does throughput** — under 20% variation across a 32× range of chunk sizes,
+  and hashing dominates chunking throughout.
+- **Index cost does**, spanning 25× across the table. At 64 KiB average the index is
+  ~0.4 MiB on a T0 node's 512 MiB contribution and ~96 MiB on a T3 node's 128 GiB.
+
+Chosen: **FastCDC v2020, 16 KiB / 64 KiB / 256 KiB**, one parameter set network-wide.
+
+### What this does not prove
+
+- **Nothing is built.** No content store exists. This measured a candidate dependency
+  against candidate parameters; the crate is the next slice.
+- **Not measured on ARM.** These are x86_64 numbers with SIMD BLAKE3. A Cortex-A72 will
+  be several times slower, and a 4 GB model must be chunked and hashed before it can be
+  stored or served. The parameter choice does not depend on it — throughput barely varies
+  — but the user-facing wait does, and it is unknown.
+- **The insertion test is synthetic.** One 64-byte insertion near the front is the
+  canonical CDC benchmark, not a distribution of real edits. Real-world dedup ratios
+  across genuinely related files have not been measured.
+- **High-entropy data does not dedup and never will.** Chunking buys resumable, parallel,
+  verifiable transfer for model weights, not storage savings. Only that is claimed.
