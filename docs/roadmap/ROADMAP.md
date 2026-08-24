@@ -178,19 +178,29 @@ GPU/NPU backends, and the tiered assistant shapes.
    private or absent. Encryption at rest, uniformly. Provenance propagation, so derived
    content cannot launder a label. Demotion, which stops future serving and says plainly
    that it recalls nothing.~~ **done**; per-recipient `SHARED` key wrapping remains
-3. Egress enforcement in `otwono-netd`, duplicated as defence in depth.
-4. Replication policy for `REPLICATED`.
-5. The **neighbourhood cache** — a bounded, encrypted, tier-scaled contributed store
-   (ADR-0015, `docs/services/NEIGHBOURHOOD-CACHE.md`). Chunking parameters are OQ-16 and
-   are a network-wide compatibility constant, so they are settled here and not later.
+3. ~~Egress enforcement in `otwono-netd`, duplicated as defence in depth.~~ **done** —
+   ADR-0017 gave the ONM content-fetch protocol; `otwono-netd` calls `store.serve` and
+   re-checks the label itself, with deliberately different code (`may_leave_a_node` is an
+   allow-list of wire strings, not a call into `otwono-store`).
+4. Replication policy for `REPLICATED`. **not started.**
+5. ~~The **neighbourhood cache** — a bounded, encrypted, tier-scaled contributed store
+   (ADR-0015, `docs/services/NEIGHBOURHOOD-CACHE.md`).~~ **done**, including fan-out fetch
+   and ADR-0018's file handoff for objects too large for the control plane. Chunking
+   parameters were OQ-16 and are settled by ADR-0016.
 
 **Exit criterion:** the negative test suite from `docs/security/DATA-VISIBILITY.md` §6
 passes, including a property test that derived content inherits the most restrictive label.
-— **three of four met.** A refusal is indistinguishable from not-found, derived content
-inherits the most restrictive label, and demotion stops future serving, all over real
-sockets with a real broker. The fourth — "a `PRIVATE` object must never appear on any link"
-— is proven at the method and not on a link, because `otwono-netd` does not yet call
-`store.serve`.
+— **met.** A refusal is indistinguishable from not-found, derived content inherits the most
+restrictive label, and demotion stops future serving, all over real sockets with a real
+broker. The fourth — "a `PRIVATE` object must never appear on any link" — is proven **on a
+link**: two booted VMs on a segment with no DHCP, mutually authenticated over Noise XX, each
+refusing the other a `PRIVATE` object it demonstrably holds, with the refusal byte-identical
+to the one an absent object gets. See `docs/build/VERIFICATION-LOG.md`.
+
+**Still outstanding here**, and named rather than folded into a later phase: per-recipient
+`SHARED` key wrapping (item 2), which needs the identity daemon's agreement keys, and the
+`REPLICATED` replication policy (item 4). Both fail closed today, which is the right way for
+a feature to be missing but is not the same as being done.
 
 ---
 
@@ -198,6 +208,12 @@ sockets with a real broker. The fourth — "a `PRIVATE` object must never appear
 
 Profile site, wiki, and messaging, in that order — they exercise all three primitives
 between them. `onm://` addressing, local resolver, browser integration, `Trickle`-safe modes.
+
+**Note on labelling.** Entries in `docs/build/VERIFICATION-LOG.md` titled "Phase 6 slice 1"
+through "slice 7" are the neighbourhood cache and the content path, which are Phase 5 item 5
+by this document. They are left under their original headings rather than renamed, because a
+verification log is a record of what was done and when, and quietly relabelling it would make
+it a worse record. Phase 6 as defined here has not started.
 
 **Exit criterion:** a three-node QEMU network where node A's wiki page is readable on node
 B, an offline message to node C is delivered when C returns, and a network partition heals
