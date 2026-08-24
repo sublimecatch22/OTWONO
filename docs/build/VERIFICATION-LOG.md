@@ -1947,3 +1947,69 @@ test caught what the missing assert did not, which is the argument for both.
 - **Provenance propagation is not implemented.** The label arithmetic for derived content
   exists and is exhaustively tested; nothing calls it.
 - **No TPM sealing.** The storage key is a 0600 file, and losing it loses the store.
+
+---
+
+## Phase 5 slice 4 — provenance and demotion
+
+Two more of `DATA-VISIBILITY.md` §6's four criteria, in the store and at the daemon.
+
+```
+cargo test --workspace   654 passed, 0 failed   (643 before)
+clippy -D warnings, fmt, shellcheck   clean
+aarch64 cross-build                   ok
+```
+
+11 new tests: 7 in `otwono-store`, 4 over the control plane.
+
+### Derivation cannot launder a label
+
+`store.put` takes `derived_from`, and the stored label is the most restrictive of the
+inputs' labels and the one the caller asked for. **The requested label is a ceiling, never a
+floor**: asking for `Public` over a `Private` input yields `Private`. That direction is the
+whole point — getting it backwards is the most likely way a system like this leaks without
+anyone deciding to.
+
+The reply reports `requested_visibility` alongside the stored one, so a caller that asked for
+`Public` and got `Private` is told rather than left to assume.
+
+**A missing input is an error, not an ignored term.** Dropping an unknown input silently
+would make the derived label looser than it should be, which is exactly the failure that
+must not be quiet.
+
+### Demotion stops serving, and recalls nothing
+
+`store.demote` only ever makes an object more restrictive. Widening is `label.promote`,
+which always confirms, and this daemon does not hold that capability — a caller wanting it
+goes to the broker rather than round it. Tested: a public object is served, demoted,
+and then refused, while remaining readable locally, so it was a label change and not a
+deletion.
+
+The reply carries `recalled_from_peers: false` and a sentence saying anything a peer already
+holds cannot be recalled. That is in the protocol rather than left to a UI to remember,
+because CLAUDE.md §8 requires the system to tell the truth about this and a silent success
+would imply the opposite.
+
+Demotion does not change the content id. The bytes are the same bytes, which is what keeping
+the label out of the identity buys.
+
+### Phase 5's exit criterion, three of four
+
+| §6 criterion | State |
+|---|---|
+| A refusal is indistinguishable from not-found | **met** — both errors compare equal after substituting the caller's own id |
+| Derived content inherits the most restrictive label | **met** — exhaustive over the arithmetic, end-to-end at the daemon |
+| Demotion stops future serving | **met** — served, demoted, refused |
+| A `PRIVATE` object never appears on any link | **not met** — proven at the method, not on a link |
+
+### What this does not prove
+
+- **The fourth criterion still needs a link.** `otwono-netd` does not call `store.serve`,
+  so nothing has crossed a wire and the duplicate check §4 asks for in the network daemon
+  does not exist. That is the next slice and it is the one that closes Phase 5.
+- **Nothing has booted.** The unit is installed by stage 30; no image has been built with it.
+- **`SHARED` is still refused rather than authorized.** Per-recipient key wrapping needs the
+  identity daemon's agreement keys.
+- **Provenance is caller-declared.** The store believes `derived_from`; nothing observes that
+  content actually was derived from what a caller claims. A caller that omits an input gets a
+  looser label and the store cannot tell.

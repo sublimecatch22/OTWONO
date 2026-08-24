@@ -53,12 +53,22 @@ pub struct StoreService {
 }
 
 #[derive(Debug, Deserialize)]
+struct DemoteParams {
+    content_id: String,
+    visibility: Visibility,
+}
+
+#[derive(Debug, Deserialize)]
 struct PutParams {
     /// Base64. Inline because the control plane is newline-delimited JSON; see
     /// [`MAX_INLINE_BYTES`].
     data: String,
     #[serde(default)]
     visibility: Visibility,
+    /// Objects this content was derived from. The stored label is the most restrictive of
+    /// these and the requested one, so derivation cannot launder a label.
+    #[serde(default)]
+    derived_from: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,8 +129,21 @@ impl StoreService {
                 bytes.len()
             )));
         }
-        let object = self.store.put_bytes(&bytes, p.visibility).map_err(rpc)?;
-        Ok(record(&object))
+        let inputs: Vec<ContentId> = p
+            .derived_from
+            .iter()
+            .map(|s| Self::parse_id(s))
+            .collect::<Result<_, _>>()?;
+        let object = self
+            .store
+            .put_derived(&bytes, p.visibility, &inputs)
+            .map_err(rpc)?;
+        let mut out = record(&object);
+        // Said back explicitly, because a caller that asked for Public over a Private input
+        // gets Private and needs to know rather than assume.
+        out["requested_visibility"] = json!(p.visibility.as_str());
+        out["derived_from"] = json!(p.derived_from);
+        Ok(out)
     }
 
     fn handle_get(&self, params: Value) -> Result<Value, RpcError> {
@@ -145,6 +168,26 @@ impl StoreService {
             .map_err(rpc)?;
         let mut out = record(&object);
         out["complete"] = json!(self.store.is_complete(&object));
+        Ok(out)
+    }
+
+    /// Make an object more restrictive.
+    ///
+    /// Only ever more restrictive. Widening is `label.promote`, which always confirms, and
+    /// this daemon does not hold that capability — a caller wanting it goes to the broker.
+    ///
+    /// Demotion stops **future** serving. It cannot recall what peers already hold, and the
+    /// reply says so rather than letting a UI imply otherwise.
+    fn handle_demote(&self, params: Value) -> Result<Value, RpcError> {
+        let p: DemoteParams = serde_json::from_value(params)
+            .map_err(|e| RpcError::invalid_params(format!("store.demote: {e}")))?;
+        let object = self
+            .store
+            .demote(&Self::parse_id(&p.content_id)?, p.visibility)
+            .map_err(rpc)?;
+        let mut out = record(&object);
+        out["recalled_from_peers"] = json!(false);
+        out["note"] = json!("future serving stops now; anything a peer already holds cannot be recalled");
         Ok(out)
     }
 
@@ -203,6 +246,8 @@ fn rpc(e: StoreError) -> RpcError {
         StoreError::Corrupt { .. } | StoreError::Crypt(_) => RpcError::internal(e.to_string()),
         StoreError::Object(_) => RpcError::internal(e.to_string()),
         StoreError::Io { .. } => RpcError::internal(e.to_string()),
+        // The caller asked for something only a person may authorize.
+        StoreError::Promotion { .. } => RpcError::invalid_params(e.to_string()),
     }
 }
 
@@ -230,6 +275,11 @@ impl Service for StoreService {
                     CAPABILITY_READ,
                 ),
                 MethodDescription::guarded(
+                    "store.demote",
+                    "Make an object more restrictive; widening is label.promote and needs a person",
+                    CAPABILITY_WRITE,
+                ),
+                MethodDescription::guarded(
                     "store.serve",
                     "Hand an object to a peer, if its label permits leaving the node",
                     CAPABILITY_SERVE,
@@ -251,6 +301,10 @@ impl Service for StoreService {
             "store.stat" => {
                 self.authorize(ctx, CAPABILITY_READ)?;
                 self.handle_stat(params)
+            }
+            "store.demote" => {
+                self.authorize(ctx, CAPABILITY_WRITE)?;
+                self.handle_demote(params)
             }
             "store.serve" => {
                 self.authorize(ctx, CAPABILITY_SERVE)?;

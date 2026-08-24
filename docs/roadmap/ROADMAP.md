@@ -175,8 +175,9 @@ GPU/NPU backends, and the tiered assistant shapes.
    **done** (the daemon, `otwono-stored`, is separate and not yet written)
 2. ~~The four labels, enforced at the boundary that matters — `store.serve` refuses
    anything but `PUBLIC` and `REPLICATED`, and refuses identically whether an object is
-   private or absent. Encryption at rest, uniformly.~~ **done**; provenance propagation
-   and per-recipient `SHARED` key wrapping remain
+   private or absent. Encryption at rest, uniformly. Provenance propagation, so derived
+   content cannot launder a label. Demotion, which stops future serving and says plainly
+   that it recalls nothing.~~ **done**; per-recipient `SHARED` key wrapping remains
 3. Egress enforcement in `otwono-netd`, duplicated as defence in depth.
 4. Replication policy for `REPLICATED`.
 5. The **neighbourhood cache** — a bounded, encrypted, tier-scaled contributed store
@@ -185,6 +186,11 @@ GPU/NPU backends, and the tiered assistant shapes.
 
 **Exit criterion:** the negative test suite from `docs/security/DATA-VISIBILITY.md` §6
 passes, including a property test that derived content inherits the most restrictive label.
+— **three of four met.** A refusal is indistinguishable from not-found, derived content
+inherits the most restrictive label, and demotion stops future serving, all over real
+sockets with a real broker. The fourth — "a `PRIVATE` object must never appear on any link"
+— is proven at the method and not on a link, because `otwono-netd` does not yet call
+`store.serve`.
 
 ---
 

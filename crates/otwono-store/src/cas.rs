@@ -57,6 +57,12 @@ pub enum StoreError {
     NotFound(String),
     Object(crate::object::ObjectError),
     Crypt(CryptError),
+    /// Widening a label is `label.promote`, which always confirms. The store will not do
+    /// it as a side effect of a relabel call.
+    Promotion {
+        from: crate::Visibility,
+        to: crate::Visibility,
+    },
 }
 
 impl std::fmt::Display for StoreError {
@@ -70,6 +76,11 @@ impl std::fmt::Display for StoreError {
             StoreError::NotFound(n) => write!(f, "{n} is not in the store"),
             StoreError::Object(e) => write!(f, "{e}"),
             StoreError::Crypt(e) => write!(f, "{e}"),
+            StoreError::Promotion { from, to } => write!(
+                f,
+                "{from} to {to} makes this object more visible, which is label.promote and \
+                 needs a person; this call only makes things more restrictive"
+            ),
         }
     }
 }
@@ -265,6 +276,58 @@ impl Store {
             })?);
         }
         Ok(out)
+    }
+
+    /// Change an object's label.
+    ///
+    /// **Demotion is always allowed; promotion is not this function's decision.** Making
+    /// something more restrictive can be done by anyone at any time and needs no
+    /// permission. Making it *less* restrictive is `label.promote`, which always confirms
+    /// (CLAUDE.md §8), so this refuses it and the daemon routes it through the broker.
+    ///
+    /// The content id does not change: the bytes are the same bytes. That is the point of
+    /// keeping the label out of the identity.
+    ///
+    /// What this cannot do, and the UI must say so: demotion stops *future* serving. It
+    /// does not recall what peers already hold.
+    pub fn demote(&self, id: &ContentId, to: crate::Visibility) -> Result<Object, StoreError> {
+        let mut object = self.get_object(id)?;
+        if !to.is_at_least_as_restrictive_as(object.visibility) {
+            return Err(StoreError::Promotion {
+                from: object.visibility,
+                to,
+            });
+        }
+        object.visibility = to;
+        self.put_object(&object)?;
+        Ok(object)
+    }
+
+    /// Store bytes derived from other objects, inheriting their labels.
+    ///
+    /// The rule from CLAUDE.md §8 and `DATA-VISIBILITY.md`: derived content carries the
+    /// **most restrictive** label among its inputs and any label the caller asked for. A
+    /// summary of a private note is private; a thumbnail of a shared photo is shared.
+    ///
+    /// Getting this backwards would let derivation launder a label, which is the most
+    /// likely way a system like this leaks without anyone deciding to. So the caller's
+    /// requested label is a *ceiling*, never a floor: asking for `Public` over a `Private`
+    /// input yields `Private`, silently and correctly.
+    ///
+    /// An input that is not in the store is an error rather than an ignored term. A missing
+    /// input would otherwise make the derived label looser than it should be, which is the
+    /// failure that must not be quiet.
+    pub fn put_derived(
+        &self,
+        data: &[u8],
+        requested: crate::Visibility,
+        inputs: &[ContentId],
+    ) -> Result<Object, StoreError> {
+        let mut labels = vec![requested];
+        for id in inputs {
+            labels.push(self.get_object(id)?.visibility);
+        }
+        self.put_bytes(data, crate::Visibility::most_restrictive(labels))
     }
 
     /// Chunk and store bytes, returning the record.
@@ -586,6 +649,130 @@ mod tests {
         raw[last] ^= 1;
         std::fs::write(&path, raw).expect("damage");
         assert!(matches!(s.read_object(&object), Err(StoreError::Crypt(_))));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn derived_content_inherits_the_most_restrictive_input() {
+        // The DATA-VISIBILITY.md Section 6 property, through the store rather than the
+        // arithmetic: a summary of a private note is private, whatever the caller asked for.
+        let d = tmp("derive");
+        let s = Store::new(&d);
+        let private = s
+            .put_bytes(b"a private note".repeat(100).as_slice(), Visibility::Private)
+            .unwrap();
+        let public = s
+            .put_bytes(b"a public page".repeat(100).as_slice(), Visibility::Public)
+            .unwrap();
+
+        let summary = s
+            .put_derived(
+                b"a summary of both",
+                Visibility::Public,
+                &[private.content_id, public.content_id],
+            )
+            .expect("derive");
+        assert_eq!(
+            summary.visibility,
+            Visibility::Private,
+            "a public request over a private input must not launder the label"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_requested_label_is_a_ceiling_not_a_floor() {
+        // Asking for something more restrictive than the inputs is honoured; asking for
+        // something looser is not.
+        let d = tmp("ceiling");
+        let s = Store::new(&d);
+        let public = s
+            .put_bytes(b"public source".repeat(100).as_slice(), Visibility::Public)
+            .unwrap();
+
+        let tighter = s
+            .put_derived(b"kept private", Visibility::Private, &[public.content_id])
+            .expect("derive");
+        assert_eq!(tighter.visibility, Visibility::Private);
+
+        let looser = s
+            .put_derived(b"still public", Visibility::Replicated, &[public.content_id])
+            .expect("derive");
+        assert_eq!(looser.visibility, Visibility::Public, "capped by the input");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn deriving_from_an_input_that_is_not_here_is_an_error() {
+        // A missing input silently dropped would make the derived label looser than it
+        // should be, which is exactly the failure that must not be quiet.
+        let d = tmp("derive-missing");
+        let s = Store::new(&d);
+        s.ensure_layout().unwrap();
+        let absent = crate::ContentId::of(&[]);
+        assert!(matches!(
+            s.put_derived(b"x", Visibility::Public, &[absent]),
+            Err(StoreError::NotFound(_))
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn deriving_from_nothing_honours_the_request() {
+        let d = tmp("derive-none");
+        let s = Store::new(&d);
+        let o = s
+            .put_derived(b"original work", Visibility::Public, &[])
+            .expect("derive");
+        assert_eq!(o.visibility, Visibility::Public);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn demotion_is_allowed_and_stops_future_serving() {
+        // The fourth Section 6 criterion. Demotion needs no permission; what it cannot do
+        // is recall what peers already hold, which the UI has to say.
+        let d = tmp("demote");
+        let s = Store::new(&d);
+        let o = s.put_bytes(&data(50_000, 53), Visibility::Public).unwrap();
+        assert!(o.visibility.may_leave_the_node_unattended());
+
+        let after = s.demote(&o.content_id, Visibility::Private).expect("demote");
+        assert_eq!(after.visibility, Visibility::Private);
+        assert!(!after.visibility.may_leave_the_node_unattended());
+
+        // Re-read from disk: the change is durable, not just in the returned value.
+        let reread = s.get_object(&o.content_id).expect("re-read");
+        assert_eq!(reread.visibility, Visibility::Private);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn demotion_does_not_rename_the_object() {
+        // The bytes are the same bytes. Keeping the label out of the identity is what makes
+        // this true, and a rename would break every reference to it.
+        let d = tmp("demote-id");
+        let s = Store::new(&d);
+        let o = s.put_bytes(&data(30_000, 59), Visibility::Replicated).unwrap();
+        let after = s.demote(&o.content_id, Visibility::Shared).expect("demote");
+        assert_eq!(after.content_id, o.content_id);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn widening_a_label_is_refused_here_and_left_to_the_broker() {
+        // label.promote always confirms. The store must not do it as a side effect.
+        let d = tmp("promote");
+        let s = Store::new(&d);
+        let o = s.put_bytes(&data(20_000, 61), Visibility::Private).unwrap();
+        for wider in [Visibility::Shared, Visibility::Public, Visibility::Replicated] {
+            assert!(
+                matches!(s.demote(&o.content_id, wider), Err(StoreError::Promotion { .. })),
+                "{wider} is wider than private and must be refused"
+            );
+        }
+        // Re-labelling to the same label is a no-op rather than an error.
+        assert!(s.demote(&o.content_id, Visibility::Private).is_ok());
         let _ = std::fs::remove_dir_all(&d);
     }
 

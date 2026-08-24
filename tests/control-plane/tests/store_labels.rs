@@ -389,6 +389,114 @@ fn every_serve_leaves_a_record_naming_the_action() {
     );
 }
 
+// --- provenance and demotion, the last two Section 6 criteria -----------------------------
+
+#[test]
+fn derived_content_cannot_launder_a_label_over_the_wire() {
+    // The property test DATA-VISIBILITY.md Section 6 asks for, at the daemon: a summary of
+    // a private note stays private no matter what the caller requests, and stays unservable.
+    let h = Harness::start("derive");
+    let private = h.put(&payload(12), "private");
+    let public = h.put(&payload(13), "public");
+
+    let out = h
+        .call(
+            "store.put",
+            json!({
+                "data": data_encoding::BASE64.encode(b"a summary of both"),
+                "visibility": "public",
+                "derived_from": [private, public],
+            }),
+            "store.write",
+        )
+        .expect("derive");
+
+    assert_eq!(out["visibility"], "private", "{out}");
+    assert_eq!(
+        out["requested_visibility"], "public",
+        "the request is reported back"
+    );
+    assert!(h
+        .call(
+            "store.serve",
+            json!({ "content_id": out["content_id"] }),
+            "store.serve"
+        )
+        .is_err());
+}
+
+#[test]
+fn deriving_from_something_this_node_does_not_have_is_refused() {
+    // Silently dropping a missing input would make the derived label looser than it should
+    // be — the failure that must not be quiet.
+    let h = Harness::start("derive-missing");
+    let err = h
+        .call(
+            "store.put",
+            json!({
+                "data": data_encoding::BASE64.encode(b"x"),
+                "visibility": "public",
+                "derived_from": ["a".repeat(64)],
+            }),
+            "store.write",
+        )
+        .expect_err("an absent input must not be ignored");
+    assert_eq!(err.code, code::INVALID_PARAMS, "{}", err.message);
+}
+
+#[test]
+fn demotion_stops_future_serving() {
+    // The fourth Section 6 criterion, end to end: served, demoted, refused.
+    let h = Harness::start("demote");
+    let id = h.put(&payload(14), "public");
+    h.call("store.serve", json!({ "content_id": id }), "store.serve")
+        .expect("served while public");
+
+    let out = h
+        .call(
+            "store.demote",
+            json!({ "content_id": id, "visibility": "private" }),
+            "store.write",
+        )
+        .expect("demote");
+    assert_eq!(out["visibility"], "private");
+    assert_eq!(
+        out["recalled_from_peers"], false,
+        "the reply must not imply anything was recalled"
+    );
+
+    assert!(
+        h.call("store.serve", json!({ "content_id": id }), "store.serve")
+            .is_err(),
+        "serving must stop after demotion"
+    );
+    // And it is still readable locally, so this was a label change and not a deletion.
+    assert!(h
+        .call("store.get", json!({ "content_id": id }), "store.read")
+        .is_ok());
+}
+
+#[test]
+fn widening_a_label_is_refused_by_this_daemon() {
+    // label.promote always confirms, and this daemon does not hold it. A caller that wants
+    // to widen goes to the broker rather than round it.
+    let h = Harness::start("promote");
+    let id = h.put(&payload(15), "private");
+    let err = h
+        .call(
+            "store.demote",
+            json!({ "content_id": id, "visibility": "public" }),
+            "store.write",
+        )
+        .expect_err("widening must be refused");
+    assert!(err.message.contains("label.promote"), "{}", err.message);
+
+    // Unchanged, and still not servable.
+    assert!(h
+        .call("store.serve", json!({ "content_id": id }), "store.serve")
+        .is_err());
+}
+
 #[test]
 fn describe_is_open_and_names_the_capability_each_method_needs() {
     let h = Harness::start("describe");
@@ -403,6 +511,7 @@ fn describe_is_open_and_names_the_capability_each_method_needs() {
         ("store.get", "store.read"),
         ("store.stat", "store.read"),
         ("store.serve", "store.serve"),
+        ("store.demote", "store.write"),
     ] {
         let m = methods
             .iter()
