@@ -1,0 +1,74 @@
+#!/bin/sh
+# OTWONO mesh content check: does content cross a link, and does PRIVATE content not?
+#
+# Phase 5's exit criterion, raised from a host-side assertion to something observed between
+# two booted nodes. Until now "a PRIVATE object never appears on any link" was proven by a
+# test that constructed daemons inside one process. This proves it over a real Noise channel
+# between two machines that authenticated each other.
+#
+# It runs on both nodes, because they run the same image. Each stores the same two fixed
+# objects and then asks its peer for both by content id.
+#
+# Why the same bytes on both sides: a content id is the hash of the content, so both nodes
+# derive the same id for the same fixed string with no coordination and no channel to pass
+# an id over. That is the one property of content addressing that makes this test possible.
+# A node fetching from a peer does not consult its own store, so holding a copy does not
+# make the fetch trivially succeed.
+#
+# It needs store.serve and net.content, which the shipped policy grants to nobody. Stage 37
+# installs the drop-in that grants them, and only when explicitly asked for.
+set -eu
+
+PUBLIC_TEXT='otwono mesh content check: this object is public and may cross a link'
+PRIVATE_TEXT='otwono mesh content check: this object is private and must never cross a link'
+ABSENT=0000000000000000000000000000000000000000000000000000000000000000
+WORK=/var/lib/otwono/mesh-content-check
+
+fail() { echo "OTWONO-MESH-CONTENT-FAIL $*" >&2; exit 1; }
+
+rm -rf "$WORK"; mkdir -p "$WORK"; chmod 0700 "$WORK"
+printf '%s' "$PUBLIC_TEXT" > "$WORK/public.txt"
+printf '%s' "$PRIVATE_TEXT" > "$WORK/private.txt"
+
+pub_id=$(otwono-storectl put --file "$WORK/public.txt" --visibility public | awk '{print $1}') \
+    || fail "could not store the public object"
+prv_id=$(otwono-storectl put --file "$WORK/private.txt" --visibility private | awk '{print $1}') \
+    || fail "could not store the private object"
+[ -n "$pub_id" ] && [ -n "$prv_id" ] || fail "a put returned no content id"
+
+# --- the positive case ------------------------------------------------------------------
+# A PUBLIC object crosses the link and the peer names it back. Retried, because discovery
+# and the Noise handshake take a while under TCG and there is no point asking before there
+# is anybody to ask; "no connected peer" is the expected answer for the first minute or two.
+got=""
+i=0
+while [ "$i" -lt 120 ]; do
+    if got=$(otwono-netd --fetch "$pub_id" --socket /run/otwono/net.sock 2>&1); then
+        break
+    fi
+    got=""
+    i=$((i + 1))
+    sleep 5
+done
+[ -n "$got" ] || fail "no peer served the public object within 600s"
+echo "$got" | grep -q "$pub_id" || fail "the peer served something else: $got"
+
+# --- the negative case, which is the point ----------------------------------------------
+# A PRIVATE object must not cross. The peer holds it -- both nodes stored it -- and refuses.
+if otwono-netd --fetch "$prv_id" --socket /run/otwono/net.sock > "$WORK/leak" 2>&1; then
+    fail "a PRIVATE object crossed the link: $(cat "$WORK/leak")"
+fi
+
+# And the refusal must be the same one an object that is simply not there gets, or a peer
+# can learn what this node holds by asking.
+otwono-netd --fetch "$ABSENT" --socket /run/otwono/net.sock > "$WORK/absent" 2>&1 || true
+sed "s/$prv_id/<id>/g" "$WORK/leak" > "$WORK/leak.norm"
+sed "s/$ABSENT/<id>/g" "$WORK/absent" > "$WORK/absent.norm"
+if ! cmp -s "$WORK/leak.norm" "$WORK/absent.norm"; then
+    echo "refused: $(cat "$WORK/leak.norm")" >&2
+    echo "absent:  $(cat "$WORK/absent.norm")" >&2
+    fail "refused and absent differ, so a peer can tell what this node holds"
+fi
+
+rm -rf "$WORK"
+echo "OTWONO-MESH-CONTENT-OK public=$pub_id private_refused=$prv_id"

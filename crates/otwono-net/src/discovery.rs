@@ -90,11 +90,68 @@ impl Discovery {
 pub fn candidate_from(info: &mdns_sd::ServiceInfo) -> Option<Candidate> {
     let claimed = info.get_property_val_str(TXT_NODE_ID)?;
     let claimed_node_id = NodeId::parse(claimed).ok()?;
-    let address = info.get_addresses().iter().next().copied()?;
+    let addresses: Vec<std::net::IpAddr> = info.get_addresses().iter().copied().collect();
+    let address = dialable_address(&addresses)?;
     Some(Candidate {
         claimed_node_id,
         address: SocketAddr::new(address, info.get_port()),
     })
+}
+
+/// Pick an address a peer can actually be reached at.
+///
+/// mDNS hands back a *set* of addresses, and the previous version of this took whichever
+/// one iteration happened to yield first. On a two-VM segment with no DHCP that was
+/// sometimes the IPv6 link-local address, and connecting to one of those without an
+/// interface scope fails with `EINVAL`:
+///
+/// ```text
+/// connect to [fe80::5054:ff:fe07:1101]:8443: link I/O failed: Invalid argument (os error 22)
+/// ```
+///
+/// So an unscoped `fe80::` address is not a candidate at all — it is a string that looks
+/// like one. It is dropped rather than ranked last, because ranking it last would still
+/// leave it chosen on a node that advertises nothing else, and a clear "no reachable
+/// address" is a better answer than a confusing `EINVAL` twenty seconds later.
+///
+/// Everything else is ranked: routable before link-local, and IPv4 before IPv6 among
+/// equals. The ordering is total and deterministic, so two nodes seeing the same
+/// advertisement make the same choice — a set's iteration order is not something a mesh
+/// should depend on.
+pub fn dialable_address(addresses: &[std::net::IpAddr]) -> Option<std::net::IpAddr> {
+    let mut usable: Vec<std::net::IpAddr> = addresses
+        .iter()
+        .copied()
+        .filter(|a| match a {
+            // Cannot be dialled without a scope id, which an advertisement does not carry.
+            std::net::IpAddr::V6(v6) => !is_ipv6_link_local(v6) && !v6.is_unspecified() && !v6.is_multicast(),
+            std::net::IpAddr::V4(v4) => !v4.is_unspecified() && !v4.is_multicast() && !v4.is_broadcast(),
+        })
+        .collect();
+    usable.sort_by_key(|a| (rank(a), a.to_string()));
+    usable.into_iter().next()
+}
+
+fn is_ipv6_link_local(v6: &std::net::Ipv6Addr) -> bool {
+    // fe80::/10. `Ipv6Addr::is_unicast_link_local` is unstable, so it is spelled out.
+    v6.segments()[0] & 0xffc0 == 0xfe80
+}
+
+/// Lower sorts first: routable, then link-local, then loopback.
+fn rank(a: &std::net::IpAddr) -> u8 {
+    let (link_local, loopback, v6) = match a {
+        std::net::IpAddr::V4(v4) => (v4.is_link_local(), v4.is_loopback(), 0),
+        std::net::IpAddr::V6(v6) => (false, v6.is_loopback(), 1),
+    };
+    // Loopback last: a peer advertising it is describing a machine that is not this one.
+    let class = if loopback {
+        4
+    } else if link_local {
+        2
+    } else {
+        0
+    };
+    class + v6
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +167,80 @@ impl std::error::Error for DiscoveryError {}
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().expect("a literal address")
+    }
+
+    #[test]
+    fn an_unscoped_ipv6_link_local_address_is_not_a_candidate() {
+        // Defect 43. Two VMs on a segment with no DHCP: mDNS advertised both a working
+        // IPv4 link-local address and an fe80:: one, the set yielded the fe80:: first, and
+        // every dial failed with EINVAL for fifteen minutes.
+        assert_eq!(
+            dialable_address(&[ip("fe80::5054:ff:fe07:1101"), ip("169.254.19.24")]),
+            Some(ip("169.254.19.24"))
+        );
+    }
+
+    #[test]
+    fn a_node_advertising_only_an_ipv6_link_local_address_has_no_reachable_one() {
+        // Dropped rather than ranked last: a clear "nowhere to dial" beats an EINVAL later.
+        assert_eq!(dialable_address(&[ip("fe80::1")]), None);
+        assert_eq!(dialable_address(&[]), None);
+    }
+
+    #[test]
+    fn a_routable_address_beats_a_link_local_one() {
+        assert_eq!(
+            dialable_address(&[ip("169.254.19.24"), ip("192.168.1.10")]),
+            Some(ip("192.168.1.10"))
+        );
+        assert_eq!(
+            dialable_address(&[ip("169.254.19.24"), ip("2001:db8::1")]),
+            Some(ip("2001:db8::1"))
+        );
+    }
+
+    #[test]
+    fn ipv4_wins_a_tie_because_it_has_no_scope_to_get_wrong() {
+        assert_eq!(
+            dialable_address(&[ip("2001:db8::1"), ip("192.168.1.10")]),
+            Some(ip("192.168.1.10"))
+        );
+    }
+
+    #[test]
+    fn loopback_is_last_because_a_peer_advertising_it_means_another_machine() {
+        assert_eq!(
+            dialable_address(&[ip("127.0.0.1"), ip("169.254.19.24")]),
+            Some(ip("169.254.19.24"))
+        );
+        // But still usable if it is genuinely all there is.
+        assert_eq!(dialable_address(&[ip("127.0.0.1")]), Some(ip("127.0.0.1")));
+    }
+
+    #[test]
+    fn the_choice_does_not_depend_on_the_order_the_set_yielded() {
+        // A mesh whose behaviour depends on a HashSet's iteration order is a mesh that
+        // works on some boots.
+        let a = [ip("fe80::1"), ip("169.254.19.24"), ip("192.168.1.10")];
+        let b = [ip("192.168.1.10"), ip("fe80::1"), ip("169.254.19.24")];
+        let c = [ip("169.254.19.24"), ip("192.168.1.10"), ip("fe80::1")];
+        assert_eq!(dialable_address(&a), dialable_address(&b));
+        assert_eq!(dialable_address(&b), dialable_address(&c));
+        assert_eq!(dialable_address(&a), Some(ip("192.168.1.10")));
+    }
+
+    #[test]
+    fn addresses_that_cannot_be_a_peer_are_refused() {
+        assert_eq!(dialable_address(&[ip("0.0.0.0")]), None);
+        assert_eq!(dialable_address(&[ip("::")]), None);
+        assert_eq!(dialable_address(&[ip("224.0.0.251")]), None);
+        assert_eq!(dialable_address(&[ip("ff02::fb")]), None);
+    }
+
     use super::*;
 
     #[test]

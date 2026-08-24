@@ -31,6 +31,7 @@ OPTIONS:
     --no-discovery         Do not announce or browse on the LAN
     --status               Query a running daemon and print its overlay status, then exit
     --peers                Query a running daemon and print its peer table, then exit
+    --fetch <CONTENT_ID>   Fetch one object from the first connected peer, then exit
     -h, --help             Show this message
 
 EXIT CODES:
@@ -84,6 +85,7 @@ fn run(args: &[String]) -> Result<String, Error> {
     let mut discovery_enabled = true;
     let mut status_only = false;
     let mut peers_only = false;
+    let mut fetch_id: Option<String> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -99,6 +101,7 @@ fn run(args: &[String]) -> Result<String, Error> {
             "--no-discovery" => discovery_enabled = false,
             "--status" => status_only = true,
             "--peers" => peers_only = true,
+            "--fetch" => fetch_id = Some(next(&mut it, "--fetch")?),
             "-h" | "--help" => return Ok(USAGE.to_string()),
             other => return Err(Error::Usage(format!("unknown option {other}"))),
         }
@@ -133,6 +136,18 @@ fn run(args: &[String]) -> Result<String, Error> {
     //
     // This exists because a mesh that will not form is otherwise invisible on a headless
     // box — the reason lives in the journal, and "connected=0" does not say why.
+    // Fetch one object from whichever peer this node has already authenticated.
+    //
+    // The peer is chosen here rather than named by the caller, because the caller that
+    // needs this most is a shell script on a booted node that has no way to know a
+    // neighbour's NodeID until the mesh has formed. It asks net.peers, takes the first
+    // connected one, and fetches.
+    if let Some(content_id) = fetch_id {
+        let socket = socket.unwrap_or_else(|| otwono_proto::socket_path("net"));
+        let perm_socket = perm_socket.unwrap_or_else(|| otwono_proto::socket_path("perm"));
+        return fetch_from_a_peer(&socket, &perm_socket, &content_id);
+    }
+
     if peers_only {
         let socket = socket.unwrap_or_else(|| otwono_proto::socket_path("net"));
         let perm_socket = perm_socket.unwrap_or_else(|| otwono_proto::socket_path("perm"));
@@ -238,6 +253,94 @@ fn run(args: &[String]) -> Result<String, Error> {
         .serve(Arc::new(NetService::new(state, perm_socket)), Shutdown::new())
         .map_err(|e| Error::Startup(format!("serve failed: {e}")))?;
     Ok(String::new())
+}
+
+/// Ask a capability of the broker, the way every other client must.
+fn broker_token(perm_socket: &std::path::Path, action: &str, reason: &str) -> Result<String, Error> {
+    let mut broker = otwono_proto::Client::connect_waiting(perm_socket, std::time::Duration::from_secs(5))
+        .map_err(|e| {
+            Error::Startup(format!(
+                "cannot reach otwono-permd at {}: {e}",
+                perm_socket.display()
+            ))
+        })?;
+    broker
+        .call(
+            "perm.request",
+            serde_json::json!({ "action": action, "reason": reason }),
+        )
+        .map_err(|e| Error::Startup(format!("perm.request transport failure: {e}")))?
+        .map_err(|e| Error::Startup(format!("perm.request refused: {}", e.message)))?
+        .get("token")
+        .and_then(|t| t.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| Error::Startup("perm.request returned no token".into()))
+}
+
+/// Fetch one object from the first connected peer.
+fn fetch_from_a_peer(
+    socket: &std::path::Path,
+    perm_socket: &std::path::Path,
+    content_id: &str,
+) -> Result<String, Error> {
+    let read_token = broker_token(perm_socket, "net.read", "otwono-netd --fetch: find a peer")?;
+    let mut client = otwono_proto::Client::connect_waiting(socket, std::time::Duration::from_secs(5))
+        .map_err(|e| Error::Startup(format!("cannot reach otwono-netd at {}: {e}", socket.display())))?;
+    let peers = client
+        .call_with_capability("net.peers", serde_json::json!({}), &read_token)
+        .map_err(|e| Error::Startup(format!("net.peers transport failure: {e}")))?
+        .map_err(|e| Error::Startup(format!("net.peers refused: {}", e.message)))?;
+
+    let peer = peers
+        .get("peers")
+        .and_then(|p| p.as_array())
+        .into_iter()
+        .flatten()
+        .find(|p| {
+            p.get("state").and_then(|s| s.as_str()) == Some("connected")
+                && p.get("addresses")
+                    .and_then(|a| a.as_array())
+                    .is_some_and(|a| !a.is_empty())
+        })
+        .cloned()
+        .ok_or_else(|| Error::Startup("no connected peer to fetch from".into()))?;
+
+    let node_id = peer
+        .get("node_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::Startup("a peer record carries no node_id".into()))?;
+    let address = peer
+        .get("addresses")
+        .and_then(|a| a.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::Startup("a connected peer has no address".into()))?;
+
+    let content_token = broker_token(
+        perm_socket,
+        "net.content",
+        "otwono-netd --fetch: fetch an object from a peer",
+    )?;
+    let value = client
+        .call_with_capability(
+            "net.fetch",
+            serde_json::json!({
+                "node_id": node_id,
+                "address": address,
+                "content_id": content_id,
+            }),
+            &content_token,
+        )
+        .map_err(|e| Error::Startup(format!("net.fetch transport failure: {e}")))?
+        .map_err(|e| Error::Startup(format!("net.fetch refused: {}", e.message)))?;
+
+    Ok(format!(
+        "{} {} bytes from {} visibility={}\n",
+        value.get("content_id").and_then(|v| v.as_str()).unwrap_or("?"),
+        value.get("size_bytes").and_then(|v| v.as_u64()).unwrap_or(0),
+        node_id,
+        value.get("visibility").and_then(|v| v.as_str()).unwrap_or("?"),
+    ))
 }
 
 /// Print one line per known peer: state, address, and the last failure if there was one.
