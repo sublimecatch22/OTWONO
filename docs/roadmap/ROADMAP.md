@@ -211,6 +211,12 @@ user owns the keys" stop being slogans:
 - **Finance** (`docs/services/FINANCE.md`) — entirely `PRIVATE`, passphrase-encrypted,
   file-import only until OQ-19 is settled.
 
+Also in this phase, and ahead of both of them in usefulness per unit of effort: a
+**companion client** so the node is reachable from the device a person actually carries
+(`docs/services/PORTABLE-APPS.md`). A Rust core with a thin shell — Linux and Android
+first, Windows next, a PWA for iOS. The application model itself is OQ-20 and needs an ADR;
+Apple platforms are OQ-21 and need a decision that is commercial rather than technical.
+
 **Exit criterion:** an end-to-end task ("convert these images and put them in a document")
 executed through the broker with a complete audit trail, on both architectures.
 
