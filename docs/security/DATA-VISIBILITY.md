@@ -66,7 +66,15 @@ Defence in depth: a bug in one must not be sufficient to leak private data.
 
 ## 5. Encryption
 
-- `PRIVATE`: XChaCha20-Poly1305 with the node storage key, TPM-sealed where available.
+- **Everything, whatever its label**: XChaCha20-Poly1305 with the node storage key.
+  Implementation note, and a deliberate strengthening of what this section originally said:
+  a chunk is content-addressed and label-agnostic, so the *same* chunk can be referenced by
+  a `PRIVATE` object and a `PUBLIC` one at once. Encryption keyed on the label would have to
+  answer "which object referenced this chunk first?", and every answer to that is a bug. So
+  the label governs who may read an object; it does not govern whether the bytes on disk are
+  encrypted. Chunk digests are over **plaintext**, so two nodes with different storage keys
+  still agree on what a chunk is called — without that the neighbourhood cache could not
+  exist. TPM sealing where available remains unimplemented.
 - `SHARED`: a per-object content key, wrapped once per authorized recipient with an X25519
   key agreement. Adding a recipient re-wraps the key; **removing one does not un-share what
   they already have**, and the UI says so.

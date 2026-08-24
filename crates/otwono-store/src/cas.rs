@@ -18,15 +18,29 @@
 //! content-addressed name.
 
 use crate::chunk::ChunkRef;
+use crate::crypt::{CryptError, StorageKey};
 use crate::object::{digest_from_hex, ContentId, Object};
 use std::path::{Path, PathBuf};
 
 /// Where an image keeps the content store.
 pub const DEFAULT_STORE_DIR: &str = "/var/lib/otwono/store";
 
-#[derive(Debug, Clone)]
 pub struct Store {
     root: PathBuf,
+    /// Absent means chunks are written in the clear.
+    ///
+    /// Only tests and inspection tools have any business without a key; a daemon always
+    /// supplies one, and `otwono-stored` refuses to start if it cannot get one.
+    key: Option<StorageKey>,
+}
+
+impl std::fmt::Debug for Store {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Store")
+            .field("root", &self.root)
+            .field("encrypted", &self.key.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -42,6 +56,7 @@ pub enum StoreError {
     },
     NotFound(String),
     Object(crate::object::ObjectError),
+    Crypt(CryptError),
 }
 
 impl std::fmt::Display for StoreError {
@@ -54,6 +69,7 @@ impl std::fmt::Display for StoreError {
             ),
             StoreError::NotFound(n) => write!(f, "{n} is not in the store"),
             StoreError::Object(e) => write!(f, "{e}"),
+            StoreError::Crypt(e) => write!(f, "{e}"),
         }
     }
 }
@@ -68,10 +84,30 @@ fn io(path: &Path, e: std::io::Error) -> StoreError {
 }
 
 impl Store {
+    /// A store that writes chunks in the clear.
+    ///
+    /// For tests and for offline inspection. A daemon uses [`Store::encrypted`]; a node
+    /// with an unencrypted store is a node whose disk is its threat model.
     pub fn new(root: impl AsRef<Path>) -> Store {
         Store {
             root: root.as_ref().to_path_buf(),
+            key: None,
         }
+    }
+
+    /// A store that seals every chunk at rest, whatever its label.
+    ///
+    /// Uniform rather than per-label, because a chunk can be referenced by a `Private`
+    /// object and a `Public` one at once — see `crypt`'s module docs.
+    pub fn encrypted(root: impl AsRef<Path>, key: StorageKey) -> Store {
+        Store {
+            root: root.as_ref().to_path_buf(),
+            key: Some(key),
+        }
+    }
+
+    pub fn is_encrypted(&self) -> bool {
+        self.key.is_some()
     }
 
     pub fn root(&self) -> &Path {
@@ -127,7 +163,11 @@ impl Store {
             std::thread::current().id(),
             r.hex()
         ));
-        std::fs::write(&staging, bytes).map_err(|e| io(&staging, e))?;
+        let on_disk = match &self.key {
+            Some(k) => k.seal(bytes, &r.digest),
+            None => bytes.to_vec(),
+        };
+        std::fs::write(&staging, &on_disk).map_err(|e| io(&staging, e))?;
         match std::fs::rename(&staging, &destination) {
             Ok(()) => Ok(r),
             Err(e) => {
@@ -145,10 +185,17 @@ impl Store {
     pub fn get_chunk(&self, r: &ChunkRef) -> Result<Vec<u8>, StoreError> {
         let hex = r.hex();
         let path = self.chunk_path(&hex);
-        let bytes = match std::fs::read(&path) {
+        let raw = match std::fs::read(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(StoreError::NotFound(hex)),
             Err(e) => return Err(io(&path, e)),
+        };
+        // Decrypt first, then verify the plaintext digest. Both checks stay: the AEAD
+        // catches a swapped or damaged file, and the digest catches a store written in the
+        // clear and then edited. Neither subsumes the other.
+        let bytes = match &self.key {
+            Some(k) => k.open(&raw, &r.digest).map_err(StoreError::Crypt)?,
+            None => raw,
         };
         let actual = ChunkRef::of(&bytes);
         if actual.digest != r.digest {
@@ -418,6 +465,127 @@ mod tests {
             assert_eq!(name.len(), 64, "a chunk file is named by its digest: {name}");
         }
         assert!(s.is_complete(&object));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_encrypted_store_round_trips() {
+        let d = tmp("enc-roundtrip");
+        let s = Store::encrypted(&d, crate::StorageKey::generate());
+        assert!(s.is_encrypted());
+        let payload = data(1 << 20, 31);
+        let object = s.put_bytes(&payload, Visibility::Private).expect("put");
+        assert_eq!(s.read_object(&object).expect("read"), payload);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_encrypted_store_leaves_no_plaintext_on_disk() {
+        // What encryption at rest is for, asserted against the actual files rather than
+        // against the API. A distinctive marker, searched for across every chunk file.
+        let d = tmp("enc-plaintext");
+        let s = Store::encrypted(&d, crate::StorageKey::generate());
+        let marker = b"CANARY-a7f3-this-must-not-appear-on-disk";
+        let mut payload = Vec::new();
+        while payload.len() < 300_000 {
+            payload.extend_from_slice(marker);
+        }
+        s.put_bytes(&payload, Visibility::Private).expect("put");
+
+        for p in walk(&s.chunks_dir()) {
+            let raw = std::fs::read(&p).expect("read chunk file");
+            assert!(
+                !raw.windows(marker.len()).any(|w| w == marker),
+                "plaintext found in {}",
+                p.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn public_data_is_encrypted_at_rest_too() {
+        // Deliberately stronger than DATA-VISIBILITY.md Section 5, and the only correct
+        // version: a chunk can belong to a Private object and a Public one at once, so
+        // keying encryption on the label would have to answer "which object first?".
+        let d = tmp("enc-public");
+        let s = Store::encrypted(&d, crate::StorageKey::generate());
+        let marker = b"PUBLIC-CANARY-also-not-on-disk-in-the-clear";
+        let mut payload = Vec::new();
+        while payload.len() < 200_000 {
+            payload.extend_from_slice(marker);
+        }
+        s.put_bytes(&payload, Visibility::Public).expect("put");
+        for p in walk(&s.chunks_dir()) {
+            let raw = std::fs::read(&p).expect("read");
+            assert!(!raw.windows(marker.len()).any(|w| w == marker));
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_store_written_under_another_key_does_not_open() {
+        // The stolen-disk property. The chunks are there and unreadable.
+        let d = tmp("enc-wrongkey");
+        let payload = data(200_000, 37);
+        let object = Store::encrypted(&d, crate::StorageKey::generate())
+            .put_bytes(&payload, Visibility::Private)
+            .expect("put");
+
+        let stranger = Store::encrypted(&d, crate::StorageKey::generate());
+        assert!(stranger.is_complete(&object), "the chunks are present");
+        assert!(
+            matches!(stranger.read_object(&object), Err(StoreError::Crypt(_))),
+            "another key must not read them"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn dedup_still_works_when_encrypted() {
+        // Names are over plaintext, so identical content still collapses even though each
+        // sealing uses a fresh nonce and produces different ciphertext.
+        let d = tmp("enc-dedup");
+        let s = Store::encrypted(&d, crate::StorageKey::generate());
+        let payload = data(1 << 20, 41);
+        let a = s.put_bytes(&payload, Visibility::Public).expect("first");
+        let after_first = walk(&s.chunks_dir()).len();
+        let b = s.put_bytes(&payload, Visibility::Public).expect("second");
+        assert_eq!(a.content_id, b.content_id);
+        assert_eq!(walk(&s.chunks_dir()).len(), after_first);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_content_id_does_not_depend_on_the_storage_key() {
+        // Two nodes with different keys must agree on what a file is called, or the
+        // neighbourhood cache cannot exist.
+        let d1 = tmp("enc-id1");
+        let d2 = tmp("enc-id2");
+        let payload = data(500_000, 43);
+        let a = Store::encrypted(&d1, crate::StorageKey::generate())
+            .put_bytes(&payload, Visibility::Public)
+            .expect("a");
+        let b = Store::encrypted(&d2, crate::StorageKey::generate())
+            .put_bytes(&payload, Visibility::Public)
+            .expect("b");
+        assert_eq!(a.content_id, b.content_id);
+        assert_eq!(a.chunks, b.chunks, "and on its chunk names");
+        let _ = std::fs::remove_dir_all(&d1);
+        let _ = std::fs::remove_dir_all(&d2);
+    }
+
+    #[test]
+    fn a_damaged_encrypted_chunk_is_reported_not_returned() {
+        let d = tmp("enc-damage");
+        let s = Store::encrypted(&d, crate::StorageKey::generate());
+        let object = s.put_bytes(&data(100_000, 47), Visibility::Public).expect("put");
+        let path = s.chunk_path(&object.chunks[0].blake3);
+        let mut raw = std::fs::read(&path).expect("read");
+        let last = raw.len() - 1;
+        raw[last] ^= 1;
+        std::fs::write(&path, raw).expect("damage");
+        assert!(matches!(s.read_object(&object), Err(StoreError::Crypt(_))));
         let _ = std::fs::remove_dir_all(&d);
     }
 

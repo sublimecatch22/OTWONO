@@ -1852,3 +1852,98 @@ happened to take.
   construction and by test, not by observation.
 - **Not measured on ARM beyond building.** The cross-build passes; chunking throughput on a
   Cortex-A72 remains the unmeasured number ADR-0016 named.
+
+---
+
+## Phase 5 slice 3 — the labels start enforcing something
+
+`otwono-stored`, encryption at rest, and the method that decides what may leave the node.
+
+### Workspace
+
+```
+cargo test --workspace   643 passed, 0 failed   (608 before)
+cargo clippy --workspace --all-targets -- -D warnings   clean
+cargo fmt --all --check / shellcheck                    clean
+cargo build --workspace --release --target aarch64-unknown-linux-gnu   ok
+```
+
+35 new tests: 19 in `otwono-store` (crypt and the encrypted store), 15 over the control
+plane, 1 in the action registry.
+
+### `store.get` and `store.serve` are different methods on purpose
+
+Both return the same bytes for a public object, and separating them is the design:
+
+- **`store.get`** is a local read. A caller on this node's socket holding `store.read` may
+  read anything the store holds. Labels do not gate it, because the label is about the
+  network boundary and not the local one.
+- **`store.serve`** *is* that boundary. It refuses anything but `Public` and `Replicated`,
+  and it carries its own capability so `otwono-netd` can be granted the ability to serve
+  peers without being granted the ability to read the user's private notes — the same
+  narrowing ADR-0010 made for signing.
+
+A test holds a `store.serve` token, is refused `store.get` on a private object, and then
+serves a public one with the same token.
+
+### A refusal must not be a disclosure
+
+Asking to serve a `Private` object and asking for one that does not exist return the
+identical answer. For a content-addressed store the distinction would confirm that this node
+holds bytes the asker already guessed. The label is checked **before** the store is
+consulted, so the two cases take the same path, and a test asserts the two error messages
+are equal after substituting the id the caller supplied.
+
+### Encryption at rest, and why it is uniform
+
+`DATA-VISIBILITY.md` §5 asked for `PRIVATE` encrypted and `PUBLIC` in the clear. That is not
+implementable as written: a chunk is content-addressed and label-agnostic, so the same chunk
+can be referenced by a `PRIVATE` object and a `PUBLIC` one at once, and label-keyed
+encryption would have to answer "which object referenced it first?". Every answer to that is
+a bug.
+
+So everything is sealed with XChaCha20-Poly1305 under a node storage key, and the document
+has been corrected. Consequences, each with a test:
+
+- **Digests are over plaintext**, so two nodes with different keys agree on what a chunk is
+  called — without which the neighbourhood cache could not exist. Asserted by storing the
+  same bytes in two stores with different keys and comparing ids *and* chunk names.
+- **Dedup still works**, even though each sealing uses a fresh nonce and produces different
+  ciphertext.
+- **The plaintext is not on disk.** A distinctive marker is stored and then searched for
+  across every chunk file, for a `Private` object and a `Public` one both.
+- **A different key does not open the store**: the chunks are present and unreadable.
+- **The plaintext digest is bound in as associated data**, so a chunk file moved to another
+  chunk's name fails to decrypt rather than decrypting into the wrong answer.
+
+XChaCha20 rather than AES-GCM for one reason: a 192-bit nonce makes a random nonce per chunk
+safe at any volume this store will reach, with no counter to persist across restarts and no
+chance of the catastrophic-reuse bug a counter gets wrong exactly once.
+
+### Defect 32: a patch that silently did not apply
+
+Wiring decryption into `get_chunk` appeared to succeed and did nothing: `cargo fmt` had
+reflowed a match arm onto one line since the file was last read, so the `str.replace` anchor
+matched nothing and the edit was a no-op. The encrypted round-trip test then failed with a
+digest mismatch — the store was reading ciphertext and hashing it.
+
+This is the third time in this project that a scripted edit has silently done nothing after
+`fmt` reflowed the target. The habit that catches it is asserting the replacement happened;
+the batch that failed had that assert on its first replacement and not on its second. The
+test caught what the missing assert did not, which is the argument for both.
+
+### What this does not prove
+
+- **Nothing has booted with it.** The unit is written and installed by stage 30; no image
+  has been built with it, so `PrivateNetwork=yes`, the syscall filter and the 0700 store
+  directory are verified by reading rather than by running.
+- **`otwono-netd` does not call `store.serve`.** The boundary exists and nothing crosses it
+  yet, so "a `PRIVATE` object never appears on any link" is proven at the method and not on
+  a link. `DATA-VISIBILITY.md` §4 asks for the check to be duplicated in `otwono-netd`; that
+  duplication does not exist.
+- **`SHARED` is refused rather than authorized.** Per-recipient key wrapping needs the
+  identity daemon's agreement keys and is its own slice. Until then `Shared` behaves as
+  `Private` at the boundary, which is the safe direction but is not the specified one.
+- **Provenance propagation is not implemented.** The label arithmetic for derived content
+  exists and is exhaustively tested; nothing calls it.
+- **No TPM sealing.** The storage key is a 0600 file, and losing it loses the store.

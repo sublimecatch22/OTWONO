@@ -173,7 +173,10 @@ GPU/NPU backends, and the tiered assistant shapes.
 1. ~~`otwono-store` — chunking at ADR-0016's parameters, BLAKE3 content addressing, the
    object model, visibility labels, and the on-disk chunk store with verified reads.~~
    **done** (the daemon, `otwono-stored`, is separate and not yet written)
-2. The four labels, enforced. Encryption at rest. Provenance propagation.
+2. ~~The four labels, enforced at the boundary that matters — `store.serve` refuses
+   anything but `PUBLIC` and `REPLICATED`, and refuses identically whether an object is
+   private or absent. Encryption at rest, uniformly.~~ **done**; provenance propagation
+   and per-recipient `SHARED` key wrapping remain
 3. Egress enforcement in `otwono-netd`, duplicated as defence in depth.
 4. Replication policy for `REPLICATED`.
 5. The **neighbourhood cache** — a bounded, encrypted, tier-scaled contributed store

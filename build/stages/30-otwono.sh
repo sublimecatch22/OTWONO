@@ -46,6 +46,9 @@ install -d -m 0755 "$ROOTFS/var/lib/otwono/models" \
 # verified yet, and no other user has business reading or -- worse -- writing them
 # between the fetch and the caller's digest check (ADR-0014).
 install -d -m 0700 "$ROOTFS/var/lib/otwono/fetch"
+# The content store. 0700 and encrypted at rest: it holds everything the user has, and the
+# storage key beside it is the only thing between a stolen disk and all of it.
+install -d -m 0700 "$ROOTFS/var/lib/otwono/store"
 install -d -m 0755 "$ROOTFS/var/log/otwono"
 
 log "installing the first-boot capability report unit"
@@ -610,6 +613,51 @@ AmbientCapabilities=
 WantedBy=multi-user.target
 UNIT
 
+log "installing the content store unit"
+# The store holds everything the user has: notes, media, a learner's record, a financial
+# ledger. It faces no network at all -- otwono-netd will call store.serve over the control
+# plane, and that method refuses anything but PUBLIC and REPLICATED.
+cat > "$ROOTFS/etc/systemd/system/otwono-stored.service" <<'UNIT'
+[Unit]
+Description=OTWONO content store daemon
+Documentation=file:/usr/share/doc/otwono/DATA-VISIBILITY.md
+After=otwono-permd.service systemd-tmpfiles-setup.service
+Requires=otwono-permd.service
+RequiresMountsFor=/var/lib/otwono
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/otwono-stored --socket /run/otwono/store.sock --perm-socket /run/otwono/perm.sock --store-dir /var/lib/otwono/store --key /var/lib/otwono/storage.key
+Restart=on-failure
+RestartSec=2
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# No network, ever. Serving a peer happens through otwono-netd over a Unix socket, which
+# is not network-namespaced, so this costs nothing and removes a whole class of mistake.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=/run/otwono /var/lib/otwono
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
 log "installing the fetch daemon unit"
 # The only unit in OTWONO that faces the open network as a client. It is a separate
 # process from otwono-netd on purpose: both are hostile-input boundaries, and a compromise
@@ -694,7 +742,7 @@ LockPersonality=yes
 WantedBy=multi-user.target
 UNIT
 
-for unit in otwono-permd otwono-hwd otwono-idd otwono-netd otwono-aid otwono-fetchd otwono-ai-check otwono-control-plane-check otwono-mesh-check otwono-mesh-check.timer; do
+for unit in otwono-permd otwono-hwd otwono-idd otwono-netd otwono-aid otwono-fetchd otwono-stored otwono-ai-check otwono-control-plane-check otwono-mesh-check otwono-mesh-check.timer; do
     # The list carries a .timer as well as services, so only append .service when the
     # entry does not already name a unit type.
     case "$unit" in
@@ -709,6 +757,7 @@ log "installing documentation"
 install -d -m 0755 "$ROOTFS/usr/share/doc/otwono"
 install -m 0644 "$REPO_ROOT/docs/hardware/CAPABILITY-TIERS.md" "$ROOTFS/usr/share/doc/otwono/"
 install -m 0644 "$REPO_ROOT/docs/security/SECURITY-MODEL.md" "$ROOTFS/usr/share/doc/otwono/"
+install -m 0644 "$REPO_ROOT/docs/security/DATA-VISIBILITY.md" "$ROOTFS/usr/share/doc/otwono/"
 install -m 0644 "$REPO_ROOT/docs/network/NODE-IDENTITY.md" "$ROOTFS/usr/share/doc/otwono/"
 install -m 0644 "$REPO_ROOT/docs/network/NODE-NETWORK.md" "$ROOTFS/usr/share/doc/otwono/"
 install -m 0644 "$REPO_ROOT/docs/network/EGRESS.md" "$ROOTFS/usr/share/doc/otwono/"

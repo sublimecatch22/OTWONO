@@ -158,6 +158,30 @@ impl ActionRegistry {
                 // the allow-list, which is a policy.write, and requiring one per call would
                 // make unattended update downloads impossible on a headless node.
                 ActionSpec::new(
+                    "store.read",
+                    "Read an object from the content store, whatever its label",
+                    BlastRadius::Read,
+                    false,
+                ),
+                ActionSpec::new(
+                    "store.write",
+                    "Put an object into the content store",
+                    BlastRadius::Reversible,
+                    false,
+                ),
+                // Separate from store.read for the reason ADR-0010 separated id.sign_session
+                // from id.sign: otwono-netd must be able to serve a peer without being able
+                // to read everything on the node. Egress blast radius because the bytes
+                // leave; not always_confirm, because the method already refuses anything
+                // but PUBLIC and REPLICATED, and a per-request prompt would make serving
+                // impossible on an unattended node.
+                ActionSpec::new(
+                    "store.serve",
+                    "Hand an object to a peer, if its label permits leaving the node",
+                    BlastRadius::Egress,
+                    false,
+                ),
+                ActionSpec::new(
                     "net.fetch",
                     "Fetch an object from a source on the egress allow-list",
                     BlastRadius::Egress,
@@ -202,6 +226,27 @@ mod tests {
             assert!(!spec.always_confirm, "{id} runs unattended");
             assert_eq!(spec.blast_radius, BlastRadius::Reversible);
         }
+    }
+
+    #[test]
+    fn serving_a_peer_is_a_narrower_action_than_reading_the_store() {
+        // A network daemon needs to hand public content to peers. It does not need to be
+        // able to read the user's private notes, and a single store.read would give it
+        // both.
+        let r = ActionRegistry::builtin();
+        let read = r.get("store.read").expect("store.read must be registered");
+        let serve = r.get("store.serve").expect("store.serve must be registered");
+        assert_eq!(read.blast_radius, BlastRadius::Read);
+        assert_eq!(
+            serve.blast_radius,
+            BlastRadius::Egress,
+            "serving sends bytes off the node"
+        );
+        assert!(
+            !serve.always_confirm,
+            "the method refuses anything but public content, and an unattended node has \
+             nobody to prompt"
+        );
     }
 
     #[test]
