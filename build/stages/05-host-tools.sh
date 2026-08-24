@@ -26,7 +26,14 @@ log "building workspace for $RUST_TARGET"
 ( cd "$REPO_ROOT" && env ${LINKER_ENV:-} cargo build --release --workspace --target "$RUST_TARGET" )
 
 BIN_SRC="$REPO_ROOT/target/$RUST_TARGET/release"
-BINARIES=(otwono-hwctl otwono-aictl otwono-permd otwono-hwd otwono-idd otwono-netd otwono-aid)
+# Every daemon stage 30 writes a unit for, and every CLI a boot check calls. Stage 30
+# verifies that correspondence rather than trusting this list -- otwono-fetchd and
+# otwono-stored were missing from it for two phases and nothing noticed, because no image
+# was built in between.
+BINARIES=(
+    otwono-hwctl otwono-aictl otwono-storectl
+    otwono-permd otwono-hwd otwono-idd otwono-netd otwono-aid otwono-fetchd otwono-stored
+)
 # AI backend adapters. Not in /usr/bin: nothing invokes them by hand, they are spawned by
 # otwono-aid, and discovery finds them by path (otwono_ai::discovery).
 ADAPTERS=(otwono-llama-backend)

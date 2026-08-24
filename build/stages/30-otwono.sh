@@ -576,6 +576,41 @@ LockPersonality=yes
 WantedBy=multi-user.target
 UNIT
 
+log "installing the content self check"
+# Everything in Phase 5 and 6 -- the store, the labels, encryption at rest, the file handoff
+# and the neighbourhood cache -- has until now been proven only by tests on a build host.
+# This runs the same paths on the booted node, through the real daemons and units.
+install -m 0755 "$BUILD_DIR/files/otwono-content-check" "$ROOTFS/usr/lib/otwono/content-check"
+cat > "$ROOTFS/etc/systemd/system/otwono-content-check.service" <<'UNIT'
+[Unit]
+Description=OTWONO content store self check
+Documentation=file:/usr/share/doc/otwono/DATA-VISIBILITY.md
+After=otwono-stored.service
+Requires=otwono-stored.service
+RequiresMountsFor=/var/lib/otwono
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/otwono/content-check
+StandardOutput=journal+console
+StandardError=journal+console
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# It needs the store's export directory as well as its own scratch: store.export writes a
+# file there and hands it to this uid, and this check reads it back and unlinks it.
+ReadWritePaths=/var/lib/otwono
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
 log "installing the AI daemon unit"
 # Whether this node can run a model is a property of the filesystem, not of the build: the
 # daemon discovers backends under /usr/libexec/otwono/ai-backends and /usr/lib/otwono/ai at
@@ -784,7 +819,7 @@ LockPersonality=yes
 WantedBy=multi-user.target
 UNIT
 
-for unit in otwono-permd otwono-hwd otwono-idd otwono-netd otwono-aid otwono-fetchd otwono-stored otwono-ai-check otwono-control-plane-check otwono-mesh-check otwono-mesh-check.timer; do
+for unit in otwono-permd otwono-hwd otwono-idd otwono-netd otwono-aid otwono-fetchd otwono-stored otwono-ai-check otwono-control-plane-check otwono-content-check otwono-mesh-check otwono-mesh-check.timer; do
     # The list carries a .timer as well as services, so only append .service when the
     # entry does not already name a unit type.
     case "$unit" in
@@ -806,6 +841,25 @@ install -m 0644 "$REPO_ROOT/docs/network/EGRESS.md" "$ROOTFS/usr/share/doc/otwon
 install -m 0644 "$REPO_ROOT/docs/ai/AI-RUNTIME.md" "$ROOTFS/usr/share/doc/otwono/"
 install -m 0644 "$REPO_ROOT/README.md" "$ROOTFS/usr/share/doc/otwono/"
 
-manifest_add "otwono-layer" "binaries, schemas, policy, 8 units installed"
+# Every ExecStart this stage wrote must name something that is actually in the image.
+#
+# This exists because it was not true. otwono-fetchd and otwono-stored had units here for
+# two phases while never being staged into the rootfs, so an image would have shipped two
+# services that fail at "executable not found" -- and nothing caught it, because the list of
+# binaries in stage 05 and the list of units here are written in different files and no
+# image was built in between. A list that has to be kept in step by hand is a list that
+# drifts; this checks instead.
+log "checking every unit's ExecStart is present in the image"
+missing=0
+while read -r prog; do
+    [ -n "$prog" ] || continue
+    if [ ! -x "$ROOTFS$prog" ]; then
+        warn "unit references $prog, which is not in the image"
+        missing=$((missing + 1))
+    fi
+done < <(grep -ho '^ExecStart=[^ ]*' "$ROOTFS/etc/systemd/system/"otwono-*.service     | cut -d= -f2 | sort -u)
+[ "$missing" -eq 0 ] || die "$missing unit(s) point at a binary that is not installed"
+
+manifest_add "otwono-layer" "binaries, schemas, policy, units installed and cross-checked"
 stage_mark_complete 30-otwono
 stage_done

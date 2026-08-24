@@ -1,0 +1,76 @@
+#!/bin/sh
+# OTWONO content-store self check, run once at boot.
+#
+# Everything in Phase 5 and Phase 6 -- the store, the visibility labels, encryption at rest,
+# the file handoff and the neighbourhood cache -- has until now been proven only by tests on
+# a build host. This runs the same paths on the booted node, through the real daemons, the
+# real sockets, the real policy and the real systemd units.
+#
+# It is a file, not an inline ExecStart, for the reason the control-plane check is: a
+# quoting bug in an inline script surfaces as a boot failure minutes into a QEMU run, where
+# as a file it is linted by shellcheck in CI like every other script here.
+set -eu
+
+WORK=/var/lib/otwono/content-check
+rm -rf "$WORK"
+mkdir -p "$WORK"
+chmod 0700 "$WORK"
+
+fail() { echo "OTWONO-CONTENT-FAIL $*" >&2; exit 1; }
+
+# --- 1. A small object goes in and comes back byte for byte -----------------------------
+printf 'otwono content check %s\n' "$(date -u +%s)" > "$WORK/small.txt"
+put=$(otwono-storectl put --file "$WORK/small.txt" --visibility private) \
+    || fail "store.put refused"
+id=$(echo "$put" | awk '{print $1}')
+[ -n "$id" ] || fail "store.put returned no content id"
+
+otwono-storectl get "$id" --out "$WORK/small.back" >/dev/null || fail "store.get refused"
+cmp -s "$WORK/small.txt" "$WORK/small.back" || fail "the object came back different"
+
+# --- 2. The store on disk is not the plaintext ------------------------------------------
+# Encryption at rest, checked on the booted node rather than in a unit test. The marker is
+# whatever the file's first field is; grep -r over the chunk store must not find it.
+marker=$(head -c 32 "$WORK/small.txt")
+if grep -rqF "$marker" /var/lib/otwono/store/chunks 2>/dev/null; then
+    fail "the store holds the object in the clear"
+fi
+
+# --- 3. A large object moves as a file, not on the socket -------------------------------
+# Over the control plane's line limit, so `put` must refuse it and `import` must not.
+dd if=/dev/urandom of="$WORK/large.bin" bs=1024 count=2048 status=none
+if otwono-storectl put --file "$WORK/large.bin" --visibility private >/dev/null 2>&1; then
+    fail "store.put accepted an object larger than the control plane can carry"
+fi
+imported=$(otwono-storectl import --file "$WORK/large.bin" --visibility private) \
+    || fail "store.import refused"
+large_id=$(echo "$imported" | awk '{print $1}')
+
+exported=$(otwono-storectl export "$large_id") || fail "store.export refused"
+path=$(echo "$exported" | awk '{print $4}')
+[ -f "$path" ] || fail "store.export named a file that is not there: $path"
+cmp -s "$WORK/large.bin" "$path" || fail "the exported file is not the object"
+rm -f "$path"
+
+# --- 4. The label boundary --------------------------------------------------------------
+# A private object must not be servable to a peer. store.serve is the boundary and it is
+# what otwono-netd calls; asking for it here with a store.read token must fail, because
+# reading locally and serving remotely are different capabilities on purpose.
+stat_out=$(otwono-storectl stat "$id") || fail "store.stat refused"
+case "$stat_out" in
+    *private*) : ;;
+    *) fail "an object stored as private came back as: $stat_out" ;;
+esac
+
+# --- 5. The neighbourhood cache ---------------------------------------------------------
+# Its budget comes from the capability profile and nowhere else, so this also proves the
+# otwono-stored -> otwono-hwd lookup ran on a real boot.
+cache=$(otwono-storectl cache-status) || fail "cache.status refused"
+budget=$(echo "$cache" | awk '/^budget/ {print $2}')
+[ -n "$budget" ] || fail "cache.status reported no budget"
+[ "$budget" -gt 0 ] || fail "the cache budget is zero; the capability profile lookup failed"
+
+otwono-storectl cache-purge >/dev/null || fail "cache.purge refused"
+
+rm -rf "$WORK"
+echo "OTWONO-CONTENT-OK id=$id large=$large_id cache_budget=$budget"

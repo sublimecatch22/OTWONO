@@ -1241,6 +1241,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "otwono-storectl"
+version = "0.1.0"
+dependencies = [
+ "data-encoding",
+ "otwono-proto",
+ "otwono-stored",
+ "serde_json",
+]
+
+[[package]]
 name = "otwono-stored"
 version = "0.1.0"
 dependencies = [
