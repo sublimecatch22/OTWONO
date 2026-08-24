@@ -549,16 +549,20 @@ cat > "$ROOTFS/etc/systemd/system/otwono-aid.service" <<'UNIT'
 [Unit]
 Description=OTWONO AI daemon
 Documentation=file:/usr/share/doc/otwono/AI-RUNTIME.md
-After=otwono-permd.service otwono-hwd.service systemd-tmpfiles-setup.service
+After=otwono-permd.service otwono-hwd.service otwono-fetchd.service systemd-tmpfiles-setup.service
 # Hard requirements: this daemon does not probe hardware itself. It asks otwono-hwd for
 # the capability tier, brokered by otwono-permd, so that exactly one component decides how
 # big this machine is (CLAUDE.md §2.6). That is also what lets it keep PrivateNetwork.
 Requires=otwono-permd.service otwono-hwd.service
+# Wants, not Requires: a node with no allow-list still runs local inference perfectly well,
+# and ai.models.pull answering "this node cannot download models" is a better state than
+# the AI daemon refusing to start because the fetcher did not.
+Wants=otwono-fetchd.service
 RequiresMountsFor=/var/lib/otwono
 
 [Service]
 Type=exec
-ExecStart=/usr/bin/otwono-aid --socket /run/otwono/ai.sock --perm-socket /run/otwono/perm.sock --hw-socket /run/otwono/hw.sock --model-dir /var/lib/otwono/models --publishers /etc/otwono/publishers.d
+ExecStart=/usr/bin/otwono-aid --socket /run/otwono/ai.sock --perm-socket /run/otwono/perm.sock --hw-socket /run/otwono/hw.sock --fetch-socket /run/otwono/fetch.sock --model-dir /var/lib/otwono/models --publishers /etc/otwono/publishers.d
 Restart=on-failure
 RestartSec=2
 # An inference engine is memory-hungry by nature and admission control already reasons
@@ -573,10 +577,11 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-# No business on the network: it reads no hardware itself and downloads nothing, and the
-# inference engine it starts talks to it over a Unix socket rather than a loopback port
-# precisely so this can stay on (ADR-0011). Model fetching is not implemented, and when it
-# is it will be a brokered egress action.
+# No business on the network, and this survived ai.models.pull: downloading happens in
+# otwono-fetchd, which this daemon drives over an AF_UNIX socket — and AF_UNIX is not
+# network-namespaced, so a private netns costs nothing here (ADR-0014). The inference
+# engine likewise talks over a Unix socket rather than a loopback port precisely so this
+# can stay on (ADR-0011).
 PrivateNetwork=yes
 RestrictAddressFamilies=AF_UNIX
 ReadWritePaths=/run/otwono /var/lib/otwono

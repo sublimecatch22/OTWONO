@@ -1040,6 +1040,7 @@ dependencies = [
 name = "otwono-control-plane-tests"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "data-encoding",
  "otwono-ai",
  "otwono-aid",

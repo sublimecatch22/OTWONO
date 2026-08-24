@@ -218,7 +218,7 @@ interrupted install leaves a stray `.incoming-*` file and never a truncated blob
 name claiming to be complete — which matters because `weights_present` is a file-exists
 check and would answer yes.
 
-### 5.1 Fetching is not implemented, and where it will live
+### 5.1 Fetching
 
 `ai.models.pull` is still absent, and the reason is architectural rather than a matter of
 effort. `otwono-aid` runs with `PrivateNetwork=yes` and `RestrictAddressFamilies=AF_UNIX`;
@@ -232,11 +232,37 @@ design decision in its own right, not an implementation detail. **ADR-0014 settl
 (closing OQ-13): one daemon, `otwono-fetchd`, is the only component that makes outbound
 client connections to hosts outside the mesh. Callers name a source from an allow-list and
 a path suffix, never a URL; the response lands in a spool and the caller verifies it.
-`ai.models.pull` therefore becomes a fetch followed by the `ai.models.install` below —
-**the pull adds no new trust code.** `otwono-fetchd` and `net.fetch` now exist and have
-fetched a real object over TLS (`docs/network/EGRESS.md`). `ai.models.pull` itself does
-not: wiring `otwono-aid` to call `fetch.get` and hand the spool path to `ai.models.install`
-is the remaining step, and it is deliberately separate from building the fetcher.
+`ai.models.pull` is therefore a fetch followed by the `ai.models.install` below — **it adds
+no new trust code.** Both exist now.
+
+**The ordering is the design.** Each step is cheaper than the one after it, and each can
+refuse, so the expensive one only runs once the cheap ones have agreed:
+
+1. Fetch the **manifest** — kilobytes.
+2. Check **provenance**. A manifest signed by nobody this node trusts is refused here,
+   before a byte of weights moves. `install` already applies that reasoning to hashing;
+   applied to downloading, it saves an hour rather than a minute.
+3. Check whether the model **could ever fit this machine** — `fits_this_machine`, which is
+   deliberately *not* `admit`. `admit` asks whether a model can load right now and so
+   refuses when no backend is installed, which is exactly the state a node is in while
+   being set up. It also returns only its first error, so `NoBackendAvailable` masked the
+   memory arithmetic entirely — a fresh 4 GiB board would have downloaded a 40 GiB model
+   without ever weighing it. The narrower check takes no backend list and cannot be masked.
+   Overridable with `allow_unadmittable`, because downloading for another machine is real.
+4. Fetch the **weights**, resumably, in bounded calls.
+5. **Install**, which re-hashes them against the manifest. The fetcher's word is taken for
+   nothing.
+6. **Discard the spool copy** — `install` copies rather than moves, and leaving it would
+   mean a 4 GB model costs 8 GB on a board that has 8.
+
+Guarded by `ai.admin`, the same as a local install: what makes it powerful is that it
+changes what the node will run, and where the bytes came from does not change that. The
+fetch itself needs `net.fetch`, which `otwono-aid` requests from the broker scoped to the
+named source.
+
+A node with no `--fetch-socket` says so plainly rather than failing obscurely, and that is
+the shipped default: an operator must add a source **and** grant `net.fetch` before this
+node downloads anything.
 
 Splitting it this way has a payoff already banked: everything that decides whether to
 *trust* a model is tested exhaustively with no network anywhere near it.

@@ -32,12 +32,13 @@ pub mod manifest;
 pub mod signature;
 pub mod supervisor;
 
-pub use admission::{admit, Admission, AdmissionError, AdmissionRequest, Reserve};
+pub use admission::{admit, fits_this_machine, Admission, AdmissionError, AdmissionRequest, Reserve};
 pub use backend::{select_backend, BackendId, BackendSelection, SelectionError};
 pub use catalog::{Catalog, CatalogEntry, CatalogError, CatalogProblem, DEFAULT_MODEL_DIR};
 pub use discovery::{discover, installed_backends, installed_backends_in, BackendInstall};
 pub use install::{
-    hash_file, install, verify_installed, InstallError, InstallRequest, Installed, Provenance, Verification,
+    check_provenance, hash_file, install, verify_installed, InstallError, InstallRequest, Installed,
+    Provenance, Verification,
 };
 pub use manifest::{Footprint, ManifestError, ModelCapability, ModelFormat, ModelManifest, Signature};
 pub use signature::{PublisherTrust, SignatureError, SignatureStatus, TrustError};

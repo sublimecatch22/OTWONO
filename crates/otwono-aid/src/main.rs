@@ -29,6 +29,8 @@ OPTIONS:
     --perm-socket <PATH>   Permission broker socket (default $OTWONO_SOCKET_DIR/perm.sock)
     --model-dir <PATH>     Model catalog directory (default /var/lib/otwono/models)
     --hw-socket <PATH>     Hardware daemon socket (default $OTWONO_SOCKET_DIR/hw.sock)
+    --fetch-socket <PATH>  Fetch daemon socket, enabling ai.models.pull. Absent means this
+                           node cannot download models and says so when asked
     --publishers <PATH>    Trusted model publishers (default /etc/otwono/publishers.d)
     --root <PATH>          Filesystem root to discover AI backends under (default /)
     --allow-unconfined-backends
@@ -78,6 +80,8 @@ fn run(args: &[String]) -> Result<String, Error> {
     let mut perm_socket: Option<PathBuf> = None;
     let mut model_dir = PathBuf::from(DEFAULT_MODEL_DIR);
     let mut hw_socket: Option<PathBuf> = None;
+    // Absent by default: a node that cannot fetch is the shipped state (ADR-0014).
+    let mut fetch_socket: Option<PathBuf> = None;
     let mut publisher_dir = PathBuf::from(DEFAULT_PUBLISHER_DIR);
     let mut root = PathBuf::from("/");
     let mut allow_unconfined_backends = false;
@@ -90,6 +94,7 @@ fn run(args: &[String]) -> Result<String, Error> {
             "--perm-socket" => perm_socket = Some(next_path(&mut it, "--perm-socket")?),
             "--model-dir" => model_dir = next_path(&mut it, "--model-dir")?,
             "--hw-socket" => hw_socket = Some(next_path(&mut it, "--hw-socket")?),
+            "--fetch-socket" => fetch_socket = Some(next_path(&mut it, "--fetch-socket")?),
             "--publishers" => publisher_dir = next_path(&mut it, "--publishers")?,
             "--root" => root = next_path(&mut it, "--root")?,
             "--allow-unconfined-backends" => allow_unconfined_backends = true,
@@ -173,10 +178,14 @@ fn run(args: &[String]) -> Result<String, Error> {
 
     server
         .serve(
-            Arc::new(
-                AiService::new(catalog, profile, trust, perm_socket, installs)
-                    .with_unconfined_backends(allow_unconfined_backends),
-            ),
+            Arc::new({
+                let mut svc = AiService::new(catalog, profile, trust, perm_socket, installs)
+                    .with_unconfined_backends(allow_unconfined_backends);
+                if let Some(f) = fetch_socket {
+                    svc = svc.with_fetch_socket(f);
+                }
+                svc
+            }),
             Shutdown::new(),
         )
         .map_err(|e| Error::Startup(format!("serve failed: {e}")))?;

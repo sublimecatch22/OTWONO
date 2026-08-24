@@ -28,6 +28,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod pull;
+
 use otwono_ai::{
     admission::{largest_admissible_context, MemoryPool},
     admit, install, verify_installed, Admission, AdmissionRequest, BackendId, BackendInstall, BackendProcess,
@@ -98,6 +100,12 @@ pub struct AiService {
     /// an operator to run inference on such a kernel at all — which is a decision for them,
     /// made in a unit file, not one for us to make by omission.
     allow_unconfined_backends: bool,
+    /// Where `otwono-fetchd` listens, when this node is allowed to download at all.
+    ///
+    /// `None` means `ai.models.pull` is unavailable and says so, which is the shipped
+    /// default: a node fetches nothing until an operator configures a source and grants
+    /// `net.fetch` (ADR-0014).
+    fetcher: Option<pull::Fetcher>,
     /// The one loaded model, if any.
     ///
     /// One at a time, and the mutex serializes inference. That is not a placeholder for
@@ -125,6 +133,24 @@ struct InstallParams {
     blob_path: String,
     #[serde(default)]
     allow_unsigned: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct PullParams {
+    /// A source id from `otwono-fetchd`'s allow-list. Never a URL — the caller cannot name
+    /// a host, which is the whole point of ADR-0014.
+    source: String,
+    /// Path suffix of the manifest under that source's prefix.
+    manifest_path: String,
+    /// Path suffix of the weights.
+    blob_path: String,
+    #[serde(default)]
+    allow_unsigned: bool,
+    /// Download a model this node could not load. Off by default: spending an hour of a
+    /// rural link on weights that admission control will refuse is a waste the node can
+    /// see coming.
+    #[serde(default)]
+    allow_unadmittable: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,9 +210,19 @@ impl AiService {
             backend_runtime_dir: PathBuf::from(DEFAULT_BACKEND_RUNTIME_DIR),
             backend_confinement,
             allow_unconfined_backends: false,
+            fetcher: None,
             session: Mutex::new(None),
             next_request_id: AtomicI64::new(1),
         }
+    }
+
+    /// Point this daemon at a fetch daemon, enabling `ai.models.pull`.
+    pub fn with_fetch_socket(mut self, fetch_socket: impl AsRef<Path>) -> Self {
+        self.fetcher = Some(pull::Fetcher {
+            fetch_socket: fetch_socket.as_ref().to_path_buf(),
+            perm_socket: self.perm_socket.clone(),
+        });
+        self
     }
 
     /// Override where backend adapters put their engine sockets. For tests, which cannot
@@ -394,11 +430,92 @@ impl AiService {
             "blake3": installed.blake3,
             "size_bytes": installed.size_bytes,
             "already_present": installed.already_present,
-            "provenance": match &installed.provenance {
-                Provenance::Trusted { publisher } => json!({ "status": "trusted", "publisher": publisher }),
-                Provenance::Unsigned => json!({ "status": "unsigned" }),
-                Provenance::UntrustedPublisher => json!({ "status": "untrusted_publisher" }),
-            },
+            "provenance": provenance_json(&installed.provenance),
+        }))
+    }
+
+    /// Download a model and install it.
+    ///
+    /// The ordering is the design. Each step is cheaper than the one after it, and each can
+    /// refuse, so the expensive one only runs when the cheap ones have already agreed:
+    ///
+    /// 1. Fetch the **manifest** — kilobytes.
+    /// 2. Check **provenance**. A manifest signed by nobody we trust is refused here, before
+    ///    a single byte of weights moves. `install` already applies this reasoning to
+    ///    hashing; applied to downloading it saves an hour rather than a minute.
+    /// 3. Check **admission**. Weights this node could never load are not worth a rural
+    ///    link's afternoon. Overridable, because downloading for another machine is a real
+    ///    thing to want.
+    /// 4. Fetch the **weights**, resumably.
+    /// 5. **Install**, which re-hashes them against the manifest with the code that was
+    ///    already tested. This call adds no new trust decision (ADR-0014).
+    /// 6. **Discard the spool copy**, because `install` copies rather than moves.
+    fn pull_model(&self, params: Value) -> Result<Value, RpcError> {
+        let p: PullParams = serde_json::from_value(params)
+            .map_err(|e| RpcError::invalid_params(format!("ai.models.pull: {e}")))?;
+        let fetcher = self.fetcher.as_ref().ok_or_else(|| {
+            RpcError::unavailable(
+                "this node has no fetch daemon configured, so it cannot download models;                  install from a local path instead",
+            )
+        })?;
+
+        // 1. The manifest.
+        let manifest_file = fetcher
+            .fetch(&p.source, &p.manifest_path)
+            .map_err(rpc_from_pull)?;
+        let text = std::fs::read_to_string(&manifest_file.path)
+            .map_err(|e| RpcError::internal(format!("cannot read {}: {e}", manifest_file.path.display())))?;
+        let manifest: ModelManifest = serde_json::from_str(&text).map_err(|e| {
+            RpcError::invalid_params(format!("{} is not a model manifest: {e}", p.manifest_path))
+        })?;
+        manifest
+            .validate()
+            .map_err(|e| RpcError::invalid_params(format!("ai.models.pull refused: {e}")))?;
+
+        // 2. Provenance, before the weights.
+        let request = InstallRequest {
+            allow_unsigned: p.allow_unsigned,
+        };
+        let provenance = otwono_ai::check_provenance(&manifest, &self.trust, &request)
+            .map_err(|e| RpcError::invalid_params(format!("ai.models.pull refused: {e}")))?;
+
+        // 3. Admission, also before the weights — but a *narrower* question than the one
+        // `ai.infer` asks. What matters before spending a download is whether this machine
+        // could ever hold the model, not whether it can run it this minute. A node with no
+        // engine installed yet is exactly the node that wants to download one, and the
+        // engine is opt-in in the build, so the two legitimately arrive in either order.
+        // Refusing "no backend installed" here would break setup on a fresh node.
+        if !p.allow_unadmittable {
+            if let Err(reason) = otwono_ai::fits_this_machine(&manifest, &self.profile) {
+                return Err(RpcError::invalid_params(format!(
+                    "ai.models.pull refused before downloading: {reason}. \
+                     Pass allow_unadmittable to download it anyway."
+                )));
+            }
+        }
+
+        // 4. The weights.
+        let blob = fetcher.fetch(&p.source, &p.blob_path).map_err(rpc_from_pull)?;
+
+        // 5. Install, which re-hashes. The fetcher's word is not taken for anything.
+        let installed = install(&self.catalog, &manifest, &blob.path, &self.trust, &request)
+            .map_err(|e| RpcError::invalid_params(format!("ai.models.pull refused: {e}")))?;
+
+        // 6. Reclaim the spool. A failure here is worth reporting and is not worth undoing
+        // a good install for, so it is a warning in the reply rather than an error.
+        let reclaimed = fetcher.discard(&p.source, &p.blob_path).is_ok()
+            && fetcher.discard(&p.source, &p.manifest_path).is_ok();
+
+        Ok(json!({
+            "schema_version": DESCRIBE_SCHEMA_VERSION,
+            "model_id": installed.model_id,
+            "blake3": installed.blake3,
+            "size_bytes": installed.size_bytes,
+            "already_present": installed.already_present,
+            "bytes_fetched": blob.bytes,
+            "fetch_calls": blob.calls,
+            "spool_reclaimed": reclaimed,
+            "provenance": provenance_json(&provenance),
         }))
     }
 
@@ -698,6 +815,11 @@ impl Service for AiService {
                     CAPABILITY_ADMIN,
                 ),
                 MethodDescription::guarded(
+                    "ai.models.pull",
+                    "Download a model from an allow-listed source and install it",
+                    CAPABILITY_ADMIN,
+                ),
+                MethodDescription::guarded(
                     "ai.models.verify",
                     "Re-hash an installed model's weights and compare them to its manifest",
                     CAPABILITY_READ,
@@ -726,6 +848,14 @@ impl Service for AiService {
                 self.authorize(ctx, CAPABILITY_ADMIN)?;
                 self.install_model(params)
             }
+            // ai.admin, the same as a local install: what makes this powerful is that it
+            // changes what the node will run, and where the bytes came from does not
+            // change that. The fetch itself needs net.fetch, which this daemon requests
+            // from the broker on the caller's behalf and scoped to the named source.
+            "ai.models.pull" => {
+                self.authorize(ctx, CAPABILITY_ADMIN)?;
+                self.pull_model(params)
+            }
             "ai.models.verify" => {
                 self.authorize(ctx, CAPABILITY_READ)?;
                 self.verify_model(params)
@@ -745,5 +875,23 @@ impl Service for AiService {
             }
             other => Err(unknown_method(other)),
         }
+    }
+}
+
+fn provenance_json(p: &Provenance) -> Value {
+    match p {
+        Provenance::Trusted { publisher } => json!({ "status": "trusted", "publisher": publisher }),
+        Provenance::Unsigned => json!({ "status": "unsigned" }),
+        Provenance::UntrustedPublisher => json!({ "status": "untrusted_publisher" }),
+    }
+}
+
+/// A fetch failure is the node's or the network's, not the caller's — except when the
+/// caller named something the allow-list does not have, which the fetcher reports as a
+/// refusal and which the caller can act on.
+fn rpc_from_pull(e: pull::PullError) -> RpcError {
+    match e {
+        pull::PullError::Refused(m) => RpcError::invalid_params(format!("ai.models.pull: {m}")),
+        other => RpcError::unavailable(format!("ai.models.pull: {other}")),
     }
 }

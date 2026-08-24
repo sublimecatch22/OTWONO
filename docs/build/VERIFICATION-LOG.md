@@ -1600,3 +1600,94 @@ in whichever direction is least convenient.
 It also cost nothing to find and would have cost a great deal to find later. A docs-only
 commit turning CI red is a gift — the alternative is the same race surfacing during a
 release.
+
+---
+
+## Phase 4 slice 8 — `ai.models.pull`, and a gate that was not checking anything
+
+Wires `otwono-aid` to `otwono-fetchd`, which until now had no production caller. A model can
+be downloaded, verified and installed in one brokered call.
+
+### Workspace
+
+```
+cargo test --workspace   560 passed, 0 failed   (541 before)
+cargo clippy --workspace --all-targets -- -D warnings   clean
+cargo fmt --all --check                                 clean
+cargo build --workspace --release --target aarch64-unknown-linux-gnu   ok
+```
+
+19 new tests: 12 over the control plane, 5 in `otwono-ai`, 2 in `otwono-aid`.
+
+### The ordering, which is the whole design
+
+Each step is cheaper than the next and each can refuse, so the expensive one runs only once
+the cheap ones agree: manifest (kilobytes) → provenance → could-it-ever-fit → weights
+(gigabytes) → install, which re-hashes → discard the spool copy.
+
+Three of the twelve integration tests assert the *ordering* rather than the outcome, by
+checking that the fake host was never asked for the weights. A test that only checked the
+final answer would pass while the node downloaded four gigabytes it was always going to
+throw away.
+
+### Defect 31: the pre-download size gate never ran
+
+Caught by an integration test, and it was a design error rather than a slip.
+
+The gate called `admit` — the same function `ai.infer` uses. Two things were wrong with
+that, and the second is the serious one:
+
+- **`admit` refuses when no backend is installed.** A node with no engine is exactly the
+  node that wants to download a model, and the engine is opt-in in the build
+  (`AI_ENGINE=llama.cpp`), so the two legitimately arrive in either order. As written, a
+  fresh node could not pull the model it was being set up to run.
+- **`admit` returns its first error.** `NoBackendAvailable` is raised at line 160;
+  the memory arithmetic is at line 182. So on a node with nothing installed, the size check
+  **never executed**. Filtering that one error out — the first fix attempted — would have
+  let a 40 GiB model onto a 4 GiB board without ever weighing it. The gate would have
+  looked present and been inert.
+
+Replaced with `otwono_ai::fits_this_machine`, which asks the narrower question — *could this
+machine ever hold this model?* — takes no backend list, and therefore cannot be masked. It
+errs toward permitting: a refused download is a hard stop for the user, a wasteful one costs
+bandwidth, so the ceiling is the largest memory pool the machine has and anything uncertain
+is allowed. Five unit tests, one of which asserts both behaviours at once so the masking
+cannot come back:
+
+```
+admit(...)             → NoBackendAvailable      (first error, memory never reached)
+fits_this_machine(...) → InsufficientMemory      (the real problem)
+```
+
+### Two test bugs found in passing
+
+Both mine, both in the new file, both worth naming because they are the shape that makes a
+test lie:
+
+- The harness requested an `ai.admin` token for every call, including `ai.models.list`,
+  which needs `ai.read`. A blanket grant would have hidden a method losing its guard.
+- `oversized()` inflated a manifest *after* signing it, so the test exercised a
+  signature-verification failure while claiming to test the size gate.
+
+### Nothing needed to change in the hardening
+
+`otwono-aid` keeps `PrivateNetwork=yes` and `RestrictAddressFamilies=AF_UNIX`. It drives the
+fetcher over an `AF_UNIX` socket, which is not network-namespaced, and its existing
+`ReadWritePaths=/var/lib/otwono` already covers the spool. The unit gained
+`Wants=otwono-fetchd.service` — Wants and not Requires, because a node with no allow-list
+still runs local inference perfectly well, and `ai.models.pull` answering "this node cannot
+download models" is a better state than the AI daemon refusing to start.
+
+### What this does not prove
+
+- **Nothing has booted with it.** No image was built with `--fetch-socket` in the unit, so
+  the ordering, the `Wants=`, and the spool permissions are verified by reading and by
+  tests, not by a running node.
+- **No real model has been pulled.** The integration tests use a fake host, and the live
+  fetch proven in slice 7 was a 40 KB JSON file from `pypi.org`. Nothing has downloaded
+  gigabytes, and the hosts that serve real models are not reachable from this environment.
+- **`fits_this_machine` has never refused a real download.** Its arithmetic is unit tested
+  against fixture profiles; it has not been exercised against a genuine oversized model on
+  genuine hardware.
+- **Tier-appropriate models remain OQ-6.** The mechanism to fetch one exists; which one to
+  fetch, and under what licence, does not.

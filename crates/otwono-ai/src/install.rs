@@ -197,7 +197,13 @@ pub fn install(
 }
 
 /// Decide whether this manifest may be installed at all.
-fn check_provenance(
+/// Decide whether this manifest is one we will accept at all.
+///
+/// Public because the same reasoning applies one level up. `install` runs it before hashing
+/// gigabytes; `ai.models.pull` runs it before *downloading* them, which is the same trade
+/// against a much larger bill. A manifest we would refuse to install is a manifest whose
+/// weights should never come down the wire.
+pub fn check_provenance(
     manifest: &ModelManifest,
     trust: &PublisherTrust,
     request: &InstallRequest,

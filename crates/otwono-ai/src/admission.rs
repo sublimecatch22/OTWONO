@@ -278,6 +278,63 @@ fn check_provenance(
 ///
 /// `None` when no accelerator reports a figure — `vram_bytes: None` means undetectable,
 /// not zero (`otwono-hal`), and the difference matters here.
+/// Could this machine *ever* hold this model, whatever is installed on it today?
+///
+/// A narrower question than [`admit`], and a different one. `admit` decides whether a model
+/// can be loaded **now**, so it refuses when no backend is installed. That is the right
+/// answer for `ai.infer` and the wrong one for `ai.models.pull`: a node with no engine yet
+/// is exactly the node that wants to download a model, and the engine is opt-in in the
+/// build, so the two legitimately arrive in either order.
+///
+/// It is also not merely `admit` with the backend check skipped. `admit` returns its *first*
+/// error, so on a node with nothing installed `NoBackendAvailable` masks the memory
+/// arithmetic entirely — and a caller filtering that error out would let a 40 GiB model
+/// onto an 8 GiB board without ever weighing it.
+///
+/// This errs toward permitting. A refused download is a hard stop for the user; a wasteful
+/// one costs bandwidth. So the memory ceiling is the *largest* pool the machine has, not the
+/// one a particular backend would charge, and anything uncertain is allowed.
+pub fn fits_this_machine(
+    manifest: &ModelManifest,
+    profile: &CapabilityProfile,
+) -> Result<(), AdmissionError> {
+    manifest.validate().map_err(AdmissionError::Manifest)?;
+
+    if profile.tier < manifest.min_tier {
+        return Err(AdmissionError::ModelTooLargeForTier {
+            model_id: manifest.id.clone(),
+            node_tier: profile.tier,
+            min_tier: manifest.min_tier,
+            limiting_factor: profile.limiting_factor.clone(),
+        });
+    }
+
+    // The most generous pool available, because we do not know which backend will
+    // eventually run this and refusing wrongly is the worse error.
+    let ceiling = profile
+        .hardware
+        .memory
+        .available_bytes
+        .max(accelerator_vram(profile).unwrap_or(0));
+    let reserve = Reserve::for_tier(profile.tier);
+    let budget = ceiling.saturating_sub(reserve.bytes);
+
+    // At the smallest context the model supports: if it does not fit even shrunk down, no
+    // configuration of it will.
+    let required = manifest.footprint.required_bytes(1, 1);
+    if required > budget {
+        return Err(AdmissionError::InsufficientMemory {
+            model_id: manifest.id.clone(),
+            pool: MemoryPool::SystemRam,
+            required_bytes: required,
+            budget_bytes: budget,
+            reserve_bytes: reserve.bytes,
+            context_tokens: 1,
+        });
+    }
+    Ok(())
+}
+
 fn accelerator_vram(profile: &CapabilityProfile) -> Option<u64> {
     let mut total = 0u64;
     let mut any = false;
@@ -909,5 +966,74 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("huge-70b-q4"), "{text}");
         assert!(text.contains("GiB"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod fits_tests {
+    use super::*;
+    use crate::manifest::fixtures::*;
+    use otwono_capability::{classify, testing::*};
+
+    fn pi4() -> CapabilityProfile {
+        classify(&report_pi4_4gb())
+    }
+
+    #[test]
+    fn a_model_that_needs_more_memory_than_the_machine_has_is_refused() {
+        // The case the pre-download gate exists for. `huge` is 40 GiB of weights; a Pi 4
+        // has 4 GiB of RAM. No amount of setup changes that, so the download is refused.
+        let mut m = huge();
+        m.min_tier = Tier::T0Micro; // isolate the memory check from the tier check
+        let e = fits_this_machine(&m, &pi4()).expect_err("40 GiB cannot fit a Pi 4");
+        assert!(matches!(e, AdmissionError::InsufficientMemory { .. }), "{e:?}");
+    }
+
+    #[test]
+    fn a_model_above_the_nodes_tier_is_refused() {
+        let e = fits_this_machine(&huge(), &pi4()).expect_err("a 70B does not fit a Pi");
+        assert!(matches!(e, AdmissionError::ModelTooLargeForTier { .. }), "{e:?}");
+    }
+
+    #[test]
+    fn a_model_that_fits_is_permitted_with_no_backend_installed() {
+        // The whole reason this is separate from `admit`, which takes a backend list and
+        // refuses when it is empty. A fresh node with no engine must still be able to
+        // download the model it is being set up to run.
+        fits_this_machine(&tiny(), &pi4())
+            .expect("having no engine yet is not a reason to refuse a download");
+    }
+
+    #[test]
+    fn no_backend_cannot_mask_the_memory_check() {
+        // The bug this function was written for. `admit` returns its first error, so on a
+        // node with nothing installed `NoBackendAvailable` came back before the memory
+        // arithmetic ever ran — and a caller that ignored that error would have let a
+        // 40 GiB model onto a 4 GiB board. Proven here by asserting both at once.
+        let backends: &[BackendId] = &[];
+        let (m, trust) = {
+            let mut m = huge();
+            m.min_tier = Tier::T0Micro;
+            let trust = crate::signature::testing::sign(&mut m, 3);
+            (m, trust)
+        };
+        let via_admit =
+            admit(&m, &pi4(), &AdmissionRequest::default(), backends, &trust).expect_err("admit refuses");
+        assert!(
+            matches!(via_admit, AdmissionError::NoBackendAvailable(_)),
+            "admit still reports the backend first: {via_admit:?}"
+        );
+        let via_fits = fits_this_machine(&m, &pi4()).expect_err("but the size is the real problem");
+        assert!(
+            matches!(via_fits, AdmissionError::InsufficientMemory { .. }),
+            "{via_fits:?}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_manifest_is_refused_rather_than_measured() {
+        let mut m = tiny();
+        m.blake3 = "not-a-digest".into();
+        assert!(fits_this_machine(&m, &pi4()).is_err());
     }
 }
