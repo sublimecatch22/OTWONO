@@ -1,0 +1,577 @@
+//! Phase 5's last exit criterion, on an actual link.
+//!
+//! `DATA-VISIBILITY.md` §6 asks for a demonstration that a `PRIVATE` object never appears
+//! on any link. Until now that was proven at the `store.serve` method — a claim about a
+//! function, not about a wire. Here two nodes authenticate over a real TCP socket, one asks
+//! the other for content, and the answers are checked.
+//!
+//! The serving node runs under a policy that **denies `store.read` outright**. So the proof
+//! is not only that a private object is refused, but that the daemon doing the serving has
+//! no capability that could return one — which is why the public case working under the
+//! same policy matters as much as the private case failing.
+//!
+//! Everything crosses a socket. An in-process test would prove nothing about the boundary
+//! being tested.
+
+use otwono_idd::IdentityService;
+use otwono_identity::{AgreementKeystore, NodeIdentity, SessionSigner, SigningKeystore};
+use otwono_net::content::{ProtocolError, Request, Response};
+use otwono_net::{Candidate, LinkProperties, MemoryLink, SecureChannel, TcpLink};
+use otwono_netd::{BrokeredSigner, ContentResponder, NetService, NetState};
+use otwono_permd::{ActionRegistry, AuditLog, Broker, Policy};
+use otwono_proto::{code, Client, Server, Shutdown};
+use otwono_store::{StorageKey, Store};
+use otwono_stored::StoreService;
+use serde_json::{json, Value};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+/// Everything the mesh and the store boundary need, and **not** `store.read`.
+///
+/// The omission is the point. A serving node that could read its own store privately is a
+/// node where a bug in the label check reaches private data; one that cannot is not.
+const POLICY: &str = r#"
+[[rule]]
+action = "id.sign_session"
+decision = "allow"
+ttl_seconds = 300
+
+[[rule]]
+action = "id.bind_agreement"
+decision = "allow"
+ttl_seconds = 300
+
+[[rule]]
+action = "store.write"
+decision = "allow"
+ttl_seconds = 300
+
+[[rule]]
+action = "store.serve"
+decision = "allow"
+ttl_seconds = 300
+
+[[rule]]
+action = "net.content"
+decision = "allow"
+ttl_seconds = 300
+
+[[rule]]
+action = "store.read"
+decision = "deny"
+"#;
+
+struct Harness {
+    dir: PathBuf,
+    perm_socket: PathBuf,
+    store_socket: PathBuf,
+    /// The asking node's own control-plane socket, where `net.fetch` lives.
+    net_socket: PathBuf,
+    /// The serving node's overlay address and the NodeID that answers there.
+    server_addr: std::net::SocketAddr,
+    server_node: otwono_identity::NodeId,
+    /// The asking node.
+    client: Arc<NetState>,
+    shutdown: Shutdown,
+}
+
+impl Harness {
+    fn start(tag: &str) -> Harness {
+        let dir = std::env::temp_dir().join(format!("otw-col-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("policy.d")).unwrap();
+        std::fs::write(dir.join("policy.d/10-test.toml"), POLICY).unwrap();
+
+        let perm_socket = dir.join("perm.sock");
+        let id_socket = dir.join("id.sock");
+        let store_socket = dir.join("store.sock");
+        let shutdown = Shutdown::new();
+
+        let policy = Policy::load_dir(&dir.join("policy.d")).expect("policy must load");
+        policy
+            .validate(&ActionRegistry::builtin())
+            .expect("the test policy must name only registered actions");
+        let broker = Arc::new(Broker::new(
+            policy,
+            AuditLog::open(dir.join("audit.jsonl")).unwrap(),
+        ));
+        let s = shutdown.clone();
+        let server = Server::bind(&perm_socket).unwrap();
+        std::thread::spawn(move || server.serve(broker, s));
+
+        // otwono-idd. Both nodes are fronted by one signing key here: what is under test is
+        // what crosses the link, not who is on each end of it.
+        let keystore = SigningKeystore::new(dir.join("identity"));
+        let (signing, _) = keystore.load_or_generate().unwrap();
+        let idd = Arc::new(IdentityService::new(keystore, signing, perm_socket.clone()));
+        let s = shutdown.clone();
+        let server = Server::bind(&id_socket).unwrap();
+        std::thread::spawn(move || server.serve(idd, s));
+
+        // otwono-stored, encrypted at rest as a node's store always is.
+        let store = Store::encrypted(dir.join("store"), StorageKey::generate());
+        store.ensure_layout().unwrap();
+        let service = Arc::new(StoreService::new(store, perm_socket.clone()));
+        let s = shutdown.clone();
+        let server = Server::bind(&store_socket).unwrap();
+        std::thread::spawn(move || server.serve(service, s));
+
+        for sock in [&perm_socket, &id_socket, &store_socket] {
+            Client::connect_waiting(sock, Duration::from_secs(5))
+                .unwrap_or_else(|_| panic!("{} never came up", sock.display()));
+        }
+
+        let signer = |agreement_dir: PathBuf| {
+            let (agreement, _) = AgreementKeystore::new(agreement_dir).load_or_generate().unwrap();
+            BrokeredSigner::bind(agreement, &id_socket, &perm_socket).expect("bind")
+        };
+
+        // The serving node: a mesh daemon with a store behind it.
+        let server_signer = signer(dir.join("agreement-server"));
+        let server_node = server_signer.node_id();
+        let listener = TcpLink::listen("127.0.0.1:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let serving = Arc::new(
+            NetState::new(Arc::new(server_signer))
+                .with_responder(ContentResponder::new(&store_socket, &perm_socket)),
+        );
+        std::thread::spawn(move || otwono_netd::run_listener(serving, listener));
+
+        let client = Arc::new(NetState::new(Arc::new(signer(dir.join("agreement-client")))));
+
+        // The asking node's control plane, so net.fetch is exercised through a socket and a
+        // capability check rather than as a function call.
+        let net_socket = dir.join("net.sock");
+        let service = Arc::new(NetService::new(Arc::clone(&client), perm_socket.clone()));
+        let s = shutdown.clone();
+        let server = Server::bind(&net_socket).unwrap();
+        std::thread::spawn(move || server.serve(service, s));
+        Client::connect_waiting(&net_socket, Duration::from_secs(5)).expect("netd never came up");
+
+        Harness {
+            net_socket,
+            dir,
+            perm_socket,
+            store_socket,
+            server_addr,
+            server_node,
+            client,
+            shutdown,
+        }
+    }
+
+    fn candidate(&self) -> Candidate {
+        Candidate {
+            claimed_node_id: self.server_node,
+            address: self.server_addr,
+        }
+    }
+
+    fn token(&self, action: &str) -> String {
+        let mut broker = Client::connect(&self.perm_socket).unwrap();
+        broker
+            .call(
+                "perm.request",
+                json!({ "action": action, "reason": "content-over-a-link test" }),
+            )
+            .unwrap()
+            .unwrap_or_else(|e| panic!("{action} refused: {}", e.message))
+            .get("token")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string()
+    }
+
+    /// Put bytes in the serving node's store under a label. Returns the content id.
+    fn put(&self, bytes: &[u8], visibility: &str) -> String {
+        let token = self.token("store.write");
+        let mut client = Client::connect(&self.store_socket).unwrap();
+        client
+            .call_with_capability(
+                "store.put",
+                json!({
+                    "data": data_encoding::BASE64.encode(bytes),
+                    "visibility": visibility,
+                }),
+                &token,
+            )
+            .unwrap()
+            .unwrap_or_else(|e| panic!("store.put refused: {}", e.message))
+            .get("content_id")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string()
+    }
+
+    fn demote(&self, content_id: &str, to: &str) {
+        let token = self.token("store.write");
+        let mut client = Client::connect(&self.store_socket).unwrap();
+        client
+            .call_with_capability(
+                "store.demote",
+                json!({ "content_id": content_id, "visibility": to }),
+                &token,
+            )
+            .unwrap()
+            .expect("demote must succeed");
+    }
+
+    /// Ask the serving node for an object over a real TCP link.
+    fn fetch(&self, content_id: &str) -> Result<otwono_netd::FetchedObject, String> {
+        self.client.fetch_from(&self.candidate(), content_id)
+    }
+
+    /// A responder wired to the same store, for asking questions the wire types cannot
+    /// express through `fetch_object` — a hand-built request, for instance.
+    fn responder(&self) -> ContentResponder {
+        ContentResponder::new(&self.store_socket, &self.perm_socket)
+    }
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        self.shutdown.trigger();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Bytes that will not chunk into one piece: over ADR-0016's 256 KiB ceiling, so the
+/// transfer needs several chunks and each chunk needs several ranges.
+fn payload(len: usize, seed: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len);
+    let mut x = seed | 1;
+    while out.len() < len {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+#[test]
+fn a_public_object_crosses_a_real_link_byte_for_byte() {
+    let h = Harness::start("public");
+    let bytes = payload(700 * 1024, 0xC0FFEE);
+    let id = h.put(&bytes, "public");
+
+    let got = h.fetch(&id).expect("a public object must be servable");
+    assert_eq!(got.content_id, id);
+    assert_eq!(got.visibility, "public");
+    assert_eq!(got.bytes.len(), bytes.len());
+    assert_eq!(
+        got.bytes, bytes,
+        "the bytes that arrived are not the bytes that were stored"
+    );
+
+    // And it really was ranged: the object spans several chunks, and the largest of them is
+    // bigger than one reply can carry, so at least one chunk took several round trips.
+    let chunks = otwono_store::chunk::slice(&bytes);
+    let per_reply = otwono_net::content::max_body_bytes(&LinkProperties::internet());
+    assert!(chunks.len() > 1, "the fixture must span several chunks");
+    assert!(
+        chunks.iter().any(|c| c.length > per_reply),
+        "no chunk exceeded the {per_reply}-byte reply cap, so ranging was never exercised"
+    );
+}
+
+#[test]
+fn a_replicated_object_crosses_a_real_link() {
+    let h = Harness::start("replicated");
+    let bytes = b"replicated content is explicitly permitted to be copied to other nodes".to_vec();
+    let id = h.put(&bytes, "replicated");
+
+    let got = h.fetch(&id).expect("a replicated object must be servable");
+    assert_eq!(got.bytes, bytes);
+    assert_eq!(got.visibility, "replicated");
+}
+
+#[test]
+fn a_private_object_never_crosses_a_link() {
+    // The criterion. A private object, in a store the serving node can reach, asked for by
+    // an authenticated peer over a real socket.
+    let h = Harness::start("private");
+    let secret = b"the user's private notes".to_vec();
+    let id = h.put(&secret, "private");
+
+    let err = h.fetch(&id).expect_err("a private object must not cross a link");
+    assert!(
+        !err.contains("private notes"),
+        "the refusal leaked the content: {err}"
+    );
+
+    // And a public object of the same size still works, so the refusal is about the label
+    // and not about the harness being broken.
+    let public = h.put(&secret, "public");
+    assert_eq!(h.fetch(&public).expect("public still works").bytes, secret);
+}
+
+#[test]
+fn a_shared_object_never_crosses_a_link() {
+    // SHARED needs a per-recipient key wrapping that does not exist yet. Until it does it
+    // must fail closed, which is the right way for a feature to be missing.
+    let h = Harness::start("shared");
+    let id = h.put(b"for one named peer only", "shared");
+    assert!(h.fetch(&id).is_err(), "shared must fail closed until it is built");
+}
+
+#[test]
+fn a_private_object_and_one_that_does_not_exist_fail_identically() {
+    // A refusal that differs from a miss is an oracle: a peer that can tell them apart can
+    // confirm this node holds bytes it already guessed.
+    let h = Harness::start("oracle");
+    let private = h.put(b"present but not for you", "private");
+    let absent = "0".repeat(64);
+
+    let a = h.fetch(&private).unwrap_err();
+    let b = h.fetch(&absent).unwrap_err();
+    // The ids differ, so compare the message with each id removed.
+    assert_eq!(
+        a.replace(&private, "<id>"),
+        b.replace(&absent, "<id>"),
+        "a private object and an absent one must be indistinguishable"
+    );
+}
+
+#[test]
+fn a_chunk_of_a_private_object_cannot_be_reached_through_a_public_one() {
+    // The probe oracle ADR-0017 closes. Two objects with the same bytes have the same
+    // chunks; asking for the private one's chunk while naming the public one's id must not
+    // work, and neither must naming a digest that belongs to no servable object.
+    let h = Harness::start("probe");
+    let bytes = payload(300 * 1024, 7);
+    let private = h.put(&bytes, "private");
+    let public = h.put(b"something else entirely", "public");
+
+    // Learn the private object's chunk digests the only way this test legitimately can:
+    // by chunking the same bytes locally, exactly as an attacker who guessed them would.
+    let guessed = otwono_store::chunk::slice(&bytes);
+    assert!(guessed.len() > 1, "the fixture must span several chunks");
+
+    let responder = h.responder();
+    let peer = h.client.node_id();
+    for entry in &guessed {
+        // Named under the public object: the digest is not in its chunk list.
+        let through_public = responder.answer(
+            peer,
+            &Request::Chunk {
+                content_id: public.clone(),
+                digest: entry.hex(),
+                offset: 0,
+                max_bytes: 1024,
+            },
+        );
+        assert!(
+            matches!(through_public, Response::NotAvailable { .. }),
+            "a chunk reached through an object that does not contain it: {through_public:?}"
+        );
+
+        // Named under the private object: refused because the object is refused.
+        let direct = responder.answer(
+            peer,
+            &Request::Chunk {
+                content_id: private.clone(),
+                digest: entry.hex(),
+                offset: 0,
+                max_bytes: 1024,
+            },
+        );
+        assert!(
+            matches!(direct, Response::NotAvailable { .. }),
+            "a chunk of a private object was served: {direct:?}"
+        );
+    }
+}
+
+#[test]
+fn demotion_stops_a_peer_fetching_what_it_could_fetch_before() {
+    let h = Harness::start("demote");
+    let bytes = b"public until it is not".to_vec();
+    let id = h.put(&bytes, "public");
+    assert_eq!(h.fetch(&id).expect("public first").bytes, bytes);
+
+    h.demote(&id, "private");
+    assert!(
+        h.fetch(&id).is_err(),
+        "demotion must stop future serving over a link, not just locally"
+    );
+}
+
+#[test]
+fn the_serving_node_serves_without_ever_holding_store_read() {
+    // Structural, and the reason the policy above denies store.read. If serving needed that
+    // capability, every test here would fail; that they pass means otwono-netd reaches the
+    // store through store.serve alone.
+    let h = Harness::start("noread");
+    let mut broker = Client::connect(&h.perm_socket).unwrap();
+    let refused = broker
+        .call(
+            "perm.request",
+            json!({ "action": "store.read", "reason": "prove the policy denies it" }),
+        )
+        .unwrap();
+    assert!(refused.is_err(), "the test policy must deny store.read");
+
+    let id = h.put(b"served without store.read", "public");
+    assert_eq!(h.fetch(&id).unwrap().bytes, b"served without store.read");
+}
+
+#[test]
+fn net_fetch_over_the_control_plane_requires_the_capability() {
+    let h = Harness::start("cap");
+    let id = h.put(b"public bytes", "public");
+    let params = json!({
+        "node_id": h.server_node.to_text(),
+        "address": h.server_addr.to_string(),
+        "content_id": id,
+    });
+
+    let mut client = Client::connect(&h.net_socket).unwrap();
+    let err = client
+        .call("net.fetch", params.clone())
+        .unwrap()
+        .expect_err("net.fetch without a token must be refused");
+    assert_eq!(err.code, code::UNAUTHORIZED);
+
+    let value = client
+        .call_with_capability("net.fetch", params, &h.token("net.content"))
+        .unwrap()
+        .expect("net.fetch with net.content must succeed");
+    assert_eq!(
+        data_encoding::BASE64
+            .decode(value["data"].as_str().unwrap().as_bytes())
+            .unwrap(),
+        b"public bytes"
+    );
+    assert_eq!(value["visibility"], "public");
+}
+
+#[test]
+fn a_trickle_link_is_refused_before_anything_is_sent() {
+    // Measured while writing ADR-0017, and it corrected the ADR: a manifest reply is 262
+    // bytes before a single entry, and EU868 LoRa will bear 256 in a frame. Chunk replies
+    // do fit — six bytes of payload at a time — so the object could be *transferred*, but
+    // it cannot be *described*, so the fetch cannot start. It must say so plainly.
+    let h = Harness::start("trickle");
+    let id = h.put(b"content that will not fit a radio's frame", "public");
+
+    let alice = NodeIdentity::generate().unwrap();
+    let bob = NodeIdentity::generate().unwrap();
+    let (client_link, server_link) = MemoryLink::pair();
+    let responder = h.responder();
+    let serving = std::thread::spawn(move || {
+        let mut channel = SecureChannel::accept(server_link, &bob).unwrap();
+        let _ = otwono_netd::serve_session(&mut channel, &responder);
+    });
+
+    let mut channel = SecureChannel::initiate(client_link, &alice).unwrap();
+    let err = otwono_netd::fetch_object(&mut channel, &id, &LinkProperties::lora_eu868())
+        .expect_err("a Trickle link cannot carry a manifest window");
+    assert!(
+        matches!(
+            err,
+            ProtocolError::TooLarge {
+                field: "manifest window",
+                ..
+            }
+        ),
+        "expected a manifest-window refusal, got {err}"
+    );
+    drop(channel);
+    let _ = serving.join();
+}
+
+#[test]
+fn the_same_protocol_moves_an_object_over_an_in_memory_link() {
+    // The transport is interchangeable: the same responder and the same requester, over a
+    // channel with no socket under it at all.
+    let h = Harness::start("memory");
+    let bytes = payload(300 * 1024, 42);
+    let id = h.put(&bytes, "public");
+
+    let alice = NodeIdentity::generate().unwrap();
+    let bob = NodeIdentity::generate().unwrap();
+    let (client_link, server_link) = MemoryLink::pair();
+    let responder = h.responder();
+    let serving = std::thread::spawn(move || {
+        let mut channel = SecureChannel::accept(server_link, &bob).unwrap();
+        let _ = otwono_netd::serve_session(&mut channel, &responder);
+    });
+
+    let mut channel = SecureChannel::initiate(client_link, &alice).unwrap();
+    let got = otwono_netd::fetch_object(&mut channel, &id, &LinkProperties::internet())
+        .expect("an in-memory link must work");
+    assert_eq!(got.bytes, bytes);
+    drop(channel);
+    let _ = serving.join();
+}
+
+#[test]
+fn a_peer_that_serves_the_wrong_bytes_is_caught() {
+    // A hostile peer, hand-rolled: it answers with a manifest for content it was not asked
+    // about. Nothing on the wire is trusted, so the requester must reject this rather than
+    // hand back whatever arrived.
+    let alice = NodeIdentity::generate().unwrap();
+    let bob = NodeIdentity::generate().unwrap();
+    let (client_link, server_link) = MemoryLink::pair();
+
+    let real = b"the bytes that were asked for".to_vec();
+    let fake = b"substituted content".to_vec();
+    let wanted = otwono_store::ContentId::of(&otwono_store::chunk::slice(&real)).to_hex();
+    let served = otwono_store::chunk::slice(&fake);
+
+    let hostile = std::thread::spawn(move || {
+        let mut channel = SecureChannel::accept(server_link, &bob).unwrap();
+        while let Ok(frame) = channel.recv() {
+            let request: Request = otwono_net::content::decode(&frame).unwrap();
+            // Always answers, always about the wrong content, always claiming the id it was
+            // asked for. Only the digests give it away.
+            let response = match request {
+                Request::Manifest { content_id, .. } => {
+                    Response::Manifest(otwono_net::content::ManifestPage {
+                        content_id,
+                        size_bytes: fake.len() as u64,
+                        chunking: otwono_store::CHUNKING_VERSION.to_string(),
+                        visibility: "public".into(),
+                        total_chunks: served.len() as u32,
+                        from_chunk: 0,
+                        chunks: served
+                            .iter()
+                            .map(|c| otwono_net::content::ChunkEntry {
+                                blake3: c.hex(),
+                                length: c.length,
+                            })
+                            .collect(),
+                    })
+                }
+                Request::Chunk {
+                    content_id, digest, ..
+                } => Response::Chunk(otwono_net::content::ChunkPart {
+                    content_id,
+                    digest,
+                    offset: 0,
+                    total_length: fake.len() as u32,
+                    data: data_encoding::BASE64.encode(&fake),
+                }),
+            };
+            if channel
+                .send(&otwono_net::content::encode(&response).unwrap())
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+
+    let mut channel = SecureChannel::initiate(client_link, &alice).unwrap();
+    let err = otwono_netd::fetch_object(&mut channel, &wanted, &LinkProperties::internet())
+        .expect_err("substituted content must be refused");
+    assert!(
+        matches!(err, ProtocolError::ObjectIdMismatch { .. }),
+        "expected an id mismatch, got {err}"
+    );
+    drop(channel);
+    let _ = hostile.join();
+}

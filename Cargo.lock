@@ -1179,6 +1179,8 @@ dependencies = [
  "otwono-identity",
  "otwono-net",
  "otwono-proto",
+ "otwono-store",
+ "otwono-stored",
  "serde",
  "serde_json",
  "zeroize",

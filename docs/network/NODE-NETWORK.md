@@ -113,6 +113,41 @@ the channel for everyone. Enforcement lives in the router, not in each service.
 Authenticated is **not** trusted. Every peer is authenticated; trust is a separate,
 explicit, user-visible decision.
 
+### 4a. Content fetch over an established channel
+
+**STATUS: IMPLEMENTED** — ADR-0017, `schemas/onm-content.schema.json`.
+
+Once a channel is up and `Hello` exchanged, the node that **dialled** may ask; the node that
+**accepted** answers. Roles are fixed for the channel's life, so this is a loop rather than a
+state machine — a node wanting content from a peer that called it dials its own channel.
+
+Two requests, both ranged, both naming the object they concern:
+
+| Message | Answers |
+|---|---|
+| `content.manifest` | one window of an object's chunk list, plus its size, chunking version and label |
+| `content.chunk` | one range of one chunk of one object |
+
+and exactly one error, `not_available`, carrying no reason — absent, private, shared,
+damaged and not-part-of-that-object must be indistinguishable, or a peer can enumerate what
+this node holds by asking.
+
+A chunk request names its `content_id` as well as the digest. Without that, a
+content-addressed store answers "do you hold these exact bytes" for any digest a stranger
+cares to guess, and since chunks are shared between objects, a private object and a public
+one can contain the same one.
+
+The responder is `otwono-netd`, which calls `store.serve_manifest` / `store.serve_chunk` on
+`otwono-stored` and re-checks the label itself before anything reaches the link
+(`DATA-VISIBILITY.md` §4). It holds `store.serve` and no other store capability.
+
+**Measured limits (2026-08-24).** The bandwidth-class table above says `Trickle` is for
+"text messages, presence, tiny signed records" and never bulk transfer. The protocol agrees
+by arithmetic: a manifest reply costs 262 bytes before a single entry, against a 256-byte
+EU868 LoRa frame, so a fetch over a `Trickle` link is refused before anything is sent. The
+Noise handshake does not fit one either — a session-proof frame is 447 bytes. Content fetch
+therefore works from `Narrow` upward. See OQ-23 and OQ-24.
+
 ## 5. Discovery
 
 | Environment | Method |

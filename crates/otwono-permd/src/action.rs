@@ -129,6 +129,16 @@ impl ActionRegistry {
                     BlastRadius::Reversible,
                     false,
                 ),
+                // Fetching from a peer brings content this node did not author onto this
+                // node. Reversible because what arrives is verified against the content id
+                // that was asked for and lands nowhere on its own — but it is a peer's
+                // bytes, and it is not a read.
+                ActionSpec::new(
+                    "net.content",
+                    "Fetch a content-addressed object from a peer",
+                    BlastRadius::Reversible,
+                    false,
+                ),
                 ActionSpec::new(
                     "id.rotate",
                     "Replace this node's identity key, changing its NodeID",

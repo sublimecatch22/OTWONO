@@ -4,7 +4,9 @@
 
 use otwono_identity::{AgreementKeystore, SessionSigner, DEFAULT_IDENTITY_DIR};
 use otwono_net::{Discovery, TcpLink};
-use otwono_netd::{run_discovery, run_listener, BrokeredSigner, NetService, NetState, DEFAULT_PORT};
+use otwono_netd::{
+    run_discovery, run_listener, BrokeredSigner, ContentResponder, NetService, NetState, DEFAULT_PORT,
+};
 use otwono_proto::{Server, Shutdown};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -20,6 +22,8 @@ OPTIONS:
     --socket <PATH>        Control-plane socket (default $OTWONO_SOCKET_DIR/net.sock)
     --perm-socket <PATH>   Permission broker socket (default $OTWONO_SOCKET_DIR/perm.sock)
     --id-socket <PATH>     Identity daemon socket (default $OTWONO_SOCKET_DIR/id.sock)
+    --store-socket <PATH>  Content store socket (default $OTWONO_SOCKET_DIR/store.sock)
+    --no-serve-content     Do not answer peers' content requests at all
     --identity-dir <PATH>  Keystore directory (default /var/lib/otwono/identity)
     --listen <ADDR>        Overlay listen address (default 0.0.0.0:8443)
     --no-discovery         Do not announce or browse on the LAN
@@ -31,6 +35,10 @@ EXIT CODES:
     0  clean shutdown
     1  usage error
     2  startup failure
+
+Content served to peers comes from otwono-stored, and this daemon holds only the
+store.serve capability: it cannot read a PRIVATE or SHARED object even if asked to. It
+checks the label a second time itself before anything reaches a link.
 
 This daemon holds only the node's X25519 agreement key. The Ed25519 key that its NodeID
 names belongs to otwono-idd, which must be running and must grant this daemon the
@@ -66,6 +74,8 @@ fn run(args: &[String]) -> Result<String, Error> {
     let mut socket: Option<PathBuf> = None;
     let mut perm_socket: Option<PathBuf> = None;
     let mut id_socket: Option<PathBuf> = None;
+    let mut store_socket: Option<PathBuf> = None;
+    let mut serve_content = true;
     let mut identity_dir = PathBuf::from(DEFAULT_IDENTITY_DIR);
     let mut listen = format!("0.0.0.0:{DEFAULT_PORT}");
     let mut discovery_enabled = true;
@@ -78,6 +88,8 @@ fn run(args: &[String]) -> Result<String, Error> {
             "--socket" => socket = Some(next(&mut it, "--socket")?.into()),
             "--perm-socket" => perm_socket = Some(next(&mut it, "--perm-socket")?.into()),
             "--id-socket" => id_socket = Some(next(&mut it, "--id-socket")?.into()),
+            "--store-socket" => store_socket = Some(next(&mut it, "--store-socket")?.into()),
+            "--no-serve-content" => serve_content = false,
             "--identity-dir" => identity_dir = next(&mut it, "--identity-dir")?.into(),
             "--listen" => listen = next(&mut it, "--listen")?,
             "--no-discovery" => discovery_enabled = false,
@@ -155,7 +167,21 @@ fn run(args: &[String]) -> Result<String, Error> {
         .local_addr()
         .map_err(|e| Error::Startup(format!("cannot read the listen address: {e}")))?;
 
-    let state = Arc::new(NetState::new(Arc::new(signer)));
+    let mut state = NetState::new(Arc::new(signer));
+    if serve_content {
+        let store_socket = store_socket.unwrap_or_else(|| otwono_proto::socket_path("store"));
+        // Not fatal if otwono-stored is not up: the responder connects per request and
+        // refuses when it cannot, which is the same answer a peer gets for anything else it
+        // may not have. A mesh that authenticates but serves nothing is still a mesh.
+        eprintln!(
+            "otwono-netd: serving peer content from {}",
+            store_socket.display()
+        );
+        state = state.with_responder(ContentResponder::new(&store_socket, &perm_socket));
+    } else {
+        eprintln!("otwono-netd: not serving content to peers (--no-serve-content)");
+    }
+    let state = Arc::new(state);
     {
         let state = Arc::clone(&state);
         std::thread::spawn(move || run_listener(state, listener));

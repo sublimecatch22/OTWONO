@@ -187,6 +187,13 @@ ttl_seconds = 300
 # fetches nothing until an operator makes two separate decisions on purpose — adding a
 # source to /etc/otwono/fetch.d, and granting net.fetch here. Either one alone does
 # nothing, which is the intended shape.
+
+# store.write, store.read, store.serve and net.content are all ungranted, so a shipped node
+# meshes and authenticates but neither stores nor serves anything. That is not an oversight
+# about PUBLIC content: nothing can *be* labelled public without store.write, so granting
+# store.serve alone would widen the boundary for a store that is necessarily empty. An
+# operator turns the content store on by granting store.write and store.serve together, and
+# net.content separately if this node should also fetch from peers (ADR-0017).
 POLICY
 
 log "installing the model publisher trust store"
@@ -393,7 +400,7 @@ cat > "$ROOTFS/etc/systemd/system/otwono-netd.service" <<'UNIT'
 [Unit]
 Description=OTWONO node mesh daemon
 Documentation=file:/usr/share/doc/otwono/NODE-NETWORK.md
-After=otwono-idd.service systemd-networkd.service systemd-tmpfiles-setup.service
+After=otwono-idd.service otwono-stored.service systemd-networkd.service systemd-tmpfiles-setup.service
 # Both are hard requirements since ADR-0010, not conveniences. This daemon holds only the
 # X25519 agreement key: it registers that key with otwono-idd at startup and asks it for a
 # signature on every handshake, brokered by otwono-permd. Without either, it can discover
@@ -405,11 +412,15 @@ Requires=otwono-permd.service otwono-idd.service
 # still serves its local control plane — an OTWONO node offline is a supported state.
 Wants=network-online.target
 After=network-online.target
+# Content served to peers comes from otwono-stored. Wants, not Requires: a node whose store
+# is down should still mesh and still authenticate, and every content request then gets the
+# same "not available" a peer gets for anything else it may not have.
+Wants=otwono-stored.service
 RequiresMountsFor=/var/lib/otwono
 
 [Service]
 Type=exec
-ExecStart=/usr/bin/otwono-netd --socket /run/otwono/net.sock --perm-socket /run/otwono/perm.sock --id-socket /run/otwono/id.sock
+ExecStart=/usr/bin/otwono-netd --socket /run/otwono/net.sock --perm-socket /run/otwono/perm.sock --id-socket /run/otwono/id.sock --store-socket /run/otwono/store.sock
 Restart=on-failure
 RestartSec=2
 

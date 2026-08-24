@@ -2013,3 +2013,118 @@ the label out of the identity buys.
 - **Provenance is caller-declared.** The store believes `derived_from`; nothing observes that
   content actually was derived from what a caller claims. A caller that omits an input gets a
   looser label and the store cannot tell.
+
+---
+
+## Phase 5 slice 5 — content crosses a link, and the label holds
+
+**Date:** 2026-08-24 · **Where:** OTWONO Cloud dev environment (no `/dev/kvm`)
+
+ADR-0017, `otwono-net::content`, `store.serve_manifest` / `store.serve_chunk`,
+`otwono-netd::content`, and `net.fetch`. This is the slice that closes Phase 5's fourth
+exit criterion, and the one where a measurement contradicted the ADR that ordered it.
+
+### Workspace
+
+```
+cargo test --workspace     697 passed, 0 failed   (was 654)
+cargo clippy --workspace --all-targets -- -D warnings   clean
+cargo fmt --all --check    clean
+shellcheck -S warning tools/*.sh build/stages/*.sh build/qemu/*.sh build/lib/*.sh build/files/*   clean
+```
+
+New tests: 21 in `otwono-net` (`content` unit tests), 8 schema contract tests, 12
+control-plane tests over a real TCP socket, 3 in `otwono-netd`.
+
+### The measurement that corrected ADR-0017
+
+The ADR's first draft claimed the ranged design produced "one protocol that works on LoRa
+and on Ethernet". A test written to demonstrate that failed at the Noise handshake, which
+was the first honest signal. Measured, on this machine:
+
+| Message | Bytes on the wire | Fits a `Trickle` frame (256)? |
+|---|---:|---|
+| Noise session proof (handshake frame) | 447 | no |
+| Manifest reply, no entries | 262 | no |
+| Manifest reply, one entry | 360 | no |
+| Chunk reply, empty body | 229 | yes, 11 bytes spare |
+| Chunk request, largest legal | 225 | yes |
+
+So chunk traffic fits a radio at about six bytes of payload per transmission; a manifest
+window does not fit at all; and the handshake never fitted, which means ONM could not have
+authenticated over LoRa regardless of anything in this ADR. The claim was removed, the
+numbers went into the ADR, and the gap became OQ-23 (a compact encoding) and OQ-24 (a
+handshake that fits, or link-layer fragmentation).
+
+Two consequences in code. `ENVELOPE_RESERVE = 512` — a guess — became two measured
+constants, `CHUNK_ENVELOPE_RESERVE = 232` and `MANIFEST_ENVELOPE_RESERVE = 272`, each pinned
+by a test that rebuilds the largest envelope and compares. And `carries_a_manifest()` refuses
+a `Trickle` link explicitly, before a byte is sent, rather than letting `PayloadTooLarge`
+surface from three layers down.
+
+### The two label checks are deliberately different code
+
+`otwono-stored` asks `Visibility::may_leave_the_node_unattended()`. `otwono-netd` does not
+call it — it holds an allow-list of the two strings that may appear on a wire and refuses
+everything else, unknown labels included. Sharing a helper would have been tidier and would
+have duplicated nothing: one bug would pass both gates. `DATA-VISIBILITY.md` §4 asks for the
+check to be duplicated, and this is what makes the duplication worth having.
+
+`otwono-netd` also holds `store.serve` and no other store capability. The control-plane test
+runs the serving node under a policy that **denies `store.read` outright**, so the public
+cases passing is itself the proof that serving never needs it.
+
+### The chunk-probe oracle, closed by construction
+
+A chunk request names its `content_id` as well as its digest. Without that, a
+content-addressed store answers "do you hold these exact bytes" for any digest a stranger
+guesses — and chunks are shared between objects, so a private object and a public one can
+contain the same one. The test chunks a private object's bytes locally, exactly as an
+attacker who guessed them would, then asks for each digest twice: named under an unrelated
+public object, and named under the private one. Both refuse.
+
+### What the tests actually assert
+
+| Property | Test |
+|---|---|
+| A public object crosses a real TCP link byte for byte, in several ranged round trips | `a_public_object_crosses_a_real_link_byte_for_byte` |
+| A `PRIVATE` object does not cross | `a_private_object_never_crosses_a_link` |
+| `SHARED` fails closed until it is built | `a_shared_object_never_crosses_a_link` |
+| Refused and absent are indistinguishable | `a_private_object_and_one_that_does_not_exist_fail_identically` |
+| A guessed chunk digest is not answerable | `a_chunk_of_a_private_object_cannot_be_reached_through_a_public_one` |
+| Demotion stops serving over a link | `demotion_stops_a_peer_fetching_what_it_could_fetch_before` |
+| Serving never needs `store.read` | `the_serving_node_serves_without_ever_holding_store_read` |
+| A peer that serves substituted bytes is caught | `a_peer_that_serves_the_wrong_bytes_is_caught` |
+| A `Trickle` link is refused before anything is sent | `a_trickle_link_is_refused_before_anything_is_sent` |
+
+The hostile-peer test hand-rolls a responder that answers every request with a manifest and
+chunks for *different* content while echoing back the id it was asked for. Only the digests
+give it away, and `fetch_object` rejects it with `ObjectIdMismatch`.
+
+### Phase 5's exit criterion, four of four
+
+| §6 criterion | State |
+|---|---|
+| A refusal is indistinguishable from not-found | **met** — over a link as well as at the method |
+| Derived content inherits the most restrictive label | **met** |
+| Demotion stops future serving | **met** — over a link |
+| A `PRIVATE` object never appears on any link | **met** — two Noise-authenticated nodes over a real TCP socket, serving node denied `store.read` |
+
+### What this does not prove
+
+- **Nothing has booted.** Stage 30 now points `otwono-netd` at `/run/otwono/store.sock` and
+  orders it after `otwono-stored`; no image has been built with either change, so the unit
+  ordering is unexercised.
+- **The shipped policy grants none of this.** `store.write`, `store.serve` and `net.content`
+  are all ungranted by default, so a stock node meshes and serves nothing. That is
+  deliberate and it means the default path is untested by construction.
+- **One request, one reply, in order.** No pipelining and no concurrency, so a high-latency
+  link is slow in proportion to its round trips. A 700 KiB object took dozens.
+- **Roles are fixed per channel.** A node can only fetch over a channel it dialled. Nothing
+  yet re-dials automatically.
+- **Nothing stores what it fetches.** `net.fetch` returns verified bytes to its caller; the
+  neighbourhood cache that would keep them does not exist.
+- **`SHARED` is still refused rather than authorized**, and per-recipient key wrapping still
+  waits on the identity daemon's agreement keys.
+- **No LoRa hardware was involved.** The `Trickle` numbers above are frame sizes measured
+  against `BandwidthClass::max_reasonable_payload()`, not a radio.

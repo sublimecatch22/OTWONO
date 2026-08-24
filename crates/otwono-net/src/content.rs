@@ -42,10 +42,16 @@ pub const PROTOCOL_VERSION: &str = "1.0.0";
 /// less the 16-byte AEAD tag.
 pub const MAX_NOISE_PLAINTEXT: usize = 65535 - 16;
 
-/// Room reserved for the JSON envelope around a body — field names, the hex content id and
-/// digest, and the numbers. Measured against the largest envelope this module can emit and
-/// rounded up; [`envelope_fits_reserve`] keeps that honest.
-pub const ENVELOPE_RESERVE: usize = 512;
+/// A Noise transport message costs 16 bytes of AEAD tag on top of its plaintext, and the
+/// *link* budget is spent on the frame, not the plaintext.
+pub const NOISE_TAG_BYTES: usize = 16;
+
+/// Room for a chunk reply's JSON envelope with an empty body. Measured at 229 bytes for the
+/// widest possible numbers and two 64-character hex ids; `envelope_fits_reserve` pins it.
+pub const CHUNK_ENVELOPE_RESERVE: usize = 232;
+
+/// Room for a manifest reply's envelope with no entries. Measured at 262.
+pub const MANIFEST_ENVELOPE_RESERVE: usize = 272;
 
 /// Ceiling on one chunk, from ADR-0016's `MAX_CHUNK`. Duplicated rather than depended on:
 /// this crate is the transport and must not pull in the store.
@@ -56,9 +62,9 @@ pub const MAX_CHUNK_BYTES: u32 = 256 * 1024;
 pub const MAX_CHUNKS_PER_REQUEST: u32 = 4096;
 
 /// Bytes of JSON one [`ChunkEntry`] costs: 64 hex characters, the field names, the length,
-/// and the punctuation. Deliberately generous — being wrong here means an over-long frame,
-/// and [`chunk_entry_fits_estimate`] pins it.
-const CHUNK_ENTRY_JSON_BYTES: usize = 112;
+/// and the punctuation. Measured at 98; `chunk_entry_fits_estimate` pins it. Being wrong
+/// here means an over-long frame, so it rounds up.
+const CHUNK_ENTRY_JSON_BYTES: usize = 104;
 
 /// A request from a peer. Untrusted until [`Request::validate`] has passed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,31 +276,50 @@ impl Request {
     }
 }
 
-/// How many raw content bytes fit in one reply on this link.
-///
-/// The smaller of what the link will carry and what a Noise frame holds, less the JSON
-/// envelope, less base64's third. Always at least one byte: a `Trickle` link is slow, not
-/// unusable, and a protocol that returned zero here would deadlock rather than crawl.
-pub fn max_body_bytes(link: &LinkProperties) -> u32 {
-    let frame = link
-        .bandwidth_class
+/// Plaintext this link can carry in one message: what the link will bear, less the AEAD
+/// tag, and never more than a Noise transport message holds.
+fn plaintext_budget(link: &LinkProperties) -> usize {
+    link.bandwidth_class
         .max_reasonable_payload()
-        .min(MAX_NOISE_PLAINTEXT);
-    let body = frame.saturating_sub(ENVELOPE_RESERVE);
+        .saturating_sub(NOISE_TAG_BYTES)
+        .min(MAX_NOISE_PLAINTEXT)
+}
+
+/// How many raw content bytes fit in one chunk reply on this link.
+///
+/// Always at least one byte. On a `Trickle` link this is single digits, which is not useful
+/// but is correct — and correct at six bytes a transmission is what a duty-cycle-limited
+/// radio actually offers.
+pub fn max_body_bytes(link: &LinkProperties) -> u32 {
+    let body = plaintext_budget(link).saturating_sub(CHUNK_ENVELOPE_RESERVE);
     // Base64 costs four characters per three bytes.
     let raw = (body / 4) * 3;
     raw.clamp(1, MAX_CHUNK_BYTES as usize) as u32
 }
 
-/// How many chunk entries fit in one manifest window on this link. At least one.
+/// How many chunk entries fit in one manifest window on this link.
+///
+/// Reports at least one so a caller never builds an empty request, which means the answer
+/// can be a window this link cannot actually carry. Ask [`carries_a_manifest`] first.
 pub fn max_chunks_per_page(link: &LinkProperties) -> u32 {
-    let frame = link
-        .bandwidth_class
-        .max_reasonable_payload()
-        .min(MAX_NOISE_PLAINTEXT);
-    let body = frame.saturating_sub(ENVELOPE_RESERVE);
+    let body = plaintext_budget(link).saturating_sub(MANIFEST_ENVELOPE_RESERVE);
     let n = body / CHUNK_ENTRY_JSON_BYTES;
     n.clamp(1, MAX_CHUNKS_PER_REQUEST as usize) as u32
+}
+
+/// Can this link carry a manifest window with even one entry in it?
+///
+/// **Measured, and the answer for a `Trickle` link is no.** A manifest reply's envelope is
+/// 262 bytes before any entry, and one entry is 98 more; EU868 LoRa will bear 256 in total.
+/// Chunk replies do fit, so an object could be *transferred* over such a link — but not
+/// described over one, so a fetch cannot begin. Saying so before sending anything is better
+/// than a `PayloadTooLarge` from three layers down.
+///
+/// The secure channel has the same problem first: a session proof frame is 447 bytes
+/// (measured), so a Noise handshake does not complete over a `Trickle` link either. See
+/// OQ-23 and OQ-24.
+pub fn carries_a_manifest(link: &LinkProperties) -> bool {
+    plaintext_budget(link) >= MANIFEST_ENVELOPE_RESERVE + CHUNK_ENTRY_JSON_BYTES
 }
 
 /// Encode a message for a channel frame.
@@ -439,18 +464,71 @@ mod tests {
     }
 
     #[test]
+    fn a_chunk_reply_sized_for_a_link_fits_that_link() {
+        // The property the sizing exists for, checked by building the reply rather than by
+        // trusting the arithmetic. Includes LoRa, where the margin is a handful of bytes.
+        for link in [LinkProperties::lora_eu868(), LinkProperties::internet()] {
+            let body = max_body_bytes(&link) as usize;
+            let reply = Response::Chunk(ChunkPart {
+                content_id: id(0xff),
+                digest: id(0xff),
+                offset: u32::MAX,
+                total_length: u32::MAX,
+                data: data_encoding::BASE64.encode(&vec![0u8; body]),
+            });
+            let frame = encode(&reply).unwrap().len() + NOISE_TAG_BYTES;
+            link.permits_payload(frame)
+                .unwrap_or_else(|e| panic!("a reply sized for a {:?} link does not fit it: {e}", link.kind));
+            assert!(frame - NOISE_TAG_BYTES <= MAX_NOISE_PLAINTEXT);
+        }
+    }
+
+    #[test]
+    fn a_trickle_link_cannot_carry_a_manifest_window() {
+        // Measured, not assumed: a manifest reply is 262 bytes before any entry and EU868
+        // LoRa bears 256. The protocol must say so rather than fail somewhere below.
+        assert!(!carries_a_manifest(&LinkProperties::lora_eu868()));
+        assert!(carries_a_manifest(&LinkProperties::internet()));
+    }
+
+    #[test]
+    fn a_manifest_window_sized_for_a_link_that_can_carry_one_fits_it() {
+        let link = LinkProperties::internet();
+        let n = max_chunks_per_page(&link) as usize;
+        let reply = Response::Manifest(ManifestPage {
+            content_id: id(0xff),
+            size_bytes: u64::MAX,
+            chunking: "fastcdc-v2020-16k-64k-256k".into(),
+            visibility: "replicated".into(),
+            total_chunks: u32::MAX,
+            from_chunk: u32::MAX,
+            chunks: vec![
+                ChunkEntry {
+                    blake3: id(0xff),
+                    length: u32::MAX,
+                };
+                n
+            ],
+        });
+        let frame = encode(&reply).unwrap().len() + NOISE_TAG_BYTES;
+        link.permits_payload(frame).expect("a full window must fit");
+        assert!(frame - NOISE_TAG_BYTES <= MAX_NOISE_PLAINTEXT, "{frame}");
+    }
+
+    #[test]
     fn a_body_never_exceeds_what_one_noise_frame_can_hold() {
         // The Wide class permits 64 MiB; the frame does not care what the class permits.
         let mut wide = LinkProperties::internet();
         wide.bandwidth_class = crate::link::BandwidthClass::Wide;
         let body = max_body_bytes(&wide) as usize;
         assert!(body <= MAX_CHUNK_BYTES as usize);
-        // base64 of the body, plus the envelope, must still fit one frame.
-        assert!(body.div_ceil(3) * 4 + ENVELOPE_RESERVE <= MAX_NOISE_PLAINTEXT);
+        assert!(body.div_ceil(3) * 4 + CHUNK_ENVELOPE_RESERVE <= MAX_NOISE_PLAINTEXT);
     }
 
     #[test]
-    fn a_manifest_window_is_at_least_one_entry_on_every_link() {
+    fn a_manifest_window_is_never_reported_as_zero_entries() {
+        // Even where the window will not fit: a zero would produce a request that
+        // `validate` refuses. `carries_a_manifest` is the check for that case.
         for p in [LinkProperties::lora_eu868(), LinkProperties::internet()] {
             assert!(max_chunks_per_page(&p) >= 1, "{:?}", p.kind);
         }
@@ -473,7 +551,8 @@ mod tests {
 
     #[test]
     fn envelope_fits_reserve() {
-        // The largest envelope this module emits, with an empty body.
+        // The two reserves are measured numbers, and this is the measurement. If a field is
+        // added to either reply, this fails rather than a link silently refusing a frame.
         let page = ManifestPage {
             content_id: id(0xff),
             size_bytes: u64::MAX,
@@ -490,14 +569,49 @@ mod tests {
             total_length: u32::MAX,
             data: String::new(),
         };
-        for (name, len) in [
-            ("manifest", encode(&Response::Manifest(page)).unwrap().len()),
-            ("chunk", encode(&Response::Chunk(part)).unwrap().len()),
+        for (name, len, reserve) in [
+            (
+                "manifest",
+                encode(&Response::Manifest(page)).unwrap().len(),
+                MANIFEST_ENVELOPE_RESERVE,
+            ),
+            (
+                "chunk",
+                encode(&Response::Chunk(part)).unwrap().len(),
+                CHUNK_ENVELOPE_RESERVE,
+            ),
         ] {
             assert!(
-                len <= ENVELOPE_RESERVE,
-                "the {name} envelope is {len} bytes, over the {ENVELOPE_RESERVE} reserved"
+                len <= reserve,
+                "the {name} envelope is {len} bytes, over the {reserve} reserved"
             );
+        }
+    }
+
+    #[test]
+    fn a_request_fits_every_link_a_reply_does() {
+        // Requests are smaller than replies, but not by so much that it can be assumed.
+        let biggest = [
+            encode(&Request::Chunk {
+                content_id: id(0xff),
+                digest: id(0xff),
+                offset: u32::MAX,
+                max_bytes: MAX_CHUNK_BYTES,
+            })
+            .unwrap()
+            .len(),
+            encode(&Request::Manifest {
+                content_id: id(0xff),
+                from_chunk: u32::MAX,
+                max_chunks: MAX_CHUNKS_PER_REQUEST,
+            })
+            .unwrap()
+            .len(),
+        ];
+        for len in biggest {
+            LinkProperties::lora_eu868()
+                .permits_payload(len + NOISE_TAG_BYTES)
+                .unwrap_or_else(|e| panic!("a request of {len} bytes will not fit LoRa: {e}"));
         }
     }
 

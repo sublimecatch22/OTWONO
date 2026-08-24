@@ -55,11 +55,29 @@ and exactly one error shape:
 ### The range is not an optimization
 
 Both requests carry a caller-chosen bound and both replies may be short. The requester
-loops. This is what lets a single protocol run over a LoRa link at 222 bytes an MTU and an
-Ethernet link at 8 MiB a payload: the *link*, through
-`BandwidthClass::max_reasonable_payload()`, decides how much of a chunk moves per frame —
-the content never does. It also makes an interrupted transfer resumable for free, which is
-the same shape `fetch.get` settled on in ADR-0014 for the same reason.
+loops. The *link*, through `BandwidthClass::max_reasonable_payload()`, decides how much of a
+chunk moves per frame; the content never does. It also makes an interrupted transfer
+resumable for free, which is the same shape `fetch.get` settled on in ADR-0014 for the same
+reason.
+
+**Amended after measuring.** The first draft of this section claimed the result was one
+protocol that runs on LoRa and on Ethernet alike. That claim was wrong, and the numbers are
+worth stating rather than quietly dropping:
+
+| Message | Bytes on the wire | Fits a `Trickle` frame (256)? |
+|---|---:|---|
+| Noise session proof (handshake) | 447 | no |
+| Manifest reply, no entries | 262 | no |
+| Manifest reply, one entry | 360 | no |
+| Chunk reply, empty body | 229 | yes, with 11 bytes to spare |
+| Chunk request, largest | 225 | yes |
+
+So a `Trickle` link can carry chunk traffic — at about six bytes of payload per
+transmission — but cannot carry a manifest window, and the Noise handshake does not
+complete over one in the first place. `content::carries_a_manifest()` says so before a fetch
+sends anything, rather than letting a `PayloadTooLarge` surface from three layers down. The
+protocol works from `Narrow` upward. Making it work on a radio needs a compact encoding
+(OQ-23) and a smaller handshake (OQ-24), and neither is in this ADR.
 
 A responder is always free to send less than asked. A requester that receives zero new
 bytes twice in a row must stop; without that rule a hostile or broken peer holds the
@@ -122,17 +140,19 @@ returns everything inline, which is fine for a local caller and wrong for a remo
 ## Consequences
 
 **Good.** Content moves between nodes over the channel that already authenticates them,
-with no new transport and no new key. The same messages work on LoRa and on Ethernet. A
-transfer resumes. A lying peer is caught at the first bad chunk. The chunk-probe oracle is
+with no new transport and no new key. A transfer resumes. A lying peer is caught at the first bad chunk. The chunk-probe oracle is
 closed by construction rather than by rate limiting. Phase 5's fourth criterion becomes
 testable on an actual link.
 
 **Bad, and worth naming.**
 
-- **JSON with base64 bodies costs a third of the payload.** On a `Wide` link that is
-  irrelevant; on `Trickle` it is a real tax on a scarce resource. Accepted for now because
-  one encoding everywhere is worth more than the bytes, and because the framing is
-  versioned — a binary body encoding is a later, additive change.
+- **JSON with base64 bodies costs a third of the payload, and the envelope costs more than
+  that.** Two 64-character hex ids and their field names are most of a 229-byte chunk
+  envelope. On a `Wide` link that is irrelevant; on a radio it is the whole budget. Accepted
+  for now because one encoding everywhere is worth more than the bytes, and because the
+  framing is versioned — a compact encoding is a later, additive change (OQ-23).
+- **`Trickle` links are out of scope until OQ-23 and OQ-24 are answered.** Measured, stated
+  above, and refused explicitly rather than left to fail obscurely.
 - **Traffic analysis is untouched.** Sizes and timings are visible to anyone watching the
   link. Noise encrypts, it does not pad.
 - **There is no request pipelining and no concurrency.** One request, one reply, in order,
@@ -148,8 +168,7 @@ testable on an actual link.
 ## Alternatives rejected
 
 - **Whole objects in one message.** Simplest, and impossible: 256 KiB chunks do not fit in
-  a 65535-byte Noise frame, and the constrained links this project exists for are three
-  orders of magnitude smaller again.
+  a 65535-byte Noise frame.
 - **Byte ranges over the object, verified by re-chunking at the end.** Genuinely simpler on
   the wire — no digests, no manifest, no pagination — and it does verify, because FastCDC
   is deterministic. Rejected because the check only fires after the last byte, which means

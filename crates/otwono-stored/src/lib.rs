@@ -47,6 +47,12 @@ pub const CAPABILITY_SERVE: &str = "store.serve";
 /// Larger objects are a streaming interface this daemon does not have yet.
 pub const MAX_INLINE_BYTES: usize = 32 * 1024 * 1024;
 
+/// Largest manifest window one `store.serve_manifest` will build. A page is assembled in
+/// memory, so an unbounded request would be an allocation a peer chooses. Matches the
+/// wire's own ceiling in `otwono_net::content`; the control-plane test asserts they agree,
+/// because this daemon must not depend on the transport crate to learn its own limit.
+pub const MAX_SERVE_CHUNKS: usize = 4096;
+
 pub struct StoreService {
     store: Store,
     perm_socket: PathBuf,
@@ -74,6 +80,34 @@ struct PutParams {
 #[derive(Debug, Deserialize)]
 struct IdParams {
     content_id: String,
+}
+
+/// One window of an object's chunk list, for a peer.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServeManifestParams {
+    content_id: String,
+    #[serde(default)]
+    from_chunk: usize,
+    max_chunks: usize,
+    #[serde(default)]
+    peer: Option<String>,
+}
+
+/// One range of one chunk of one object, for a peer.
+///
+/// `content_id` is not redundant next to `digest`: it is the whole reason a peer cannot use
+/// this method to ask whether the node holds arbitrary bytes. See ADR-0017.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServeChunkParams {
+    content_id: String,
+    digest: String,
+    #[serde(default)]
+    offset: usize,
+    max_bytes: usize,
+    #[serde(default)]
+    peer: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -191,6 +225,110 @@ impl StoreService {
         Ok(out)
     }
 
+    /// The whole of the network boundary, in one place.
+    ///
+    /// Every peer-facing method goes through this and nothing else, so there is one label
+    /// check to audit rather than three that must be kept in step. It returns the same
+    /// error for absent, private, shared, and unreadable, because a peer that can tell
+    /// those apart can enumerate what this node holds.
+    fn servable(&self, id: &ContentId) -> Result<Object, RpcError> {
+        self.store
+            .get_object(id)
+            .ok()
+            .filter(|o| o.visibility.may_leave_the_node_unattended())
+            .ok_or_else(|| not_available(id))
+    }
+
+    /// One window of an object's chunk list.
+    ///
+    /// Paginated because a large object's chunk list does not fit in a link frame — a 1 GiB
+    /// object is roughly 16000 chunks at ADR-0016's average. `total_chunks` comes back in
+    /// every window so a requester can size the job from the first one.
+    fn handle_serve_manifest(&self, params: Value) -> Result<Value, RpcError> {
+        let p: ServeManifestParams = serde_json::from_value(params)
+            .map_err(|e| RpcError::invalid_params(format!("store.serve_manifest: {e}")))?;
+        if p.max_chunks == 0 {
+            return Err(RpcError::invalid_params("max_chunks must be greater than zero"));
+        }
+        let id = Self::parse_id(&p.content_id)?;
+        let object = self.servable(&id)?;
+
+        // Saturating rather than indexing: a peer naming a window past the end gets an
+        // empty one, which is a true answer, not an error worth distinguishing.
+        let want = p.max_chunks.min(MAX_SERVE_CHUNKS);
+        let from = p.from_chunk.min(object.chunks.len());
+        let to = from.saturating_add(want).min(object.chunks.len());
+        let chunks: Vec<Value> = object.chunks[from..to]
+            .iter()
+            .map(|c| json!({ "blake3": c.blake3, "length": c.length }))
+            .collect();
+
+        Ok(json!({
+            "schema_version": DESCRIBE_SCHEMA_VERSION,
+            "content_id": object.content_id.to_hex(),
+            "size_bytes": object.size_bytes,
+            "chunking": object.chunking,
+            "visibility": object.visibility.as_str(),
+            "total_chunks": object.chunks.len(),
+            "from_chunk": from,
+            "chunks": chunks,
+            "served_to": p.peer,
+        }))
+    }
+
+    /// One range of one chunk of one object.
+    ///
+    /// The digest must be in *that object's* chunk list. Without that check this method
+    /// would answer "do you hold these exact bytes" for any digest a peer cared to guess,
+    /// whatever label the object carrying them had — chunks are shared between objects by
+    /// design, so a private object and a public one can contain the same one (ADR-0017).
+    fn handle_serve_chunk(&self, params: Value) -> Result<Value, RpcError> {
+        let p: ServeChunkParams = serde_json::from_value(params)
+            .map_err(|e| RpcError::invalid_params(format!("store.serve_chunk: {e}")))?;
+        if p.max_bytes == 0 {
+            return Err(RpcError::invalid_params("max_bytes must be greater than zero"));
+        }
+        let id = Self::parse_id(&p.content_id)?;
+        let object = self.servable(&id)?;
+
+        let entry = object
+            .chunks
+            .iter()
+            .find(|c| c.blake3 == p.digest)
+            .ok_or_else(|| not_available(&id))?;
+        let digest: [u8; 32] = data_encoding::HEXLOWER
+            .decode(entry.blake3.as_bytes())
+            .ok()
+            .and_then(|v| v.try_into().ok())
+            .ok_or_else(|| RpcError::internal("a stored chunk digest is not 32 hex bytes"))?;
+        let chunk_ref = otwono_store::ChunkRef {
+            digest,
+            length: entry.length,
+        };
+        // A damaged or missing chunk is not-available too. The peer asked for an object
+        // this node advertises; that it cannot produce the bytes is this node's problem.
+        let bytes = self.store.get_chunk(&chunk_ref).map_err(|_| not_available(&id))?;
+
+        let from = p.offset.min(bytes.len());
+        let to = from
+            .saturating_add(p.max_bytes.min(otwono_store::chunk::MAX_CHUNK))
+            .min(bytes.len());
+
+        Ok(json!({
+            "schema_version": DESCRIBE_SCHEMA_VERSION,
+            "content_id": object.content_id.to_hex(),
+            "digest": entry.blake3,
+            // Sent so otwono-netd can make the same decision independently before a byte
+            // reaches a link (DATA-VISIBILITY.md §4). It is always public or replicated,
+            // because servable() already refused everything else.
+            "visibility": object.visibility.as_str(),
+            "offset": from,
+            "total_length": bytes.len(),
+            "data": data_encoding::BASE64.encode(&bytes[from..to]),
+            "served_to": p.peer,
+        }))
+    }
+
     /// The network boundary.
     ///
     /// The label is checked **before** the store is consulted, so that "you may not have
@@ -201,30 +339,22 @@ impl StoreService {
             .map_err(|e| RpcError::invalid_params(format!("store.serve: {e}")))?;
         let id = Self::parse_id(&p.content_id)?;
 
-        let permitted = self
-            .store
-            .get_object(&id)
-            .ok()
-            .filter(|o| o.visibility.may_leave_the_node_unattended());
-
-        // One refusal for every reason. Absent, private, shared, damaged: all "not
-        // available". Anything more specific tells a stranger what this node holds.
-        let Some(object) = permitted else {
-            return Err(RpcError::invalid_params(format!(
-                "{} is not available to peers",
-                id.to_hex()
-            )));
-        };
-        let bytes = self
-            .store
-            .read_object(&object)
-            .map_err(|_| RpcError::invalid_params(format!("{} is not available to peers", id.to_hex())))?;
+        let object = self.servable(&id)?;
+        let bytes = self.store.read_object(&object).map_err(|_| not_available(&id))?;
 
         let mut out = record(&object);
         out["data"] = json!(data_encoding::BASE64.encode(&bytes));
         out["served_to"] = json!(p.peer);
         Ok(out)
     }
+}
+
+/// The one thing a peer is ever told when it may not have something.
+///
+/// Deliberately identical for absent, private, shared, damaged, and
+/// not-part-of-that-object. It names the id the peer already sent, and nothing else.
+fn not_available(id: &ContentId) -> RpcError {
+    RpcError::invalid_params(format!("{} is not available to peers", id.to_hex()))
 }
 
 fn record(o: &Object) -> Value {
@@ -284,6 +414,16 @@ impl Service for StoreService {
                     "Hand an object to a peer, if its label permits leaving the node",
                     CAPABILITY_SERVE,
                 ),
+                MethodDescription::guarded(
+                    "store.serve_manifest",
+                    "One window of a servable object's chunk list, for a peer",
+                    CAPABILITY_SERVE,
+                ),
+                MethodDescription::guarded(
+                    "store.serve_chunk",
+                    "One range of one chunk of a servable object, for a peer",
+                    CAPABILITY_SERVE,
+                ),
             ],
         }
     }
@@ -309,6 +449,14 @@ impl Service for StoreService {
             "store.serve" => {
                 self.authorize(ctx, CAPABILITY_SERVE)?;
                 self.handle_serve(params)
+            }
+            "store.serve_manifest" => {
+                self.authorize(ctx, CAPABILITY_SERVE)?;
+                self.handle_serve_manifest(params)
+            }
+            "store.serve_chunk" => {
+                self.authorize(ctx, CAPABILITY_SERVE)?;
+                self.handle_serve_chunk(params)
             }
             other => Err(unknown_method(other)),
         }

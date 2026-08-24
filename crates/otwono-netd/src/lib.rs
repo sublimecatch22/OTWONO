@@ -16,8 +16,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod content;
 pub mod signer;
 
+pub use content::{fetch_object, serve_session, ContentResponder, FetchedObject};
 pub use signer::{BindError, BrokeredSigner};
 
 use otwono_identity::{NodeId, SessionSigner};
@@ -35,9 +37,13 @@ pub const SERVICE_NAME: &str = "otwono-netd";
 pub const DESCRIBE_SCHEMA_VERSION: &str = "1.0.0";
 pub const CAPABILITY_READ: &str = "net.read";
 pub const CAPABILITY_CONNECT: &str = "net.connect";
+/// Fetching content from a peer. Distinct from `net.connect`, and distinct from
+/// `otwono-fetchd`'s `net.fetch`, which is outbound HTTPS to the Internet (ADR-0014) and
+/// has nothing to do with the mesh.
+pub const CAPABILITY_CONTENT: &str = "net.content";
 pub const DEFAULT_PORT: u16 = 8443;
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The first message each side sends once authenticated.
 ///
@@ -52,6 +58,10 @@ pub struct Hello {
 }
 
 pub struct NetState {
+    /// Answers peers' content requests, when this node has a store to answer from. `None`
+    /// on a node built without one: such a node meshes and authenticates, and refuses every
+    /// content request by never listening for one.
+    pub responder: Option<Arc<ContentResponder>>,
     /// Whatever can sign for this node. In the daemon it is a [`BrokeredSigner`]; in a
     /// test it is usually a whole `NodeIdentity`, which signs locally.
     pub signer: Arc<dyn SessionSigner>,
@@ -64,11 +74,18 @@ impl NetState {
     pub fn new(signer: Arc<dyn SessionSigner>) -> Self {
         let node_id = signer.node_id();
         NetState {
+            responder: None,
             signer,
             node_id,
             peers: Mutex::new(PeerTable::new()),
             listen_addr: Mutex::new(None),
         }
+    }
+
+    /// Give this node a store to serve peers from.
+    pub fn with_responder(mut self, responder: ContentResponder) -> Self {
+        self.responder = Some(Arc::new(responder));
+        self
     }
 
     pub fn node_id(&self) -> &NodeId {
@@ -100,6 +117,17 @@ impl NetState {
                     "otwono-netd: inbound peer authenticated: {}",
                     node_id.fingerprint()
                 );
+
+                // The accepting side answers; the dialling side asks (ADR-0017). A node
+                // with no store simply drops the channel here, as it always did.
+                if let Some(responder) = self.responder.clone() {
+                    if let Err(e) = content::serve_session(&mut channel, responder.as_ref()) {
+                        eprintln!(
+                            "otwono-netd: content session with {} ended: {e}",
+                            node_id.fingerprint()
+                        );
+                    }
+                }
             }
             Err(e) => eprintln!("otwono-netd: inbound handshake refused: {e}"),
         }
@@ -157,6 +185,34 @@ impl NetState {
             .unwrap()
             .record_authenticated(proved, Some(candidate.address), now);
         Ok(proved)
+    }
+
+    /// Dial a peer and fetch one object from it.
+    ///
+    /// A fresh channel every time, because roles are fixed for a channel's life and this
+    /// node has to be the one that dialled in order to ask. It is also the reason this does
+    /// not reuse a connection the peer opened to us.
+    pub fn fetch_from(&self, candidate: &Candidate, content_id: &str) -> Result<FetchedObject, String> {
+        let link = TcpLink::connect(candidate.address, content::FETCH_TIMEOUT)
+            .map_err(|e| format!("connect to {}: {e}", candidate.address))?;
+        link.set_timeout(Some(content::FETCH_TIMEOUT))
+            .map_err(|e| e.to_string())?;
+        // Taken before the link is moved into the channel: it is what bounds every message,
+        // and a LoRa link and an Ethernet link get very different numbers from it.
+        let properties = link.properties();
+
+        let mut channel = SecureChannel::initiate(link, self.signer.as_ref()).map_err(|e| e.to_string())?;
+        let proved = channel.peer().node_id;
+        if proved != candidate.claimed_node_id {
+            return Err(format!(
+                "{} advertised {} but authenticated as {}",
+                candidate.address,
+                candidate.claimed_node_id.fingerprint(),
+                proved.fingerprint()
+            ));
+        }
+        self.exchange_hello(&mut channel, true)?;
+        content::fetch_object(&mut channel, content_id, &properties).map_err(|e| e.to_string())
     }
 
     fn exchange_hello<L: LinkAdapter>(
@@ -304,6 +360,29 @@ impl NetService {
         NetService { state, perm_socket }
     }
 
+    /// A peer to talk to: an address, and the NodeID the caller expects to find there.
+    ///
+    /// Both are required. Dialling an address without saying who should answer would make
+    /// this daemon connect to whatever is listening, which is exactly the check `dial`
+    /// exists to perform.
+    fn candidate(params: &Value) -> Result<Candidate, RpcError> {
+        let address = params
+            .get("address")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::invalid_params("an address is required"))?;
+        let node_id = params
+            .get("node_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::invalid_params("a node_id is required"))?;
+        Ok(Candidate {
+            claimed_node_id: otwono_identity::NodeId::parse(node_id)
+                .map_err(|e| RpcError::invalid_params(e.to_string()))?,
+            address: address
+                .parse()
+                .map_err(|e| RpcError::invalid_params(format!("bad address: {e}")))?,
+        })
+    }
+
     fn authorize(&self, ctx: &CallContext, action: &str) -> Result<(), RpcError> {
         let token = ctx
             .capability
@@ -343,6 +422,11 @@ impl Service for NetService {
                     "Dial a peer at a given address and authenticate it",
                     CAPABILITY_CONNECT,
                 ),
+                MethodDescription::guarded(
+                    "net.fetch",
+                    "Fetch one content-addressed object from a peer, verified on arrival",
+                    CAPABILITY_CONTENT,
+                ),
             ],
         }
     }
@@ -368,26 +452,33 @@ impl Service for NetService {
             }
             "net.connect" => {
                 self.authorize(ctx, CAPABILITY_CONNECT)?;
-                let address = params
-                    .get("address")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| RpcError::invalid_params("net.connect needs an address"))?;
-                let node_id = params
-                    .get("node_id")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| RpcError::invalid_params("net.connect needs a node_id"))?;
-                let candidate = Candidate {
-                    claimed_node_id: otwono_identity::NodeId::parse(node_id)
-                        .map_err(|e| RpcError::invalid_params(e.to_string()))?,
-                    address: address
-                        .parse()
-                        .map_err(|e| RpcError::invalid_params(format!("bad address: {e}")))?,
-                };
+                let candidate = Self::candidate(&params)?;
                 let proved = self
                     .state
                     .dial(&candidate)
                     .map_err(|e| RpcError::new(otwono_proto::code::UNAVAILABLE, e))?;
                 Ok(json!({ "node_id": proved.to_text(), "fingerprint": proved.fingerprint() }))
+            }
+            "net.fetch" => {
+                self.authorize(ctx, CAPABILITY_CONTENT)?;
+                let candidate = Self::candidate(&params)?;
+                let content_id = params
+                    .get("content_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| RpcError::invalid_params("net.fetch needs a content_id"))?;
+                let fetched = self
+                    .state
+                    .fetch_from(&candidate, content_id)
+                    .map_err(|e| RpcError::new(otwono_proto::code::UNAVAILABLE, e))?;
+                Ok(json!({
+                    "schema_version": DESCRIBE_SCHEMA_VERSION,
+                    "content_id": fetched.content_id,
+                    "visibility": fetched.visibility,
+                    "chunking": fetched.chunking,
+                    "size_bytes": fetched.bytes.len(),
+                    "from": candidate.claimed_node_id.to_text(),
+                    "data": data_encoding::BASE64.encode(&fetched.bytes),
+                }))
             }
             other => Err(unknown_method(other)),
         }

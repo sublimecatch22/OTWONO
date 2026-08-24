@@ -57,12 +57,22 @@ Every object in `otwono-stored` carries exactly one visibility label.
 |---|---|
 | `otwono-stored` write path | Label assignment, provenance propagation, encryption at rest |
 | `otwono-stored` read path | Caller authorization before returning bytes |
-| `otwono-netd` egress | Label check on **every** outbound object. `PRIVATE` is dropped and the attempt is logged as an incident. |
+| `otwono-netd` egress | Label check on **every** outbound object. `PRIVATE` is dropped and the attempt is logged as an incident. **STATUS: IMPLEMENTED** — `otwono_netd::content::may_leave_a_node`. |
 | `otwono-svcd` | Services cannot publish what the label forbids |
 | `otwono-permd` | Confirmation for promotion and for egress of `SHARED` |
 
 Egress enforcement is deliberately duplicated in the store and the network daemon.
 Defence in depth: a bug in one must not be sufficient to leak private data.
+
+The duplication is only worth having if the two checks are *different code*.
+`otwono-stored` asks `Visibility::may_leave_the_node_unattended()`, an enum method over a
+parsed label. `otwono-netd` does not call it: it holds an allow-list of the two strings that
+may appear on a wire and refuses everything else, including labels that do not exist yet. A
+shared helper would have been tidier and would have duplicated nothing — one bug would pass
+both gates. See ADR-0017.
+
+`otwono-netd` also holds `store.serve` and no other store capability, so there is no call it
+can make that returns a `PRIVATE` object even if both checks failed at once.
 
 ## 5. Encryption
 
@@ -92,3 +102,20 @@ Negative tests are the point of this subsystem:
 - Derived content inherits the most restrictive input label, verified by a property test
   across random label combinations.
 - Label demotion stops future serving.
+
+### Where each of those stands
+
+**STATUS: VERIFIED** for the first, third and fourth; **SPECIFIED** for the second.
+
+| Property | Where it is proven |
+|---|---|
+| A `PRIVATE` object never appears on any link | `tests/control-plane/tests/content_over_a_link.rs` — two nodes over a real TCP socket, Noise-authenticated, under a policy that denies `store.read` outright |
+| A refusal is indistinguishable from not-found | same file: the two errors are compared with the content id substituted out |
+| Derived content inherits the most restrictive label | `tests/control-plane/tests/store_labels.rs` |
+| Demotion stops future serving | proven over a link, not only at the method |
+
+The `SHARED` case is stated as specified rather than tested because `SHARED` is not
+implemented: it needs the per-recipient key wrapping of §5, which needs the identity
+daemon's agreement keys. Until it exists it fails closed and is refused exactly as `PRIVATE`
+is, which is the right way for a feature to be missing but is not the same as the property
+above being met.
