@@ -144,8 +144,7 @@ fn run(args: &[String]) -> Result<String, Error> {
         let bytes = data_encoding::BASE64
             .decode(data.as_bytes())
             .map_err(|e| Error::Runtime(format!("the daemon's data is not base64: {e}")))?;
-        std::fs::write(&out, &bytes)
-            .map_err(|e| Error::Runtime(format!("{}: {e}", out.display())))?;
+        std::fs::write(&out, &bytes).map_err(|e| Error::Runtime(format!("{}: {e}", out.display())))?;
         if opts.json {
             return render_json(&value);
         }
@@ -189,8 +188,8 @@ fn build_call(opts: &Options) -> Result<(String, Value, Option<&'static str>), E
     Ok(match opts.command.as_str() {
         "put" => {
             let path = need_file("put")?;
-            let bytes = std::fs::read(&path)
-                .map_err(|e| Error::Runtime(format!("{}: {e}", path.display())))?;
+            let bytes =
+                std::fs::read(&path).map_err(|e| Error::Runtime(format!("{}: {e}", path.display())))?;
             // Checked here as well as in the daemon, so the answer is a sentence rather
             // than a refused socket line, and so the file is not read twice to find out.
             if bytes.len() > otwono_stored::MAX_INLINE_BYTES {
@@ -316,7 +315,12 @@ fn render(command: &str, v: &Value) -> String {
     let n = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
     match command {
         "put" | "import" => {
-            let mut out = format!("{} {} bytes {}\n", s("content_id"), n("size_bytes"), s("visibility"));
+            let mut out = format!(
+                "{} {} bytes {}\n",
+                s("content_id"),
+                n("size_bytes"),
+                s("visibility")
+            );
             // Said plainly, because a caller that asked for public over a private input got
             // private and needs to know rather than assume.
             if let Some(asked) = v.get("requested_visibility").and_then(Value::as_str) {
@@ -395,9 +399,7 @@ fn parse_args(args: &[String]) -> Result<Options, Error> {
             "--visibility" => opts.visibility = Some(next(&mut it, "--visibility")?),
             "--derived-from" => opts.derived_from.push(next(&mut it, "--derived-from")?),
             "--json" => opts.json = true,
-            other if other.starts_with('-') => {
-                return Err(Error::Usage(format!("unknown option {other}")))
-            }
+            other if other.starts_with('-') => return Err(Error::Usage(format!("unknown option {other}"))),
             positional => {
                 if opts.target.is_some() {
                     return Err(Error::Usage(format!("unexpected argument {positional}")));
