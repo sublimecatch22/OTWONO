@@ -460,6 +460,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastcdc"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0431c3132902a1bed6fe77dcfa5d03844e083f263b81288246a2d43dd7d4b2ad"
+
+[[package]]
 name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1208,8 +1214,19 @@ dependencies = [
  "otwono-fetch",
  "otwono-hal",
  "otwono-llama",
+ "otwono-store",
  "serde_json",
  "toml",
+]
+
+[[package]]
+name = "otwono-store"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "fastcdc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1461,7 +1478,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2003,7 +2020,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

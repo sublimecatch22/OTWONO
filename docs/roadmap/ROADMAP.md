@@ -170,7 +170,9 @@ GPU/NPU backends, and the tiered assistant shapes.
 
 ## Phase 5 — Content store and data visibility
 
-1. `otwono-stored` — BLAKE3 CAS, chunking, dedup.
+1. ~~`otwono-store` — chunking at ADR-0016's parameters, BLAKE3 content addressing, the
+   object model, visibility labels, and the on-disk chunk store with verified reads.~~
+   **done** (the daemon, `otwono-stored`, is separate and not yet written)
 2. The four labels, enforced. Encryption at rest. Provenance propagation.
 3. Egress enforcement in `otwono-netd`, duplicated as defence in depth.
 4. Replication policy for `REPLICATED`.

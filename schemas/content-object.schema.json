@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://otwono.org/schemas/content-object-1.0.0.json",
+  "title": "OTWONO Content Object",
+  "description": "What the content store records about one object: the chunks it is made of, how large it is, and how visible it may be. The content_id is derived from the chunk list alone and from nothing else — not the label, not the filename, not who stored it — so two nodes holding the same bytes agree on its name even if they label it differently. That is what lets any holder of a chunk serve any other node (ADR-0015). Chunking parameters are a network-wide constant (ADR-0016) and are recorded here so an object split under other rules can be detected, which is all that can be done about it.",
+  "type": "object",
+  "required": ["schema_version", "content_id", "chunking", "chunks", "size_bytes"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "content_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "BLAKE3 over the domain separator, the chunking version, the chunk count, and each chunk's digest and length in order. Order is part of the name: the same chunks rearranged are a different object."
+    },
+    "chunking": {
+      "type": "string",
+      "const": "fastcdc-v2020-16k-64k-256k",
+      "description": "The parameters that produced this split, fixed by ADR-0016. A different value means the object's chunks cannot be shared with this node — not that it is corrupt."
+    },
+    "chunks": {
+      "type": "array",
+      "description": "In order. An empty array is a zero-length object, which is valid and stores nothing.",
+      "items": {
+        "type": "object",
+        "required": ["blake3", "length"],
+        "additionalProperties": false,
+        "properties": {
+          "blake3": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "length": { "type": "integer", "minimum": 1, "maximum": 262144 }
+        }
+      }
+    },
+    "size_bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Must equal the sum of the chunk lengths. Checked before a record is written and again when one is read."
+    },
+    "visibility": {
+      "enum": ["private", "shared", "public", "replicated"],
+      "default": "private",
+      "description": "Absent means private, and so does any value not in this list. A reader must never fail on an unrecognised label — it must treat it as private, so that damaging a record cannot make its contents more available (CLAUDE.md Section 8)."
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Never part of the identity. A media type, an original filename, a service's own key — all things that legitimately differ between two nodes holding the same bytes."
+    }
+  },
+  "examples": [
+    {
+      "schema_version": "1.0.0",
+      "content_id": "0000000000000000000000000000000000000000000000000000000000000000",
+      "chunking": "fastcdc-v2020-16k-64k-256k",
+      "chunks": [{ "blake3": "1111111111111111111111111111111111111111111111111111111111111111", "length": 65536 }],
+      "size_bytes": 65536,
+      "visibility": "public",
+      "metadata": { "media_type": "text/markdown" }
+    }
+  ]
+}

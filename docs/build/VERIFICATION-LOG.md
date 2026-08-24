@@ -1777,3 +1777,78 @@ Chosen: **FastCDC v2020, 16 KiB / 64 KiB / 256 KiB**, one parameter set network-
   across genuinely related files have not been measured.
 - **High-entropy data does not dedup and never will.** Chunking buys resumable, parallel,
   verifiable transfer for model weights, not storage savings. Only that is claimed.
+
+---
+
+## Phase 5 slice 2 — the content store's contracts
+
+`otwono-store`: chunking, content addressing, the object model, visibility labels, and the
+on-disk chunk store. Pure logic and local files, no daemon — the daemon is the next slice.
+
+### Workspace
+
+```
+cargo test --workspace   608 passed, 0 failed   (560 before)
+cargo clippy --workspace --all-targets -- -D warnings   clean
+cargo fmt --all --check                                 clean
+cargo build --workspace --release --target aarch64-unknown-linux-gnu   ok
+```
+
+48 new tests: 42 in `otwono-store`, 6 schema contract tests.
+
+### Four decisions worth naming
+
+**Identity is the content and nothing else.** A `ContentId` is BLAKE3 over the chunk list,
+the chunking version, and each chunk's digest and length — not the label, not a filename,
+not who stored it. Two people who store the same bytes get the same name even if one marks
+it `Public` and the other `Private`, which is what makes any holder of a chunk
+interchangeable with any other (ADR-0015). Relabelling therefore does not rename anything.
+The cost, recorded rather than glossed: a content id **reveals that you hold particular
+bytes** to anyone who can guess them, which is the same "holding is publishing" property
+ADR-0015 names, and it is why `Private` objects never enter any shared index.
+
+**Labels cannot fail to parse.** `Deserialize` for `Visibility` is infallible: a missing
+field, a value from a newer version, a JSON number where a string belongs — all read as
+`Private`. The alternative is an error, and an error is a decision a caller can get wrong.
+Damaging a record must never make its contents *more* available. `parse_strict` exists
+separately for config files, where a human who typed `publik` should be told.
+
+**Every read is verified.** `get_chunk` re-hashes what it read and reports a mismatch as
+corruption rather than returning the bytes. A caller asked for particular bytes by name;
+anything else is not a smaller answer, it is a wrong one. This is what lets an untrusted
+peer serve a chunk safely, and it is tested by writing junk over a stored chunk and
+requiring the read to fail.
+
+**Streaming and in-memory chunking must agree.** A 4 GB model on a 4 GB board has to be
+chunked without being read into memory, so there are two code paths. A test asserts they
+produce identical digests — otherwise dedup would silently depend on which path a file
+happened to take.
+
+### The properties the tests actually assert
+
+- Chunking the same bytes twice gives the same chunks. If this can ever be false, two nodes
+  cannot serve each other and nothing tells them why.
+- An insertion near the front leaves >90% of chunks shared — the ADR-0016 property,
+  asserted as a property rather than as its measured figure, which depends on the data.
+- Storing the same bytes twice stores them once, and an edited file adds chunks
+  proportional to the edit rather than to the file.
+- A tampered chunk is reported, not returned. A missing one is "not found", not a short read.
+- Derived content inherits the most restrictive input label, checked exhaustively over
+  every pair and triple of the four labels — the property test `DATA-VISIBILITY.md` §6 asks
+  for, done by enumeration since there are only four.
+- An interrupted write leaves no chunk under a finished name.
+
+### What this does not prove
+
+- **There is no daemon.** No control-plane methods, no brokered access, no authorization.
+  Everything here is a library that a caller could use wrongly; the enforcement points in
+  `DATA-VISIBILITY.md` §4 do not exist yet.
+- **Nothing is encrypted.** `PRIVATE` objects sit on disk in the clear. The encryption
+  design is written down and unimplemented.
+- **The negative suite is not done.** "A `PRIVATE` object must never appear on any link,
+  under any code path" cannot be tested until there is a link. What exists is the label
+  arithmetic underneath it.
+- **No object has crossed a network.** Two nodes agreeing on a content id is proven by
+  construction and by test, not by observation.
+- **Not measured on ARM beyond building.** The cross-build passes; chunking throughput on a
+  Cortex-A72 remains the unmeasured number ADR-0016 named.

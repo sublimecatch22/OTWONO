@@ -1,0 +1,18 @@
+[package]
+name = "otwono-store"
+description = "OTWONO content store contracts: chunking, content addressing, visibility labels, and the on-disk chunk store."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The hash used everywhere else in this system: the audit chain, the model store, the
+# fetch spool. One hash function, not four (CLAUDE.md Section 2.3).
+blake3 = "1"
+# Content-defined chunking at the parameters ADR-0016 measured. Seven crates, no async
+# runtime, and it provides the streaming chunker a 4 GB model on a 4 GB board requires.
+fastcdc = "5"
