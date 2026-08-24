@@ -2809,3 +2809,137 @@ re-run. The risk was named and taken and it did not pay.
 - **The check is a smoke test, not a suite.** It proves these paths work once, on one node,
   with one object each. The negative properties — a `PRIVATE` object never crossing a link,
   a refusal being indistinguishable from a miss — remain host-side assertions.
+
+---
+
+## Phase 6 slice 7 — two nodes, one link, and the criterion that needed a wire
+
+**Date:** 2026-08-24 · **Where:** OTWONO Cloud dev environment (no `/dev/kvm`, TCG only)
+
+`DATA-VISIBILITY.md` §6's first criterion — *a `PRIVATE` object must never appear on any
+link* — has been marked met since Phase 5 slice 5 on the strength of a test that builds
+daemons inside one process and talks over a temp socket. That proves the method. This proves
+the wire.
+
+### The run
+
+```
+$ make -C build TARGET=amd64-qemu-ubuntu MESH_CONTENT_SMOKE=1 image
+$ build/qemu/two-node-test.sh --image out/.../otwono-amd64-qemu-ubuntu.img --arch amd64
+
+node A identity: otw1:jm8k-jfre-1709-sqnm
+node B identity: otw1:8w2e-ddef-4tbs-ff3k
+node A address: 169.254.129.75/16
+node B address: 169.254.220.112/16
+node A peers connected: 1
+node B peers connected: 1
+PASS: two nodes discovered and mutually authenticated
+```
+
+and from both guests' consoles:
+
+```
+OTWONO-MESH-CONTENT-OK public=45df7afd815dc66cdc46e897a55f332d2cdc95a35ebb6bf8d7fc1647751a9102
+                       private_refused=fdadceaec830951dbcc57cc41a5b74f4b8b51506c59b651d132d12b62bc65036
+```
+
+Two VMs on a private QEMU segment with no DHCP and no host bridge, each with its own copy of
+the image and its own first-boot identity, discovering each other over mDNS on IPv4
+link-local addresses and authenticating with Noise XX.
+
+### What the content markers prove
+
+Each node stored the same two fixed objects, one `PUBLIC` and one `PRIVATE`, and then asked
+its **peer** for both by content id:
+
+- the `PUBLIC` object crossed the link and the peer named it back;
+- the `PRIVATE` object was refused, though the peer demonstrably held it — both nodes stored
+  it;
+- the refusal was **byte-identical** to the one an object that does not exist gets, after
+  substituting the id out. A peer that could tell those apart could enumerate what a node
+  holds by asking.
+
+Note the two content ids are the same on both nodes. Neither node was told an id by the
+other and there is no channel here that could have carried one: a content id is the hash of
+the content, so both derived the same names for the same fixed strings independently. That
+is the property the whole design rests on, observed rather than assumed.
+
+A node fetching from a peer does not consult its own store, so holding a copy did not make
+the fetch trivially succeed. This is a real request over the wire in both directions.
+
+### Defect 43: an unscoped IPv6 link-local address is not somewhere you can dial
+
+The first two-node run failed, for fifteen minutes, every five seconds:
+
+```
+OTWONO-MESH-PEER otw1:9b24-... failed [fe80::5054:ff:fe07:1101]:8443
+  error=connect to [fe80::5054:ff:fe07:1101]:8443: link I/O failed: Invalid argument (os error 22)
+```
+
+An IPv6 link-local address needs an interface scope to be connected to, and an mDNS
+advertisement does not carry one, so `connect()` returns `EINVAL`. Both nodes also had
+perfectly good IPv4 link-local addresses. `candidate_from` took
+`info.get_addresses().iter().next()` — whichever address a set happened to yield first — and
+chose the one that cannot work.
+
+That also made the bug flaky by construction: a different iteration order picks the IPv4
+address and the mesh forms. **A mesh whose behaviour depends on a `HashSet`'s ordering is a
+mesh that works on some boots**, which is worse than one that never works, and it is the same
+shape as defect 38 — something passing on scheduling luck.
+
+`dialable_address` now drops `fe80::` entirely rather than ranking it last (a clear "no
+reachable address" beats an `EINVAL` twenty seconds later) and ranks the rest by a total,
+deterministic order: routable, then link-local, then loopback; IPv4 before IPv6 among equals.
+Seven unit tests, one of which is the exact address pair from the failing boot.
+
+**Only two booted VMs could have found this.** Host-side tests dial `127.0.0.1`. The
+single-node boot has no peer to dial. Every layer was individually correct.
+
+### Making the result load-bearing
+
+Defect 40 was a boot test reporting success while a check inside it printed FAIL. The same
+mistake was available here, so: the two-node harness now fails on
+`OTWONO-MESH-CONTENT-FAIL` anywhere, in the wait loop and again at the end, and **requires**
+`OTWONO-MESH-CONTENT-OK` from both nodes when `MESH_CONTENT_SMOKE` is set. A plain image
+does not carry the check and is unaffected — requiring it everywhere would fail every
+release-image run for the wrong reason.
+
+### The test image is a test image
+
+Stage 37 installs a policy drop-in granting `store.serve` and `net.content`. Those two *are*
+the network boundary — serving the street, and holding a neighbour's content — and the
+shipped policy grants neither. Off by default, gated on `MESH_CONTENT_SMOKE=1`, following
+stage 36's precedent for `ai.admin`, and the file says at the top what it is so an operator
+who finds it on a real machine knows immediately.
+
+### Workspace
+
+```
+cargo test --workspace     782 passed, 0 failed   (was 775)
+cargo clippy --workspace --all-targets -- -D warnings   clean
+cargo fmt --all --check    clean
+shellcheck -S warning ...  clean
+```
+
+### `DATA-VISIBILITY.md` §6, restated honestly
+
+| Property | Where it is proven now |
+|---|---|
+| A `PRIVATE` object never appears on any link | **On a link.** Two booted, mutually authenticated nodes over Noise XX; the private object refused while demonstrably held |
+| A refusal is indistinguishable from not-found | **On a link.** Byte-identical replies for refused and absent |
+| Derived content inherits the most restrictive label | host-side only |
+| Demotion stops future serving | host-side only |
+
+### What this does not prove
+
+- **Two nodes, not three.** Fan-out's whole claim is that a fetch draws from *several* peers.
+  That remains host-side, on in-memory links.
+- **One object each, one direction that matters.** The public object is 68 bytes. Nothing
+  large crossed a real link, so ADR-0018's file handoff and the ranged chunk protocol are
+  exercised on a wire only at their smallest.
+- **`SHARED` is still refused rather than authorized**, so the label that needs per-recipient
+  key wrapping has still never been served to anybody.
+- **amd64 only.** arm64 has not been run two-node with any of this.
+- **No real hardware, no radio.** `Trickle` links remain arithmetic (OQ-23, OQ-24).
+- **The cache never ran.** Both VMs probe as `storage=constrained`, so their budget is zero
+  and neither opened a cache. Nothing cached anything for a neighbour.

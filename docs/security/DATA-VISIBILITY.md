@@ -109,8 +109,8 @@ Negative tests are the point of this subsystem:
 
 | Property | Where it is proven |
 |---|---|
-| A `PRIVATE` object never appears on any link | `tests/control-plane/tests/content_over_a_link.rs` — two nodes over a real TCP socket, Noise-authenticated, under a policy that denies `store.read` outright |
-| A refusal is indistinguishable from not-found | same file: the two errors are compared with the content id substituted out |
+| A `PRIVATE` object never appears on any link | **On an actual link between two booted nodes.** `build/files/otwono-mesh-content-check` under `build/qemu/two-node-test.sh`: two VMs on a segment with no DHCP, mutually authenticated over Noise XX, each refusing the other a `PRIVATE` object it demonstrably holds. Also host-side in `tests/control-plane/tests/content_over_a_link.rs` |
+| A refusal is indistinguishable from not-found | **On an actual link**, byte-identical replies for refused and absent; and host-side in the same file |
 | Derived content inherits the most restrictive label | `tests/control-plane/tests/store_labels.rs` |
 | Demotion stops future serving | proven over a link, not only at the method |
 

@@ -170,7 +170,8 @@ echo "waiting for both nodes to form a mesh (TCG, up to ${TIMEOUT}s)"
 deadline=$(( $(date +%s) + TIMEOUT ))
 result=timeout
 while [ "$(date +%s)" -lt "$deadline" ]; do
-    if grep -qa "Kernel panic\|OTWONO-MESH-FAIL" "$OUT/node-a.log" "$OUT/node-b.log" 2>/dev/null; then
+    if grep -qa "Kernel panic\|OTWONO-MESH-FAIL\|OTWONO-MESH-CONTENT-FAIL" \
+        "$OUT/node-a.log" "$OUT/node-b.log" 2>/dev/null; then
         result=fail; break
     fi
     # Wait on the periodic mesh marker, not on otwono-netd's own log lines: the daemon
@@ -225,6 +226,29 @@ for n in a b; do
     case "$conn" in ''|*[!0-9]*) conn=0 ;; esac
     [ "$conn" -ge 1 ] || { echo "FAIL: node $n reports no peer" >&2; exit 1; }
 done
+
+# A content check that failed must never be a passing run. This harness reported success
+# once while a check inside a guest printed FAIL, on the single-node side (defect 40), and
+# the lesson is not specific to that harness: an assertion nobody looks at is not one.
+if grep -qa "OTWONO-MESH-CONTENT-FAIL" "$OUT/node-a.log" "$OUT/node-b.log" 2>/dev/null; then
+    echo "FAIL: a node's content check failed" >&2
+    grep -ha "OTWONO-MESH-CONTENT-FAIL" "$OUT/node-a.log" "$OUT/node-b.log" >&2 || true
+    exit 1
+fi
+
+# On an image built with MESH_CONTENT_SMOKE=1 the check is present, so its success marker is
+# required rather than merely welcome. On a plain image it is absent and this is skipped:
+# requiring it everywhere would fail every release-image run for the wrong reason.
+if [ "${MESH_CONTENT_SMOKE:-0}" != 0 ]; then
+    for n in a b; do
+        grep -qa "OTWONO-MESH-CONTENT-OK" "$OUT/node-$n.log" || {
+            echo "FAIL: node $n never reported OTWONO-MESH-CONTENT-OK" >&2
+            echo "      (the image was built with MESH_CONTENT_SMOKE, so the check is there)" >&2
+            exit 1
+        }
+    done
+    echo "content: both nodes served a public object and refused a private one"
+fi
 
 echo "PASS: two nodes discovered and mutually authenticated"
 echo "  A $A_ID"
