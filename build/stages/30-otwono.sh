@@ -61,6 +61,10 @@ install -d -m 0700 "$ROOTFS/var/lib/otwono/cache"
 # caller that asked for it, so the directory being unlistable is what stops one user
 # enumerating another's exports.
 install -d -m 0700 "$ROOTFS/var/lib/otwono/export"
+# otwono-netd's own, for objects fetched from peers with to_file. Deliberately not shared
+# with otwono-stored's: two daemons sweeping one directory means each reaper can delete the
+# other's in-flight file.
+install -d -m 0700 "$ROOTFS/var/lib/otwono/net-export"
 install -d -m 0755 "$ROOTFS/var/log/otwono"
 
 log "installing the first-boot capability report unit"
@@ -439,7 +443,7 @@ RequiresMountsFor=/var/lib/otwono
 
 [Service]
 Type=exec
-ExecStart=/usr/bin/otwono-netd --socket /run/otwono/net.sock --perm-socket /run/otwono/perm.sock --id-socket /run/otwono/id.sock --store-socket /run/otwono/store.sock
+ExecStart=/usr/bin/otwono-netd --socket /run/otwono/net.sock --perm-socket /run/otwono/perm.sock --id-socket /run/otwono/id.sock --store-socket /run/otwono/store.sock --export-dir /var/lib/otwono/net-export
 Restart=on-failure
 RestartSec=2
 

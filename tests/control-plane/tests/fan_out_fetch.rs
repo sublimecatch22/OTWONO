@@ -250,6 +250,17 @@ fn three_peers_holding_disjoint_pieces_complete_a_fetch() {
         report.chunks_from.values().sum::<usize>() >= digests.len(),
         "fewer chunks were served than the object has: {report:?}"
     );
+    // The regression this guards: an honest peer holding a third of an object is refused
+    // about twice for every hit, because there is no want-list. Counting those refusals as
+    // failures dropped exactly the peers the fan-out exists to combine.
+    assert!(
+        report.dropped.is_empty(),
+        "an honest partial peer was treated as faulty: {report:?}"
+    );
+    assert!(
+        report.demerits.is_empty(),
+        "not having a chunk was counted against a peer: {report:?}"
+    );
     for t in threads {
         let _ = t.join();
     }
@@ -466,4 +477,227 @@ fn a_peer_serving_rubbish_wastes_bandwidth_and_cannot_corrupt_the_result() {
     assert!(report.dropped.contains(&"liar".to_string()), "{report:?}");
     let _ = hostile.join();
     let _ = serving.join();
+}
+
+#[test]
+fn a_fetch_to_a_file_never_holds_the_object_and_is_byte_identical() {
+    // OQ-25. An 8 MiB object across three partial peers, straight to a file: the workers
+    // hold one chunk each and the assembled file is checked against origin.
+    let bytes = payload(8 * 1024 * 1024, 11);
+    let nodes = [Node::start("f0"), Node::start("f1"), Node::start("f2")];
+    let scratch = std::env::temp_dir().join(format!("otw-fan-file-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).unwrap();
+
+    let origin = scratch.join("origin.bin");
+    std::fs::write(&origin, &bytes).unwrap();
+    let mut id = String::new();
+    for n in &nodes {
+        // store.put cannot carry 8 MiB, so each node imports it from the file (ADR-0018).
+        let token = n.token("store.write");
+        let mut client = Client::connect(&n.store_socket).unwrap();
+        let record = client
+            .call_with_capability(
+                "store.import",
+                json!({ "path": origin.display().to_string(), "visibility": "public" }),
+                &token,
+            )
+            .unwrap()
+            .unwrap();
+        let this = record["content_id"].as_str().unwrap().to_string();
+        if id.is_empty() {
+            id = this;
+        } else {
+            assert_eq!(id, this, "the three nodes disagree about the object's identity");
+        }
+    }
+
+    // Give each node a different third, as above.
+    let token = nodes[0].token("store.serve");
+    let mut client = Client::connect(&nodes[0].store_socket).unwrap();
+    let manifest = client
+        .call_with_capability(
+            "store.serve_manifest",
+            json!({ "content_id": id, "max_chunks": 4096 }),
+            &token,
+        )
+        .unwrap()
+        .unwrap();
+    let digests: Vec<String> = manifest["chunks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["blake3"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        digests.len() > 30,
+        "8 MiB should be many chunks, got {}",
+        digests.len()
+    );
+    for (i, node) in nodes.iter().enumerate() {
+        let drop: Vec<String> = digests
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| j % 3 != i)
+            .map(|(_, d)| d.clone())
+            .collect();
+        node.drop_chunks(&drop);
+    }
+
+    let mut sources = Vec::new();
+    let mut threads = Vec::new();
+    for (i, node) in nodes.iter().enumerate() {
+        let (peer, t) = source(&format!("peer-{i}"), node.responder());
+        sources.push(peer);
+        threads.push(t);
+    }
+    let out = scratch.join("fetched.bin");
+    let file = std::fs::File::options()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&out)
+        .unwrap();
+    let (meta, report) = otwono_netd::fetch_object_to_file(sources, &id, file)
+        .expect("three partial peers must suffice for a file fetch");
+
+    assert_eq!(meta.size_bytes, bytes.len() as u64);
+    assert_eq!(meta.content_id, id);
+    assert_eq!(std::fs::read(&out).unwrap(), bytes, "the file is not the object");
+    assert_eq!(report.peers_that_served(), 3, "{report:?}");
+    for t in threads {
+        let _ = t.join();
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn a_file_fetch_that_cannot_complete_leaves_nothing_that_looks_complete() {
+    // A file of the right length full of holes hashes to something, and that something is
+    // not what was asked for. It must be truncated away.
+    let bytes = payload(400 * 1024, 12);
+    let node = Node::start("holes");
+    let source_path = std::env::temp_dir().join(format!("otw-holes-{}.bin", std::process::id()));
+    std::fs::write(&source_path, &bytes).unwrap();
+    let token = node.token("store.write");
+    let id = Client::connect(&node.store_socket)
+        .unwrap()
+        .call_with_capability(
+            "store.import",
+            json!({ "path": source_path.display().to_string(), "visibility": "public" }),
+            &token,
+        )
+        .unwrap()
+        .unwrap()["content_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Learn the chunk list, then remove every chunk but the first: the manifest still
+    // serves, and the object cannot be completed.
+    let token = node.token("store.serve");
+    let manifest = Client::connect(&node.store_socket)
+        .unwrap()
+        .call_with_capability(
+            "store.serve_manifest",
+            json!({ "content_id": id, "max_chunks": 4096 }),
+            &token,
+        )
+        .unwrap()
+        .unwrap();
+    let digests: Vec<String> = manifest["chunks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["blake3"].as_str().unwrap().to_string())
+        .collect();
+    assert!(digests.len() > 1);
+    node.drop_chunks(&digests[1..]);
+
+    let out = std::env::temp_dir().join(format!("otw-holes-out-{}.bin", std::process::id()));
+    let file = std::fs::File::options()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&out)
+        .unwrap();
+    let (peer, serving) = source("partial", node.responder());
+    let err = otwono_netd::fetch_object_to_file(vec![peer], &id, file)
+        .expect_err("an incompletable fetch must fail");
+    assert!(matches!(err, ProtocolError::NotAvailable(_)), "{err}");
+    assert_eq!(
+        std::fs::metadata(&out).unwrap().len(),
+        0,
+        "a partial fetch left a file that looks like an object"
+    );
+    let _ = serving.join();
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&source_path);
+}
+
+#[test]
+fn the_in_memory_path_still_refuses_what_it_cannot_carry() {
+    // The file path lifted the ceiling; the inline one must keep it, because its result
+    // goes back on a control-plane line.
+    let bytes = payload(otwono_stored::MAX_INLINE_BYTES + 1024, 13);
+    let node = Node::start("cap");
+    let source_path = std::env::temp_dir().join(format!("otw-cap-{}.bin", std::process::id()));
+    std::fs::write(&source_path, &bytes).unwrap();
+    let token = node.token("store.write");
+    let id = Client::connect(&node.store_socket)
+        .unwrap()
+        .call_with_capability(
+            "store.import",
+            json!({ "path": source_path.display().to_string(), "visibility": "public" }),
+            &token,
+        )
+        .unwrap()
+        .unwrap()["content_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (peer, serving) = source("holder", node.responder());
+    let err = otwono_netd::fetch_object_from_peers(vec![peer], &id)
+        .expect_err("the inline path must refuse an object it cannot return");
+    assert!(
+        matches!(
+            err,
+            ProtocolError::TooLarge {
+                field: "size_bytes",
+                ..
+            }
+        ),
+        "{err}"
+    );
+    let _ = serving.join();
+    let _ = std::fs::remove_file(&source_path);
+}
+
+#[test]
+fn a_peer_that_lies_and_a_peer_that_is_merely_small_are_reported_differently() {
+    // "This neighbour is faulty" and "this neighbour had a small share" must never look the
+    // same in a log, because one is a judgement and the other is the ordinary case.
+    let bytes = payload(400 * 1024, 21);
+    let holder = Node::start("h");
+    let empty = Node::start("e");
+    let id = holder.put(&bytes)["content_id"].as_str().unwrap().to_string();
+
+    let (a, ta) = source("has-nothing", empty.responder());
+    let (b, tb) = source("has-everything", holder.responder());
+    let (fetched, report) = otwono_netd::fetch_object_from_peers(vec![b, a], &id).unwrap();
+    assert_eq!(fetched.bytes, bytes);
+
+    // The empty peer either exhausted or was never needed. Either way it is not "dropped",
+    // which is reserved for lying and breaking.
+    assert!(
+        !report.dropped.contains(&"has-nothing".to_string()),
+        "an empty peer was recorded as faulty: {report:?}"
+    );
+    assert_eq!(report.chunks_from.get("has-nothing"), Some(&0));
+    for t in [ta, tb] {
+        let _ = t.join();
+    }
 }

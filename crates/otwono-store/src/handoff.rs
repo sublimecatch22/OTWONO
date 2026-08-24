@@ -266,6 +266,31 @@ fn unlinkable_name() -> String {
     s
 }
 
+/// Sweep an export directory on a timer, for the life of the process.
+///
+/// A reaper that only runs at startup is a reaper that does not run: a daemon that stays up
+/// for a month accumulates every export a caller crashed before unlinking, and
+/// [`EXPORT_MAX_AGE`] then describes nothing. The thread is detached and its failures are
+/// logged rather than propagated, because a directory that cannot be swept must not take
+/// the daemon down with it.
+pub fn spawn_reaper(handoff: Handoff, every: Duration, max_age: Duration) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(every);
+        match handoff.reap(max_age) {
+            Ok(0) => {}
+            Ok(n) => eprintln!(
+                "otwono: reaped {n} abandoned export(s) from {}",
+                handoff.root().display()
+            ),
+            Err(e) => eprintln!("otwono: could not sweep {}: {e}", handoff.root().display()),
+        }
+    })
+}
+
+/// How often [`spawn_reaper`] wakes. Well under [`EXPORT_MAX_AGE`], so a file is never much
+/// older than the age it was promised.
+pub const REAP_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -24,6 +24,8 @@ OPTIONS:
     --id-socket <PATH>     Identity daemon socket (default $OTWONO_SOCKET_DIR/id.sock)
     --store-socket <PATH>  Content store socket (default $OTWONO_SOCKET_DIR/store.sock)
     --no-serve-content     Do not answer peers' content requests at all
+    --export-dir <PATH>    Where objects fetched with to_file are written
+                           (default /var/lib/otwono/net-export)
     --identity-dir <PATH>  Keystore directory (default /var/lib/otwono/identity)
     --listen <ADDR>        Overlay listen address (default 0.0.0.0:8443)
     --no-discovery         Do not announce or browse on the LAN
@@ -76,6 +78,7 @@ fn run(args: &[String]) -> Result<String, Error> {
     let mut id_socket: Option<PathBuf> = None;
     let mut store_socket: Option<PathBuf> = None;
     let mut serve_content = true;
+    let mut export_dir = PathBuf::from("/var/lib/otwono/net-export");
     let mut identity_dir = PathBuf::from(DEFAULT_IDENTITY_DIR);
     let mut listen = format!("0.0.0.0:{DEFAULT_PORT}");
     let mut discovery_enabled = true;
@@ -90,6 +93,7 @@ fn run(args: &[String]) -> Result<String, Error> {
             "--id-socket" => id_socket = Some(next(&mut it, "--id-socket")?.into()),
             "--store-socket" => store_socket = Some(next(&mut it, "--store-socket")?.into()),
             "--no-serve-content" => serve_content = false,
+            "--export-dir" => export_dir = next(&mut it, "--export-dir")?.into(),
             "--identity-dir" => identity_dir = next(&mut it, "--identity-dir")?.into(),
             "--listen" => listen = next(&mut it, "--listen")?,
             "--no-discovery" => discovery_enabled = false,
@@ -167,7 +171,22 @@ fn run(args: &[String]) -> Result<String, Error> {
         .local_addr()
         .map_err(|e| Error::Startup(format!("cannot read the listen address: {e}")))?;
 
-    let mut state = NetState::new(Arc::new(signer));
+    // Its own directory, not otwono-stored's: two daemons sharing one export directory
+    // means each reaper can delete the other's in-flight file.
+    let handoff = otwono_store::Handoff::new(&export_dir);
+    handoff
+        .ensure_layout()
+        .map_err(|e| Error::Startup(format!("export directory: {e}")))?;
+    if let Err(e) = handoff.reap(otwono_store::EXPORT_MAX_AGE) {
+        eprintln!("otwono-netd: could not sweep {}: {e}", export_dir.display());
+    }
+    otwono_store::handoff::spawn_reaper(
+        otwono_store::Handoff::new(&export_dir),
+        otwono_store::handoff::REAP_INTERVAL,
+        otwono_store::EXPORT_MAX_AGE,
+    );
+
+    let mut state = NetState::new(Arc::new(signer)).with_handoff(handoff);
     if serve_content {
         let store_socket = store_socket.unwrap_or_else(|| otwono_proto::socket_path("store"));
         // Not fatal if otwono-stored is not up: the responder connects per request and

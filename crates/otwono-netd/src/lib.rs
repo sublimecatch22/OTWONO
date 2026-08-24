@@ -20,8 +20,8 @@ pub mod content;
 pub mod signer;
 
 pub use content::{
-    fetch_object, fetch_object_from_peers, serve_session, ContentResponder, FanOutReport, FetchedObject,
-    PeerSource,
+    fetch_object, fetch_object_from_peers, fetch_object_to_file, serve_session, ContentResponder,
+    FanOutReport, FetchedMeta, FetchedObject, PeerSource,
 };
 pub use signer::{BindError, BrokeredSigner};
 
@@ -61,6 +61,10 @@ pub struct Hello {
 }
 
 pub struct NetState {
+    /// Where objects too large to return inline are written for the caller (ADR-0018).
+    /// `None` on a daemon started without one, and then `net.fetch` says so rather than
+    /// silently capping at the inline size.
+    pub handoff: Option<otwono_store::Handoff>,
     /// Answers peers' content requests, when this node has a store to answer from. `None`
     /// on a node built without one: such a node meshes and authenticates, and refuses every
     /// content request by never listening for one.
@@ -77,12 +81,19 @@ impl NetState {
     pub fn new(signer: Arc<dyn SessionSigner>) -> Self {
         let node_id = signer.node_id();
         NetState {
+            handoff: None,
             responder: None,
             signer,
             node_id,
             peers: Mutex::new(PeerTable::new()),
             listen_addr: Mutex::new(None),
         }
+    }
+
+    /// Give this node somewhere to write objects too large to return inline.
+    pub fn with_handoff(mut self, handoff: otwono_store::Handoff) -> Self {
+        self.handoff = Some(handoff);
+        self
     }
 
     /// Give this node a store to serve peers from.
@@ -243,6 +254,57 @@ impl NetState {
             ));
         }
         content::fetch_object_from_peers(sources, content_id).map_err(|e| e.to_string())
+    }
+
+    /// Fetch one object from several peers straight into a file owned by `uid`.
+    ///
+    /// The whole point is that nothing here is ever the size of the object: the workers hold
+    /// one chunk each and the bytes go to disk as they are verified (OQ-25).
+    pub fn fetch_to_file(
+        &self,
+        candidates: &[Candidate],
+        content_id: &str,
+        uid: u32,
+    ) -> Result<(FetchedMeta, FanOutReport, std::path::PathBuf), String> {
+        let handoff = self
+            .handoff
+            .as_ref()
+            .ok_or("this daemon was started without an export directory")?;
+        let mut sources = Vec::new();
+        let mut unreachable = Vec::new();
+        for candidate in candidates {
+            match self.open_content_channel(candidate) {
+                Ok(source) => sources.push(source),
+                Err(e) => unreachable.push(format!("{}: {e}", candidate.address)),
+            }
+        }
+        if sources.is_empty() {
+            return Err(format!(
+                "no candidate could be reached and authenticated: {}",
+                unreachable.join("; ")
+            ));
+        }
+
+        // The size is not known until the manifest arrives, so the free-space check cannot
+        // be exact. Zero here means "check the floor only"; a fetch that runs out of room
+        // fails on a short write, and the file is truncated to nothing when it does.
+        let mut outcome = None;
+        let exported = handoff
+            .export(uid, 0, |file| {
+                let file = file
+                    .try_clone()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                match content::fetch_object_to_file(sources, content_id, file) {
+                    Ok(v) => {
+                        outcome = Some(v);
+                        Ok(())
+                    }
+                    Err(e) => Err(std::io::Error::other(e.to_string())),
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        let (meta, report) = outcome.ok_or("the fetch reported neither success nor failure")?;
+        Ok((meta, report, exported.path))
     }
 
     fn open_content_channel(&self, candidate: &Candidate) -> Result<content::PeerSource<TcpLink>, String> {
@@ -529,6 +591,33 @@ impl Service for NetService {
                     return Err(RpcError::invalid_params("net.fetch needs at least one peer"));
                 }
                 let names: Vec<String> = candidates.iter().map(|c| c.claimed_node_id.to_text()).collect();
+                // Explicit, not guessed. A caller that does not know an object's size asks
+                // for a file; one that knows it is small saves itself a file to clean up.
+                let to_file = params.get("to_file").and_then(Value::as_bool).unwrap_or(false);
+                if to_file {
+                    let (meta, report, path) = self
+                        .state
+                        .fetch_to_file(&candidates, content_id, ctx.peer.uid)
+                        .map_err(|e| RpcError::new(otwono_proto::code::UNAVAILABLE, e))?;
+                    return Ok(json!({
+                        "schema_version": DESCRIBE_SCHEMA_VERSION,
+                        "content_id": meta.content_id,
+                        "visibility": meta.visibility,
+                        "chunking": meta.chunking,
+                        "size_bytes": meta.size_bytes,
+                        "path": path.display().to_string(),
+                        "owner_uid": ctx.peer.uid,
+                        "asked": names,
+                        "manifest_from": report.manifest_from,
+                        "chunks_from": report.chunks_from,
+                        "peers_that_served": report.peers_that_served(),
+                        "dropped": report.dropped,
+                        // Caching a file-delivered object would need a cache.import that
+                        // does not exist; cache.put is inline and inherits the 640 KiB cap.
+                        "cached": false,
+                        "note": "this file is plaintext and yours; read it and unlink it",
+                    }));
+                }
                 let (fetched, report) = self
                     .state
                     .fetch_from_peers(&candidates, content_id)

@@ -345,6 +345,16 @@ pub fn fetch_object<L: LinkAdapter>(
     // gigabyte of perfectly-verifying wrong chunks.
     verified_refs(content_id, &entries)?;
 
+    // Checked here rather than in fetch_manifest: the answer goes back on a control-plane
+    // line, which is this destination's limit and not the peer's problem.
+    if header.size_bytes > MAX_FETCH_BYTES {
+        return Err(ProtocolError::TooLarge {
+            field: "size_bytes",
+            asked: header.size_bytes,
+            ceiling: MAX_FETCH_BYTES,
+        });
+    }
+
     let mut bytes = Vec::with_capacity(header.size_bytes.min(MAX_FETCH_BYTES) as usize);
     for entry in &entries {
         let chunk = fetch_chunk(channel, content_id, entry, link, &mut budget)?;
@@ -451,13 +461,12 @@ fn fetch_manifest<L: LinkAdapter>(
                 page.visibility
             )));
         }
-        if page.size_bytes > MAX_FETCH_BYTES {
-            return Err(ProtocolError::TooLarge {
-                field: "size_bytes",
-                asked: page.size_bytes,
-                ceiling: MAX_FETCH_BYTES,
-            });
-        }
+        // Deliberately no size check here. Whether an object is too large is a property of
+        // where it is going, not of the peer offering it — and a failure raised inside a
+        // per-peer manifest fetch is indistinguishable, to the fan-out loop above, from
+        // "this peer does not have it". That is how a 641 KiB object came back as
+        // NotAvailable instead of TooLarge. The caller checks, once it knows the
+        // destination.
         let total = page.total_chunks as usize;
         if total > MAX_FETCH_CHUNKS {
             return Err(ProtocolError::TooLarge {
@@ -568,12 +577,81 @@ fn fetch_chunk<L: LinkAdapter>(
     Ok(got)
 }
 
+/// Where a fan-out fetch puts the chunks as they arrive.
+///
+/// Two shapes, one worker loop. The difference matters on a small board: `Memory` holds the
+/// whole object, and `File` holds one chunk per peer no matter how large the object is
+/// (OQ-25). A T0 node with 512 MiB of RAM can fetch a 2 GiB object through the second and
+/// cannot through the first.
+enum Destination {
+    /// Slot per chunk, assembled in order at the end.
+    Memory(Mutex<Vec<Option<Vec<u8>>>>),
+    /// Written straight to the file at each chunk's offset.
+    ///
+    /// Chunks arrive out of order from parallel peers, which would mean buffering — except
+    /// that the manifest gives every chunk's length, so every offset is known before a
+    /// single byte is asked for. `pwrite` at a computed offset needs no ordering and no
+    /// shared cursor.
+    File {
+        file: std::fs::File,
+        offsets: Vec<u64>,
+        /// Which chunks have landed. The file itself cannot be asked, because a hole and a
+        /// chunk of zeroes look the same.
+        written: Mutex<Vec<bool>>,
+    },
+}
+
+impl Destination {
+    fn put(&self, index: usize, bytes: &[u8]) -> std::io::Result<()> {
+        match self {
+            Destination::Memory(slots) => {
+                slots.lock().expect("fan-out slots poisoned")[index] = Some(bytes.to_vec());
+                Ok(())
+            }
+            Destination::File {
+                file,
+                offsets,
+                written,
+            } => {
+                use std::os::unix::fs::FileExt;
+                file.write_all_at(bytes, offsets[index])?;
+                written.lock().expect("fan-out slots poisoned")[index] = true;
+                Ok(())
+            }
+        }
+    }
+
+    fn missing(&self) -> bool {
+        match self {
+            Destination::Memory(slots) => slots
+                .lock()
+                .expect("fan-out slots poisoned")
+                .iter()
+                .any(|s| s.is_none()),
+            Destination::File { written, .. } => {
+                written.lock().expect("fan-out slots poisoned").iter().any(|w| !w)
+            }
+        }
+    }
+}
+
 /// One peer, ready to be asked for chunks.
 pub struct PeerSource<L: LinkAdapter> {
     /// How this peer is named in the report. A NodeID fingerprint on a real node.
     pub name: String,
     pub channel: SecureChannel<L>,
     pub link: LinkProperties,
+}
+
+/// Why one peer's worker stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerEnd {
+    /// The queue emptied, or the destination broke. Nothing to say about the peer.
+    Done,
+    /// It lied or broke too often.
+    Faulty,
+    /// It ran out of chunks it had. Not its fault and not a judgement.
+    Exhausted,
 }
 
 /// Who served what, after a fan-out fetch.
@@ -589,8 +667,12 @@ pub struct FanOutReport {
     pub chunks_from: std::collections::BTreeMap<String, usize>,
     /// Failures per peer: a refusal, a bad digest, or a dead link.
     pub demerits: std::collections::BTreeMap<String, usize>,
-    /// Peers dropped mid-transfer for failing too often.
+    /// Peers dropped mid-transfer for lying or breaking. A judgement.
     pub dropped: Vec<String>,
+    /// Peers that simply ran out of chunks they had. Not a judgement, and reported
+    /// separately so that "this neighbour is faulty" and "this neighbour had a small share"
+    /// never look the same in a log.
+    pub exhausted: Vec<String>,
 }
 
 impl FanOutReport {
@@ -599,12 +681,28 @@ impl FanOutReport {
     }
 }
 
-/// How many failures a peer gets before this transfer stops asking it.
+/// How many *faults* a peer gets before this transfer stops asking it.
 ///
-/// Per transfer, not remembered. A peer that is merely slow or has been evicting things is
-/// not an enemy, and a persistent judgement about neighbours is the beginning of the
-/// reputation system ADR-0015 declined to build (OQ-17).
-pub const MAX_PEER_FAILURES: usize = 3;
+/// A fault is a lie or a broken link: a chunk whose bytes do not match the digest the
+/// manifest declared, a reply that is not the answer to the question, or a dead channel.
+///
+/// It is **not** a peer saying it does not have a chunk. That distinction is the whole of
+/// this rule and getting it wrong broke the first version: with no want-list, a peer holding
+/// a third of an object is asked for chunks it lacks about twice for every one it has, so
+/// counting "not available" as a failure drops exactly the honest partial peers the fan-out
+/// exists to combine.
+///
+/// Per transfer, not remembered. A peer that is merely slow is not an enemy, and a
+/// persistent judgement about neighbours is the beginning of the reputation system ADR-0015
+/// declined to build (OQ-17).
+pub const MAX_PEER_FAULTS: usize = 3;
+
+/// How long a worker waits when every outstanding chunk is either being fetched by somebody
+/// else or is one this peer has already said it lacks.
+///
+/// Short, because the thing it is waiting for is another peer's round trip finishing, and
+/// the only alternative is to exit and possibly leave work undone.
+const IDLE_WAIT: Duration = Duration::from_millis(5);
 
 /// Fetch one object from several peers at once, verifying every chunk on arrival.
 ///
@@ -624,6 +722,67 @@ pub fn fetch_object_from_peers<L: LinkAdapter + Send + 'static>(
     peers: Vec<PeerSource<L>>,
     content_id: &str,
 ) -> Result<(FetchedObject, FanOutReport), ProtocolError> {
+    let (header, report, destination) = fan_out(peers, content_id, None)?;
+    let Destination::Memory(slots) = destination else {
+        unreachable!("a fetch with no file asked for assembles in memory");
+    };
+    let slots = slots.into_inner().expect("fan-out slots poisoned");
+    let mut bytes = Vec::with_capacity(header.size_bytes as usize);
+    for chunk in slots.into_iter().flatten() {
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok((
+        FetchedObject {
+            content_id: content_id.to_string(),
+            visibility: header.visibility,
+            chunking: header.chunking,
+            bytes,
+        },
+        report,
+    ))
+}
+
+/// Fetch one object from several peers straight into a file, holding one chunk per peer.
+///
+/// The difference from [`fetch_object_from_peers`] is memory, and on a small board it is the
+/// whole difference: this holds `peers x MAX_CHUNK` at a time — under a megabyte for three
+/// peers — where the in-memory form holds the entire object. A T0 node with 512 MiB can
+/// fetch a 2 GiB object through this and cannot through that (OQ-25).
+///
+/// The file is left at the object's exact length and every byte of it is verified. On any
+/// failure it is truncated to nothing before returning, because a partially-written file
+/// that looks complete is worse than no file.
+pub fn fetch_object_to_file<L: LinkAdapter + Send + 'static>(
+    peers: Vec<PeerSource<L>>,
+    content_id: &str,
+    file: std::fs::File,
+) -> Result<(FetchedMeta, FanOutReport), ProtocolError> {
+    let (header, report, _) = fan_out(peers, content_id, Some(file))?;
+    Ok((
+        FetchedMeta {
+            content_id: content_id.to_string(),
+            visibility: header.visibility,
+            chunking: header.chunking,
+            size_bytes: header.size_bytes,
+        },
+        report,
+    ))
+}
+
+/// What is known about an object fetched to a file: everything except its bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedMeta {
+    pub content_id: String,
+    pub visibility: String,
+    pub chunking: String,
+    pub size_bytes: u64,
+}
+
+fn fan_out<L: LinkAdapter + Send + 'static>(
+    peers: Vec<PeerSource<L>>,
+    content_id: &str,
+    into: Option<std::fs::File>,
+) -> Result<(ManifestPage, FanOutReport, Destination), ProtocolError> {
     if !content::is_hex_digest(content_id) {
         return Err(ProtocolError::NotHex { field: "content_id" });
     }
@@ -670,7 +829,9 @@ pub fn fetch_object_from_peers<L: LinkAdapter + Send + 'static>(
     };
 
     let total: u64 = refs.iter().map(|r| r.length as u64).sum();
-    if total > MAX_FETCH_BYTES {
+    // The in-memory path is capped because the reply carries the object on one
+    // control-plane line (ADR-0018). The file path is not: that is what it is for.
+    if into.is_none() && total > MAX_FETCH_BYTES {
         return Err(ProtocolError::TooLarge {
             field: "size_bytes",
             asked: total,
@@ -678,84 +839,173 @@ pub fn fetch_object_from_peers<L: LinkAdapter + Send + 'static>(
         });
     }
 
-    let queue: Arc<Mutex<std::collections::VecDeque<usize>>> =
+    let destination = Arc::new(match into {
+        Some(file) => {
+            // Sized up front so every offset is inside the file before any worker writes,
+            // and so a short disk is discovered now rather than at the last chunk.
+            file.set_len(total)
+                .map_err(|e| ProtocolError::Malformed(format!("cannot size the fetch file: {e}")))?;
+            let mut offsets = Vec::with_capacity(refs.len());
+            let mut at = 0u64;
+            for r in &refs {
+                offsets.push(at);
+                at += r.length as u64;
+            }
+            Destination::File {
+                file,
+                offsets,
+                written: Mutex::new(vec![false; refs.len()]),
+            }
+        }
+        None => Destination::Memory(Mutex::new(vec![None; entries.len()])),
+    });
+
+    // Outstanding chunks, and which are being fetched right now.
+    //
+    // The first version was a queue that workers popped from and pushed back to on failure,
+    // which made a peer ask for the same missing chunk over and over: with no want-list, a
+    // peer holding a third of an object is refused twice for every hit, and a rotating queue
+    // turns that into an unbounded spin. Each worker now remembers what *this* peer has said
+    // it lacks and never asks twice, so a worker ends exactly when every chunk still needed
+    // is one it has already been refused. No heuristic, no arbitrary miss count.
+    let outstanding: Arc<Mutex<std::collections::BTreeSet<usize>>> =
         Arc::new(Mutex::new((0..entries.len()).collect()));
-    let slots: Arc<Mutex<Vec<Option<Vec<u8>>>>> = Arc::new(Mutex::new(vec![None; entries.len()]));
+    let in_flight: Arc<Mutex<std::collections::BTreeSet<usize>>> =
+        Arc::new(Mutex::new(std::collections::BTreeSet::new()));
     let entries = Arc::new(entries);
     let id = content_id.to_string();
 
     let mut workers = Vec::new();
     for mut peer in usable {
-        let queue = Arc::clone(&queue);
-        let slots = Arc::clone(&slots);
+        let outstanding = Arc::clone(&outstanding);
+        let in_flight = Arc::clone(&in_flight);
+        let destination = Arc::clone(&destination);
         let entries = Arc::clone(&entries);
         let id = id.clone();
         workers.push(std::thread::spawn(move || {
             let mut served = 0usize;
-            let mut failed = 0usize;
+            let mut faults = 0usize;
             let mut budget = MAX_ROUND_TRIPS;
-            loop {
-                if failed >= MAX_PEER_FAILURES {
-                    break;
+            // What *this* peer has said it does not have. Never asked for twice.
+            let mut lacks = std::collections::BTreeSet::new();
+
+            let outcome = loop {
+                if faults >= MAX_PEER_FAULTS {
+                    break WorkerEnd::Faulty;
                 }
-                let Some(index) = queue.lock().expect("fan-out queue poisoned").pop_front() else {
-                    break;
+                // Take the first chunk still needed that this peer has not already refused
+                // and nobody else is currently fetching.
+                let claimed = {
+                    let outstanding = outstanding.lock().expect("fan-out set poisoned");
+                    let mut busy = in_flight.lock().expect("fan-out set poisoned");
+                    match outstanding
+                        .iter()
+                        .find(|i| !lacks.contains(*i) && !busy.contains(*i))
+                    {
+                        Some(&i) => {
+                            busy.insert(i);
+                            Some(i)
+                        }
+                        None => {
+                            // Nothing for this peer right now. If somebody else is still
+                            // working, wait for them: their attempt may fail and leave a
+                            // chunk this peer does have.
+                            if busy.is_empty() {
+                                None
+                            } else {
+                                Some(usize::MAX)
+                            }
+                        }
+                    }
                 };
-                let entry = &entries[index];
-                match fetch_chunk(&mut peer.channel, &id, entry, &peer.link, &mut budget) {
-                    Ok(bytes) if ChunkRef::of(&bytes).hex() == entry.blake3 => {
-                        slots.lock().expect("fan-out slots poisoned")[index] = Some(bytes);
-                        served += 1;
+                let index = match claimed {
+                    Some(usize::MAX) => {
+                        std::thread::sleep(IDLE_WAIT);
+                        continue;
                     }
-                    // A wrong digest and a refusal are the same event here: this peer did
-                    // not supply this chunk. Put it back for someone else.
+                    Some(i) => i,
+                    None => break WorkerEnd::Exhausted,
+                };
+
+                let entry = &entries[index];
+                let result = fetch_chunk(&mut peer.channel, &id, entry, &peer.link, &mut budget);
+                let mut done = false;
+                match result {
+                    Ok(bytes) if ChunkRef::of(&bytes).hex() == entry.blake3 => {
+                        // Verified before it is written, always. A chunk that fails here
+                        // never reaches the destination, in memory or on disk.
+                        match destination.put(index, &bytes) {
+                            Ok(()) => {
+                                served += 1;
+                                done = true;
+                            }
+                            Err(_) => {
+                                // The destination is broken, not the peer. Stop this worker
+                                // rather than blaming a neighbour for a full disk.
+                                in_flight.lock().expect("fan-out set poisoned").remove(&index);
+                                break WorkerEnd::Done;
+                            }
+                        }
+                    }
+                    // Not having a chunk is an ordinary answer, not a fault -- and with no
+                    // want-list it is also the common answer, which is exactly why it must
+                    // not count against a peer. Remembered, so it is never asked again.
+                    Err(ProtocolError::NotAvailable(_)) => {
+                        lacks.insert(index);
+                    }
+                    // Everything else is a fault: a wrong digest, a reply to a different
+                    // question, a dead link.
                     _ => {
-                        failed += 1;
-                        queue.lock().expect("fan-out queue poisoned").push_back(index);
+                        faults += 1;
+                        lacks.insert(index);
                     }
                 }
-            }
-            (peer.name, served, failed)
+                in_flight.lock().expect("fan-out set poisoned").remove(&index);
+                if done {
+                    outstanding.lock().expect("fan-out set poisoned").remove(&index);
+                }
+                if outstanding.lock().expect("fan-out set poisoned").is_empty() {
+                    break WorkerEnd::Done;
+                }
+            };
+            (peer.name, served, faults, outcome)
         }));
     }
 
     for worker in workers {
-        let (name, served, failed) = worker
+        let (name, served, faults, outcome) = worker
             .join()
             .map_err(|_| ProtocolError::Malformed("a fan-out worker panicked".into()))?;
         report.chunks_from.insert(name.clone(), served);
-        if failed > 0 {
-            *report.demerits.entry(name.clone()).or_insert(0) += failed;
+        if faults > 0 {
+            *report.demerits.entry(name.clone()).or_insert(0) += faults;
         }
-        if failed >= MAX_PEER_FAILURES {
-            report.dropped.push(name);
+        match outcome {
+            WorkerEnd::Faulty => report.dropped.push(name),
+            WorkerEnd::Exhausted => report.exhausted.push(name),
+            WorkerEnd::Done => {}
         }
     }
 
-    let slots = Arc::try_unwrap(slots)
-        .map_err(|_| ProtocolError::Malformed("fan-out slots outlived their workers".into()))?
-        .into_inner()
-        .expect("fan-out slots poisoned");
-    let mut bytes = Vec::with_capacity(total as usize);
-    for (index, slot) in slots.into_iter().enumerate() {
-        // No peer could supply this chunk. Report it as the object not being available
-        // rather than naming the chunk: a partial object is not a smaller answer.
-        let Some(chunk) = slot else {
-            let _ = index;
-            return Err(ProtocolError::NotAvailable(id));
-        };
-        bytes.extend_from_slice(&chunk);
+    let destination = Arc::try_unwrap(destination)
+        .map_err(|_| ProtocolError::Malformed("the fetch destination outlived its workers".into()))?;
+
+    // No peer could supply some chunk. Reported as the object not being available rather
+    // than naming which: a partial object is not a smaller answer.
+    if destination.missing() {
+        if let Destination::File { file, .. } = &destination {
+            // Leave nothing that looks complete. A file of the right length full of holes
+            // would hash to something, and that something is not what was asked for.
+            let _ = file.set_len(0);
+        }
+        return Err(ProtocolError::NotAvailable(id));
+    }
+    if let Destination::File { file, .. } = &destination {
+        file.sync_all()
+            .map_err(|e| ProtocolError::Malformed(format!("cannot flush the fetch file: {e}")))?;
     }
 
-    Ok((
-        FetchedObject {
-            content_id: id,
-            visibility: header.visibility,
-            chunking: header.chunking,
-            bytes,
-        },
-        report,
-    ))
+    Ok((header, report, destination))
 }
 
 fn round_trip<L: LinkAdapter>(

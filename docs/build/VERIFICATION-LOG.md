@@ -2539,3 +2539,108 @@ change is on disk. Cheap, and it turns a confusing test failure into a one-line 
   `--export-dir`; neither has run on a node.
 - **No object over 8 MiB has been tested**, and nothing has been tested against a genuinely
   full disk.
+
+---
+
+## Phase 6 slice 5 — a fetch that does not hold the object, and a demerit rule that was wrong
+
+**Date:** 2026-08-24 · **Where:** OTWONO Cloud dev environment (no `/dev/kvm`)
+
+`fetch_object_to_file`, `net.fetch { to_file: true }`, and a rewrite of the fan-out worker
+loop after two of its rules turned out to be wrong.
+
+### Workspace
+
+```
+cargo test --workspace     767 passed, 0 failed   (was 763)
+cargo clippy --workspace --all-targets -- -D warnings   clean
+cargo fmt --all --check    clean
+shellcheck -S warning ...  clean
+```
+
+### OQ-25: the object no longer has to fit in memory
+
+Chunks arrive out of order from parallel peers, which normally means buffering — except that
+the manifest gives every chunk's length, so every offset is known before a single byte is
+asked for. Each worker `pwrite`s its verified chunk at its computed offset. Memory is
+`peers x MAX_CHUNK`: under a megabyte for three peers, whatever the object's size.
+
+An incomplete fetch truncates the file to nothing before returning. A file of the right
+length full of holes hashes to *something*, and that something is not what was asked for.
+
+### Defect 37: a size check in the wrong place became "this peer does not have it"
+
+`fetch_manifest` carried the `size_bytes > MAX_FETCH_BYTES` check. In the fan-out loop, any
+error from `fetch_manifest` is treated as "this peer cannot serve this object" — which is
+right for a refusal and wrong for a ceiling. So a 641 KiB object came back as
+`NotAvailable` rather than `TooLarge`, and an 8 MiB file fetch failed for a reason that did
+not apply to it at all.
+
+Whether an object is too large is a property of *where it is going*, not of the peer
+offering it. The check moved to the two callers, which know their destination: the in-memory
+path keeps it, the file path does not have one.
+
+### Defect 38: the demerit rule punished exactly the peers fan-out exists for
+
+`MAX_PEER_FAILURES = 3` counted a peer saying "I do not have that chunk" as a failure. With
+no want-list, a peer holding a third of an object is refused about twice for every hit — so
+three peers with disjoint thirds were all dropped within the first handful of chunks. The
+three-peer test passed only because seven chunks is few enough to get lucky.
+
+Two things were wrong and both needed fixing:
+
+- **A refusal is not a fault.** A fault is a lie or a broken link: a chunk whose bytes do not
+  match the declared digest, a reply to a different question, a dead channel. Those still
+  cost a peer its place after three. Not having a chunk costs nothing.
+- **The rotating queue asked the same peer the same question forever.** Workers popped from
+  a shared queue and pushed failures back, so a peer was re-asked for chunks it had already
+  refused, without limit. The first fix for this was a consecutive-miss cap, which is a
+  heuristic with an arbitrary constant — and it still failed, because busy-spinning reaches
+  any constant.
+
+  The queue is now a set of outstanding chunks plus a set in flight, and **each worker
+  remembers what its own peer has refused**. A worker takes the first outstanding chunk it
+  has not been refused and nobody else is fetching, and ends exactly when every chunk still
+  needed is one it has already been refused. No heuristic, no constant, and one round trip
+  per (peer, chunk) at worst.
+
+The report now separates `dropped` (lied or broke — a judgement) from `exhausted` (ran out
+of chunks it had — the ordinary case). "This neighbour is faulty" and "this neighbour had a
+small share" must never look the same in a log.
+
+`three_peers_holding_disjoint_pieces_complete_a_fetch` now also asserts `dropped` and
+`demerits` are both **empty**, which is the assertion that would have caught this.
+
+### The reaper runs on a timer now
+
+The last slice noted that `EXPORT_MAX_AGE` promised an hour and the sweep only happened at
+startup, so on a daemon that stays up for a month it described nothing. `spawn_reaper` sweeps
+every ten minutes in both `otwono-stored` and `otwono-netd`. Each daemon has its own export
+directory: two daemons sweeping one directory means each reaper can delete the other's
+in-flight file.
+
+### Disk
+
+The 8 MiB fixtures plus `target/` filled the dev environment's allowance mid-run, and
+`store.export` refused with `an export of 1048576 bytes needs more room than the 252559360
+bytes free above the reserve floor`. That is the reserve floor working exactly as intended,
+observed for the first time against a genuinely full disk rather than a `u64::MAX` request.
+Cleared `target/aarch64-unknown-linux-gnu` and stale temp directories; 11 GB free after.
+
+### What this does not prove
+
+- **`net.fetch { to_file: true }` is not exercised over a socket.** `fetch_object_to_file`
+  is tested directly, including the three-peer and truncation cases; the control-plane method
+  around it is compiled and not called from a test.
+- **No want-list (OQ-26).** A worker now asks each peer about each chunk at most once, which
+  bounds the waste — but that is still O(peers x chunks) misses on a sparse street, and each
+  miss is a round trip.
+- **`cache: true` and `to_file: true` do not combine.** Caching a file-delivered object needs
+  a `cache.import` that does not exist, because `cache.put` is inline and inherits the
+  640 KiB cap. The reply says `cached: false` rather than pretending.
+- **Nothing has booted.** Stage 30 creates `/var/lib/otwono/net-export` and passes
+  `--export-dir`; neither has run on a node, and neither has `spawn_reaper`'s ten-minute
+  tick, which no test waits for.
+- **The largest object tested is 8 MiB.** Nothing has been fetched at a size where holding it
+  in memory would actually have failed, so the memory claim rests on the code shape rather
+  than on an observation.

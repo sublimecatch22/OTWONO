@@ -163,6 +163,13 @@ fn run(args: &[String]) -> Result<String, Error> {
         ),
         Err(e) => eprintln!("otwono-stored: could not sweep {}: {e}", export_dir.display()),
     }
+    // And then on a timer, for the life of the process. A sweep that only happens at startup
+    // is one that does not happen on a daemon that stays up for a month.
+    otwono_store::handoff::spawn_reaper(
+        Handoff::new(&export_dir),
+        otwono_store::handoff::REAP_INTERVAL,
+        EXPORT_MAX_AGE,
+    );
 
     let mut service = StoreService::new(store, perm_socket.clone()).with_handoff(handoff);
     if want_cache {
