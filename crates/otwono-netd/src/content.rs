@@ -30,7 +30,7 @@ use otwono_net::content::{self, ChunkEntry, ChunkPart, ManifestPage, ProtocolErr
 use otwono_net::{LinkAdapter, LinkProperties, SecureChannel};
 use otwono_proto::{code, Client};
 use otwono_store::{ChunkRef, ContentId};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -217,19 +217,58 @@ impl ContentResponder {
         if let Some(t) = self.token.lock().expect("token lock poisoned").clone() {
             return Some(t);
         }
-        let mut broker = Client::connect(&self.perm_socket).ok()?;
-        let value = broker
-            .call(
-                "perm.request",
-                json!({
-                    "action": otwono_stored::CAPABILITY_SERVE,
-                    "reason": "otwono-netd answers peers' content requests from the local store",
-                }),
-            )
-            .ok()?
-            .ok()?;
-        value.get("token")?.as_str().map(str::to_string)
+        let token = request_token(
+            &self.perm_socket,
+            otwono_stored::CAPABILITY_SERVE,
+            "otwono-netd answers peers' content requests from the local store",
+        )
+        .ok()?;
+        Some(token)
     }
+
+    /// Put content just fetched from a peer into the neighbourhood cache.
+    ///
+    /// Never automatic. "Serving is carrying" — caching a peer's content means storing bytes
+    /// the operator did not choose one at a time — so `net.fetch` only does this when its
+    /// caller asked, and the caller had to hold `net.content` to ask at all.
+    ///
+    /// The label check is `otwono-stored`'s: `cache.put` refuses anything but `Public` and
+    /// `Replicated`, and an unrecognised label parses as `Private` and is refused with them.
+    /// This daemon holds `cache.write` and not `store.write`, so there is no call it can make
+    /// that reaches the user's own store.
+    pub fn cache(&self, fetched: &FetchedObject) -> Result<Value, String> {
+        let token = request_token(
+            &self.perm_socket,
+            otwono_stored::CAPABILITY_CACHE_WRITE,
+            "otwono-netd keeps content fetched from a peer for the neighbourhood",
+        )?;
+        let mut client = Client::connect(&self.store_socket)
+            .map_err(|e| format!("{}: {e}", self.store_socket.display()))?;
+        client
+            .call_with_capability(
+                "cache.put",
+                json!({
+                    "data": data_encoding::BASE64.encode(&fetched.bytes),
+                    "visibility": fetched.visibility,
+                }),
+                &token,
+            )
+            .map_err(|e| format!("cache.put: {e}"))?
+            .map_err(|e| e.message)
+    }
+}
+
+fn request_token(perm_socket: &Path, action: &str, reason: &str) -> Result<String, String> {
+    let mut broker = Client::connect(perm_socket).map_err(|e| format!("{}: {e}", perm_socket.display()))?;
+    let value = broker
+        .call("perm.request", json!({ "action": action, "reason": reason }))
+        .map_err(|e| format!("perm.request: {e}"))?
+        .map_err(|e| format!("{action} refused: {}", e.message))?;
+    value
+        .get("token")
+        .and_then(|t| t.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| "perm.request returned no token".to_string())
 }
 
 /// Serve one peer until the channel closes.

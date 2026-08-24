@@ -49,6 +49,12 @@ install -d -m 0700 "$ROOTFS/var/lib/otwono/fetch"
 # The content store. 0700 and encrypted at rest: it holds everything the user has, and the
 # storage key beside it is the only thing between a stolen disk and all of it.
 install -d -m 0700 "$ROOTFS/var/lib/otwono/store"
+# The neighbourhood cache. A separate directory from the store, not a subdirectory of it:
+# everything here is disposable and evictable, everything there is the user's, and keeping
+# the two apart on disk means eviction has no path to their data (ADR-0015). 0700 for the
+# same reason as the spool -- these are a neighbour's bytes, encrypted with the node's
+# storage key, and no other user has business reading them.
+install -d -m 0700 "$ROOTFS/var/lib/otwono/cache"
 install -d -m 0755 "$ROOTFS/var/log/otwono"
 
 log "installing the first-boot capability report unit"
@@ -194,6 +200,13 @@ ttl_seconds = 300
 # store.serve alone would widen the boundary for a store that is necessarily empty. An
 # operator turns the content store on by granting store.write and store.serve together, and
 # net.content separately if this node should also fetch from peers (ADR-0017).
+#
+# cache.read and cache.write are ungranted for a further reason of their own. Holding is
+# publishing: a node that caches for its neighbours tells them what it holds, and what a
+# household reads is partly inferable from what its node serves (ADR-0015). That is a cost
+# an operator agrees to, not a default. cache.write is separate from store.write precisely
+# so it can be granted alone -- a node may contribute to the street without otwono-netd
+# gaining any way to write the user's own store.
 POLICY
 
 log "installing the model publisher trust store"
@@ -628,17 +641,25 @@ log "installing the content store unit"
 # The store holds everything the user has: notes, media, a learner's record, a financial
 # ledger. It faces no network at all -- otwono-netd will call store.serve over the control
 # plane, and that method refuses anything but PUBLIC and REPLICATED.
+#
+# It also owns the neighbourhood cache at /var/lib/otwono/cache: a separate directory, so
+# that eviction has no path to the user's own data and a cached object cannot be mistaken
+# for their copy (ADR-0015).
 cat > "$ROOTFS/etc/systemd/system/otwono-stored.service" <<'UNIT'
 [Unit]
 Description=OTWONO content store daemon
 Documentation=file:/usr/share/doc/otwono/DATA-VISIBILITY.md
-After=otwono-permd.service systemd-tmpfiles-setup.service
+After=otwono-permd.service otwono-hwd.service systemd-tmpfiles-setup.service
 Requires=otwono-permd.service
+# The neighbourhood cache's size comes from the capability profile and nowhere else
+# (CLAUDE.md §2.6), so this daemon asks otwono-hwd for it at startup. Wants, not Requires:
+# a node whose hardware daemon is down runs without a cache rather than not running.
+Wants=otwono-hwd.service
 RequiresMountsFor=/var/lib/otwono
 
 [Service]
 Type=exec
-ExecStart=/usr/bin/otwono-stored --socket /run/otwono/store.sock --perm-socket /run/otwono/perm.sock --store-dir /var/lib/otwono/store --key /var/lib/otwono/storage.key
+ExecStart=/usr/bin/otwono-stored --socket /run/otwono/store.sock --perm-socket /run/otwono/perm.sock --store-dir /var/lib/otwono/store --key /var/lib/otwono/storage.key --cache-dir /var/lib/otwono/cache
 Restart=on-failure
 RestartSec=2
 

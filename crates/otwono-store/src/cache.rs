@@ -95,6 +95,22 @@ impl CacheIndex {
     }
 }
 
+/// Wall-clock milliseconds, for `last_access_ms`.
+///
+/// A third copy of four lines that `otwono-identity` and `otwono-permd` also carry. Adding
+/// a dependency between three otherwise-unrelated crates to share a clock would be the
+/// worse trade; consolidating them is a workspace-wide refactor, not part of this.
+///
+/// It is a *wall* clock, so a clock that jumps backwards makes recently-used objects look
+/// old. The consequence is a worse eviction order for one interval, which is the right
+/// severity for a cache — nothing here is correctness-critical, unlike a token expiry.
+pub fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 pub struct Cache {
     store: Store,
     budget_bytes: u64,
@@ -311,6 +327,24 @@ impl Cache {
             return Err(CacheError::Store(StoreError::NotFound(id.to_hex())));
         }
         self.store.get_object(id).map_err(CacheError::Store)
+    }
+
+    /// Read one chunk of a cached object **without** counting it as a use.
+    ///
+    /// This is the path that answers a peer. Local reads go through [`Cache::get`] and do
+    /// count; a peer's request must not, or the eviction policy belongs to strangers.
+    ///
+    /// The trade-off is real and worth naming: a node's cache therefore keeps what its own
+    /// household fetched in preference to what the street keeps asking for, which is
+    /// slightly backwards for a *neighbourhood* cache. Letting peers drive eviction is the
+    /// larger hazard, so this is where it sits until there is a reason to move it.
+    pub fn chunk(&self, r: &ChunkRef) -> Result<Vec<u8>, CacheError> {
+        self.store.get_chunk(r).map_err(CacheError::Store)
+    }
+
+    /// Read a whole cached object without counting it as a use.
+    pub fn read_for_peer(&self, object: &Object) -> Result<Vec<u8>, CacheError> {
+        self.store.read_object(object).map_err(CacheError::Store)
     }
 
     /// Pin or unpin an object. A pinned object is never evicted.

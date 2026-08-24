@@ -31,7 +31,7 @@
 use otwono_proto::{
     unknown_method, CallContext, Client, MethodDescription, RpcError, Service, ServiceDescription,
 };
-use otwono_store::{ContentId, Object, Store, StoreError, Visibility};
+use otwono_store::{Cache, CacheError, ContentId, Object, Store, StoreError, Visibility};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -42,6 +42,11 @@ pub const DESCRIBE_SCHEMA_VERSION: &str = "1.0.0";
 pub const CAPABILITY_READ: &str = "store.read";
 pub const CAPABILITY_WRITE: &str = "store.write";
 pub const CAPABILITY_SERVE: &str = "store.serve";
+/// The neighbourhood cache's own pair, deliberately not `store.read`/`store.write`:
+/// `otwono-netd` must be able to add what it fetched to the shared cache without being able
+/// to write the user's own store (ADR-0015).
+pub const CAPABILITY_CACHE_READ: &str = "cache.read";
+pub const CAPABILITY_CACHE_WRITE: &str = "cache.write";
 
 /// A cap on one `store.put`, so a caller cannot exhaust memory through the control plane.
 /// Larger objects are a streaming interface this daemon does not have yet.
@@ -55,6 +60,11 @@ pub const MAX_SERVE_CHUNKS: usize = 4096;
 
 pub struct StoreService {
     store: Store,
+    /// The neighbourhood cache, when this machine contributes one. `None` on a machine
+    /// whose capability profile set the budget to zero, or when no cache directory was
+    /// configured — and then every cache method answers "not available" rather than
+    /// pretending to have cached something.
+    cache: Option<Cache>,
     perm_socket: PathBuf,
 }
 
@@ -110,6 +120,25 @@ struct ServeChunkParams {
     peer: Option<String>,
 }
 
+/// Put content fetched from a peer into the neighbourhood cache.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CachePutParams {
+    /// Base64, subject to [`MAX_INLINE_BYTES`] like `store.put`.
+    data: String,
+    /// The label the object was served under. Only `public` and `replicated` are accepted,
+    /// and an unrecognised label parses as `private` and is therefore refused.
+    #[serde(default)]
+    visibility: Visibility,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CachePinParams {
+    content_id: String,
+    pinned: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct ServeParams {
     content_id: String,
@@ -120,9 +149,40 @@ struct ServeParams {
     peer: Option<String>,
 }
 
+/// Which of this daemon's two stores an object came out of.
+///
+/// Not exposed on the wire. A peer must not be able to tell whether this node keeps
+/// something because its own user wanted it or because a neighbour did — that is exactly
+/// the "holding is publishing" cost ADR-0015 names, and there is no reason to make it
+/// sharper than it already is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Own,
+    Cached,
+}
+
 impl StoreService {
     pub fn new(store: Store, perm_socket: PathBuf) -> Self {
-        StoreService { store, perm_socket }
+        StoreService {
+            store,
+            cache: None,
+            perm_socket,
+        }
+    }
+
+    /// Give this daemon a neighbourhood cache to hold peers' content in.
+    pub fn with_cache(mut self, cache: Cache) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    fn cache(&self) -> Result<&Cache, RpcError> {
+        self.cache.as_ref().ok_or_else(|| {
+            RpcError::unavailable(
+                "this node contributes no neighbourhood cache; its capability profile set \
+                 the budget to zero, or none was configured",
+            )
+        })
     }
 
     fn authorize(&self, ctx: &CallContext, action: &str) -> Result<(), RpcError> {
@@ -231,12 +291,54 @@ impl StoreService {
     /// check to audit rather than three that must be kept in step. It returns the same
     /// error for absent, private, shared, and unreadable, because a peer that can tell
     /// those apart can enumerate what this node holds.
-    fn servable(&self, id: &ContentId) -> Result<Object, RpcError> {
-        self.store
-            .get_object(id)
-            .ok()
-            .filter(|o| o.visibility.may_leave_the_node_unattended())
+    fn servable(&self, id: &ContentId) -> Result<(Object, Source), RpcError> {
+        let own = self.store.get_object(id).ok().map(|o| (o, Source::Own));
+        // The node's own copy first, then the cache. Both are subject to the same label
+        // check below — a cached object carries the label it was served under, and an
+        // unrecognised one fails closed like everything else.
+        let found = own.or_else(|| {
+            self.cache
+                .as_ref()
+                .and_then(|c| c.stat(id).ok())
+                .map(|o| (o, Source::Cached))
+        });
+        found
+            .filter(|(o, _)| o.visibility.may_leave_the_node_unattended())
             .ok_or_else(|| not_available(id))
+    }
+
+    /// Read one chunk from wherever the object was found.
+    ///
+    /// Neither path counts as a use of the cache: a peer must not be able to keep something
+    /// alive in this node's cache by asking for it.
+    fn chunk_from(&self, source: Source, r: &otwono_store::ChunkRef) -> Result<Vec<u8>, StoreError> {
+        match source {
+            Source::Own => self.store.get_chunk(r),
+            Source::Cached => self
+                .cache
+                .as_ref()
+                .ok_or_else(|| StoreError::NotFound(r.hex()))?
+                .chunk(r)
+                .map_err(|e| match e {
+                    CacheError::Store(e) => e,
+                    other => StoreError::NotFound(other.to_string()),
+                }),
+        }
+    }
+
+    fn read_from(&self, source: Source, object: &Object) -> Result<Vec<u8>, StoreError> {
+        match source {
+            Source::Own => self.store.read_object(object),
+            Source::Cached => self
+                .cache
+                .as_ref()
+                .ok_or_else(|| StoreError::NotFound(object.content_id.to_hex()))?
+                .read_for_peer(object)
+                .map_err(|e| match e {
+                    CacheError::Store(e) => e,
+                    other => StoreError::NotFound(other.to_string()),
+                }),
+        }
     }
 
     /// One window of an object's chunk list.
@@ -251,7 +353,7 @@ impl StoreService {
             return Err(RpcError::invalid_params("max_chunks must be greater than zero"));
         }
         let id = Self::parse_id(&p.content_id)?;
-        let object = self.servable(&id)?;
+        let (object, _) = self.servable(&id)?;
 
         // Saturating rather than indexing: a peer naming a window past the end gets an
         // empty one, which is a true answer, not an error worth distinguishing.
@@ -289,7 +391,7 @@ impl StoreService {
             return Err(RpcError::invalid_params("max_bytes must be greater than zero"));
         }
         let id = Self::parse_id(&p.content_id)?;
-        let object = self.servable(&id)?;
+        let (object, source) = self.servable(&id)?;
 
         let entry = object
             .chunks
@@ -307,7 +409,9 @@ impl StoreService {
         };
         // A damaged or missing chunk is not-available too. The peer asked for an object
         // this node advertises; that it cannot produce the bytes is this node's problem.
-        let bytes = self.store.get_chunk(&chunk_ref).map_err(|_| not_available(&id))?;
+        let bytes = self
+            .chunk_from(source, &chunk_ref)
+            .map_err(|_| not_available(&id))?;
 
         let from = p.offset.min(bytes.len());
         let to = from
@@ -339,13 +443,141 @@ impl StoreService {
             .map_err(|e| RpcError::invalid_params(format!("store.serve: {e}")))?;
         let id = Self::parse_id(&p.content_id)?;
 
-        let object = self.servable(&id)?;
-        let bytes = self.store.read_object(&object).map_err(|_| not_available(&id))?;
+        let (object, source) = self.servable(&id)?;
+        let bytes = self.read_from(source, &object).map_err(|_| not_available(&id))?;
 
         let mut out = record(&object);
         out["data"] = json!(data_encoding::BASE64.encode(&bytes));
         out["served_to"] = json!(p.peer);
         Ok(out)
+    }
+
+    /// Put content fetched from a peer into the cache.
+    ///
+    /// The label decides, in the cache itself rather than here: `Private` and `Shared` are
+    /// refused whatever a caller claims, and a label this build does not recognise parses as
+    /// `Private` and is refused with them.
+    ///
+    /// The reply says what was evicted to make room, because "serving is carrying" and an
+    /// operator who cannot see the cache turning over cannot reason about it.
+    fn handle_cache_put(&self, params: Value) -> Result<Value, RpcError> {
+        let p: CachePutParams = serde_json::from_value(params)
+            .map_err(|e| RpcError::invalid_params(format!("cache.put: {e}")))?;
+        let bytes = data_encoding::BASE64
+            .decode(p.data.as_bytes())
+            .map_err(|e| RpcError::invalid_params(format!("data must be base64: {e}")))?;
+        if bytes.len() > MAX_INLINE_BYTES {
+            return Err(RpcError::invalid_params(format!(
+                "{} bytes is over the {MAX_INLINE_BYTES}-byte inline cap",
+                bytes.len()
+            )));
+        }
+        let cache = self.cache()?;
+        let before = cache.used_bytes();
+        let object = cache
+            .insert(&bytes, p.visibility, otwono_store::cache::now_unix_ms())
+            .map_err(cache_rpc)?;
+        let after = cache.used_bytes();
+        let mut out = record(&object);
+        out["cached"] = json!(true);
+        out["cache_used_bytes"] = json!(after);
+        out["cache_budget_bytes"] = json!(cache.budget_bytes());
+        out["evicted_bytes"] = json!((before + object.size_bytes).saturating_sub(after));
+        Ok(out)
+    }
+
+    /// Read a cached object, counting it as a local use.
+    ///
+    /// Unlike `store.serve_*`, this **does** refresh the object's place in the eviction
+    /// order: a caller on this node's own socket is the operator, and what the operator
+    /// reads is what the cache should keep.
+    fn handle_cache_get(&self, params: Value) -> Result<Value, RpcError> {
+        let p: IdParams = serde_json::from_value(params)
+            .map_err(|e| RpcError::invalid_params(format!("cache.get: {e}")))?;
+        let cache = self.cache()?;
+        let id = Self::parse_id(&p.content_id)?;
+        let object = cache.stat(&id).map_err(cache_rpc)?;
+        let bytes = cache
+            .get(&id, otwono_store::cache::now_unix_ms())
+            .map_err(cache_rpc)?;
+        let mut out = record(&object);
+        out["data"] = json!(data_encoding::BASE64.encode(&bytes));
+        out["cached"] = json!(true);
+        Ok(out)
+    }
+
+    /// What the cache holds, and how much room is left.
+    fn handle_cache_status(&self, _params: Value) -> Result<Value, RpcError> {
+        let cache = self.cache()?;
+        let entries: Vec<Value> = cache
+            .entries()
+            .iter()
+            .map(|e| {
+                json!({
+                    "content_id": e.content_id,
+                    "size_bytes": e.size_bytes,
+                    "last_access_ms": e.last_access_ms,
+                    "pinned": e.pinned,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "schema_version": DESCRIBE_SCHEMA_VERSION,
+            "budget_bytes": cache.budget_bytes(),
+            "used_bytes": cache.used_bytes(),
+            "objects": entries.len(),
+            "entries": entries,
+            // Stated on every call, because an operator has to be told and a UI that has to
+            // remember to say it is a UI that will forget.
+            "note": "holding is publishing: serving a chunk tells your neighbours you have it",
+        }))
+    }
+
+    fn handle_cache_pin(&self, params: Value) -> Result<Value, RpcError> {
+        let p: CachePinParams = serde_json::from_value(params)
+            .map_err(|e| RpcError::invalid_params(format!("cache.pin: {e}")))?;
+        let id = Self::parse_id(&p.content_id)?;
+        let found = self.cache()?.set_pinned(&id, p.pinned).map_err(cache_rpc)?;
+        if !found {
+            return Err(RpcError::invalid_params(format!(
+                "{} is not in the cache",
+                id.to_hex()
+            )));
+        }
+        Ok(json!({
+            "schema_version": DESCRIBE_SCHEMA_VERSION,
+            "content_id": id.to_hex(),
+            "pinned": p.pinned,
+        }))
+    }
+
+    /// Empty the cache, pinned objects included.
+    ///
+    /// "Serving is carrying": an operator holds bytes they did not choose one at a time, so
+    /// a purge is always one action away (`NEIGHBOURHOOD-CACHE.md` §6). It touches only the
+    /// cache — the user's own store is a different directory and this has no path to it.
+    fn handle_cache_purge(&self, _params: Value) -> Result<Value, RpcError> {
+        let cache = self.cache()?;
+        let freed = cache.purge().map_err(cache_rpc)?;
+        Ok(json!({
+            "schema_version": DESCRIBE_SCHEMA_VERSION,
+            "freed_bytes": freed,
+            "used_bytes": cache.used_bytes(),
+            "note": "the cache is empty; nothing in the node's own store was touched",
+        }))
+    }
+}
+
+/// A cache failure, translated for a caller.
+fn cache_rpc(e: CacheError) -> RpcError {
+    match e {
+        // The caller asked for something the label forbids. Their error, and named.
+        CacheError::NotCacheable(_) => RpcError::invalid_params(e.to_string()),
+        CacheError::LargerThanBudget { .. } => RpcError::invalid_params(e.to_string()),
+        // This node's condition, not the caller's request.
+        CacheError::NoSpace { .. } | CacheError::Disabled => RpcError::unavailable(e.to_string()),
+        CacheError::Store(inner) => rpc(inner),
+        CacheError::Io(_) => RpcError::internal(e.to_string()),
     }
 }
 
@@ -424,6 +656,31 @@ impl Service for StoreService {
                     "One range of one chunk of a servable object, for a peer",
                     CAPABILITY_SERVE,
                 ),
+                MethodDescription::guarded(
+                    "cache.put",
+                    "Put content fetched from a peer into the neighbourhood cache",
+                    CAPABILITY_CACHE_WRITE,
+                ),
+                MethodDescription::guarded(
+                    "cache.get",
+                    "Read a cached object, counting it as a local use",
+                    CAPABILITY_CACHE_READ,
+                ),
+                MethodDescription::guarded(
+                    "cache.status",
+                    "The cache's budget, usage and contents",
+                    CAPABILITY_CACHE_READ,
+                ),
+                MethodDescription::guarded(
+                    "cache.pin",
+                    "Keep an object in the cache regardless of use, or stop keeping it",
+                    CAPABILITY_CACHE_WRITE,
+                ),
+                MethodDescription::guarded(
+                    "cache.purge",
+                    "Empty the neighbourhood cache; the node's own store is untouched",
+                    CAPABILITY_CACHE_WRITE,
+                ),
             ],
         }
     }
@@ -457,6 +714,26 @@ impl Service for StoreService {
             "store.serve_chunk" => {
                 self.authorize(ctx, CAPABILITY_SERVE)?;
                 self.handle_serve_chunk(params)
+            }
+            "cache.put" => {
+                self.authorize(ctx, CAPABILITY_CACHE_WRITE)?;
+                self.handle_cache_put(params)
+            }
+            "cache.get" => {
+                self.authorize(ctx, CAPABILITY_CACHE_READ)?;
+                self.handle_cache_get(params)
+            }
+            "cache.status" => {
+                self.authorize(ctx, CAPABILITY_CACHE_READ)?;
+                self.handle_cache_status(params)
+            }
+            "cache.pin" => {
+                self.authorize(ctx, CAPABILITY_CACHE_WRITE)?;
+                self.handle_cache_pin(params)
+            }
+            "cache.purge" => {
+                self.authorize(ctx, CAPABILITY_CACHE_WRITE)?;
+                self.handle_cache_purge(params)
             }
             other => Err(unknown_method(other)),
         }

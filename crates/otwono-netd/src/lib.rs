@@ -470,6 +470,21 @@ impl Service for NetService {
                     .state
                     .fetch_from(&candidate, content_id)
                     .map_err(|e| RpcError::new(otwono_proto::code::UNAVAILABLE, e))?;
+
+                // Never by default. Caching a peer's content is storing bytes the operator
+                // did not choose one at a time, so it is asked for or it does not happen
+                // (NEIGHBOURHOOD-CACHE.md §5).
+                let wanted_cache = params.get("cache").and_then(Value::as_bool).unwrap_or(false);
+                let cached = match (wanted_cache, self.state.responder.as_ref()) {
+                    (false, _) => json!(false),
+                    (true, None) => json!({ "error": "this daemon has no store to cache into" }),
+                    (true, Some(responder)) => match responder.cache(&fetched) {
+                        Ok(v) => v,
+                        // A cache miss is not a fetch failure. The bytes are verified and in
+                        // the caller's hands either way, and saying so beats discarding them.
+                        Err(e) => json!({ "error": e }),
+                    },
+                };
                 Ok(json!({
                     "schema_version": DESCRIBE_SCHEMA_VERSION,
                     "content_id": fetched.content_id,
@@ -477,6 +492,7 @@ impl Service for NetService {
                     "chunking": fetched.chunking,
                     "size_bytes": fetched.bytes.len(),
                     "from": candidate.claimed_node_id.to_text(),
+                    "cached": cached,
                     "data": data_encoding::BASE64.encode(&fetched.bytes),
                 }))
             }

@@ -2232,3 +2232,101 @@ by asking about it would hand the eviction policy to strangers.
   `statvfs` and refuses below 256 MiB free; that path has been read, not exercised.
 - **"Usefully rather than thrashing" on a T0 board** needs a T0 board. Only the 512 MiB
   default is asserted.
+
+---
+
+## Phase 6 slice 2 — the cache does something: a node serves what it fetched
+
+**Date:** 2026-08-24 · **Where:** OTWONO Cloud dev environment (no `/dev/kvm`)
+
+The wiring the previous slice deliberately left out. `otwono-stored` now opens a cache and
+serves out of it; `net.fetch` can keep what it fetched; `cache.read` and `cache.write` are
+their own capabilities.
+
+### Workspace
+
+```
+cargo test --workspace     730 passed, 0 failed   (was 718)
+cargo clippy --workspace --all-targets -- -D warnings   clean
+cargo fmt --all --check    clean
+shellcheck -S warning ...  clean
+aarch64 cross-build        links
+```
+
+### `cache.write` is not `store.write`, for a reason with a test
+
+`otwono-netd` has to be able to put what it fetched into the shared cache. If that were
+`store.write`, the network-facing daemon would also gain the ability to write the user's own
+store — which is the thing every other boundary in this project has been arranged to
+prevent. So the cache has its own pair, and
+`the_cache_daemon_cannot_write_the_users_own_store` runs the whole caching path under a
+policy that denies `store.write` outright.
+
+This is the same shape as `store.serve` not being `store.read` (ADR-0017) and
+`id.sign_session` not being `id.sign` (ADR-0010). Three instances now, which suggests it is
+the rule rather than three exceptions: **a capability that a hostile-input daemon must hold
+is never the same capability as the one that would let it reach the user's data.**
+
+### Caching is opt-in per fetch
+
+`net.fetch` takes `cache: bool`, default false. "Serving is carrying" — an operator who
+caches for neighbours stores bytes they did not choose one at a time — so the shipped
+behaviour is that a fetch hands back verified bytes and keeps nothing. A cache failure is
+also not a fetch failure: the reply carries `cached: {error: ...}` and the bytes, because
+the bytes are verified and in the caller's hands either way.
+
+### The budget is asked for, not guessed
+
+`otwono-stored` requests `hw.read` at startup and reads
+`features.neighbourhood_cache_bytes` out of `hw.profile`. If `otwono-hwd` cannot be reached
+it runs **without** a cache and says so, rather than picking a number — which is what
+CLAUDE.md §2.6 means by one place deciding. The unit gained `Wants=otwono-hwd.service`, not
+`Requires`: a node whose hardware daemon is down should still store and still mesh.
+
+### My test was wrong about labels, and the code was right
+
+`private_content_cannot_be_cached_however_it_is_labelled` asserted that `"PUBLIC"` would be
+refused. It is accepted, because `Visibility::parse` trims and folds case by design — a
+person editing a config should not be defeated by a capital letter — while anything it does
+not recognise is `Private`.
+
+That is the correct contract and the test was asserting a stricter one than the code
+promises. Replaced with `label_parsing_is_case_insensitive_but_never_generous`, which pins
+both halves: `" PUBLIC "` is public, and `"pubic"`, `"public-ish"` and `"public-ish"`-shaped
+typos are not. The asymmetry with the wire is deliberate and now recorded in the test:
+`otwono_netd::content::may_leave_a_node` accepts exact lowercase only, because bytes from a
+stranger get no benefit of the doubt.
+
+### What the tests actually assert
+
+| Property | Test |
+|---|---|
+| A cached object is servable to the next peer, chunk by chunk, byte for byte | `a_cached_object_is_servable_to_the_next_peer` |
+| `PRIVATE`, `SHARED` and unrecognised labels cannot be cached | `private_content_cannot_be_cached_however_it_is_labelled` |
+| Case folds; unknown labels do not | `label_parsing_is_case_insensitive_but_never_generous` |
+| The caching daemon cannot write the user's store | `the_cache_daemon_cannot_write_the_users_own_store` |
+| Every cache method is capability-guarded | `every_cache_method_is_guarded` |
+| Eviction happens over the control plane and is reported | `the_cache_evicts_over_the_control_plane_and_reports_what_it_dropped` |
+| A purge empties the cache and does not touch the user's store | `a_purge_empties_the_cache_and_leaves_the_users_store_alone` |
+| With both copies present, the user's own answers, and survives a purge | `the_users_own_copy_wins_over_a_cached_one_of_the_same_bytes` |
+| A peer cannot keep an object alive by asking about it | `serving_a_cached_object_to_a_peer_does_not_keep_it_alive` |
+| A node with no cache says so plainly | `a_node_with_no_cache_answers_plainly_rather_than_pretending` |
+| `cache.status` always states that holding is publishing | `the_status_call_always_says_that_holding_is_publishing` |
+
+### What this does not prove
+
+- **Fan-out still does not exist.** ADR-0015's central claim — density makes transfers
+  faster because a fetch draws from every peer holding pieces — remains unimplemented. The
+  fetch is one peer, one chunk at a time. `NEIGHBOURHOOD-CACHE.md` §8's three-peer
+  criterion is untouched, and it is the most valuable thing left in this subsystem.
+- **`net.fetch --cache` has not been exercised end to end.** The `cache.put` call it makes
+  is tested directly; the two-node path that ends in a cached object is not, because the
+  link test's serving node and the caching node would have to be different harnesses.
+- **Nothing has booted.** `/var/lib/otwono/cache` is created by stage 30 and the unit asks
+  `otwono-hwd` for a budget; neither has run on a node.
+- **The `hw.profile` lookup is best-effort by design**, and "otwono-hwd was slow to start"
+  is indistinguishable from "otwono-hwd is broken" — both produce a node with no cache and
+  a log line. On a cold SBC first boot that may be the common case, and nothing retries.
+- **A peer's requests never refresh the cache**, so this node keeps what its own household
+  fetched in preference to what the street keeps asking for. That is slightly backwards for
+  a neighbourhood cache and is the safe direction; it wants revisiting once fan-out exists.
