@@ -29,6 +29,11 @@ the design before adding a fourth primitive.
 | **Distributed search** | Local full-text index over local + subscribed content; fan-out to reachable peers with per-peer scope and rate limits | Query + top-N titles |
 | **AI services** | `otwono-aid` exposed to authorized peers with quotas | Short prompts only |
 | **Permission-controlled sharing** | Falls out of `SHARED` labels + per-peer authorization | Yes |
+| **Education** | `PUBLIC`/`REPLICATED` curriculum blocks + a `PRIVATE` learner record + signed transcripts. See `EDUCATION.md` | Practice and record-keeping; no generation |
+| **Finance** | Entirely `PRIVATE`, passphrase-encrypted, never replicated or cached. See `FINANCE.md` | Yes — arithmetic needs no network |
+
+**The neighbourhood cache is not in this table** because it is not a service — it is how the
+first primitive gets from one node to another. See `NEIGHBOURHOOD-CACHE.md` and ADR-0015.
 
 ## 3. Addressing
 

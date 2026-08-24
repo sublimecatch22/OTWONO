@@ -1,0 +1,123 @@
+# The Neighbourhood Cache
+
+**Status:** `SPECIFIED`. No implementation. Nothing in this document has been built, run,
+or measured. Decided in **ADR-0015**; belongs to Phase 5 (the content store) and Phase 6
+(peer exchange).
+
+---
+
+## 1. What it is for
+
+A node contributes a bounded slice of its disk. That slice holds content-addressed chunks,
+encrypted at rest, reachable only by `otwono-stored`. When the node wants something, it asks
+every peer it can reach for the chunks in parallel and verifies each one by its hash.
+
+The property this buys: **a dense neighbourhood is a fast neighbourhood.** Ten houses on a
+street each fetching the same 4 GB model over their own uplinks is ten downloads. Ten houses
+with overlapping caches is one download and nine LAN copies. Nothing coordinates that — it
+falls out of naming chunks by their hash, which makes every holder interchangeable.
+
+It also means the network gets *better* as it grows, which is the opposite of how most
+distributed systems behave, and it is the reason to build it this way.
+
+## 2. What it is not
+
+It is not a blockchain, and the difference matters enough to state twice. A blockchain
+settles disagreements about history between parties who distrust each other. Here there is
+nothing to disagree about: a chunk either hashes to its name or it is discarded. See
+ADR-0015 for the full argument, including where something ledger-like *would* be needed.
+
+## 3. Structure
+
+```
+/var/lib/otwono/cache/          0700, encrypted at rest, otwono-stored only
+  chunks/<aa>/<bb>/<blake3>     one file per chunk, name is the hash
+  have.idx                      what this node holds, for answering peers
+  meta.db                       size accounting, last-access, pin flags
+```
+
+| Property | Value |
+|---|---|
+| Addressing | BLAKE3 of the chunk's plaintext |
+| Chunk size | Content-defined boundaries, parameters fixed by schema (**OQ-16**) |
+| Encryption | At rest, node-held key; a stolen disk is not a readable cache |
+| Eviction | Least-recently-used, except pinned objects |
+| Size | Operator-set, defaulted from the capability tier |
+
+### Size by tier
+
+The default comes from the capability policy engine and nowhere else (CLAUDE.md §2.6). An
+operator may raise or lower it; no subsystem may infer it.
+
+| Tier | Default contribution | Rationale |
+|---|---|---|
+| T0 | 512 MiB | An 8 GB eMMC has little to spare, and a full disk is a broken node |
+| T1 | 4 GiB | Enough for a model and a media manifest set |
+| T2 | 32 GiB | A working set for a household |
+| T3 | 128 GiB | A neighbourhood's shoulder |
+
+**A cache that fills the disk is a fault, not a feature.** The reserve floor that protects
+the audit log and the spool applies here too.
+
+## 4. Fetching
+
+1. Resolve the object to a chunk list (from its signed manifest).
+2. Ask reachable peers which of those chunks they hold — LAN peers first, then the wider
+   overlay, then origin.
+3. Request chunks in parallel across every holder, weighted by the link's bandwidth class.
+4. **Verify each chunk against its hash on arrival.** A mismatch discards the chunk and
+   demerits that peer for this transfer. It never reaches the caller.
+5. Assemble, verify the whole object against the manifest, hand back a path.
+
+A peer that lies wastes our bandwidth. It cannot corrupt our data, and it does not have to
+be trusted to be useful — that is the entire security argument, and it is one hash long.
+
+### Ordering that matters
+
+**Local before uplink, always.** The point of the design is that a chunk available at LAN
+speed is never fetched over a metered, slower, or duty-cycle-limited link. The router
+already knows the bandwidth class of every link (`NODE-NETWORK.md` §3); this consults it.
+
+## 5. What may be cached
+
+**Only `PUBLIC` and `REPLICATED` objects.** `PRIVATE` and `SHARED` never enter the shared
+cache, in any form, at any time. This is enforced in `otwono-stored`, not left to callers,
+and it is the property that makes the whole thing safe to switch on.
+
+Nothing is replicated without the operator's per-collection opt-in, per
+`DISTRIBUTED-SERVICES.md` §5. The cache does not create an exception to that rule; it is a
+consumer of it.
+
+## 6. Two costs the operator must be told about
+
+Stated here so they are stated in the UI:
+
+- **Holding is publishing.** Serving a chunk tells your neighbours you have it. What a
+  household reads is partly inferable from what its node serves. Restricting the cache to
+  public and replicated content bounds this; it does not remove it.
+- **Serving is carrying.** You will store bytes you did not choose individually. The
+  per-collection opt-in is the control, and a purge must always be one action away.
+
+## 7. Integrate, do not reinvent
+
+Per CLAUDE.md §2.3, the mechanisms here are well-trodden and the adapter layer is our job:
+
+| Need | Prior art to draw on |
+|---|---|
+| Swarm fetch, piece selection | BitTorrent — rarest-first, endgame mode |
+| Content-addressed block exchange | IPFS Bitswap — want-lists and provider hints |
+| Content-defined chunking | FastCDC, restic, casync |
+| Local provider discovery | mDNS, already in use for peer discovery |
+
+## 8. What must be true before this is called done
+
+- A chunk that fails its hash never reaches a caller, proven by a test that serves a
+  corrupted chunk from a peer.
+- A fetch with three peers holding disjoint pieces completes and is byte-identical to
+  origin.
+- A `PRIVATE` object cannot be placed in the cache by any code path, proven negatively.
+- The cache respects its size cap under sustained pressure and evicts rather than filling
+  the disk.
+- A T0 node with 512 MiB participates usefully rather than thrashing.
+
+Until each has a test and a log, this document describes an intention.

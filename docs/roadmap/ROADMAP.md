@@ -176,6 +176,9 @@ GPU/NPU backends, and the tiered assistant shapes.
 2. The four labels, enforced. Encryption at rest. Provenance propagation.
 3. Egress enforcement in `otwono-netd`, duplicated as defence in depth.
 4. Replication policy for `REPLICATED`.
+5. The **neighbourhood cache** — a bounded, encrypted, tier-scaled contributed store
+   (ADR-0015, `docs/services/NEIGHBOURHOOD-CACHE.md`). Chunking parameters are OQ-16 and
+   are a network-wide compatibility constant, so they are settled here and not later.
 
 **Exit criterion:** the negative test suite from `docs/security/DATA-VISIBILITY.md` §6
 passes, including a property test that derived content inherits the most restrictive label.
@@ -198,6 +201,16 @@ with convergence asserted.
 Tool registry, first adapters (pandoc, ffmpeg, ImageMagick, mpv, LibreOffice), planner and
 executor, snapshot-before-destructive, dry-run mode.
 
+Then the two household applications, which exist to prove the layers beneath them carry real
+weight — an offline school and a private ledger are the cases where "local-first" and "the
+user owns the keys" stop being slogans:
+
+- **Education** (`docs/services/EDUCATION.md`) — curriculum shared as `PUBLIC` content,
+  learner records `PRIVATE` and never replicated, signed transcripts. The accreditation
+  question is OQ-18 and is not an engineering task.
+- **Finance** (`docs/services/FINANCE.md`) — entirely `PRIVATE`, passphrase-encrypted,
+  file-import only until OQ-19 is settled.
+
 **Exit criterion:** an end-to-end task ("convert these images and put them in a document")
 executed through the broker with a complete audit trail, on both architectures.
 
@@ -215,8 +228,11 @@ automatically. Both boot logs captured.
 
 ## Phase 9 — Mesh and radio
 
-Wi-Fi Direct and LoRa link adapters, store-and-forward, the routing decision from OQ-4,
-duty-cycle enforcement, DTN semantics.
+Wi-Fi link adapters in all three roles — `Station`, `AccessPoint` (the node runs `hostapd`
+and *is* the network) and `WiFiMesh` (802.11s) — plus Wi-Fi Direct and LoRa, store-and-forward,
+the routing decision from OQ-4, duty-cycle enforcement, DTN semantics. The `AccessPoint` role
+is what lets a street of nodes reach each other with nobody's uplink involved; chipset and
+per-region regulatory support is OQ-15.
 
 **Exit criterion:** two nodes exchange messages with no IP network between them, on real
 radio hardware, with duty-cycle compliance measured.

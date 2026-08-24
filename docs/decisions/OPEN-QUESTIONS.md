@@ -18,6 +18,11 @@ Do not treat any of these as settled, and do not let code quietly settle one.
 | **OQ-11** | Distributed search ranking without a global index and without a reputation system — is a useful ranking even possible? | Phase 6 | Phase 6 research |
 | **OQ-12** | Do we ship a browser integration for `onm://`, or a local HTTP gateway with a reserved hostname? Extension maintenance versus a weaker security boundary | Phase 6 | Phase 6 |
 | **OQ-14** | The arm64 boot counter. ADR-0008 names U-Boot `bootcount`, but the packaged `u-boot-rpi` for the Pi 4 is built with `CONFIG_BOOTCOUNT_LIMIT` off (measured 2026-08-23). Rebuild U-Boot with it, or count boots in userspace against a grubenv-equivalent on the ESP? | Phase 8 | Phase 8 |
+| **OQ-15** | Wi-Fi `AccessPoint` and 802.11s `WiFiMesh` roles: which consumer chipsets and drivers actually support AP+STA concurrently and 802.11s at all? Needs a hardware survey, not a datasheet reading. Also: per-region channel/power/DFS profiles, the Wi-Fi analogue of OQ-10 | Phase 9 | Phase 9 |
+| **OQ-16** | Chunking parameters for the neighbourhood cache — algorithm and size. Two nodes that chunk differently cannot serve each other, so this is a network-wide compatibility constant, versioned in the schema. Changing it splits the swarm | Phase 5 | Phase 5 |
+| **OQ-17** | Freeloading in the neighbourhood cache. ADR-0015 deliberately ships no fairness mechanism, because accounting between distrusting neighbours is where a ledger creeps back in. Revisit only with evidence of real harm — and if revisited, what is the cheapest thing that works? | 1.x | After Phase 6 |
+| **OQ-18** | Assessment integrity in the education service. A record signed by a node the learner controls proves what was recorded, not that the learner did the work. What does a defensible proctored mode look like, and which accreditors would accept it? Partly a research question and partly a conversation with an accrediting body | Phase 7 | Phase 7 |
+| **OQ-19** | Bank connectivity beyond file import. Holding credentials on a household device, or an aggregator holding them, are both at odds with §1 of CLAUDE.md. Does any jurisdiction's open-banking regime give the *user* a direct, revocable, credential-free grant to their own software? Default stays "no automatic sync" until answered | Phase 7 | Phase 7 |
 
 ## Resolved
 

@@ -35,8 +35,9 @@ metastasizing through the codebase.
 ```rust
 pub trait LinkAdapter: Send + Sync {
     fn id(&self) -> LinkId;
-    fn kind(&self) -> LinkKind;              // Ethernet | WiFi | WiFiDirect | Ble
+    fn kind(&self) -> LinkKind;              // Ethernet | WiFi | WiFiDirect | WiFiMesh | Ble
                                              // | LoRa | Ieee802154 | Ax25 | UsbGadget | Internet
+    fn role(&self) -> LinkRole;              // Station | AccessPoint | Peer
     fn properties(&self) -> LinkProperties;
     fn send(&self, to: LinkPeer, frame: &[u8]) -> Result<(), LinkError>;
     fn subscribe(&self) -> Receiver<LinkEvent>;
@@ -51,6 +52,40 @@ pub struct LinkProperties {
     pub typical_latency: Duration,
 }
 ```
+
+### A node may create the network, not only join it
+
+`LinkRole` exists because "Wi-Fi" is two different things to this system, and only one of
+them was covered before.
+
+| Role | Meaning | Why it matters |
+|---|---|---|
+| `Station` | The node joins an existing network | The ordinary home case: a router already exists |
+| `AccessPoint` | The node **is** the network — it runs `hostapd` and others associate to it | A node in a place with no infrastructure, a field deployment, or a neighbourhood where one house's node serves the street |
+| `Peer` | Symmetric, no infrastructure: Wi-Fi Direct, 802.11s mesh, LoRa | Nodes find each other with nothing in between |
+
+The `AccessPoint` role is what turns a household node into local infrastructure. Combined
+with the neighbourhood cache, it is the difference between "there is a fast copy nearby" and
+"there is a fast copy nearby **and a way to reach it**" — a street where every house has a
+node does not need anyone's uplink to move data between houses.
+
+802.11s (`WiFiMesh`) is the middle ground: several nodes form a self-healing mesh at layer 2
+with no single node designated as the infrastructure. Where the hardware and drivers support
+it, it beats a chain of access points. Where they do not — and consumer Wi-Fi chipsets are
+uneven here — `AccessPoint` plus `Station` is the fallback that always works.
+
+Three things this must get right, and each is a way to cause real harm:
+
+- **Regulatory.** Channel, power and DFS behaviour are jurisdiction-bound. The same
+  per-region profile-as-data approach that **OQ-10** specifies for LoRa duty cycles applies
+  to Wi-Fi, and for the same reason: these are legal limits, not preferences.
+- **An open access point is an abuse vector.** A node broadcasting an unsecured network is
+  offering an anonymous uplink to anyone in range, with the operator's name on the line.
+  Access points are authenticated by default, and the gateway rules in §7 — opt-in, with the
+  legal exposure explained in plain language — apply in full.
+- **Bringing up an AP disturbs the household.** A single-radio device cannot be a station and
+  an access point on different channels at once without cost. Do not silently reconfigure
+  someone's working Wi-Fi; this is opt-in, and it says what it will do first.
 
 ### Bandwidth classes
 
