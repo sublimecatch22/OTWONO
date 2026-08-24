@@ -36,12 +36,16 @@ install -m 0644 "$REPO_ROOT"/schemas/*.json "$ROOTFS/usr/share/otwono/schemas/"
 
 log "creating the OTWONO state directories"
 install -d -m 0755 "$ROOTFS/etc/otwono" "$ROOTFS/etc/otwono/policy.d" \
-    "$ROOTFS/etc/otwono/publishers.d"
+    "$ROOTFS/etc/otwono/publishers.d" "$ROOTFS/etc/otwono/fetch.d"
 install -d -m 0700 "$ROOTFS/var/lib/otwono" "$ROOTFS/var/lib/otwono/identity"
 # The model catalog. Manifests are public metadata; blobs are large and content-addressed.
 # Ships empty: models are never committed and never baked into an image (CLAUDE.md §9).
 install -d -m 0755 "$ROOTFS/var/lib/otwono/models" \
     "$ROOTFS/var/lib/otwono/models/manifests" "$ROOTFS/var/lib/otwono/models/blobs"
+# The fetch spool. 0700: partial downloads are bytes from a stranger that nothing has
+# verified yet, and no other user has business reading or -- worse -- writing them
+# between the fetch and the caller's digest check (ADR-0014).
+install -d -m 0700 "$ROOTFS/var/lib/otwono/fetch"
 install -d -m 0755 "$ROOTFS/var/log/otwono"
 
 log "installing the first-boot capability report unit"
@@ -174,6 +178,12 @@ ttl_seconds = 300
 # ai.infer is deliberately NOT granted. No inference backend is linked into this build, so
 # a rule here would grant a capability for something that cannot happen — and when an
 # engine does land, running a model is a decision an operator should make on purpose.
+
+# net.fetch is deliberately NOT granted either, for a stronger reason: it is the only
+# action that sends bytes off this node without stopping for a human (ADR-0014). A node
+# fetches nothing until an operator makes two separate decisions on purpose — adding a
+# source to /etc/otwono/fetch.d, and granting net.fetch here. Either one alone does
+# nothing, which is the intended shape.
 POLICY
 
 log "installing the model publisher trust store"
@@ -198,6 +208,42 @@ publisher, and unsigned models, both require an explicit opt-in to load. A model
 signature does not verify is refused regardless: it has been altered since it was signed.
 READMEEOF
 chmod 0644 "$ROOTFS/etc/otwono/publishers.d/README"
+
+log "installing the egress allow-list directory"
+# Ships empty, and empty permits nothing. This directory is the whole of what this node
+# may contact: otwono-fetchd composes every URL from an entry here plus a caller-supplied
+# path suffix, so a caller can never name a host (ADR-0014).
+cat > "$ROOTFS/etc/otwono/fetch.d/README" <<'READMEEOF'
+Where this node is permitted to fetch from.
+
+Drop a .toml file here to allow one source:
+
+    [[source]]
+    id = "models"
+    host = "models.example.org"
+    path_prefix = "/otwono/models/"
+    max_bytes = 21474836480
+
+Empty means this node contacts nothing, which is the shipped default.
+
+Two things to understand before adding one:
+
+  * A caller names the source id and a path under path_prefix. It never supplies a URL,
+    so it cannot choose the host, the scheme, the port, a query string or a header. The
+    scheme is always https and is not configurable.
+
+  * Adding a source is the moment the decision gets made. `net.fetch` does not stop for a
+    human on every call -- an unattended node has nobody to ask -- so the confirmation is
+    here, once, when you write this file. A source you add is a place this node may send
+    bytes to, unattended, from then on.
+
+The path a caller supplies is bounded (256 bytes of [A-Za-z0-9._~/-]) and every fetch is
+in the audit log, but it is still caller-chosen text leaving the node. Add sources you
+would be content to see in an outbound firewall log.
+
+Format: schemas/egress-source.schema.json. Validate with: otwono-fetchd --check
+READMEEOF
+chmod 0644 "$ROOTFS/etc/otwono/fetch.d/README"
 
 log "installing the control-plane runtime directory"
 install -d -m 0755 "$ROOTFS/usr/lib/tmpfiles.d"
@@ -559,6 +605,62 @@ AmbientCapabilities=
 WantedBy=multi-user.target
 UNIT
 
+log "installing the fetch daemon unit"
+# The only unit in OTWONO that faces the open network as a client. It is a separate
+# process from otwono-netd on purpose: both are hostile-input boundaries, and a compromise
+# of one should not yield the other's keys. This one holds no keys at all (ADR-0014).
+cat > "$ROOTFS/etc/systemd/system/otwono-fetchd.service" <<'UNIT'
+[Unit]
+Description=OTWONO fetch daemon
+Documentation=file:/usr/share/doc/otwono/EGRESS.md
+After=otwono-permd.service systemd-tmpfiles-setup.service
+Requires=otwono-permd.service
+# Wants, not Requires: a node with no usable link still boots and still serves its local
+# control plane. Answering "cannot reach the source" is a better state than not running.
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=/var/lib/otwono
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/otwono-fetchd --socket /run/otwono/fetch.sock --perm-socket /run/otwono/perm.sock --source-dir /etc/otwono/fetch.d --spool-dir /var/lib/otwono/fetch
+Restart=on-failure
+RestartSec=2
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# It has the network by definition. No AF_NETLINK, unlike otwono-netd: this daemon never
+# enumerates interfaces, it only opens outbound connections.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Contains the obvious SSRF. A source is a DNS name that must resolve somewhere, and
+# without this a name pointing at 127.0.0.1 would aim a fetch at this node's own control
+# plane, or at a device on the local segment. Best-effort by nature: it is a cgroup BPF
+# program, and on a kernel without CONFIG_CGROUP_BPF systemd logs a failure and runs the
+# unit anyway. A mitigation, not a boundary.
+IPAddressDeny=localhost link-local multicast
+# It writes only to the spool. The allow-list under /etc is read-only to it, so a
+# compromised fetcher cannot add a source for itself.
+ReadWritePaths=/run/otwono /var/lib/otwono/fetch
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
 log "installing the AI self check"
 install -m 0755 "$BUILD_DIR/files/otwono-ai-check" "$ROOTFS/usr/lib/otwono/ai-check"
 cat > "$ROOTFS/etc/systemd/system/otwono-ai-check.service" <<'UNIT'
@@ -587,7 +689,7 @@ LockPersonality=yes
 WantedBy=multi-user.target
 UNIT
 
-for unit in otwono-permd otwono-hwd otwono-idd otwono-netd otwono-aid otwono-ai-check otwono-control-plane-check otwono-mesh-check otwono-mesh-check.timer; do
+for unit in otwono-permd otwono-hwd otwono-idd otwono-netd otwono-aid otwono-fetchd otwono-ai-check otwono-control-plane-check otwono-mesh-check otwono-mesh-check.timer; do
     # The list carries a .timer as well as services, so only append .service when the
     # entry does not already name a unit type.
     case "$unit" in
@@ -604,6 +706,7 @@ install -m 0644 "$REPO_ROOT/docs/hardware/CAPABILITY-TIERS.md" "$ROOTFS/usr/shar
 install -m 0644 "$REPO_ROOT/docs/security/SECURITY-MODEL.md" "$ROOTFS/usr/share/doc/otwono/"
 install -m 0644 "$REPO_ROOT/docs/network/NODE-IDENTITY.md" "$ROOTFS/usr/share/doc/otwono/"
 install -m 0644 "$REPO_ROOT/docs/network/NODE-NETWORK.md" "$ROOTFS/usr/share/doc/otwono/"
+install -m 0644 "$REPO_ROOT/docs/network/EGRESS.md" "$ROOTFS/usr/share/doc/otwono/"
 install -m 0644 "$REPO_ROOT/docs/ai/AI-RUNTIME.md" "$ROOTFS/usr/share/doc/otwono/"
 install -m 0644 "$REPO_ROOT/README.md" "$ROOTFS/usr/share/doc/otwono/"
 

@@ -233,7 +233,10 @@ design decision in its own right, not an implementation detail. **ADR-0014 settl
 client connections to hosts outside the mesh. Callers name a source from an allow-list and
 a path suffix, never a URL; the response lands in a spool and the caller verifies it.
 `ai.models.pull` therefore becomes a fetch followed by the `ai.models.install` below —
-**the pull adds no new trust code.** Neither the daemon nor the action exists yet.
+**the pull adds no new trust code.** `otwono-fetchd` and `net.fetch` now exist and have
+fetched a real object over TLS (`docs/network/EGRESS.md`). `ai.models.pull` itself does
+not: wiring `otwono-aid` to call `fetch.get` and hand the spool path to `ai.models.install`
+is the remaining step, and it is deliberately separate from building the fetcher.
 
 Splitting it this way has a payoff already banked: everything that decides whether to
 *trust* a model is tested exhaustively with no network anywhere near it.

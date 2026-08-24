@@ -38,9 +38,9 @@ path suffix under that source's configured prefix. `otwono-fetchd` composes the 
 Consequently a caller cannot choose the host, the scheme, the port, the headers, the
 request body, or the query string.
 
-- **The allow-list is policy, not code.** It lives in `/etc/otwono/policy.d/`, so changing
-  it is `policy.write` — `Irreversible`, `always_confirm`. Adding a place this node may
-  talk to is a decision a human makes once, deliberately and audibly.
+- **The allow-list is policy, not code.** Changing it is `policy.write` —
+  `Irreversible`, `always_confirm`. Adding a place this node may talk to is a decision a
+  human makes once, deliberately and audibly.
 - **Redirects never leave the source.** A `3xx` to a host or prefix outside the entry is a
   denied fetch, not a followed one.
 - **The response goes to a spool, never to a subsystem's store.** `otwono-fetchd` streams
@@ -133,10 +133,43 @@ a cheap thing to lose.
   tests, not a product requirement, and the proxy must not become an assumed part of the
   design.
 
-**Nothing is built.** This ADR is a decision, not an implementation: there is no
-`otwono-fetchd` crate, no `net.fetch` in the registry, no schema, and no unit. Per CLAUDE.md
-§3 the implementation lands as a crate under `crates/`, a schema in `schemas/`, and a
-document under `docs/network/`, together. **STATUS: SPECIFIED.**
+**Nothing is built** at the time this ADR was written. **STATUS: SPECIFIED** then;
+implemented since — see the amendment below.
+
+## Amendment, 2026-08-24: the allow-list is its own directory
+
+Implementation moved the allow-list from `/etc/otwono/policy.d/` to
+**`/etc/otwono/fetch.d/`**. The intent above is unchanged — it is still policy, and writing
+it is still `policy.write` — but sharing a directory with `otwono-permd` is a footgun. The
+two loaders have two different schemas, and `permd`'s `PolicyFile` deserializes a file full
+of `[[source]]` tables as *zero rules* without complaint. A typo in a source entry would
+then read as a valid empty policy rather than an error, in the one directory where silent
+acceptance is least affordable. Separate directories, separate loaders, and each refuses
+what it does not understand.
+
+Two further details settled by building it, both narrower than the decision above:
+
+- **The `net.fetch` token's resource is the source id**, so policy can grant one caller the
+  model host and not the update host. Without it every grant would silently be "anywhere in
+  the allow-list", which is coarser than the allow-list itself already expresses.
+- **`fetch.get` is bounded and resumable rather than blocking to completion.** The control
+  plane's client sets a read timeout and a 4 GB model does not fit inside one; a caller
+  loops. This is how the ADR's "resumption is required, not optional" is met, and it makes
+  resumption the ordinary path rather than an error path.
+
+Two claims in the decision above were **wrong**, and pointing the daemon at a real host is
+what showed it:
+
+- **"`ca-certificates` is already in every recipe"** was true and irrelevant. `ureq`
+  defaults to the Mozilla roots compiled into the binary, so the image's trust store was
+  not what the fetcher consulted — a node could not have fetched from a mirror behind a
+  private CA, and nothing in the image would have explained why. The daemon now uses the
+  platform verifier and reads `/etc/ssl/certs`. Three extra crates (31 against 28).
+- **Nothing in the decision considered content encoding**, and `gzip` is on by default in
+  `ureq`. A decompressed body is not the bytes a server's `Range` addresses, so every
+  resumed fetch of a compressed response would have asked for the wrong offset — and on a
+  server that accepted it, silently assembled a corrupt file that only the caller's digest
+  would have caught. Automatic decoding is off.
 
 ## Alternatives rejected
 
@@ -162,6 +195,8 @@ document under `docs/network/`, together. **STATUS: SPECIFIED.**
 ## References
 
 - Resolves **OQ-13**.
+- Implemented in `crates/otwono-fetch` and `crates/otwono-fetchd`; see
+  `docs/network/EGRESS.md` and `schemas/egress-source.schema.json`.
 - ADR-0003 (control plane), ADR-0010 (splitting a broad capability into a narrow one),
   ADR-0011 and ADR-0012 (the adapter and its confinement, which this keeps intact).
 - `docs/ai/AI-RUNTIME.md` §5.1, which stated the problem and deferred it here.

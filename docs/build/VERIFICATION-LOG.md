@@ -1388,3 +1388,155 @@ The pieces ADR-0014 assumes are in the tree and tested:
   specified. That is a deliberate constraint and it is untested against a real registry.
 - **That the covert channel is as narrow as claimed.** The bound on a path suffix is a
   design intent, not a measurement.
+
+---
+
+## Phase 4 slice 7 — brokered egress, and three defects a real server found
+
+ADR-0014 implemented. `otwono-fetch` (the rules) and `otwono-fetchd` (the daemon) are in
+the tree, `net.fetch` is a registered action, `schemas/egress-source.schema.json` is the
+allow-list contract, and `docs/network/EGRESS.md` describes the subsystem.
+
+### Workspace
+
+```
+cargo test --workspace   541 passed, 0 failed   (471 before this slice)
+cargo clippy --workspace --all-targets -- -D warnings   clean
+cargo fmt --all --check                                 clean
+cargo build --workspace --release --target aarch64-unknown-linux-gnu   ok
+qemu-aarch64-static … otwono-fetchd --check    prints the allow-list, rc=0
+```
+
+70 new tests: 34 in `otwono-fetch`, 9 in `otwono-fetchd`, 21 over the control plane, 5
+schema contract tests, 1 in the action registry.
+
+### The design in one line
+
+A caller names a source and a path suffix. It never supplies a URL, so it cannot choose the
+scheme, host, port, query string or a header — the only bytes it contributes to what leaves
+this node are 256 bytes of a restricted alphabet, logged per fetch.
+
+### Measured before deciding: what `http::Uri` actually does
+
+The redirect check is the security boundary, so its parser's behaviour was measured rather
+than assumed. Seventeen hostile URLs through `http::Uri`, and the four results that shaped
+the code:
+
+| Input | Result |
+|---|---|
+| `https://evil.example.com@huggingface.co/a` | `host()` returns `huggingface.co` — userinfo is stripped, so a host comparison is already safe. Refused anyway. |
+| `https://HuggingFace.CO/a` | host preserved verbatim — a byte comparison would reject a legitimate redirect, so matching is ASCII-case-insensitive |
+| `https://huggingface.co/a/../../b` | **not normalised** — `..` arrives intact, so the path rules must run on redirect targets too, not only on caller input |
+| `https://huggingface.co/a%2f..%2fb` | `%2f` not decoded — so `%` is refused outright rather than decoded, because an encoded delimiter is a traversal only if something downstream decodes it |
+
+`file://` and a backslash in the authority are both rejected by the parser itself.
+
+The same crate parses the URL that goes on the wire, deliberately: validating with one
+parser and requesting with another means the two can disagree about what the host is, and
+that disagreement is the whole attack.
+
+### Defect 26: an unknown field in the allow-list was silently ignored
+
+The schema contract test caught it before anything shipped. `Source` had no
+`deny_unknown_fields`, so `max_byte = 10` — a plausible typo — parsed as a source with no
+cap rather than as an error, and the operator who wrote it had no way to tell. In the one
+file that decides where a node may send bytes, silent acceptance is the least affordable
+failure. Fixed with `deny_unknown_fields` on both the entry and the file, and the schema
+carries `additionalProperties: false` to match.
+
+The same test found the schema's host pattern accepting `10.0.0.5` while the loader refused
+it. A `not: {pattern: "^[0-9.]+$"}` clause makes the two agree.
+
+### Three defects that only a live server produced
+
+The state machine had 21 passing integration tests against a network double before any of
+this. All three of the following got through it.
+
+**Defect 27: the fetcher did not trust the system's certificates.** Pointed at a real host,
+it refused with `invalid peer certificate: UnknownIssuer`. `ureq` defaults to the Mozilla
+roots compiled into the binary, so `/etc/ssl/certs` — the store the rest of the OS uses, and
+the one `ca-certificates` populates in every recipe — was not what the fetcher consulted. A
+node could not have fetched from a mirror behind a private CA, and nothing in the image
+would have explained why. ADR-0014 asserted "`ca-certificates` is already in every recipe",
+which was true and irrelevant. Fixed with `ureq`'s `platform-verifier`: 31 crates against
+28, and `/etc/ssl/certs` is now load-bearing.
+
+**Defect 28: transparent decompression would have silently corrupted resumed downloads.**
+`gzip` is a default feature of `ureq`. A decompressed body is not the bytes the server's
+`Range` header addresses, so the second call of every resumed fetch would have asked for the
+wrong offset. Against a server that refuses the range it fails loudly; against one that
+accepts it, it assembles a corrupt file that only the caller's digest catches — after the
+whole transfer. Fixed by dropping the feature. We fetch opaque blobs; the caller hashes
+them.
+
+**Defect 29: a partial that could never be resumed made the caller loop forever.** With no
+`Content-Length` there is nothing to resume *to*. The first call filled its budget and
+returned `complete: false`; the second asked for a range the server refused; the partial was
+discarded; the third started over. Observed running six times with no progress. The fix is
+to refuse once, clearly: an object whose size the server will not state must fit one call,
+and the message says to retry with a larger `max_bytes`. Two regression tests, including one
+that the ordinary short-body case still completes.
+
+None of the three is exotic. All three needed a server that was not written by the same
+person as the client.
+
+### The live run
+
+```
+call 1: bytes_have 16384  bytes_total 40256  complete false
+call 2: bytes_have 32768  bytes_total 40256  complete false
+call 3: bytes_have 40256  bytes_total 40256  complete true   blob_path …/e9c3….blob
+
+curl:   5d33fd0c1128bc0266f96f36ced03c47  40256 bytes
+fetchd: 5d33fd0c1128bc0266f96f36ced03c47  40256 bytes
+IDENTICAL
+```
+
+Real `otwono-permd` issuing a real `net.fetch` token, real Unix sockets, real TLS to
+`pypi.org` with a 16 KiB per-call budget, three resumed `Range` requests, reassembled
+byte-for-byte. The refusal paths were exercised on the same running instance: a `..` segment
+(`-32602`), a token scoped to a different source (`-32000`), no token at all (`-32000`), a
+second fetch served from the spool without touching the network, and `fetch.discard`
+emptying it.
+
+TLS was reachable at all only because this environment's proxy tunnels allow-listed hosts,
+which is also how Defect 27 surfaced — the proxy's CA is in the system store and not in
+`ureq`'s bundled roots.
+
+One more real-world encounter, not a defect: PyPI redirects `/simple/six` to `/simple/six/`,
+and this daemon refuses to follow a redirect to a path ending in `/`. That is intended — it
+fetches objects, not listings — and it is now recorded in `EGRESS.md` as a limitation rather
+than discovered later.
+
+### The unit, checked but not booted
+
+`systemd-analyze verify` accepts `otwono-fetchd.service` as the stage writes it, complaining
+only that `otwono-permd.service` and `/usr/bin/otwono-fetchd` are absent on the build host.
+
+The syscall filter was checked against the target rootfs rather than assumed, because
+`@system-service` is exactly what caused Defect 22 for Landlock:
+
+```
+$ chroot out/amd64-qemu-ubuntu/rootfs systemd-analyze syscall-filter @network-io
+connect getpeername getsockname getsockopt recvfrom recvmsg sendmsg sendto
+setsockopt shutdown socket
+```
+
+`@network-io` is inside `@system-service`, and `getrandom` is in `@default`. Everything a
+TLS client needs is permitted, so this unit does not repeat that mistake.
+
+### What this does not prove
+
+- **Nothing has booted.** No image was built with `otwono-fetchd.service`, so the unit's
+  hardening — `IPAddressDeny`, `ReadWritePaths`, the syscall filter — has been read and
+  verified, never enforced. `EGRESS.md` says so in its status banner.
+- **`IPAddressDeny` has never blocked anything here.** It is a cgroup BPF program and this
+  container is not where that gets tested.
+- **Nothing large has been fetched.** 40 KB in three calls, not 4 GB in sixty-four. The
+  arithmetic is the same; the failure modes of an hour-long transfer are not.
+- **`ai.models.pull` still does not exist.** This slice built the thing it was blocked on.
+  Wiring `otwono-aid` to call `fetch.get` and hand the spool path to `ai.models.install` is
+  the next slice, and it is deliberately not in this one.
+- **No proxy configuration ships.** TLS was exercised through this environment's proxy via
+  `ureq`'s reading of the standard environment variables. No node sets them, and nothing
+  here manages them.

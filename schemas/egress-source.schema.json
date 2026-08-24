@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://otwono.org/schemas/egress-source-1.0.0.json",
+  "title": "OTWONO Egress Source",
+  "description": "One place this node is permitted to fetch from. Sources live in /etc/otwono/fetch.d/*.toml and are the whole of what otwono-fetchd will contact: a caller names a source and a path suffix under its prefix, never a URL, so the host, scheme, port and query string are the operator's decision rather than the caller's. Adding a source is a policy.write and confirms; see ADR-0014. This document describes the TOML file as parsed, expressed as JSON.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "source": {
+      "type": "array",
+      "description": "Zero or more sources. An empty or absent list permits nothing, which is the shipped default.",
+      "items": {
+        "$ref": "#/$defs/source"
+      }
+    }
+  },
+  "$defs": {
+    "source": {
+      "type": "object",
+      "required": [
+        "id",
+        "host",
+        "path_prefix",
+        "max_bytes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
+          "description": "Stable name a caller uses in fetch.get, and the resource a net.fetch capability token is bound to — so policy can grant one source and not another."
+        },
+        "host": {
+          "type": "string",
+          "maxLength": 253,
+          "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$",
+          "description": "Fully qualified DNS name, lowercase. Never an IP literal (the `not` clause refuses a dotted-quad): the allow-list exists to be read by a person deciding whether to approve it, and a name is also what TLS verifies against. Lowercase is required so the file reads the way the code compares it — matching itself is case-insensitive.",
+          "not": {
+            "pattern": "^[0-9.]+$"
+          }
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "default": 443,
+          "description": "Omit for 443. The scheme is always https and is deliberately not configurable, so no file can turn a source into cleartext."
+        },
+        "path_prefix": {
+          "type": "string",
+          "pattern": "^/([A-Za-z0-9._~-]+/)*$",
+          "description": "Absolute, slash-terminated. Every request is composed as this prefix followed by the caller's suffix. The trailing slash is required: without it a suffix could extend the last segment, so a prefix of /otwono/model would also reach /otwono/models-elsewhere."
+        },
+        "max_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Hard cap on one object fetched from this source. Checked against the size the server states before any transfer begins, and again as bytes arrive."
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "source": [
+        {
+          "id": "models",
+          "host": "models.example.org",
+          "path_prefix": "/otwono/models/",
+          "max_bytes": 21474836480
+        }
+      ]
+    }
+  ]
+}

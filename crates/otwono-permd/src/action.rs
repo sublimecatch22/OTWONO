@@ -149,6 +149,20 @@ impl ActionRegistry {
                     true,
                 ),
                 ActionSpec::new("net.egress", "Send data off this node", BlastRadius::Egress, true),
+                // Narrower than net.egress, and separate for the same reason id.sign_session
+                // is separate from id.sign: policy should be able to grant a node the
+                // ability to fetch from sources an operator approved without granting a
+                // general egress oracle. Egress blast radius, because bytes do leave — the
+                // request path is a bounded covert channel and ADR-0014 says so. Not
+                // always_confirm: the confirmation happened when the source was added to
+                // the allow-list, which is a policy.write, and requiring one per call would
+                // make unattended update downloads impossible on a headless node.
+                ActionSpec::new(
+                    "net.fetch",
+                    "Fetch an object from a source on the egress allow-list",
+                    BlastRadius::Egress,
+                    false,
+                ),
                 ActionSpec::new(
                     "pkg.install",
                     "Install or remove software",
@@ -188,6 +202,23 @@ mod tests {
             assert!(!spec.always_confirm, "{id} runs unattended");
             assert_eq!(spec.blast_radius, BlastRadius::Reversible);
         }
+    }
+
+    #[test]
+    fn fetching_is_a_narrower_action_than_general_egress() {
+        // Both send bytes off the node, so both carry Egress blast radius. The difference
+        // is that a fetch goes somewhere an operator already approved, so it does not stop
+        // for a human it may not have (ADR-0014).
+        let r = ActionRegistry::builtin();
+        let egress = r.get("net.egress").expect("net.egress must be registered");
+        let fetch = r.get("net.fetch").expect("net.fetch must be registered");
+        assert_eq!(egress.blast_radius, BlastRadius::Egress);
+        assert_eq!(fetch.blast_radius, BlastRadius::Egress);
+        assert!(egress.always_confirm);
+        assert!(
+            !fetch.always_confirm,
+            "an unattended node has no one to confirm to"
+        );
     }
 
     #[test]

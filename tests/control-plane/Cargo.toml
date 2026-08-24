@@ -16,6 +16,8 @@ otwono-netd = { path = "../../crates/otwono-netd" }
 otwono-net = { path = "../../crates/otwono-net" }
 otwono-identity = { path = "../../crates/otwono-identity" }
 otwono-aid = { path = "../../crates/otwono-aid" }
+otwono-fetch = { path = "../../crates/otwono-fetch" }
+otwono-fetchd = { path = "../../crates/otwono-fetchd" }
 otwono-ai = { path = "../../crates/otwono-ai", features = ["testing"] }
 otwono-hal = { path = "../../crates/otwono-hal" }
 otwono-capability = { path = "../../crates/otwono-capability", features = ["testing"] }

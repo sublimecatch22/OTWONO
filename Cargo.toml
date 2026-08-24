@@ -9,6 +9,8 @@ members = [
     "crates/otwono-aictl",
     "crates/otwono-identity",
     "crates/otwono-net",
+    "crates/otwono-fetch",
+    "crates/otwono-fetchd",
     "crates/otwono-netd",
     "crates/otwono-proto",
     "crates/otwono-permd",
@@ -37,6 +39,8 @@ otwono-ai = { path = "crates/otwono-ai" }
 otwono-llama = { path = "crates/otwono-llama" }
 otwono-identity = { path = "crates/otwono-identity" }
 otwono-net = { path = "crates/otwono-net" }
+otwono-fetch = { path = "crates/otwono-fetch" }
+otwono-fetchd = { path = "crates/otwono-fetchd" }
 otwono-proto = { path = "crates/otwono-proto" }
 otwono-permd = { path = "crates/otwono-permd" }
 otwono-idd = { path = "crates/otwono-idd" }

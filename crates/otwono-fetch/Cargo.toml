@@ -1,0 +1,23 @@
+[package]
+name = "otwono-fetch"
+description = "OTWONO egress contracts: the source allow-list, URL composition, and redirect admission."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
+# The same URI parser the HTTP client uses. Deliberate: if this crate validated a URL with
+# one parser and the client requested it with another, the two could disagree about what
+# the host is, and that difference is the whole attack. `http` is types only — no I/O, no
+# runtime — so it does not compromise this crate's "pure" property (ADR-0014).
+http = "1"
+serde_json = { workspace = true }
+# The hash the audit log and the model store already use. One hash function in the system,
+# not three (CLAUDE.md Section 2.3).
+blake3 = "1"
+# statvfs, so a fetch can refuse before it fills an SBC's eMMC rather than after.
+rustix = { version = "0.38", features = ["fs"] }
