@@ -34,3 +34,5 @@ Rules:
 | 0017 | The ONM content-fetch protocol: ranged, object-scoped, verified per chunk | accepted |
 | 0018 | Large content moves as files handed to the caller's uid, not as bytes on the control plane | accepted |
 | 0019 | `SHARED` objects: encrypt before chunking, wrap per recipient, sharing key in `otwono-idd` | accepted |
+| 0020 | A recipient discovers what was shared with it, by asking, and learns nothing else | accepted |
+| 0021 | Signed transfer receipts: the receiver counts, and says so under its own key | accepted |
