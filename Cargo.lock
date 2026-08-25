@@ -1260,6 +1260,7 @@ name = "otwono-stored"
 version = "0.1.0"
 dependencies = [
  "data-encoding",
+ "otwono-identity",
  "otwono-proto",
  "otwono-store",
  "serde",

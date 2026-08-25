@@ -725,8 +725,12 @@ cat > "$ROOTFS/etc/systemd/system/otwono-stored.service" <<'UNIT'
 [Unit]
 Description=OTWONO content store daemon
 Documentation=file:/usr/share/doc/otwono/DATA-VISIBILITY.md
-After=otwono-permd.service otwono-hwd.service systemd-tmpfiles-setup.service
+After=otwono-permd.service otwono-hwd.service otwono-idd.service systemd-tmpfiles-setup.service
 Requires=otwono-permd.service
+# Only store.open_shared talks to otwono-idd (ADR-0019). Wants, not Requires: a node whose
+# identity daemon is down should still store and read its own objects, and say plainly that
+# it cannot open what was shared with it.
+Wants=otwono-idd.service
 # The neighbourhood cache's size comes from the capability profile and nowhere else
 # (CLAUDE.md §2.6), so this daemon asks otwono-hwd for it at startup. Wants, not Requires:
 # a node whose hardware daemon is down runs without a cache rather than not running.
@@ -735,7 +739,7 @@ RequiresMountsFor=/var/lib/otwono
 
 [Service]
 Type=exec
-ExecStart=/usr/bin/otwono-stored --socket /run/otwono/store.sock --perm-socket /run/otwono/perm.sock --store-dir /var/lib/otwono/store --key /var/lib/otwono/storage.key --cache-dir /var/lib/otwono/cache --export-dir /var/lib/otwono/export
+ExecStart=/usr/bin/otwono-stored --socket /run/otwono/store.sock --perm-socket /run/otwono/perm.sock --id-socket /run/otwono/id.sock --store-dir /var/lib/otwono/store --key /var/lib/otwono/storage.key --cache-dir /var/lib/otwono/cache --export-dir /var/lib/otwono/export
 Restart=on-failure
 RestartSec=2
 

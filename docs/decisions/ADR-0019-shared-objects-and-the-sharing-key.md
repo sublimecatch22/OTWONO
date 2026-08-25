@@ -6,14 +6,16 @@
   (`seal_to`/`open_with`), and §3's third key — generated at startup by `otwono-idd`,
   vouched for under its own signing domain, recorded in `node.key`, published in `node.pub`
   and by the open `id.sharing_binding` method.
-  `id.unwrap_shared` exists behind its own capability, which no shipped policy grants
-  because nothing calls it yet.
+  `id.unwrap_shared` exists behind its own capability. No shipped policy grants it, or
+  `store.share`, because nothing on a booted node calls either yet.
   §1 is implemented in `otwono-store`: `put_shared_reader` seals then chunks, the object
-  record carries a `sharing` envelope, and the schema describes it.
-- **SPECIFIED, no code:** §4 (authorized serving and the confirmation for `SHARED` egress)
-  and §5 (adding and removing recipients). `otwono-stored` exposes no way to create a
-  `SHARED` object at all, so nothing can be served and `SHARED` still fails closed
-  everywhere, exactly as described under Context.
+  record carries a `sharing` envelope, and the schema describes it. `otwono-stored` exposes
+  `store.share`, `store.share_file` and `store.open_shared`, the last of which asks
+  `otwono-idd` to unwrap on the caller's own capability.
+- **SPECIFIED, no code:** §4's authorized serving, and §5 (adding and removing recipients).
+  `store.serve` still refuses `Shared` with the same words it refuses an absent object, so
+  a `SHARED` object can be created and read by its recipients on the node that holds it and
+  **has still never crossed a link**.
 
 ## Context
 
@@ -107,6 +109,17 @@ who it shares with.
 Egress of `SHARED` requires confirmation at `otwono-permd`, per `DATA-VISIBILITY.md` §4.
 That is a separate capability from `store.serve`, because serving public content unattended
 and serving shared content are different decisions.
+
+**Amended when §1–§3 were implemented.** Creating a shared object — `store.share` — is *not*
+confirmed, and the reasoning is worth stating because it looks like a weakening. §8's
+confirmation rule is about **promotion**: making data that already exists more visible.
+`store.demote` refuses widening and routes it to `label.promote`, which does confirm.
+`store.share` creates a new object out of bytes the caller already holds, and it is strictly
+narrower than `store.put` with `visibility: "public"` — which needs only `store.write` and
+no confirmation at all. Requiring a person for the encrypted, recipient-limited call while
+the plaintext-to-everyone call goes through unattended would make the safer option the
+harder one, which is how a system teaches people to use the unsafe one. A registry test
+asserts the two cannot invert. The confirmation this section asks for stays on egress.
 
 ### 5. Removing a recipient does not un-share
 

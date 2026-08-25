@@ -182,6 +182,25 @@ impl ActionRegistry {
                 // always_confirm: the confirmation happened when the source was added to
                 // the allow-list, which is a policy.write, and requiring one per call would
                 // make unattended update downloads impossible on a headless node.
+                // Egress blast radius: nothing moves here, but after this call the object
+                // is permitted to reach the peers named and nothing further will be asked.
+                //
+                // Not always_confirm, which is the uncomfortable half of this decision. §8's
+                // rule is about *promotion* — making existing data more visible — and
+                // store.demote already refuses widening and routes it to label.promote.
+                // This creates a new object out of bytes the caller already holds, and it
+                // is strictly narrower than store.put with visibility "public", which needs
+                // only store.write and no confirmation. Requiring a person for the
+                // encrypted, recipient-limited call while the plaintext-to-everyone call
+                // goes through unattended would make the safer option the harder one, which
+                // is how a system teaches people to use the unsafe one. Confirmation for
+                // SHARED stays where ADR-0019 §4 puts it: on egress.
+                ActionSpec::new(
+                    "store.share",
+                    "Encrypt an object to named recipients, allowing it to reach them",
+                    BlastRadius::Egress,
+                    false,
+                ),
                 ActionSpec::new(
                     "store.read",
                     "Read an object from the content store, whatever its label",
@@ -341,6 +360,25 @@ mod tests {
             let spec = r.get(id).unwrap_or_else(|| panic!("{id} must be registered"));
             assert!(spec.always_confirm, "{id} must always require confirmation");
         }
+    }
+
+    #[test]
+    fn sharing_is_never_harder_to_reach_than_publishing_the_same_bytes() {
+        // If this inverts, the system teaches people to publish rather than share: the
+        // encrypted, recipient-limited call would stop for a person while the
+        // plaintext-to-everyone one does not.
+        let r = ActionRegistry::builtin();
+        let share = r.get("store.share").expect("store.share must be registered");
+        let put = r.get("store.write").expect("store.write must be registered");
+        assert!(
+            !(share.always_confirm && !put.always_confirm),
+            "store.share must not demand confirmation that store.write does not"
+        );
+        assert_eq!(
+            share.blast_radius,
+            BlastRadius::Egress,
+            "after this call the object may reach the peers named, with nothing else asked"
+        );
     }
 
     #[test]

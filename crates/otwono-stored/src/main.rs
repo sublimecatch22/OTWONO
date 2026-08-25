@@ -21,6 +21,7 @@ USAGE:
 OPTIONS:
     --socket <PATH>        Control-plane socket (default $OTWONO_SOCKET_DIR/store.sock)
     --perm-socket <PATH>   Permission broker socket (default $OTWONO_SOCKET_DIR/perm.sock)
+    --id-socket <PATH>     Identity daemon socket (default $OTWONO_SOCKET_DIR/id.sock)
     --store-dir <PATH>     Where objects and chunks live (default /var/lib/otwono/store)
     --key <PATH>           Storage key, generated on first use (default /var/lib/otwono/storage.key)
     --cache-dir <PATH>     Neighbourhood cache (default /var/lib/otwono/cache)
@@ -84,6 +85,7 @@ enum Error {
 fn run(args: &[String]) -> Result<String, Error> {
     let mut socket: Option<PathBuf> = None;
     let mut perm_socket: Option<PathBuf> = None;
+    let mut id_socket: Option<PathBuf> = None;
     let mut store_dir = PathBuf::from(DEFAULT_STORE_DIR);
     let mut key_path = PathBuf::from(DEFAULT_KEY_PATH);
     let mut cache_dir = PathBuf::from(DEFAULT_CACHE_DIR);
@@ -96,6 +98,7 @@ fn run(args: &[String]) -> Result<String, Error> {
         match arg.as_str() {
             "--socket" => socket = Some(next_path(&mut it, "--socket")?),
             "--perm-socket" => perm_socket = Some(next_path(&mut it, "--perm-socket")?),
+            "--id-socket" => id_socket = Some(next_path(&mut it, "--id-socket")?),
             "--store-dir" => store_dir = next_path(&mut it, "--store-dir")?,
             "--key" => key_path = next_path(&mut it, "--key")?,
             "--cache-dir" => cache_dir = next_path(&mut it, "--cache-dir")?,
@@ -139,6 +142,7 @@ fn run(args: &[String]) -> Result<String, Error> {
 
     let socket = socket.unwrap_or_else(|| otwono_proto::socket_path("store"));
     let perm_socket = perm_socket.unwrap_or_else(|| otwono_proto::socket_path("perm"));
+    let id_socket = id_socket.unwrap_or_else(|| otwono_proto::socket_path("id"));
     let server = Server::bind(&socket)
         .map_err(|e| Error::Startup(format!("cannot bind {}: {e}", socket.display())))?;
     eprintln!(
@@ -171,7 +175,9 @@ fn run(args: &[String]) -> Result<String, Error> {
         EXPORT_MAX_AGE,
     );
 
-    let mut service = StoreService::new(store, perm_socket.clone()).with_handoff(handoff);
+    let mut service = StoreService::new(store, perm_socket.clone())
+        .with_handoff(handoff)
+        .with_identity(id_socket);
     if want_cache {
         // The budget is the capability policy engine's decision and nobody else's
         // (CLAUDE.md §2.6). An override is an operator saying so on purpose; absent one,

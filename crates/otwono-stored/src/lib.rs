@@ -31,8 +31,9 @@
 use otwono_proto::{
     unknown_method, CallContext, Client, MethodDescription, RpcError, Service, ServiceDescription,
 };
+use otwono_store::cas::Recipient;
 use otwono_store::{
-    Cache, CacheError, ContentId, Handoff, HandoffError, Object, Store, StoreError, Visibility,
+    Cache, CacheError, ContentId, ContentKey, Handoff, HandoffError, Object, Store, StoreError, Visibility,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -44,6 +45,15 @@ pub const DESCRIBE_SCHEMA_VERSION: &str = "1.0.0";
 pub const CAPABILITY_READ: &str = "store.read";
 pub const CAPABILITY_WRITE: &str = "store.write";
 pub const CAPABILITY_SERVE: &str = "store.serve";
+pub const CAPABILITY_SHARE: &str = "store.share";
+/// The capability `otwono-idd` requires to unwrap a content key, named here because
+/// `store.open_shared` is guarded by the *same* one and forwards the caller's token.
+///
+/// A capability token names one action, so this cannot be a different capability that the
+/// daemon then trades for an unwrap: doing that would mean anyone with `store.read` could
+/// open every object shared with this node, which is precisely the split ADR-0019 §3 makes.
+/// A test asserts this string still matches the daemon that checks it.
+pub const CAPABILITY_UNWRAP: &str = "id.unwrap_shared";
 /// The neighbourhood cache's own pair, deliberately not `store.read`/`store.write`:
 /// `otwono-netd` must be able to add what it fetched to the shared cache without being able
 /// to write the user's own store (ADR-0015).
@@ -90,6 +100,10 @@ pub struct StoreService {
     /// configured — and then every cache method answers "not available" rather than
     /// pretending to have cached something.
     cache: Option<Cache>,
+    /// Where `otwono-idd` listens, so a content key sealed to this node can be unwrapped
+    /// without this daemon ever holding the sharing key (ADR-0019 §3). `None` on a daemon
+    /// started without one, and then `store.open_shared` says so.
+    id_socket: Option<PathBuf>,
     perm_socket: PathBuf,
 }
 
@@ -183,6 +197,34 @@ struct ImportParams {
     derived_from: Vec<String>,
 }
 
+/// Store bytes encrypted to a set of named recipients (ADR-0019).
+///
+/// Recipients arrive as **signed bindings**, not bare keys. A bare X25519 key says nothing
+/// about whose it is, and this daemon has no way to find out — so it verifies each binding
+/// itself and seals to what the signature vouches for. Whoever calls is responsible for
+/// having obtained the bindings; this daemon needs no network access to check them.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShareParams {
+    /// Base64, subject to [`MAX_INLINE_BYTES`] like `store.put`.
+    data: String,
+    recipients: Vec<otwono_identity::SharingBinding>,
+}
+
+/// The same, from a file the caller owns, for objects past the inline cap.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShareFileParams {
+    path: String,
+    recipients: Vec<otwono_identity::SharingBinding>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenSharedParams {
+    content_id: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct ServeParams {
     content_id: String,
@@ -211,8 +253,28 @@ impl StoreService {
             store,
             handoff: None,
             cache: None,
+            id_socket: None,
             perm_socket,
         }
+    }
+
+    /// Tell this daemon where the identity daemon is, so it can unwrap what was shared
+    /// with this node (ADR-0019 §3).
+    ///
+    /// Optional, like the export directory: a node that has never been shared with does not
+    /// need it, and a daemon started without it says so rather than pretending.
+    pub fn with_identity(mut self, id_socket: PathBuf) -> Self {
+        self.id_socket = Some(id_socket);
+        self
+    }
+
+    fn id_socket(&self) -> Result<&PathBuf, RpcError> {
+        self.id_socket.as_ref().ok_or_else(|| {
+            RpcError::unavailable(
+                "this daemon was started without an identity socket, so it cannot ask for a \
+                 content key to be unwrapped",
+            )
+        })
     }
 
     /// Give this daemon somewhere to hand large objects over.
@@ -315,6 +377,157 @@ impl StoreService {
         // gets Private and needs to know rather than assume.
         out["requested_visibility"] = json!(p.visibility.as_str());
         out["derived_from"] = json!(p.derived_from);
+        Ok(out)
+    }
+
+    /// Turn signed bindings into recipients, refusing anything that does not check out.
+    ///
+    /// Every failure is the caller's: they handed over a binding that does not verify, or
+    /// two bindings for one node. Sealing to an unverified key would mean sealing to
+    /// whoever claimed to be the recipient, which is the one mistake this whole mechanism
+    /// exists to prevent.
+    fn recipients(bindings: &[otwono_identity::SharingBinding]) -> Result<Vec<Recipient>, RpcError> {
+        if bindings.is_empty() {
+            return Err(RpcError::invalid_params(
+                "no recipients; an object nobody can open is not a shared object",
+            ));
+        }
+        let mut out = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            let key = binding.verify().map_err(|e| {
+                RpcError::invalid_params(format!(
+                    "the binding for {} does not check out ({e}), so there is no key it is \
+                     safe to seal to",
+                    binding.node_id.to_text()
+                ))
+            })?;
+            let node_id = binding.node_id.to_text();
+            if out.iter().any(|r: &Recipient| r.node_id == node_id) {
+                return Err(RpcError::invalid_params(format!(
+                    "{node_id} appears twice, and there is no way to tell which key is meant"
+                )));
+            }
+            out.push(Recipient {
+                node_id,
+                sharing_public_key: key,
+            });
+        }
+        Ok(out)
+    }
+
+    fn handle_share(&self, params: Value) -> Result<Value, RpcError> {
+        let p: ShareParams = serde_json::from_value(params)
+            .map_err(|e| RpcError::invalid_params(format!("store.share: {e}")))?;
+        let bytes = data_encoding::BASE64
+            .decode(p.data.as_bytes())
+            .map_err(|e| RpcError::invalid_params(format!("data must be base64: {e}")))?;
+        if bytes.len() > MAX_INLINE_BYTES {
+            return Err(RpcError::invalid_params(format!(
+                "{} bytes is over the {MAX_INLINE_BYTES}-byte inline cap; use store.share_file",
+                bytes.len()
+            )));
+        }
+        let recipients = Self::recipients(&p.recipients)?;
+        let (object, _) = self
+            .store
+            .put_shared_reader(bytes.as_slice(), &recipients)
+            .map_err(rpc)?;
+        Ok(record(&object))
+    }
+
+    fn handle_share_file(&self, ctx: &CallContext, params: Value) -> Result<Value, RpcError> {
+        let p: ShareFileParams = serde_json::from_value(params)
+            .map_err(|e| RpcError::invalid_params(format!("store.share_file: {e}")))?;
+        // Checked on the descriptor before the recipients are, so a caller naming a file
+        // that is not theirs learns nothing about whether their bindings were good.
+        let mut file =
+            Handoff::open_owned(std::path::Path::new(&p.path), ctx.peer.uid).map_err(handoff_rpc)?;
+        let recipients = Self::recipients(&p.recipients)?;
+        let (object, _) = self
+            .store
+            .put_shared_reader(&mut file, &recipients)
+            .map_err(rpc)?;
+        let mut out = record(&object);
+        out["imported_from"] = json!(p.path);
+        Ok(out)
+    }
+
+    /// Open an object that was shared *with* this node.
+    ///
+    /// The content key is unwrapped by `otwono-idd`, which holds the sharing key; it comes
+    /// back here, where the storage key already is, so no new trust boundary is crossed
+    /// (ADR-0019 §3). This daemon never sees the sharing secret and `otwono-netd` is not in
+    /// the path at all.
+    fn handle_open_shared(&self, ctx: &CallContext, params: Value) -> Result<Value, RpcError> {
+        let p: OpenSharedParams = serde_json::from_value(params)
+            .map_err(|e| RpcError::invalid_params(format!("store.open_shared: {e}")))?;
+        let object = self
+            .store
+            .get_object(&Self::parse_id(&p.content_id)?)
+            .map_err(rpc)?;
+        let sharing = object.sharing.as_ref().ok_or_else(|| {
+            RpcError::invalid_params(format!(
+                "{} is not a sealed object; store.get reads it",
+                object.content_id.to_hex()
+            ))
+        })?;
+        if sharing.plaintext_size_bytes > MAX_INLINE_BYTES as u64 {
+            return Err(RpcError::invalid_params(format!(
+                "{} bytes of plaintext is over the {MAX_INLINE_BYTES}-byte inline cap",
+                sharing.plaintext_size_bytes
+            )));
+        }
+
+        let mut idd = Client::connect(self.id_socket()?).map_err(|e| {
+            RpcError::unavailable(format!(
+                "cannot reach the identity daemon at {}: {e}",
+                self.id_socket().expect("checked above").display()
+            ))
+        })?;
+        let me = idd
+            .call("id.fingerprint", json!({}))
+            .map_err(|e| RpcError::unavailable(format!("id.fingerprint failed: {e}")))?
+            .map_err(|e| RpcError::unavailable(format!("id.fingerprint refused: {}", e.message)))?
+            .get("node_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| RpcError::internal("id.fingerprint did not name this node"))?;
+
+        let copy = sharing.copy_for(&me).ok_or_else(|| {
+            RpcError::invalid_params(format!(
+                "{} was not shared with this node, so there is no copy of its key here",
+                object.content_id.to_hex()
+            ))
+        })?;
+
+        // The caller's own token is forwarded: unwrapping happens on their authority, not
+        // on this daemon's, so a caller without id.unwrap_shared cannot borrow one by
+        // asking the store instead.
+        let token = ctx.capability.as_deref().ok_or_else(|| {
+            RpcError::unauthorized(format!("store.open_shared requires a {CAPABILITY_UNWRAP} token"))
+        })?;
+        let unwrapped = idd
+            .call_with_capability("id.unwrap_shared", json!({ "sealed_key": copy }), token)
+            .map_err(|e| RpcError::unavailable(format!("id.unwrap_shared failed: {e}")))?
+            .map_err(|e| RpcError::unauthorized(format!("id.unwrap_shared refused: {}", e.message)))?;
+        let key_bytes: [u8; 32] = data_encoding::BASE64
+            .decode(
+                unwrapped
+                    .get("content_key")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| RpcError::internal("id.unwrap_shared returned no key"))?
+                    .as_bytes(),
+            )
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| RpcError::internal("id.unwrap_shared returned something else"))?;
+
+        let mut plaintext = Vec::with_capacity(sharing.plaintext_size_bytes as usize);
+        self.store
+            .open_shared(&object, &ContentKey::from_bytes(key_bytes), &mut plaintext)
+            .map_err(rpc)?;
+        let mut out = record(&object);
+        out["data"] = json!(data_encoding::BASE64.encode(&plaintext));
         Ok(out)
     }
 
@@ -754,14 +967,27 @@ fn not_available(id: &ContentId) -> RpcError {
 }
 
 fn record(o: &Object) -> Value {
-    json!({
+    let mut out = json!({
         "schema_version": DESCRIBE_SCHEMA_VERSION,
         "content_id": o.content_id.to_hex(),
         "size_bytes": o.size_bytes,
         "chunks": o.chunks.len(),
         "visibility": o.visibility.as_str(),
         "chunking": o.chunking,
-    })
+    });
+    // The envelope, when there is one. Its recipient list is what a caller needs to see to
+    // know who can open this — including to notice that it is not what they expected. The
+    // sealed copies go with it: they are useless without a sharing secret, and a recipient
+    // on another node needs its own copy to hand back for unwrapping.
+    if let Some(sharing) = &o.sharing {
+        out["sharing"] = json!({
+            "encryption": sharing.encryption,
+            "plaintext_size_bytes": sharing.plaintext_size_bytes,
+            "authorized": sharing.authorized_nodes(),
+            "sealed_keys": sharing.sealed_keys,
+        });
+    }
+    out
 }
 
 fn rpc(e: StoreError) -> RpcError {
@@ -799,6 +1025,21 @@ impl Service for StoreService {
                     "store.stat",
                     "Describe an object without returning its bytes",
                     CAPABILITY_READ,
+                ),
+                MethodDescription::guarded(
+                    "store.share",
+                    "Encrypt bytes to named recipients and store the result (ADR-0019)",
+                    CAPABILITY_SHARE,
+                ),
+                MethodDescription::guarded(
+                    "store.share_file",
+                    "The same, from a file the caller owns, for objects past the inline cap",
+                    CAPABILITY_SHARE,
+                ),
+                MethodDescription::guarded(
+                    "store.open_shared",
+                    "Open an object shared with this node, asking otwono-idd for the key",
+                    CAPABILITY_UNWRAP,
                 ),
                 MethodDescription::guarded(
                     "store.demote",
@@ -904,6 +1145,22 @@ impl Service for StoreService {
             "cache.pin" => {
                 self.authorize(ctx, CAPABILITY_CACHE_WRITE)?;
                 self.handle_cache_pin(params)
+            }
+            "store.share" => {
+                self.authorize(ctx, CAPABILITY_SHARE)?;
+                self.handle_share(params)
+            }
+            "store.share_file" => {
+                self.authorize(ctx, CAPABILITY_SHARE)?;
+                self.handle_share_file(ctx, params)
+            }
+            // Guarded by the unwrap capability rather than store.read, because that is the
+            // decision being made: opening what somebody shared with this node is the
+            // unwrap. The same token is forwarded to otwono-idd, so a caller who can read
+            // the store cannot open a shared object by asking the store instead.
+            "store.open_shared" => {
+                self.authorize(ctx, CAPABILITY_UNWRAP)?;
+                self.handle_open_shared(ctx, params)
             }
             "store.export" => {
                 self.authorize(ctx, CAPABILITY_READ)?;
