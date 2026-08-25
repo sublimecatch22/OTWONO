@@ -1,9 +1,13 @@
 # Wallet
 
-**Status:** the key material is `IMPLEMENTED` — `crates/otwono-wallet`, unit tested, not yet
-driven by a daemon and not booted. `otwono-walletd`, the control-plane surface, and signing
-are `SPECIFIED` only. Decided in **ADR-0022**; the finance surface it belongs to is
-`docs/services/FINANCE.md` §2a, and the desktop placement is `docs/services/DESKTOP.md` §4.
+**Status:** `IMPLEMENTED`, not booted. `crates/otwono-wallet` (keys) and
+`crates/otwono-walletd` (the daemon) both exist and are tested — the daemon against a real
+`otwono-permd` over real sockets. There is no systemd unit, nothing in any image, and no run
+on a booted node. Signing is `SPECIFIED` only.
+
+Decided in **ADR-0022** (keys, curve, daemon, capabilities) and **ADR-0023** (how the
+passphrase reaches it, and what it holds). The finance surface it belongs to is
+`docs/services/FINANCE.md` §2a; the desktop placement is `docs/services/DESKTOP.md` §4.
 
 ---
 
@@ -19,8 +23,27 @@ testable without a control plane and without root (CLAUDE.md §2.4).
 | BIP-44 paths `m/44'/coin'/account'/change/index` | IMPLEMENTED |
 | Passphrase-encrypted seed vault (Argon2id + XChaCha20-Poly1305) | IMPLEMENTED |
 | Address *encoding* | **not built, deliberately** — see §4 |
-| `otwono-walletd`, `wallet.read`, `wallet.sign`, `wallet.export_seed` | SPECIFIED (ADR-0022 §2, §3) |
-| Signing | SPECIFIED, and unusable until Phase 7 **by construction** — see §5 |
+| `otwono-walletd`: `wallet.status`, `wallet.public_keys`, `wallet.create`, `wallet.export_seed` | IMPLEMENTED, 11 integration tests against a real broker |
+| The four capabilities in `otwono-permd`'s registry | IMPLEMENTED |
+| A systemd unit, and a place in any image | **not built** |
+| Signing | SPECIFIED, and unreachable until Phase 7 **by construction** — see §5 |
+
+### What the daemon can actually do today
+
+On a booted node: **read, and nothing else.** `wallet.create`, `wallet.sign` and
+`wallet.export_seed` are `always_confirm`, `policy.rs` turns `Allow` into `Ask` for those,
+and no confirmation channel exists — so `otwono-permd` will not issue a token for any of
+them. A policy saying `wallet.* = allow`, which is what an operator would actually write,
+still gets `ask` on all three and `allow` on `wallet.read`. That is tested at three levels:
+the registry, the policy evaluation, and end to end through the broker.
+
+The consequence for anyone building on this: **a wallet cannot be created through the daemon
+yet.** Tests plant a vault directly through `crates/otwono-wallet`, which is also the shape a
+console-side creation flow will take when there is one.
+
+`wallet.sign` is deliberately not implemented at all rather than implemented-and-refusing:
+nothing can be signed until a chain is chosen (§4), and a method that existed but always said
+no would be a worse answer than one that is honestly absent.
 
 ## 2. Why the wallet key is not the node key
 
@@ -129,7 +152,8 @@ most likely to soften:
 
 Not built:
 
-- `otwono-walletd`, its unit, its socket, and every control-plane method.
+- A systemd unit for `otwono-walletd`, and any place for it in a built image. It has never
+  run on a booted node.
 - Signing, and therefore any transaction.
 - Address encoding (§4), balances, history, and anything that talks to a chain.
 - The encrypted identity backup ADR-0022's consequences say a wallet forces

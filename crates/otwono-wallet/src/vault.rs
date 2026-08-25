@@ -227,10 +227,24 @@ impl Vault {
             .map_err(|e| VaultError::Io(format!("{}: {e}", self.path.display())))
     }
 
-    /// Read and decrypt the seed.
-    pub fn open(&self, passphrase: &str) -> Result<Zeroizing<[u8; SEED_BYTES]>, VaultError> {
+    /// What the vault says about itself, without decrypting anything.
+    ///
+    /// Everything here is already visible to whoever can read the file, so returning it
+    /// costs nothing that holding the file does not already cost. It exists so a status
+    /// call can answer "is there a wallet, and what is it" without asking for a passphrase
+    /// — which under ADR-0023 §2 is the only thing that *can* be answered without one, since
+    /// no public key is stored in the clear.
+    ///
+    /// The permission check still applies: this is the file's metadata, not a licence to
+    /// read the file.
+    pub fn describe(&self) -> Result<VaultFile, VaultError> {
         let text = std::fs::read_to_string(&self.path)
             .map_err(|e| VaultError::Io(format!("{}: {e}", self.path.display())))?;
+        self.check_permissions()?;
+        serde_json::from_str(&text).map_err(|e| VaultError::Malformed(e.to_string()))
+    }
+
+    fn check_permissions(&self) -> Result<(), VaultError> {
         let mode = std::fs::metadata(&self.path)
             .map_err(|e| VaultError::Io(format!("{}: {e}", self.path.display())))?
             .permissions()
@@ -242,6 +256,14 @@ impl Vault {
                 mode,
             });
         }
+        Ok(())
+    }
+
+    /// Read and decrypt the seed.
+    pub fn open(&self, passphrase: &str) -> Result<Zeroizing<[u8; SEED_BYTES]>, VaultError> {
+        let text = std::fs::read_to_string(&self.path)
+            .map_err(|e| VaultError::Io(format!("{}: {e}", self.path.display())))?;
+        self.check_permissions()?;
 
         let file: VaultFile =
             serde_json::from_str(&text).map_err(|e| VaultError::Malformed(e.to_string()))?;
