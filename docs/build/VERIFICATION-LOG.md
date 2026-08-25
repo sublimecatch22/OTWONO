@@ -3904,3 +3904,98 @@ approved a different subject's.
 
 Recorded here rather than by editing the entry above, because a log that quietly acquires the
 right answer is not a log.
+
+
+---
+
+## A confirmation completes on a booted node, and the channel gets a client
+
+**STATUS: VERIFIED on a booted node.** `out/amd64-qemu-ubuntu/boot.log`:
+
+```
+OTWONO-CONTROL-PLANE-OK tier=T0_MICRO audit_records=12 wallet_ns=isolated wallet_status=no-wallet confirm_socket=present confirmed=yes
+
+```
+
+`confirmed=yes` is the line that matters, and it is the gap the previous entry named: the
+channel existed as a set of parts that had never been put together on a machine.
+
+### Two findings that redirected this work
+
+**There is no agent process.** Every entry since ADR-0022 has said the blocker is "the agent
+running under its own uid". Tracing it: no daemon has `User=` — everything runs as root —
+and the only daemon that calls `perm.request` autonomously is `otwono-aid`, which asks for
+`hw.read`, which does not confirm. The Phase 7 agent layer is not built. So the prerequisite
+being repeated names a component that does not exist, and a uid split done now would be
+protecting against nothing.
+
+**The channel had no client.** `otwono-permd` served `confirm.list`, `confirm.approve` and
+`confirm.deny`, and nothing in the image could call them. A confirmation nobody can answer
+never completes. That was built, not found: the previous commit shipped a mechanism with no
+way to use it.
+
+### What was built
+
+`otwono-permctl` — `list`, `approve`, `deny`, `request`, `claim`, `audit`. It talks to
+**two sockets** and says so in its own help, because the separation is what the rule about
+who may answer stands on, and a CLI that hid it would invite somebody to merge them.
+
+Its help tells a person the two things they can be misled about: read the *resource*, not
+just the action; and `claims` is whatever asked for the permission describing itself — an
+assertion, not a fact, and on a node running an agent possibly text the agent did not write.
+
+### What the boot proves
+
+The whole sequence, on the machine: ask for `fs.delete` → refused with a confirmation id →
+it appears in the waiting list **naming the resource** → claiming before approval is refused
+→ the designated confirmer approves → claiming yields a token → a second claim finds nothing.
+
+One property is worth pulling out. The test image's policy rule says `decision = "allow"`
+for `fs.delete`, and the action still stopped for a person. Policy could not clear an
+intrinsic confirmation requirement — asserted in a unit test since Phase 4, and now observed
+on a booted node.
+
+### The honesty this required, and where it is written down
+
+Designating `uid:0` a confirmer on an image where every daemon runs as root designates
+*everything*. That is acceptable **today** and only today: there is no agent process, so
+nothing on the node would answer that a person would not want answering. Stage 30 says this
+at the point where the drop-in is written, including the condition that ends it — the moment
+the Phase 7 agent layer exists, an agent running as root with that drop-in installed could
+approve its own destructive requests.
+
+So it is off by default, a release image ships no confirmer, and the boot check reports
+`confirmed=no-confirmer` rather than passing quietly on an image that cannot confirm.
+
+### What is not tested
+
+- **No release-path regression test beyond one boot each way.** Both paths were booted in
+  sequence after the fix below: with a confirmer, `confirmed=yes`; without, `no-confirmer`.
+- **No wallet action has been confirmed.** The boot uses `fs.delete`. The wallet path is the
+  same code and has not been walked, and the image designates no wallet capability anyway.
+- **Nothing notifies anybody.** A person must run `otwono-permctl list` to discover that
+  something is waiting. There is no prompt, no console notice, no companion client.
+- **Expiry is still only tested against an injected clock.** No boot has left a confirmation
+  pending long enough to expire.
+- **The uid split is not done and is deliberately not started** — see the first finding
+  above. It becomes real work when there is an agent to separate.
+- amd64 only, TCG, single node.
+
+### Defect: a test-only confirmer would have shipped in a release image
+
+Found by booting the default path and reading the marker instead of assuming: it said
+`confirmed=yes` on a build made with **no** `OTWONO_CONFIRMER`.
+
+The rootfs is incremental. Stage 30 wrote the drop-in and the test policy rule when the
+variable was set and simply *skipped* writing them when it was not — so both files, written
+by the previous build, survived into what was meant to be a release image. A release image
+would have designated `uid:0` a confirmer and granted `fs.delete`, neither of which it may.
+
+The fix is to remove them in the `else` branch rather than skip writing them. This is the
+same shape as the stale `node.pub` that outlived the identity it named: **a conditional that
+creates an artifact must delete it when the condition is false**, because the thing being
+built is not fresh.
+
+Worth recording as a pattern rather than an incident. Two of these have now been found in
+this repository, both by looking at an artifact rather than at the code that writes it, and
+both would have been invisible to a build that only ever ran one way.

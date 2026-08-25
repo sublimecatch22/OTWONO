@@ -511,6 +511,69 @@ AmbientCapabilities=
 WantedBy=multi-user.target
 UNIT
 
+# --- a designated confirmer, for test images only ----------------------------------------
+# ADR-0024 §3a: only a subject in permd's confirmer set may answer a confirmation, and the
+# set is empty by default. That default is correct for a shipped image and it means nothing
+# on such an image can ever confirm, so the channel cannot be exercised on a booted node.
+#
+# OTWONO_CONFIRMER=uid:0 writes a drop-in that designates one. It is off by default and must
+# stay that way, for a reason that is worth stating rather than assuming: on this image every
+# daemon runs as root, so designating uid:0 designates *everything*. Today that is only the
+# operator and a handful of daemons that ask for hw.read -- there is no agent process yet, so
+# there is nothing here that a person would not want answering. The moment the Phase 7 agent
+# layer exists, an agent running as root with this drop-in installed could approve its own
+# destructive requests, and that is the point at which this must be replaced by a real uid
+# split rather than kept as a convenience.
+CONFIRMER="${OTWONO_CONFIRMER:-}"
+if [ -n "$CONFIRMER" ]; then
+    log "designating $CONFIRMER as a confirmer (TEST IMAGES ONLY)"
+    install -d -m 0755 "$ROOTFS/etc/systemd/system/otwono-permd.service.d"
+    cat > "$ROOTFS/etc/systemd/system/otwono-permd.service.d/90-confirmer.conf" <<UNIT
+# BUILT FOR TESTING. Designates who may answer confirmations (ADR-0024 §3a).
+#
+# A release image ships no confirmer: an unconfigured node confirms nothing, which is the
+# fail-closed default. If you are reading this on a machine you care about, delete it and
+# designate a real person's uid instead -- and make sure that uid is not one any agent runs
+# under.
+[Service]
+ExecStart=
+ExecStart=/usr/bin/otwono-permd --socket /run/otwono/perm.sock --policy-dir /etc/otwono/policy.d --audit-log /var/log/otwono/audit.jsonl --confirmer $CONFIRMER
+UNIT
+
+    # A rule for an always_confirm action, so there is something to confirm.
+    #
+    # This says `allow` and grants nothing: policy.rs turns Allow into Ask for any
+    # always_confirm action, so what it actually does is make fs.delete *reachable* enough to
+    # stop for a person. That is worth exercising on a booted node -- a rule that looks
+    # permissive and still demands a human is the property the whole model rests on, and
+    # until now it had only ever been asserted in a unit test.
+    cat > "$ROOTFS/etc/otwono/policy.d/92-confirm-smoke.toml" <<'POLICY'
+# BUILT FOR TESTING. Installed only alongside a designated confirmer.
+#
+# fs.delete is always_confirm, so this `allow` is turned into `ask` before it reaches a
+# caller. It grants nothing on its own; it exists so the boot check has an action that
+# requires a person rather than one that is simply denied.
+[[rule]]
+action = "fs.delete"
+subjects = ["uid:0"]
+decision = "allow"
+ttl_seconds = 300
+POLICY
+    manifest_add "confirmer" "$CONFIRMER"
+else
+    # Remove them, do not merely skip writing them.
+    #
+    # The rootfs is incremental: a drop-in written by an earlier build with OTWONO_CONFIRMER
+    # set survives into a build without it, so "skip when unset" ships a test-only confirmer
+    # in a release image. Caught by booting the default path and seeing confirmed=yes when it
+    # should have said no-confirmer -- the same shape as the stale node.pub that outlived the
+    # identity it named.
+    rm -f "$ROOTFS/etc/systemd/system/otwono-permd.service.d/90-confirmer.conf"
+    rmdir "$ROOTFS/etc/systemd/system/otwono-permd.service.d" 2>/dev/null || true
+    rm -f "$ROOTFS/etc/otwono/policy.d/92-confirm-smoke.toml"
+    manifest_add "confirmer" "none"
+fi
+
 log "installing the wallet daemon unit"
 # ADR-0022 §2 and ADR-0023. This daemon holds the household's money key, and the two
 # hardening lines that matter are PrivateNetwork and RestrictAddressFamilies: it signs,

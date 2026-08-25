@@ -17,6 +17,7 @@ members = [
     "crates/otwono-netd",
     "crates/otwono-proto",
     "crates/otwono-permd",
+    "crates/otwono-permctl",
     "crates/otwono-hwd",
     "crates/otwono-idd",
     "crates/otwono-wallet",

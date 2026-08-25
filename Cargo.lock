@@ -1327,6 +1327,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "otwono-permctl"
+version = "0.1.0"
+dependencies = [
+ "otwono-proto",
+ "serde_json",
+]
+
+[[package]]
 name = "otwono-permd"
 version = "0.1.0"
 dependencies = [

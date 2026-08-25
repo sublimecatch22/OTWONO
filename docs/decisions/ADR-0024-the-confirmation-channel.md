@@ -123,6 +123,27 @@ correct, tested, and inert. That is worth building in this order — the alterna
 discover the uid split is needed while also debugging a new protocol — but it must not be
 described as "confirmation works" in the meantime.
 
+### 4a. Correction: there is no agent to split off yet
+
+**Amended 2026-08-25, on going to do the uid split §4 asks for.** §4 says the prerequisite is
+"the agent must run under its own uid". Tracing it before building it: **no such process
+exists.** No daemon has `User=`, so everything runs as root; the only daemon calling
+`perm.request` autonomously is `otwono-aid`, which asks for `hw.read`, which does not confirm.
+The Phase 7 agent layer — tool registry, planner, executor — is not built.
+
+So a uid split done now would separate daemons from each other, which is worth doing for its
+own reasons, and would protect against nothing this ADR is about.
+
+What §4 should have said, and now does: **the prerequisite is that no agent shares a uid with
+a confirmer.** Today that holds trivially, because there is no agent. It stops holding the
+moment the agent layer lands, and that — not a general uid split — is when this becomes
+urgent.
+
+That makes the channel usable now on a single-operator node, where the operator at the
+console *is* the person the confirmation is for. It is configuration, not a compromise: the
+confirmer set defaults to empty, a release image designates nobody, and a node that wants
+confirmations working designates a uid deliberately.
+
 ### 5. Pending confirmations expire, and expiry is a denial
 
 A pending record has a lifetime (default 300 s). Expiry is not a soft state: a claim against

@@ -51,6 +51,61 @@ fi
 }
 confirm_socket=present
 
+# A confirmation, end to end, when this image designates somebody to answer.
+#
+# Everything above proves the socket exists. This proves the mechanism completes: ask for an
+# always_confirm action, see it refused with a confirmation id, answer it, and collect the
+# token that answering authorised. Without this the channel is a set of parts that have
+# never been put together on a machine.
+#
+# Skipped, and reported as skipped, on an image with no confirmer -- which is every release
+# image. A check that silently passed here would be reporting a working confirmation on a
+# node that cannot make one.
+confirmed=no-confirmer
+if [ -f /etc/systemd/system/otwono-permd.service.d/90-confirmer.conf ]; then
+    confirmed=failed
+    # fs.delete is always_confirm, so policy alone cannot authorise it however it is written.
+    out=$(otwono-permctl request fs.delete --resource /var/lib/otwono/confirm-check 2>&1 || true)
+    cid=$(echo "$out" | tr ' ' '\n' | grep -E '^[0-9a-f]{64}$' | head -1)
+    [ -n "$cid" ] || {
+        echo "OTWONO-CONTROL-PLANE-FAIL asking for fs.delete produced no confirmation id: $out" >&2
+        exit 1
+    }
+
+    # It must be waiting, and the listing must name what it would actually do.
+    listed=$(otwono-permctl list 2>&1) || {
+        echo "OTWONO-CONTROL-PLANE-FAIL cannot list confirmations: $listed" >&2
+        exit 1
+    }
+    echo "$listed" | grep -q "$cid" \
+        || { echo "OTWONO-CONTROL-PLANE-FAIL $cid is not in the waiting list" >&2; exit 1; }
+    echo "$listed" | grep -q "/var/lib/otwono/confirm-check" \
+        || { echo "OTWONO-CONTROL-PLANE-FAIL the listing does not name the resource" >&2; exit 1; }
+
+    # Nothing is authorised before somebody answers.
+    if otwono-permctl claim "$cid" >/dev/null 2>&1; then
+        echo "OTWONO-CONTROL-PLANE-FAIL a token was issued before anybody confirmed" >&2
+        exit 1
+    fi
+
+    otwono-permctl approve "$cid" >/dev/null 2>&1 \
+        || { echo "OTWONO-CONTROL-PLANE-FAIL the designated confirmer could not approve" >&2; exit 1; }
+
+    claimed=$(otwono-permctl claim "$cid" 2>&1) || {
+        echo "OTWONO-CONTROL-PLANE-FAIL an approved confirmation yielded no token: $claimed" >&2
+        exit 1
+    }
+    echo "$claimed" | grep -q '^token ' \
+        || { echo "OTWONO-CONTROL-PLANE-FAIL claim returned no token: $claimed" >&2; exit 1; }
+
+    # One approval, one request. A second claim must find nothing.
+    if otwono-permctl claim "$cid" >/dev/null 2>&1; then
+        echo "OTWONO-CONTROL-PLANE-FAIL the same approval was spent twice" >&2
+        exit 1
+    fi
+    confirmed=yes
+fi
+
 # --- the wallet daemon (ADR-0022 §2, ADR-0023 §4) ------------------------------------
 # Three things, and the first is the one a document cannot establish on its own.
 #
@@ -110,4 +165,4 @@ case "$out" in
         ;;
 esac
 
-echo "OTWONO-CONTROL-PLANE-OK tier=$tier audit_records=$records wallet_ns=$wallet_ns wallet_status=$wallet_status confirm_socket=$confirm_socket"
+echo "OTWONO-CONTROL-PLANE-OK tier=$tier audit_records=$records wallet_ns=$wallet_ns wallet_status=$wallet_status confirm_socket=$confirm_socket confirmed=$confirmed"
