@@ -31,15 +31,18 @@
 #![forbid(unsafe_code)]
 
 pub mod sharing;
-pub use sharing::{open_with, seal_to, SealedKey, SEAL_DOMAIN};
+pub use sharing::{
+    open_with, seal_to, sharing_binding_message, SealedKey, SharingBinding, SharingKey, SEAL_DOMAIN,
+};
 
 pub mod keystore;
 pub mod node_id;
 pub mod signer;
 
 pub use keystore::{
-    migrate_combined, AgreementKeystore, KeystoreError, SigningKeystore, StoredAgreementKey,
-    StoredSigningKey, SuccessionRecord, AGREEMENT_KEY_FILE, DEFAULT_IDENTITY_DIR, SIGNING_KEY_FILE,
+    migrate_combined, AgreementKeystore, KeystoreError, SharingKeystore, SigningKeystore, StoredAgreementKey,
+    StoredSharingKey, StoredSigningKey, SuccessionRecord, AGREEMENT_KEY_FILE, DEFAULT_IDENTITY_DIR,
+    SHARING_KEY_FILE, SIGNING_KEY_FILE,
 };
 pub use node_id::{NodeId, NodeIdError};
 pub use signer::{session_proof_message, SessionSigner, SignerError, HANDSHAKE_HASH_LEN, SESSION_DOMAIN};
@@ -138,6 +141,22 @@ impl SigningIdentity {
             node_id: self.node_id,
             public_key: base64_encode(&self.public_key_bytes()),
             agreement_public_key: base64_encode(agreement_public_key),
+            signature: base64_encode(&signature.to_bytes()),
+        }
+    }
+
+    /// Vouch for this node's sharing key (ADR-0019).
+    ///
+    /// The same shape as [`SigningIdentity::bind_agreement`] and for the same reason: an
+    /// X25519 public key says nothing about whose it is, and a recipient list names NodeIDs.
+    /// Sharing to `otw1:...` without this would mean sharing to whichever key somebody
+    /// claimed was theirs.
+    pub fn bind_sharing(&self, sharing_public_key: &[u8; 32]) -> sharing::SharingBinding {
+        let signature = self.sign(&sharing::sharing_binding_message(sharing_public_key));
+        sharing::SharingBinding {
+            node_id: self.node_id,
+            public_key: base64_encode(&self.public_key_bytes()),
+            sharing_public_key: base64_encode(sharing_public_key),
             signature: base64_encode(&signature.to_bytes()),
         }
     }
@@ -384,6 +403,13 @@ pub struct VerifiedPeer {
     pub node_id: NodeId,
     pub public_key: [u8; 32],
     pub agreement_public_key: [u8; 32],
+}
+
+/// The agreement binding's message, exposed to tests so the sharing module can assert the
+/// two domains differ. A shared helper would defeat the point of them being different.
+#[cfg(test)]
+pub(crate) fn tests_binding_message(k: &[u8; 32]) -> Vec<u8> {
+    binding_message(k)
 }
 
 /// Domain-separated message signed by a binding.

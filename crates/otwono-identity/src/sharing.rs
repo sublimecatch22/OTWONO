@@ -23,7 +23,7 @@
 //! recipient-side forward secrecy; getting that needs key rotation and re-wrapping, which is
 //! OQ-27 and is not built.
 
-use crate::{base64_encode, IdentityError};
+use crate::{base64_encode, now_unix_ms, IdentityError, NodeId};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use serde::{Deserialize, Serialize};
@@ -34,6 +34,114 @@ use zeroize::Zeroizing;
 /// confused with any other use of an X25519 shared secret on this node — the Noise
 /// handshake's above all.
 pub const SEAL_DOMAIN: &[u8] = b"otwono-shared-key-seal-v1";
+
+/// A node's sharing key: the X25519 secret that opens content keys sealed to it.
+///
+/// Deliberately **not** the same type as [`AgreementKey`], and deliberately not
+/// interchangeable with it, even though both are X25519 keypairs. ADR-0010 keeps the Noise
+/// agreement key in `otwono-netd`, the daemon that parses input from the network; ADR-0019
+/// keeps this one in `otwono-idd`. Using one where the other belongs is the exact mistake
+/// both decisions exist to prevent, so it is a compile error rather than a comment.
+///
+/// [`AgreementKey`]: crate::AgreementKey
+pub struct SharingKey {
+    secret: X25519Secret,
+    created_at_unix_ms: u64,
+}
+
+impl std::fmt::Debug for SharingKey {
+    /// Public half and nothing else. A `Debug` that printed the secret would put it in
+    /// every log line that ever formatted a struct containing one.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharingKey")
+            .field("public", &base64_encode(&self.public()))
+            .field("created_at_unix_ms", &self.created_at_unix_ms)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SharingKey {
+    pub fn generate() -> Result<Self, IdentityError> {
+        let mut seed = Zeroizing::new([0u8; 32]);
+        getrandom::getrandom(seed.as_mut()).map_err(|e| IdentityError::Entropy(e.to_string()))?;
+        Ok(Self::from_seed(&seed, now_unix_ms()))
+    }
+
+    pub fn from_seed(seed: &[u8; 32], created_at_unix_ms: u64) -> Self {
+        SharingKey {
+            secret: X25519Secret::from(*seed),
+            created_at_unix_ms,
+        }
+    }
+
+    pub fn created_at_unix_ms(&self) -> u64 {
+        self.created_at_unix_ms
+    }
+
+    pub fn public(&self) -> [u8; 32] {
+        *X25519Public::from(&self.secret).as_bytes()
+    }
+
+    pub fn secret_bytes(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.secret.to_bytes())
+    }
+
+    /// Open a content key sealed to this node.
+    pub fn open(&self, sealed: &SealedKey) -> Result<Zeroizing<[u8; 32]>, IdentityError> {
+        open_with(sealed, &self.secret)
+    }
+}
+
+/// The node's signing key vouching for its sharing key.
+///
+/// The same shape and the same argument as [`AgreementBinding`]: an X25519 public key on its
+/// own says nothing about whose it is, so a recipient list naming a NodeID needs a way to
+/// get from that name to a key. Without it, sharing to `otw1:...` would mean sharing to
+/// whichever key someone claimed was theirs.
+///
+/// The domain string differs from the agreement binding's, so a signature over one can
+/// never be replayed as the other.
+///
+/// [`AgreementBinding`]: crate::AgreementBinding
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharingBinding {
+    pub node_id: NodeId,
+    /// Base64 Ed25519 public key.
+    pub public_key: String,
+    /// Base64 X25519 sharing public key.
+    pub sharing_public_key: String,
+    /// Base64 Ed25519 signature over `sharing_binding_message`.
+    pub signature: String,
+}
+
+/// What a signing key signs to vouch for a sharing key.
+pub fn sharing_binding_message(sharing_public_key: &[u8; 32]) -> Vec<u8> {
+    let mut m = b"otwono-sharing-binding-v1:".to_vec();
+    m.extend_from_slice(sharing_public_key);
+    m
+}
+
+impl SharingBinding {
+    /// Check every link: the NodeID names the signing key, and the signing key vouches for
+    /// the sharing key. Returns the sharing key it is now safe to seal to.
+    pub fn verify(&self) -> Result<[u8; 32], IdentityError> {
+        let public_key = decode32(&self.public_key)?;
+        if !self.node_id.matches_public_key(&public_key) {
+            return Err(IdentityError::NodeIdMismatch);
+        }
+        let sharing_public_key = decode32(&self.sharing_public_key)?;
+        let signature = data_encoding::BASE64
+            .decode(self.signature.as_bytes())
+            .map_err(|_| IdentityError::MalformedSignature)?;
+        crate::verify_signature(
+            &public_key,
+            &sharing_binding_message(&sharing_public_key),
+            &signature,
+        )?;
+        Ok(sharing_public_key)
+    }
+}
 
 /// A content key sealed to one recipient.
 ///
@@ -161,6 +269,66 @@ mod tests {
         let secret = X25519Secret::from([seed; 32]);
         let public = *X25519Public::from(&secret).as_bytes();
         (secret, public)
+    }
+
+    #[test]
+    fn a_binding_gets_a_recipient_from_a_name_to_a_key() {
+        let identity = crate::SigningIdentity::generate().unwrap();
+        let sharing = SharingKey::generate().unwrap();
+        let binding = identity.bind_sharing(&sharing.public());
+        assert_eq!(binding.verify().unwrap(), sharing.public());
+        assert_eq!(binding.node_id, *identity.node_id());
+    }
+
+    #[test]
+    fn a_binding_that_names_someone_elses_node_id_is_refused() {
+        let identity = crate::SigningIdentity::generate().unwrap();
+        let other = crate::SigningIdentity::generate().unwrap();
+        let sharing = SharingKey::generate().unwrap();
+        let mut binding = identity.bind_sharing(&sharing.public());
+        binding.node_id = *other.node_id();
+        assert!(matches!(binding.verify(), Err(IdentityError::NodeIdMismatch)));
+    }
+
+    #[test]
+    fn a_binding_cannot_be_made_to_vouch_for_a_different_key() {
+        // The attack this stops: swap in your own sharing key under somebody's name, and
+        // everything shared to them is sealed to you instead.
+        let identity = crate::SigningIdentity::generate().unwrap();
+        let theirs = SharingKey::generate().unwrap();
+        let mine = SharingKey::generate().unwrap();
+        let mut binding = identity.bind_sharing(&theirs.public());
+        binding.sharing_public_key = crate::base64_encode(&mine.public());
+        assert!(binding.verify().is_err());
+    }
+
+    #[test]
+    fn an_agreement_signature_cannot_be_replayed_as_a_sharing_one() {
+        // Different domain strings. Without that, a node that had ever bound an agreement
+        // key would have implicitly vouched for it as a sharing key too -- putting the
+        // Noise key back in the business ADR-0019 took it out of.
+        let sharing = SharingKey::generate().unwrap();
+        assert_ne!(
+            sharing_binding_message(&sharing.public()),
+            crate::tests_binding_message(&sharing.public())
+        );
+    }
+
+    #[test]
+    fn a_sharing_key_opens_what_was_sealed_to_it() {
+        let key = SharingKey::generate().unwrap();
+        let content_key = [0x33u8; 32];
+        let sealed = seal_to("otw1:aaaa-bbbb-cccc-dddd", &key.public(), &content_key).unwrap();
+        assert_eq!(*key.open(&sealed).unwrap(), content_key);
+    }
+
+    #[test]
+    fn a_sharing_key_never_prints_its_secret() {
+        let key = SharingKey::generate().unwrap();
+        let rendered = format!("{key:?}");
+        let secret = crate::base64_encode(key.secret_bytes().as_ref());
+        assert!(!rendered.contains(&secret), "{rendered}");
+        assert!(rendered.contains(&crate::base64_encode(&key.public())));
     }
 
     #[test]

@@ -4,14 +4,20 @@
 //! /var/lib/otwono/identity/
 //!   node.key         0600  Ed25519 signing seed + the bound agreement public key   (otwono-idd)
 //!   agreement.key    0600  X25519 agreement secret                                 (otwono-netd)
+//!   sharing.key      0600  X25519 sharing secret                                   (otwono-idd)
 //!   node.pub         0644  the public identity, safe to copy anywhere
 //!   succession.jsonl 0644  signed rotation records, append-only
 //! ```
 //!
-//! Two files, not one, because two different daemons need two different halves and
-//! neither should be able to read the other's (ADR-0010). `node.key` never contains an
-//! agreement *secret*; it records the agreement *public* key so `otwono-idd` can say what
-//! it has vouched for without holding anything it does not need.
+//! Separate files, not one, because different daemons need different halves and neither
+//! should be able to read the other's (ADR-0010). `node.key` never contains an agreement
+//! *secret*; it records the agreement *public* key so `otwono-idd` can say what it has
+//! vouched for without holding anything it does not need.
+//!
+//! `sharing.key` is `otwono-idd`'s second secret (ADR-0019) and lives in its own file for
+//! the same reason: two secrets held by one daemon can still be backed up, rotated and
+//! eventually TPM-sealed on their own schedules, and adding it did not have to change
+//! `node.key`'s schema on every node that already has one.
 //!
 //! # Upgrading from the single-file layout
 //!
@@ -32,8 +38,8 @@
 //! experience must not imply otherwise.
 
 use crate::{
-    base64_decode, base64_encode, AgreementKey, IdentityError, NodeId, NodeIdentity, SigningIdentity,
-    SCHEMA_VERSION,
+    base64_decode, base64_encode, AgreementKey, IdentityError, NodeId, NodeIdentity, SharingKey,
+    SigningIdentity, SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -44,6 +50,7 @@ use zeroize::Zeroizing;
 pub const DEFAULT_IDENTITY_DIR: &str = "/var/lib/otwono/identity";
 pub const SIGNING_KEY_FILE: &str = "node.key";
 pub const AGREEMENT_KEY_FILE: &str = "agreement.key";
+pub const SHARING_KEY_FILE: &str = "sharing.key";
 const PUB_FILE: &str = "node.pub";
 const SUCCESSION_FILE: &str = "succession.jsonl";
 
@@ -61,6 +68,21 @@ pub struct StoredSigningKey {
     agreement_seed: Option<String>,
     pub created_at_unix_ms: u64,
     /// False until TPM/TrustZone sealing exists. Never set this optimistically.
+    pub hardware_backed: bool,
+}
+
+/// `sharing.key`: the third key (ADR-0019), held by the identity daemon.
+///
+/// A separate file rather than a field in `node.key` so that the two secrets the identity
+/// daemon holds can be handled, backed up and eventually TPM-sealed independently — and so
+/// that adding this did not change `node.key`'s schema, which every existing node already
+/// has on disk.
+#[derive(Serialize, Deserialize)]
+pub struct StoredSharingKey {
+    pub schema_version: String,
+    pub algorithm: String,
+    sharing_seed: String,
+    pub created_at_unix_ms: u64,
     pub hardware_backed: bool,
 }
 
@@ -344,6 +366,83 @@ impl SigningKeystore {
     }
 }
 
+/// Where `otwono-idd` keeps the sharing key.
+///
+/// Deliberately its own type rather than a second [`AgreementKeystore`] pointed at a
+/// different filename: the two keys must not be interchangeable, and a keystore that could
+/// load either into either would make that a runtime question instead of a compile-time one
+/// (ADR-0019).
+pub struct SharingKeystore {
+    dir: PathBuf,
+}
+
+impl SharingKeystore {
+    pub fn new(dir: impl AsRef<Path>) -> Self {
+        SharingKeystore {
+            dir: dir.as_ref().to_path_buf(),
+        }
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn key_path(&self) -> PathBuf {
+        self.dir.join(SHARING_KEY_FILE)
+    }
+
+    pub fn exists(&self) -> bool {
+        self.key_path().exists()
+    }
+
+    /// Load the sharing key, or generate and persist one if there is none.
+    ///
+    /// A node that has never shared anything still gets one at first boot, because the key
+    /// is what makes it *addressable* as a recipient — somebody else has to be able to seal
+    /// to it before it knows it wants them to.
+    pub fn load_or_generate(&self) -> Result<(SharingKey, bool), KeystoreError> {
+        if self.exists() {
+            Ok((self.load()?, false))
+        } else {
+            let key = SharingKey::generate().map_err(KeystoreError::Identity)?;
+            self.persist(&key)?;
+            Ok((key, true))
+        }
+    }
+
+    pub fn load(&self) -> Result<SharingKey, KeystoreError> {
+        let path = self.key_path();
+        let text = read_private(&path)?;
+        let stored: StoredSharingKey = serde_json::from_str(&text)
+            .map_err(|e| KeystoreError::Malformed(format!("{}: {e}", path.display())))?;
+        if stored.algorithm != "x25519" {
+            return Err(KeystoreError::Malformed(format!(
+                "unsupported algorithm {:?}; this build understands x25519",
+                stored.algorithm
+            )));
+        }
+        Ok(SharingKey::from_seed(
+            &decode_seed(&stored.sharing_seed)?,
+            stored.created_at_unix_ms,
+        ))
+    }
+
+    pub fn persist(&self, key: &SharingKey) -> Result<(), KeystoreError> {
+        ensure_dir(&self.dir)?;
+        let stored = StoredSharingKey {
+            schema_version: SCHEMA_VERSION.to_string(),
+            algorithm: "x25519".to_string(),
+            sharing_seed: base64_encode(key.secret_bytes().as_ref()),
+            created_at_unix_ms: key.created_at_unix_ms(),
+            hardware_backed: false,
+        };
+        let body = Zeroizing::new(
+            serde_json::to_string_pretty(&stored).map_err(|e| KeystoreError::Malformed(e.to_string()))?,
+        );
+        write_private(&self.key_path(), &body)
+    }
+}
+
 /// The X25519 half of the keystore. Only `otwono-netd` opens this.
 pub struct AgreementKeystore {
     dir: PathBuf,
@@ -517,6 +616,136 @@ mod tests {
             .bind_agreement(&signing, &agreement.public())
             .unwrap();
         (signing, agreement)
+    }
+
+    /// A node fully provisioned under ADR-0019: all three keys.
+    fn provisioned_with_sharing(dir: &Path) -> (SigningIdentity, AgreementKey, SharingKey) {
+        let (signing, agreement) = provisioned(dir);
+        let (sharing, _) = SharingKeystore::new(dir).load_or_generate().unwrap();
+        (signing, agreement, sharing)
+    }
+
+    #[test]
+    fn a_sharing_key_survives_a_reload() {
+        let dir = tmpdir("sharing-reload");
+        let store = SharingKeystore::new(&dir);
+        let (key, generated) = store.load_or_generate().unwrap();
+        assert!(generated, "the first call must generate");
+        assert!(store.exists());
+
+        let (again, generated) = store.load_or_generate().unwrap();
+        assert!(!generated, "the second call must load, not regenerate");
+        assert_eq!(
+            key.public(),
+            again.public(),
+            "a node that regenerated this key would silently stop being able to open \
+             anything already sealed to it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn what_was_sealed_before_a_restart_still_opens_after_one() {
+        // Public-key equality is not the property that matters; being able to *open* is.
+        // This goes through the real seal path so a corrupted secret half would show up.
+        let dir = tmpdir("sharing-open");
+        let (public, recipient) = {
+            let (key, _) = SharingKeystore::new(&dir).load_or_generate().unwrap();
+            (key.public(), "otwono1recipient".to_string())
+        };
+        let content_key = [7u8; 32];
+        let sealed = crate::seal_to(&recipient, &public, &content_key).unwrap();
+
+        let reloaded = SharingKeystore::new(&dir).load().unwrap();
+        let opened = reloaded.open(&sealed).unwrap();
+        assert_eq!(opened.as_ref(), &content_key);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_sharing_key_is_not_the_agreement_key() {
+        // ADR-0019 adds a third key rather than reusing the second. If these ever coincide,
+        // a peer that can negotiate a session can also open everything shared with the node.
+        let dir = tmpdir("sharing-distinct");
+        let (signing, agreement, sharing) = provisioned_with_sharing(&dir);
+        assert_ne!(agreement.public(), sharing.public());
+        assert_ne!(agreement.secret_bytes().as_ref(), sharing.secret_bytes().as_ref());
+        assert_ne!(signing.seed().as_ref(), sharing.secret_bytes().as_ref());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_key_file_contains_another_key_file_s_secret() {
+        // The split only means anything if each file is useless to whoever holds the others.
+        let dir = tmpdir("sharing-split");
+        let (signing, agreement, sharing) = provisioned_with_sharing(&dir);
+        let secrets = [
+            ("signing", base64_encode(signing.seed().as_ref())),
+            ("agreement", base64_encode(agreement.secret_bytes().as_ref())),
+            ("sharing", base64_encode(sharing.secret_bytes().as_ref())),
+        ];
+        let files = [
+            ("signing", SigningKeystore::new(&dir).key_path()),
+            ("agreement", AgreementKeystore::new(&dir).key_path()),
+            ("sharing", SharingKeystore::new(&dir).key_path()),
+            ("public", SigningKeystore::new(&dir).public_path()),
+        ];
+        for (file_name, path) in files {
+            let raw = std::fs::read_to_string(&path).unwrap();
+            for (secret_name, secret) in &secrets {
+                let belongs = file_name == *secret_name;
+                assert_eq!(
+                    raw.contains(secret.as_str()),
+                    belongs,
+                    "{} in {}",
+                    secret_name,
+                    path.display()
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_sharing_key_file_is_owner_only_and_refused_when_it_is_not() {
+        let dir = tmpdir("sharing-mode");
+        provisioned_with_sharing(&dir);
+        let path = SharingKeystore::new(&dir).key_path();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = SharingKeystore::new(&dir).load().unwrap_err();
+        assert!(matches!(err, KeystoreError::InsecurePermissions { .. }), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_sharing_key_of_an_unknown_algorithm_is_refused_rather_than_guessed() {
+        let dir = tmpdir("sharing-algo");
+        provisioned_with_sharing(&dir);
+        let path = SharingKeystore::new(&dir).key_path();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let swapped = raw.replace("\"x25519\"", "\"kyber768\"");
+        assert_ne!(raw, swapped, "the algorithm field must be there to swap");
+        write_private(&path, &swapped).unwrap();
+
+        let err = SharingKeystore::new(&dir).load().unwrap_err();
+        assert!(matches!(err, KeystoreError::Malformed(_)), "{err}");
+        assert!(err.to_string().contains("kyber768"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_stored_sharing_key_does_not_claim_hardware_backing() {
+        let dir = tmpdir("sharing-hw");
+        provisioned_with_sharing(&dir);
+        let raw = std::fs::read_to_string(SharingKeystore::new(&dir).key_path()).unwrap();
+        let stored: StoredSharingKey = serde_json::from_str(&raw).unwrap();
+        assert!(!stored.hardware_backed, "there is no TPM sealing yet");
+        assert_eq!(stored.schema_version, SCHEMA_VERSION);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
