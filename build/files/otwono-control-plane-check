@@ -35,6 +35,22 @@ fi
     exit 1
 }
 
+# --- the confirmation socket (ADR-0024) ----------------------------------------------
+# otwono-permd binds two sockets: the control plane every daemon reaches, and the one a
+# person answers confirmations on. Their separation is the whole basis of the rule that a
+# subject may not confirm its own request, so a node where only one of them exists has a
+# permission model with a hole in it.
+#
+# permd exits non-zero if either bind fails, so "the service started" already implies this.
+# Asserted anyway: an inference from a unit's state is not an observation of the socket, and
+# this is the file that gets read when somebody wants to know what was actually true.
+[ -S /run/otwono/confirm.sock ] || {
+    echo "OTWONO-CONTROL-PLANE-FAIL otwono-permd bound no confirmation socket at" \
+         "/run/otwono/confirm.sock; nothing could approve an always_confirm action" >&2
+    exit 1
+}
+confirm_socket=present
+
 # --- the wallet daemon (ADR-0022 §2, ADR-0023 §4) ------------------------------------
 # Three things, and the first is the one a document cannot establish on its own.
 #
@@ -94,4 +110,4 @@ case "$out" in
         ;;
 esac
 
-echo "OTWONO-CONTROL-PLANE-OK tier=$tier audit_records=$records wallet_ns=$wallet_ns wallet_status=$wallet_status"
+echo "OTWONO-CONTROL-PLANE-OK tier=$tier audit_records=$records wallet_ns=$wallet_ns wallet_status=$wallet_status confirm_socket=$confirm_socket"

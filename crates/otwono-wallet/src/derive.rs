@@ -151,7 +151,8 @@ impl Account {
     ///
     /// Deliberately awkward to reach and deliberately not `Clone`: nothing outside a signing
     /// path has any business with it, and signing is not built (ADR-0022 §3 — `wallet.sign`
-    /// is `always_confirm` and no confirmation channel exists until Phase 7).
+    /// is `always_confirm`, and ADR-0024's channel refuses an approval from the uid that
+    /// asked — which on a single-uid image is every approval).
     pub fn private_key_bytes(&self) -> &Zeroizing<[u8; 32]> {
         &self.key
     }

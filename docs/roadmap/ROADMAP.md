@@ -75,6 +75,10 @@ boot, and the audit log it wrote was recovered and verified on the host.
 **Carried forward (not done):** both daemons run as root; the dedicated Z2/Z3 users and
 Landlock scoping listed above are outstanding, and need group-aware socket binding. There
 is no confirmation channel yet, so `Ask` fails closed with an error.
+   **Superseded by ADR-0024**: `Ask` now opens a pending confirmation and returns its id, and a second
+   socket carries the answer. Still fails closed — nothing is authorised until somebody
+   approves — and still inert on the shipped image, where the asker and the confirmer are
+   the same uid.
 
 ---
 

@@ -3804,3 +3804,83 @@ that reads as paranoid was the weak one.
   passing run. Recorded rather than called a flake.
 - **The T0 timing is extrapolated** from an amd64 host, not measured on a board.
 - **No signing, no address, no balance, no chain.** amd64 only, TCG, single node.
+
+---
+
+## The confirmation channel: a person can answer, and a subject cannot answer itself
+
+**STATUS: VERIFIED on a booted node** for the wiring; the property that makes it *mean*
+something is not deployable yet and this entry says so twice.
+
+```
+OTWONO-CONTROL-PLANE-OK tier=T0_MICRO audit_records=12 wallet_ns=isolated wallet_status=no-wallet confirm_socket=present
+```
+
+ADR-0024. Since Phase 4, an `Ask` decision returned an error because nothing could ask a
+person — correct as a fail-closed answer to a missing feature, and blocking five actions:
+`fs.delete`, `net.egress`, `wallet.create`, `wallet.sign`, `wallet.export_seed`.
+
+### Workspace
+
+```
+cargo test --workspace                                   970 passed, 0 failed
+cargo clippy --workspace --all-targets -- -D warnings     clean
+cargo fmt --all --check                                   clean
+shellcheck, CI's multi-file invocation                    clean
+cargo build --workspace --target aarch64-unknown-linux-gnu   ok
+```
+
+970 from 949: ten unit tests on the pending store, eleven integration tests over two real
+sockets.
+
+### The test that took work to make real
+
+Ten of the eleven integration tests run as a single uid — which is exactly the situation
+ADR-0024 §3 refuses, so the *refusal* is directly observable and the *approval* path is not
+reachable at all. Asserting approval with a stubbed subject would have proved nothing: the
+rule is about `SO_PEERCRED`, and a stub does not have one.
+
+So `a_second_user_can_approve_and_then_the_asker_gets_its_token` connects **as a different
+real uid** — `setpriv --reuid 65534` running `socat` against the confirmation socket, which
+is possible only because the control plane is newline-delimited JSON-RPC over a Unix socket
+and CLAUDE.md §4.1 chose that partly so it could be driven this way. It asserts the token is
+issued, that it is one-shot, that the same approval cannot be spent twice, and that the audit
+chain names `uid:65534` as the approver. It skips when not run as root, and was confirmed to
+have actually run rather than skipped.
+
+Without it the suite would have been eleven tests none of which exercised a working
+confirmation.
+
+### What is verified on the machine, and what that is worth
+
+`confirm_socket=present`. permd exits non-zero if either bind fails, so "the service started"
+already implied it — the assertion exists because an inference from a unit's state is not an
+observation of the socket, and this file is what gets read when somebody wants to know what
+was actually true.
+
+**And then the honest part.** The rule that carries the whole design is that an approval from
+the uid that asked is refused. The shipped image runs every daemon as `uid:0`, and its policy
+grants to `subjects = ["uid:0"]`. So on that image **every approval would be a
+self-approval, and every one is refused** — the channel is present, correct, exercised, and
+authorises nothing.
+
+That is not a defect to fix later; ADR-0024 §4 chose it, and it means the wallet's blocker
+has changed name rather than gone away. What unblocks `wallet.create` is **the agent running
+under its own uid**, which is separate work this did not do.
+
+### What is not tested
+
+- **No wallet action has been confirmed**, on a node or anywhere. The two-uid test uses
+  `fs.delete`; the wallet path is the same code and has not been walked.
+- **No image change gives the agent its own uid**, so nothing on a booted node can be
+  approved. The boot proves the socket exists, not that a confirmation can complete there.
+- **Nothing notifies anybody.** A confirmation waits for a caller of `confirm.list`; there is
+  no console prompt, no companion client, no desktop surface. ADR-0024 left that open
+  deliberately, but it means a person has to be looking.
+- **Expiry is tested only against an injected clock** in unit tests. No boot has left a
+  confirmation pending long enough to expire.
+- **Socket permissions are not the mechanism.** `Server::bind` sets 0660 on both sockets;
+  the separation tested here is which methods each socket serves, not who can open it. On a
+  node with a real uid split, the confirmation socket's ownership would also need to be
+  right, and nothing here checks that.
+- amd64 only, TCG, single node.

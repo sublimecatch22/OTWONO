@@ -15,8 +15,9 @@ Holds the household's money key. It has no network, holds nothing unlocked betwe
 and takes a passphrase per call rather than keeping a session (ADR-0023).
 
 Most of what it does needs a person: wallet.create, wallet.sign and wallet.export_seed all
-require confirmation, and no confirmation channel exists until Phase 7. On a booted node
-today the wallet can be read and nothing else.
+require confirmation. ADR-0024 built that channel, but an approval from the uid that asked is
+refused and the shipped image runs everything as one uid -- so on a booted node today the
+wallet can be read and nothing else.
 
 USAGE:
     otwono-walletd [OPTIONS]

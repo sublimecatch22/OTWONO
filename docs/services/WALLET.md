@@ -35,10 +35,16 @@ testable without a control plane and without root (CLAUDE.md §2.4).
 
 ### What the daemon can actually do today
 
-On a booted node: **read, and nothing else.** `wallet.create`, `wallet.sign` and
-`wallet.export_seed` are `always_confirm`, `policy.rs` turns `Allow` into `Ask` for those,
-and no confirmation channel exists — so `otwono-permd` will not issue a token for any of
-them. A policy saying `wallet.* = allow`, which is what an operator would actually write,
+On a booted node: **read, and nothing else** — though the reason has changed since
+**ADR-0024** built the confirmation channel. `wallet.create`, `wallet.sign` and
+`wallet.export_seed` are `always_confirm`, so `policy.rs` turns `Allow` into `Ask` and
+`otwono-permd` opens a pending confirmation rather than issuing a token. Somebody can now
+answer it, on `/run/otwono/confirm.sock`.
+
+What still blocks the wallet is the half ADR-0024 deliberately did not deliver: **an approval
+from the uid that asked is refused**, and on the shipped image everything runs as `uid:0`. So
+the channel exists, is tested, and cannot yet authorise anything on a real node. The wallet's
+remaining dependency is the agent running under its own uid, not the channel. A policy saying `wallet.* = allow`, which is what an operator would actually write,
 still gets `ask` on all three and `allow` on `wallet.read`. That is tested at three levels:
 the registry, the policy evaluation, and end to end through the broker.
 
@@ -122,8 +128,9 @@ family agrees on — and stops. Whatever encodes an address takes those 33 bytes
 ## 5. Signing, and why it is not reachable
 
 `wallet.sign` is `Irreversible` and `always_confirm` (ADR-0022 §3). `policy.rs` turns `Allow`
-into `Ask` for any `always_confirm` action, and no confirmation channel exists until Phase 7,
-so `otwono-permd` answers `confirmation_required`.
+into `Ask` for any `always_confirm` action, so `otwono-permd` opens a pending confirmation
+and answers `confirmation_required` with its id (ADR-0024). Somebody can answer it; on the
+shipped image nobody whose uid differs from the asker's can, which is what still blocks it.
 
 **The wallet's signing path is therefore unusable until Phase 7 by construction**, and that
 is correct rather than inconvenient. The vault, the derivation, the public side and the

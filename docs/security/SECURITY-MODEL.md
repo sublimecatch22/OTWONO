@@ -91,6 +91,17 @@ Regardless of policy or model confidence:
 - Enabling a network role that spends the user's bandwidth, disk, or GPU
 - Any action flagged irreversible
 
+**How the confirmation happens: ADR-0024.** An `Ask` decision opens a pending confirmation
+and returns its id rather than blocking; a person answers on a **separate socket**
+(`/run/otwono/confirm.sock`), and the asker then claims the token. Two properties carry the
+design: an approval from the uid that asked is **refused** — a subject agreeing with itself
+is not a confirmation — and one approval authorises exactly one request, so "yes, delete this
+file" never becomes "yes, `fs.delete`".
+
+The limit is stated in the ADR rather than left to be discovered: this proves a *different
+uid*, not a human, and on a node where the agent runs as root it stops nothing. The agent
+running under its own uid is a prerequisite the ADR imposes and does not deliver.
+
 ### Audit log
 
 Append-only and hash-chained at `/var/log/otwono/audit.jsonl`. Every decision, every token

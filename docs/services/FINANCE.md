@@ -4,7 +4,10 @@
 encryption at rest) and Phase 7 (agent layer). Targeted at Phase 7.
 
 The wallet (§2a, ADR-0022) is targeted at Phase 10 and is **gated behind Phase 7 by
-construction**: `wallet.sign` always confirms, and no confirmation channel exists until then.
+construction**: `wallet.sign` always confirms. ADR-0024 has since built the channel, and
+the wallet is still unreachable — an approval from the uid that asked is refused, and the
+shipped image runs everything as one uid. The blocker is now the agent's uid, not the
+channel.
 Its keystore, derivation, addresses and backup can be built and tested before signing is
 reachable at all.
 

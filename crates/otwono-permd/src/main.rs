@@ -16,6 +16,10 @@ USAGE:
 
 OPTIONS:
     --socket <PATH>       Control-plane socket (default $OTWONO_SOCKET_DIR/perm.sock)
+    --confirm-socket <PATH>
+                          Where a person answers confirmations (default
+                          $OTWONO_SOCKET_DIR/confirm.sock). Deliberately a different socket
+                          from --socket: see ADR-0024.
     --policy-dir <PATH>   Policy directory (default /etc/otwono/policy.d)
     --audit-log <PATH>    Audit log (default /var/log/otwono/audit.jsonl)
     --check               Load and validate the policy, then exit
@@ -55,6 +59,7 @@ enum Error {
 
 fn run(args: &[String]) -> Result<String, Error> {
     let mut socket: Option<PathBuf> = None;
+    let mut confirm_socket: Option<PathBuf> = None;
     let mut policy_dir = PathBuf::from(DEFAULT_POLICY_DIR);
     let mut audit_log = PathBuf::from(DEFAULT_AUDIT_LOG);
     let mut check_only = false;
@@ -63,6 +68,13 @@ fn run(args: &[String]) -> Result<String, Error> {
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
+            "--confirm-socket" => {
+                confirm_socket = Some(
+                    it.next()
+                        .map(PathBuf::from)
+                        .ok_or_else(|| Error::Usage("--confirm-socket needs a path".into()))?,
+                )
+            }
             "--socket" => {
                 socket = Some(
                     it.next()
@@ -151,8 +163,30 @@ fn run(args: &[String]) -> Result<String, Error> {
     );
 
     let broker = Arc::new(Broker::new(policy, audit));
+
+    // The confirmation surface, on its own socket (ADR-0024 §3). It shares the broker's
+    // state but serves only confirm.*, so whatever can reach it can answer requests and
+    // cannot make them.
+    //
+    // Bound before the control-plane socket is served, so there is no window in which a
+    // request can be made that nobody could yet answer.
+    let confirm_socket = confirm_socket.unwrap_or_else(|| otwono_proto::socket_path("confirm"));
+    let confirm_server = Server::bind(&confirm_socket)
+        .map_err(|e| Error::Startup(format!("cannot bind {}: {e}", confirm_socket.display())))?;
+    eprintln!("otwono-permd: confirmations on {}", confirm_socket.display());
+    // Stated plainly at startup, because a channel that cannot do its job should say so
+    // rather than look like it is working (ADR-0024 §4).
+    eprintln!(
+        "otwono-permd: a confirmation is refused when the approver's uid matches the asker's. \
+         On a node where both run as the same user this stops nothing"
+    );
+    let confirmations = Arc::new(broker.confirmations());
+    let shutdown = Shutdown::new();
+    let s = shutdown.clone();
+    std::thread::spawn(move || confirm_server.serve(confirmations, s));
+
     server
-        .serve(broker, Shutdown::new())
+        .serve(broker, shutdown)
         .map_err(|e| Error::Startup(format!("serve failed: {e}")))?;
     Ok(String::new())
 }

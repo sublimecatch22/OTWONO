@@ -111,6 +111,16 @@ pub fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// An unguessable identifier, for anything that must not be predictable.
+///
+/// Used for capability tokens and for confirmation ids (ADR-0024). A confirmation id is not
+/// itself a capability — `perm.claim` checks the claiming subject and `confirm.approve`
+/// refuses the asking subject — but a predictable one would let something act on a request
+/// it was never told about, and there is no reason to make it cheap to guess.
+pub fn random_id() -> String {
+    random_token()
+}
+
 fn random_token() -> String {
     let mut bytes = [0u8; TOKEN_BYTES];
     // A failure here means the OS has no entropy source. Refusing to continue is the only

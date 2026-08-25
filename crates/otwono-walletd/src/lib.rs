@@ -28,9 +28,12 @@
 //! # Most of it cannot run yet, and that is deliberate
 //!
 //! `wallet.create`, `wallet.sign` and `wallet.export_seed` are `always_confirm`. `policy.rs`
-//! turns `Allow` into `Ask` for those, and no confirmation channel exists until Phase 7, so
-//! `otwono-permd` answers `confirmation_required`. On a booted node today the wallet can be
-//! read and nothing else (ADR-0023 §4).
+//! turns `Allow` into `Ask` for those, so `otwono-permd` opens a pending confirmation
+//! (ADR-0024) rather than issuing a token.
+//!
+//! The channel exists now. What still blocks the wallet is that an approval from the uid
+//! that asked is refused, and the shipped image runs everything as `uid:0` — so on a booted
+//! node today the wallet can be read and nothing else (ADR-0023 §4, ADR-0024 §4).
 
 #![forbid(unsafe_code)]
 
@@ -191,8 +194,8 @@ impl WalletService {
     /// Create a wallet, and show its recovery phrase once.
     ///
     /// Guarded by `wallet.create`, which is `always_confirm` — so in practice this answers
-    /// `confirmation_required` until Phase 7. It is written and tested now because the
-    /// alternative is writing it later against a channel nobody has used either.
+    /// `confirmation_required` with a confirmation id (ADR-0024), and stays unreachable
+    /// while the asker and any possible approver share a uid.
     ///
     /// **Refuses to overwrite**, rather than confirming (ADR-0023 §3). A confirmation dialog
     /// is the wrong instrument for "this destroys the key to your funds": the answer is no,
