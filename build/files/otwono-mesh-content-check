@@ -57,13 +57,21 @@ printf '%s' "$PRIVATE_TEXT" > "$WORK/private.txt"
 #
 # Deterministic bytes, not /dev/urandom: both nodes must derive the same content id, and
 # they cannot if the contents differ.
-awk 'BEGIN { s = ""; for (i = 0; i < 10000; i++) s = s "otwono-mesh-large-object-fixture-" i "\n"; printf "%s", s }' \
+# Deliberately above the control plane's 640 KiB inline cap, so it can only cross as a file
+# (ADR-0018). Deterministic bytes, not /dev/urandom: both nodes must derive the same content
+# id, and they cannot if the contents differ.
+awk 'BEGIN { s = ""; for (i = 0; i < 20000; i++) s = s "otwono-mesh-large-object-fixture-" i "\n"; printf "%s", s }' \
     > "$WORK/large.bin"
 
 pub_id=$(otwono-storectl put --file "$WORK/public.txt" --visibility public | awk '{print $1}') \
     || fail "could not store the public object"
-big_id=$(otwono-storectl put --file "$WORK/large.bin" --visibility public | awk '{print $1}') \
-    || fail "could not store the large public object"
+# Over the inline cap, so `put` must refuse it and `import` must not -- the same boundary
+# ADR-0018 draws, checked here on a booted node.
+if otwono-storectl put --file "$WORK/large.bin" --visibility public >/dev/null 2>&1; then
+    fail "store.put accepted an object larger than the control plane can carry"
+fi
+big_id=$(otwono-storectl import --file "$WORK/large.bin" --visibility public | awk '{print $1}') \
+    || fail "could not import the large public object"
 [ -n "$big_id" ] || fail "the large put returned no content id"
 
 # Asserted, not assumed: if the fixture ever shrinks below one chunk this test quietly stops
@@ -150,7 +158,7 @@ echo "$got" | grep -q "$pub_id" || fail "the peer served something else: $got"
 big=""
 i=0
 while [ "$i" -lt 60 ]; do
-    if big=$(otwono-netd --fetch "$big_id" --socket /run/otwono/net.sock 2>&1); then
+    if big=$(otwono-netd --fetch "$big_id" --to-file --socket /run/otwono/net.sock 2>&1); then
         break
     fi
     big=""
@@ -162,6 +170,23 @@ echo "$big" | grep -q "$big_id" || fail "the peer served the wrong large object:
 big_size=$(wc -c < "$WORK/large.bin")
 echo "$big" | grep -q " $big_size bytes " \
     || fail "the large object arrived at the wrong size (wanted $big_size): $big"
+
+# It came as a file, and the file is the object. This is ADR-0018's handoff between two
+# machines rather than between a caller and a daemon on one.
+big_path=$(echo "$big" | grep -o "path=[^ ]*" | cut -d= -f2)
+case "$big_path" in
+    /*) : ;;
+    *) fail "a to-file fetch named no path: $big" ;;
+esac
+[ -f "$big_path" ] || fail "the fetched file is not there: $big_path"
+cmp -s "$WORK/large.bin" "$big_path" \
+    || fail "the file that crossed the link is not the object"
+rm -f "$big_path"
+
+# And the inline path must refuse it rather than truncate or hang, naming its own limit.
+if otwono-netd --fetch "$big_id" --socket /run/otwono/net.sock >/dev/null 2>&1; then
+    fail "an inline fetch accepted an object larger than a control-plane line"
+fi
 
 # How many peers actually served chunks of it. Reported rather than asserted here, because
 # on a two-node segment there is only ever one peer and which peer answers a given chunk
@@ -198,12 +223,27 @@ fi
 # the storage axis. Reported rather than asserted beyond being answerable: what matters here
 # is that a node with a real budget opens a real cache and can be asked about it.
 cache_state=none
+cache_held=0
 if cache=$(otwono-storectl cache-status 2>&1); then
     cache_state=$(echo "$cache" | awk '/^budget/ {print $2}')
     [ -n "$cache_state" ] || fail "cache.status answered without a budget: $cache"
     [ "$cache_state" -gt 0 ] \
         || fail "the override did not give this node a cache budget: $cache"
+
+    # Fetch the small object again, this time keeping it. Until now the cache has had a
+    # budget and held nothing on every booted node, because net.fetch caches only when asked
+    # and nothing asked.
+    kept=$(otwono-netd --fetch "$pub_id" --cache --socket /run/otwono/net.sock 2>&1) \
+        || fail "a caching fetch failed: $kept"
+    echo "$kept" | grep -q "cached=" || fail "a caching fetch said nothing about caching: $kept"
+    echo "$kept" | grep -q "cached=false" \
+        && fail "asked to cache and it did not: $kept"
+
+    cache_held=$(otwono-storectl cache-status | awk '/^budget/ {print $6}')
+    case "$cache_held" in ''|*[!0-9]*) cache_held=0 ;; esac
+    [ "$cache_held" -ge 1 ] \
+        || fail "the cache holds $cache_held object(s) after a caching fetch"
 fi
 
 rm -rf "$WORK"
-echo "OTWONO-MESH-CONTENT-OK node=$node_ordinal/$node_total public=$pub_id large=$big_id large_served=$big_served private_refused=$prv_id cache_budget=$cache_state"
+echo "OTWONO-MESH-CONTENT-OK node=$node_ordinal/$node_total public=$pub_id large=$big_id large_served=$big_served private_refused=$prv_id cache_budget=$cache_state cache_held=$cache_held"

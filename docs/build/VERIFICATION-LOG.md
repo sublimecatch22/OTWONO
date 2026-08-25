@@ -3166,3 +3166,75 @@ shellcheck -S warning ...  clean
 - **No partition and no healing.** Phase 6's exit criterion also wants a network that splits
   and reconverges; this harness only ever brings nodes up.
 - **amd64 only**, three nodes, one segment, no real hardware.
+
+---
+
+## Phase 5 item 5 — the last two gaps: a file across a link, and a cache that holds something
+
+**Date:** 2026-08-25 · **Where:** OTWONO Cloud dev environment (no `/dev/kvm`, TCG only)
+
+Two items have appeared in every "what this does not prove" list since ADR-0018 landed.
+Both are closed.
+
+### The run
+
+```
+node n1: otw1:3w7d-h8e0-439y-r3m0 at 169.254.221.7/16, 2 peer(s)
+node n2: otw1:ad25-g8rc-rby1-54rk at 169.254.183.238/16, 2 peer(s)
+node n3: otw1:yq3g-1866-fpme-0bf7 at 169.254.216.124/16, 2 peer(s)
+
+OTWONO-MESH-CONTENT-OK node=1/3 ... large_served=2 ... cache_budget=536870912 cache_held=1
+OTWONO-MESH-CONTENT-OK node=2/3 ... large_served=2 ... cache_budget=536870912 cache_held=1
+OTWONO-MESH-CONTENT-OK node=3/3 ... large_served=2 ... cache_budget=536870912 cache_held=1
+fan-out: 3 of 3 node(s) drew the large object from several peers
+PASS: 3 nodes discovered and mutually authenticated
+```
+
+### ADR-0018's handoff, between two machines
+
+The large fixture is now **768 890 bytes** — deliberately above the 640 KiB the control plane
+can carry on one line. On each node the check asserts, in order:
+
+- `store.put` **refuses** it and `store.import` accepts it, which is ADR-0018's boundary
+  drawn on a booted node rather than in a unit test;
+- an **inline** `net.fetch` refuses it rather than truncating or hanging;
+- `net.fetch --to-file` succeeds, names a path, and the file at that path is **byte-for-byte
+  identical** to the original.
+
+And it arrived by fan-out from peers holding disjoint shares — every node reports
+`large_served=2`, and no node holds the whole object. So this is `fetch_object_to_file`'s
+`pwrite`-at-computed-offsets path, fed by two peers at once, on a real link, for an object
+that could not have crossed any other way.
+
+### The cache holds something
+
+Every booted node until now has reported a cache with a budget and nothing in it, because
+`net.fetch` caches only when asked and nothing asked. `--cache` now exists, the check uses
+it, and `cache_held=1` on all three nodes.
+
+The flag is not a default and will not become one. "Serving is carrying": caching a peer's
+content means storing bytes the operator did not choose one at a time
+(`NEIGHBOURHOOD-CACHE.md` §6). The reply says `cached=` either way, so a caller that asked
+and did not get it knows, and one that did not ask can see nothing was kept.
+
+### Workspace
+
+```
+cargo test --workspace     782 passed, 0 failed
+cargo clippy --workspace --all-targets -- -D warnings   clean
+cargo fmt --all --check    clean
+shellcheck -S warning ...  clean
+```
+
+### What this does not prove
+
+- **No speedup was measured.** Still. Three TCG guests on one host say nothing about
+  wall-clock time on a street, and that is the claim ADR-0015 is actually about.
+- **The cache holds one small object.** Nothing has been evicted on a booted node, no
+  budget has been reached, and nothing has been served *out of* a cache to a further peer —
+  which is the property that would make a dense neighbourhood compound.
+- **No partition, no healing.** Phase 6's exit criterion wants a network that splits and
+  reconverges; this harness only ever brings nodes up and never takes one away.
+- **`SHARED` has still never been served to anybody**, and the `REPLICATED` replication
+  policy does not exist. Both are named outstanding in `ROADMAP.md` under Phase 5.
+- **amd64 only**, three nodes, one segment, no real hardware, no radio.

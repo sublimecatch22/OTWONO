@@ -31,7 +31,12 @@ OPTIONS:
     --no-discovery         Do not announce or browse on the LAN
     --status               Query a running daemon and print its overlay status, then exit
     --peers                Query a running daemon and print its peer table, then exit
-    --fetch <CONTENT_ID>   Fetch one object from the first connected peer, then exit
+    --fetch <CONTENT_ID>   Fetch one object from every connected peer, then exit
+    --to-file              Write the fetched object to a file instead of returning its
+                           bytes. Required above the control-plane's inline cap (ADR-0018).
+    --cache                Keep what was fetched in the neighbourhood cache. Never the
+                           default: caching a peer's content is storing bytes the operator
+                           did not choose one at a time.
     -h, --help             Show this message
 
 EXIT CODES:
@@ -86,6 +91,8 @@ fn run(args: &[String]) -> Result<String, Error> {
     let mut status_only = false;
     let mut peers_only = false;
     let mut fetch_id: Option<String> = None;
+    let mut fetch_to_file = false;
+    let mut fetch_cache = false;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -102,6 +109,8 @@ fn run(args: &[String]) -> Result<String, Error> {
             "--status" => status_only = true,
             "--peers" => peers_only = true,
             "--fetch" => fetch_id = Some(next(&mut it, "--fetch")?),
+            "--to-file" => fetch_to_file = true,
+            "--cache" => fetch_cache = true,
             "-h" | "--help" => return Ok(USAGE.to_string()),
             other => return Err(Error::Usage(format!("unknown option {other}"))),
         }
@@ -145,7 +154,7 @@ fn run(args: &[String]) -> Result<String, Error> {
     if let Some(content_id) = fetch_id {
         let socket = socket.unwrap_or_else(|| otwono_proto::socket_path("net"));
         let perm_socket = perm_socket.unwrap_or_else(|| otwono_proto::socket_path("perm"));
-        return fetch_from_a_peer(&socket, &perm_socket, &content_id);
+        return fetch_from_a_peer(&socket, &perm_socket, &content_id, fetch_to_file, fetch_cache);
     }
 
     if peers_only {
@@ -282,6 +291,8 @@ fn fetch_from_a_peer(
     socket: &std::path::Path,
     perm_socket: &std::path::Path,
     content_id: &str,
+    to_file: bool,
+    cache: bool,
 ) -> Result<String, Error> {
     let read_token = broker_token(perm_socket, "net.read", "otwono-netd --fetch: find a peer")?;
     let mut client = otwono_proto::Client::connect_waiting(socket, std::time::Duration::from_secs(5))
@@ -320,7 +331,12 @@ fn fetch_from_a_peer(
     let value = client
         .call_with_capability(
             "net.fetch",
-            serde_json::json!({ "peers": candidates, "content_id": content_id }),
+            serde_json::json!({
+                "peers": candidates,
+                "content_id": content_id,
+                "to_file": to_file,
+                "cache": cache,
+            }),
             &content_token,
         )
         .map_err(|e| Error::Startup(format!("net.fetch transport failure: {e}")))?
@@ -329,8 +345,8 @@ fn fetch_from_a_peer(
     // `served` is what shows whether the work actually spread. A shell check on a booted
     // node has no other way to see it, and "it completed" does not distinguish one peer
     // doing everything from three sharing it.
-    Ok(format!(
-        "{} {} bytes visibility={} asked={asked} served={}\n",
+    let mut out = format!(
+        "{} {} bytes visibility={} asked={asked} served={}",
         value.get("content_id").and_then(|v| v.as_str()).unwrap_or("?"),
         value.get("size_bytes").and_then(|v| v.as_u64()).unwrap_or(0),
         value.get("visibility").and_then(|v| v.as_str()).unwrap_or("?"),
@@ -338,7 +354,19 @@ fn fetch_from_a_peer(
             .get("peers_that_served")
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
-    ))
+    );
+    if let Some(path) = value.get("path").and_then(|v| v.as_str()) {
+        out.push_str(&format!(" path={path}"));
+    }
+    // Said either way. A caller that asked for caching and did not get it needs to know,
+    // and one that did not ask needs to be able to see that nothing was kept.
+    match value.get("cached") {
+        Some(serde_json::Value::Bool(b)) => out.push_str(&format!(" cached={b}")),
+        Some(other) => out.push_str(&format!(" cached={other}")),
+        None => {}
+    }
+    out.push('\n');
+    Ok(out)
 }
 
 /// Print one line per known peer: state, address, and the last failure if there was one.
