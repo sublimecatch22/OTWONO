@@ -288,6 +288,21 @@ radio hardware, with duty-cycle compliance measured.
 Tiered desktop shells, gateways, federation, a security review, and reproducible-build
 verification.
 
+The desktop is specified in `docs/services/DESKTOP.md`: a tier-selected shell, a
+customisable dashboard, the node contribution control (one on/off switch plus storage, RAM,
+CPU and GPU sliders), an assistant toggle where *off* means nothing is listening, integrated
+VMs through KVM/libvirt, a few built-in games, and the finance surface carrying a crypto
+wallet alongside the household's accounts.
+
+Most of its *content* belongs to subsystems specified elsewhere — `FINANCE.md`,
+`EDUCATION.md`, `docs/ai/` — and the media applications are integrated, never rewritten
+(CLAUDE.md §2.3). What is genuinely new at this phase is the shell, the dashboard and the
+contribution control.
+
+**The largest open question in the phase**: which desktop environment or compositor. GNOME,
+KDE, a bespoke Wayland shell and wlroots-based options have very different costs at T0, and
+the answer needs measurement on real hardware rather than preference. It gets an ADR.
+
 ---
 
 ## Sequencing rationale

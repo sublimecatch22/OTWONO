@@ -146,6 +146,12 @@ desktop integration is allowed as a *bridge*, never as the source of truth.
 | `otwono-permd` | Issue/verify capability tokens; policy; user prompts; audit log | Perform the privileged action itself |
 | `otwono-updated` | A/B image updates, verification, rollback | Update itself in place |
 | `otwono-agentd` | Plan and execute user intent through declared tools | Hold ambient privilege; run as root |
+| `otwono-walletd` | **SPECIFIED, Phase 10.** Hold the household's secp256k1 wallet keys; sign transactions under confirmation | Reach the network (it signs; `otwono-fetchd` carries); derive its key from the node identity |
+
+L5, the surface a person actually uses, is specified in `docs/services/DESKTOP.md`: the
+tier-selected shell, the customisable dashboard, the node contribution control, the
+assistant toggle, VMs, and the finance surface that carries the wallet. Which desktop
+environment or compositor is an open ADR.
 
 ---
 

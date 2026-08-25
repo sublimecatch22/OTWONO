@@ -28,6 +28,35 @@ into anything a peer can query.
 Label promotion is not merely "an explicit user action" here — the UI should treat any
 attempt to promote financial data as a mistake and say so.
 
+## 2a. A crypto wallet lives here, and §2 does not yet allow it
+
+**Decided 2026-08-25, and this section is a placeholder for the ADR that must resolve it.**
+
+The finance surface is to carry a crypto wallet, on **secp256k1** (Ethereum/Bitcoin/Cosmos
+family), so a household can hold and spend the rewards a future contribution system pays for
+running a node.
+
+As §2 is written, that is forbidden: everything here is `PRIVATE`, never `SHARED`, and the UI
+should treat promotion as a mistake. A wallet cannot work under that rule, because a wallet
+must broadcast signed transactions.
+
+The distinction §2 is missing, and which the ADR must draw precisely:
+
+- **Keys, balances, transaction history and the contribution record stay `PRIVATE`.** No
+  exception, no cache, no peer index — exactly as §2 says today.
+- **A signed transaction is deliberately published.** That is egress, it requires
+  confirmation, and it is audited. It is not a label promotion of stored data; it is a new
+  object created for the purpose of leaving.
+
+Also open, and pulled forward by this: **the wallet forces the encrypted backup that the
+identity keystore has been deferring.** `keystore.rs` says plainly that losing `node.key`
+loses the identity, with no encrypted export yet. Tolerable for a machine's name. Not
+tolerable for money — a wallet without seed-phrase backup eats funds.
+
+secp256k1 also introduces a **third curve family** to a codebase that has so far used Ed25519
+for signing and X25519 for agreement. That is a new dependency and a new code path in the
+most sensitive part of the system, and it is a cost the ADR should state rather than absorb.
+
 ## 3. Encryption, and why the node key is not enough
 
 Financial records get their own key, derived from a **user passphrase**, not the node
