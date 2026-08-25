@@ -65,14 +65,14 @@ if tar -tf /dev/null >/dev/null 2>&1; then :; fi
 
 case "$ARCH" in
     amd64)
-        QEMU=qemu-system-x86_64
+        QEMU="qemu-system-x86_64"
         MACHINE=(-machine q35 -cpu max)
         FW_CODE=$(ls /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd 2>/dev/null | head -1 || true)
         FW_VARS_SRC=$(ls /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd 2>/dev/null | head -1 || true)
         PFLASH_SIZE=0
         ;;
     arm64)
-        QEMU=qemu-system-aarch64
+        QEMU="qemu-system-aarch64"
         MACHINE=(-machine virt -cpu cortex-a72)
         FW_CODE=$(ls /usr/share/AAVMF/AAVMF_CODE.fd 2>/dev/null | head -1 || true)
         FW_VARS_SRC=$(ls /usr/share/AAVMF/AAVMF_VARS.fd 2>/dev/null | head -1 || true)

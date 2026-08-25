@@ -96,14 +96,14 @@ first_existing() {
 # shellcheck disable=SC2054  # commas belong to QEMU option values, not array syntax
 case "$ARCH" in
     amd64)
-        QEMU=qemu-system-x86_64
+        QEMU="qemu-system-x86_64"
         MACHINE=(-machine q35,accel=tcg -cpu max)
         FW_CODE=$(first_existing /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd || true)
         FW_VARS_SRC=$(first_existing /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd || true)
         PFLASH_SIZE=0
         ;;
     arm64)
-        QEMU=qemu-system-aarch64
+        QEMU="qemu-system-aarch64"
         MACHINE=(-machine virt,accel=tcg -cpu cortex-a72)
         FW_CODE=$(first_existing /usr/share/AAVMF/AAVMF_CODE.fd /usr/share/qemu-efi-aarch64/QEMU_EFI.fd || true)
         FW_VARS_SRC=$(first_existing /usr/share/AAVMF/AAVMF_VARS.fd || true)

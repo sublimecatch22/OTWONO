@@ -3466,6 +3466,23 @@ failure to exchange content. A wrong answer wearing slowness as a disguise.
 `segment_mac()` now lives in `build/qemu/common.sh` and both harnesses call it. One
 definition, because the bug was that there were two.
 
+### Defect 48: verified with a different command than CI runs
+
+The commit carrying defects 46 and 47's fixes went red on CI for a third thing. I had
+shellchecked the harnesses **one file at a time**; CI passes them all in one invocation.
+
+That is not a cosmetic difference. Adding `source common.sh` to the two harnesses — needed so
+both could call `segment_mac()` — gave shellcheck, in multi-file mode, the ability to follow
+the source and reason across the files. It changed the analysis in *both* directions: two
+long-standing `SC2034`s in `run-{amd64,arm64}.sh` stopped firing, and four new `SC2100`s
+appeared on `QEMU=qemu-system-x86_64`, which lexes as arithmetic (`qemu - system - x86_64`)
+once shellcheck has reason to think the surrounding assignments are numeric.
+
+The assignments are quoted now, which is right regardless of what prompted it. The process
+lesson is the more useful half: **run the command CI runs, not one that resembles it.** A
+per-file loop and a single multi-file invocation are different analyses of the same code, and
+only one of them is the one that decides whether the branch is green.
+
 ### Defect 47: a check that printed nothing until it was done
 
 Finding defect 46 took an extra ten-minute cycle for no reason: the check emits a single
