@@ -62,6 +62,7 @@ confirm_socket=present
 # image. A check that silently passed here would be reporting a working confirmation on a
 # node that cannot make one.
 confirmed=no-confirmer
+wallet_created=skipped
 if [ -f /etc/systemd/system/otwono-permd.service.d/90-confirmer.conf ]; then
     confirmed=failed
     # fs.delete is always_confirm, so policy alone cannot authorise it however it is written.
@@ -104,6 +105,60 @@ if [ -f /etc/systemd/system/otwono-permd.service.d/90-confirmer.conf ]; then
         exit 1
     fi
     confirmed=yes
+
+    # And now the thing all of this was for: create a wallet, the way a person would.
+    #
+    # Until this ran, otwono-walletd was a daemon whose main method had never executed. The
+    # sequence is the one a household follows -- ask, be told somebody must confirm, have
+    # them confirm, resume -- and it is worth walking on a machine because every step of it
+    # crosses a process boundary that a host-side test replaces with a function call.
+    wallet_created=failed
+    ask=$(otwono-walletctl create --passphrase "boot-check-passphrase" 2>&1 || true)
+    wcid=$(echo "$ask" | tr ' ' '\n' | grep -E '^[0-9a-f]{64}$' | head -1)
+    [ -n "$wcid" ] || {
+        echo "OTWONO-CONTROL-PLANE-FAIL creating a wallet did not ask for confirmation: $ask" >&2
+        exit 1
+    }
+    # It must have stopped rather than proceeded: no vault yet.
+    otwono-walletctl status 2>&1 | grep -q "no wallet" \
+        || { echo "OTWONO-CONTROL-PLANE-FAIL a wallet appeared before anybody confirmed" >&2; exit 1; }
+
+    otwono-permctl approve "$wcid" >/dev/null 2>&1 \
+        || { echo "OTWONO-CONTROL-PLANE-FAIL could not approve the wallet creation" >&2; exit 1; }
+    made=$(otwono-walletctl create --passphrase "boot-check-passphrase" --confirmation "$wcid" 2>&1) || {
+        echo "OTWONO-CONTROL-PLANE-FAIL creating the wallet after approval failed: $made" >&2
+        exit 1
+    }
+    # The phrase is shown once, with the warning attached. A creation that printed neither
+    # would leave somebody with a wallet and no way back into it.
+    echo "$made" | grep -q "Write these 24 words down" \
+        || { echo "OTWONO-CONTROL-PLANE-FAIL creation did not show the recovery phrase" >&2; exit 1; }
+    words=$(echo "$made" | sed -n 's/^  \([a-z].*\)$/\1/p' | head -1 | wc -w)
+    [ "$words" -eq 24 ] \
+        || { echo "OTWONO-CONTROL-PLANE-FAIL the recovery phrase is $words words, not 24" >&2; exit 1; }
+
+    otwono-walletctl status 2>&1 | grep -q "argon2id" \
+        || { echo "OTWONO-CONTROL-PLANE-FAIL the wallet is not readable after creation" >&2; exit 1; }
+
+    # Derive from it, which is the only way to know the vault actually opens.
+    keys=$(otwono-walletctl address --passphrase "boot-check-passphrase" --index 0 --index 1 2>&1) || {
+        echo "OTWONO-CONTROL-PLANE-FAIL cannot derive from the new wallet: $keys" >&2
+        exit 1
+    }
+    derived=$(echo "$keys" | grep -c "^m/44'")
+    [ "$derived" -eq 2 ] \
+        || { echo "OTWONO-CONTROL-PLANE-FAIL derived $derived keys, expected 2" >&2; exit 1; }
+    # Two indices, two different keys -- addresses are free, so reuse is never forced.
+    distinct=$(echo "$keys" | awk "/^m\/44'/ {print \$2}" | sort -u | wc -l)
+    [ "$distinct" -eq 2 ] \
+        || { echo "OTWONO-CONTROL-PLANE-FAIL two indices produced the same key" >&2; exit 1; }
+
+    # And the wrong passphrase opens nothing.
+    if otwono-walletctl address --passphrase "wrong" >/dev/null 2>&1; then
+        echo "OTWONO-CONTROL-PLANE-FAIL the wrong passphrase derived a key" >&2
+        exit 1
+    fi
+    wallet_created=yes
 fi
 
 # --- the wallet daemon (ADR-0022 §2, ADR-0023 §4) ------------------------------------
@@ -165,4 +220,4 @@ case "$out" in
         ;;
 esac
 
-echo "OTWONO-CONTROL-PLANE-OK tier=$tier audit_records=$records wallet_ns=$wallet_ns wallet_status=$wallet_status confirm_socket=$confirm_socket confirmed=$confirmed"
+echo "OTWONO-CONTROL-PLANE-OK tier=$tier audit_records=$records wallet_ns=$wallet_ns wallet_status=$wallet_status confirm_socket=$confirm_socket confirmed=$confirmed wallet_created=$wallet_created"

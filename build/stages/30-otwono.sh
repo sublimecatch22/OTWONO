@@ -558,6 +558,16 @@ action = "fs.delete"
 subjects = ["uid:0"]
 decision = "allow"
 ttl_seconds = 300
+
+# And wallet.create, for the same reason and with the same effect: always_confirm, so this
+# `allow` becomes `ask`. It is what lets a boot check create a wallet the way a person
+# would -- ask, have somebody approve, then proceed -- rather than leaving the wallet as a
+# daemon whose main method has never run.
+[[rule]]
+action = "wallet.create"
+subjects = ["uid:0"]
+decision = "allow"
+ttl_seconds = 300
 POLICY
     manifest_add "confirmer" "$CONFIRMER"
 else

@@ -1429,6 +1429,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "otwono-walletctl"
+version = "0.1.0"
+dependencies = [
+ "otwono-proto",
+ "serde_json",
+]
+
+[[package]]
 name = "otwono-walletd"
 version = "0.1.0"
 dependencies = [

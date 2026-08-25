@@ -3,12 +3,15 @@
 **Status:** `VERIFIED` on a booted node, for what can run there. `crates/otwono-wallet`
 (keys) and `crates/otwono-walletd` (the daemon) exist, are tested against a real
 `otwono-permd` over real sockets, and the daemon ships in the image and starts on boot with
-its network isolation asserted as an observable fact
-(`out/amd64-qemu-ubuntu/boot.log`: `wallet_ns=isolated wallet_status=no-wallet`).
+its network isolation asserted as an observable fact (`wallet_ns=isolated`).
 
-What has **not** run on a node is everything that needs a person: no wallet has been
-created, signed with, or exported, and none can be until Phase 7. Signing is `SPECIFIED`
-only.
+**A wallet has now been created on a booted node**, through a real confirmation, with keys
+derived from it afterwards (`out/amd64-qemu-ubuntu/boot.log`:
+`confirmed=yes wallet_created=yes wallet_status=present`). That needed the confirmation
+channel (ADR-0024), a client for it (`otwono-permctl`), and a client for this daemon
+(`otwono-walletctl`) — none of which existed when this document first said "not booted".
+
+Signing is still `SPECIFIED` only: there is nothing to sign until a chain is chosen.
 
 Decided in **ADR-0022** (keys, curve, daemon, capabilities) and **ADR-0023** (how the
 passphrase reaches it, and what it holds). The finance surface it belongs to is
@@ -31,21 +34,27 @@ testable without a control plane and without root (CLAUDE.md §2.4).
 | `otwono-walletd`: `wallet.status`, `wallet.public_keys`, `wallet.create`, `wallet.export_seed` | IMPLEMENTED, 11 integration tests against a real broker |
 | The four capabilities in `otwono-permd`'s registry | IMPLEMENTED |
 | A systemd unit, and a place in the image | IMPLEMENTED, and booted |
+| `otwono-walletctl` — status, create, address, export-seed | IMPLEMENTED, and a wallet created on a booted node |
 | Signing | SPECIFIED, and unreachable until Phase 7 **by construction** — see §5 |
 
 ### What the daemon can actually do today
 
-On a booted node: **read, and nothing else** — though the reason has changed since
-**ADR-0024** built the confirmation channel. `wallet.create`, `wallet.sign` and
+On a booted node: **read, create, and derive.** The reason has changed twice since this
+section was written, and the current state is worth stating exactly. `wallet.create`, `wallet.sign` and
 `wallet.export_seed` are `always_confirm`, so `policy.rs` turns `Allow` into `Ask` and
 `otwono-permd` opens a pending confirmation rather than issuing a token. Somebody can now
 answer it, on `/run/otwono/confirm.sock`.
 
-What still blocks the wallet is the half ADR-0024 deliberately did not deliver: **only a
-subject in the configured confirmer set may answer** (§3a), and the shipped image configures
-nobody. So the channel exists, is tested, and cannot yet authorise anything on a real node.
-The wallet's remaining dependencies are a designated confirmer and an agent running under its
-own uid — not the channel. A policy saying `wallet.* = allow`, which is what an operator would actually write,
+`wallet.create` and `wallet.export_seed` are `always_confirm`, so they stop for a person —
+and a person can now answer, if the node designates one. A **release image designates
+nobody**, so on a stock node those two remain unreachable; that is configuration, and
+deliberate. A node that wants them working names a confirmer uid, and must name one no agent
+runs under (ADR-0024 §4a).
+
+`otwono-walletctl create` makes the two-step shape visible rather than hiding it: the first
+run prints the confirmation id and stops, and the second — after somebody approves — resumes
+with `--confirmation`. A command that appeared to hang while waiting for a human would be a
+worse lie than one that says what it is waiting for. A policy saying `wallet.* = allow`, which is what an operator would actually write,
 still gets `ask` on all three and `allow` on `wallet.read`. That is tested at three levels:
 the registry, the policy evaluation, and end to end through the broker.
 

@@ -3999,3 +3999,69 @@ built is not fresh.
 Worth recording as a pattern rather than an incident. Two of these have now been found in
 this repository, both by looking at an artifact rather than at the code that writes it, and
 both would have been invisible to a build that only ever ran one way.
+
+
+---
+
+## A wallet is created on a booted node, through a real confirmation
+
+**STATUS: VERIFIED on a booted node.**
+
+```
+OTWONO-CONTROL-PLANE-OK tier=T0_MICRO audit_records=12 wallet_ns=isolated wallet_status=present confirm_socket=present confirmed=yes wallet_created=yes
+
+```
+
+`wallet_created=yes` is the end of an arc that started with ADR-0022. Until this ran,
+`otwono-walletd` was a daemon whose main method had never executed anywhere but a unit test.
+
+### The gap, and it was the same one twice
+
+`otwono-walletd` had no client. Its four methods were uncallable from the image, exactly as
+`confirm.approve` had been one commit earlier. Both were mechanisms shipped without a way to
+use them, and both were found by asking "who calls this?" rather than by any test failing —
+a suite of green integration tests says nothing about whether a person can reach the thing.
+
+So: `otwono-walletctl` — status, create, address, export-seed.
+
+### What the boot walks
+
+The sequence a household would follow, every step of it across a process boundary that a
+host-side test replaces with a function call:
+
+1. `otwono-walletctl create` → refused, and prints the confirmation id.
+2. **No wallet exists yet** — asserted, because a creation that proceeded before approval
+   would be the whole point missed.
+3. `otwono-permctl approve <id>`.
+4. `otwono-walletctl create --confirmation <id>` → the wallet, and **24 words shown once**
+   with the warning attached. The check counts them: a phrase of the wrong length would be a
+   wallet nobody can restore.
+5. `status` reports it.
+6. `address --index 0 --index 1` derives **two different keys** — addresses are free, so
+   reuse is never forced by the wallet.
+7. The **wrong passphrase derives nothing**.
+
+### The two-step is visible on purpose
+
+`otwono-walletctl create` prints the confirmation id and stops, and is resumed with
+`--confirmation`. It does not wait, spin, or poll. A command that appeared to hang while a
+human decided would be a worse lie than one that says what it is waiting for, and on a
+headless node nobody is watching the terminal it hung in.
+
+It also exits **3** rather than 1 or 2, so a script can tell "a person must act" from "this
+failed".
+
+### What is not tested
+
+- **No signing, and no chain.** `wallet.sign` is not implemented; there is nothing to sign
+  until a chain is chosen, and `address` deliberately prints public keys rather than
+  addresses because an address string would decide the chain in a render function.
+- **`export-seed` has never run.** It is granted no capability in any image, including the
+  test one — deliberately, since it is the call that hands over everything at once.
+- **The passphrase is on a command line** in the boot check, which is fine for a check and
+  is not how a person should ever be asked for one. Nothing here designs that prompt.
+- **A release image still creates nothing**, because it designates no confirmer. Verified by
+  booting that path too.
+- **Expiry is still only tested against an injected clock**, and nothing notifies anybody a
+  confirmation is waiting — a person must run `otwono-permctl list`.
+- amd64 only, TCG, single node.

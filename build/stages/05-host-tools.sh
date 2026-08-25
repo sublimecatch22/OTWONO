@@ -31,7 +31,7 @@ BIN_SRC="$REPO_ROOT/target/$RUST_TARGET/release"
 # otwono-stored were missing from it for two phases and nothing noticed, because no image
 # was built in between.
 BINARIES=(
-    otwono-hwctl otwono-aictl otwono-storectl otwono-permctl
+    otwono-hwctl otwono-aictl otwono-storectl otwono-permctl otwono-walletctl
     otwono-permd otwono-hwd otwono-idd otwono-netd otwono-aid otwono-fetchd otwono-stored
     otwono-walletd
 )
