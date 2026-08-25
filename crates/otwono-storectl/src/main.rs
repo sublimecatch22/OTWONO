@@ -53,6 +53,8 @@ COMMANDS:
     demote <CONTENT_ID>       Make an object more restrictive. Widening needs a person.
     share                     Encrypt a file to named recipients and store it (ADR-0019)
     open <CONTENT_ID>         Open an object shared with this node, writing the plaintext
+    grant <CONTENT_ID>        Add recipients to an object this node can open
+    revoke <CONTENT_ID>       Delete recipients' copies of the key. Recalls nothing.
     cache-status              The neighbourhood cache's budget, usage and contents
     cache-purge               Empty the neighbourhood cache. The node's own store is untouched.
 
@@ -65,7 +67,8 @@ OPTIONS:
     --derived-from <ID>       An object this content was derived from. Repeatable.
     --recipient <SELF|PATH>   Who may open a shared object. `self` asks this node's identity
                               daemon for its own binding; a path reads one from a file.
-                              Repeatable; share needs at least one.
+                              Repeatable; share and grant need at least one.
+    --node <NODE_ID>          Who to revoke. Repeatable; revoke needs at least one.
     --id-socket <PATH>        Identity daemon socket (default $OTWONO_SOCKET_DIR/id.sock),
                               used only to resolve `--recipient self`
     --json                    Print the daemon's reply verbatim
@@ -125,6 +128,7 @@ struct Options {
     visibility: Option<String>,
     derived_from: Vec<String>,
     recipients: Vec<String>,
+    nodes: Vec<String>,
     id_socket: Option<PathBuf>,
     json: bool,
 }
@@ -345,6 +349,30 @@ fn build_call(opts: &Options, recipients: &[Value]) -> Result<(String, Value, Op
             json!({ "content_id": need_target("open")? }),
             Some("id.unwrap_shared"),
         ),
+        // Also id.unwrap_shared: adding a recipient means re-wrapping the content key, and
+        // the only way to have it is to open the object first (ADR-0019 §5).
+        "grant" => {
+            let target = need_target("grant")?;
+            if recipients.is_empty() {
+                return Err(Error::Usage("grant needs at least one --recipient".into()));
+            }
+            (
+                "store.add_recipients".into(),
+                json!({ "content_id": target, "recipients": recipients }),
+                Some("id.unwrap_shared"),
+            )
+        }
+        "revoke" => {
+            let target = need_target("revoke")?;
+            if opts.nodes.is_empty() {
+                return Err(Error::Usage("revoke needs at least one --node".into()));
+            }
+            (
+                "store.remove_recipients".into(),
+                json!({ "content_id": target, "node_ids": opts.nodes }),
+                Some("store.write"),
+            )
+        }
         "cache-status" => ("cache.status".into(), json!({}), Some("cache.read")),
         "cache-purge" => ("cache.purge".into(), json!({}), Some("cache.write")),
         other => return Err(Error::Usage(format!("unknown command {other:?}"))),
@@ -444,6 +472,34 @@ fn render(command: &str, v: &Value) -> String {
                 }
             )
         }
+        "grant" => {
+            let who: Vec<&str> = v["sharing"]["authorized"]
+                .as_array()
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            format!("{} now sealed to {}\n", s("content_id"), who.join(", "))
+        }
+        "revoke" => {
+            let removed: Vec<&str> = v["removed"]
+                .as_array()
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let remaining: Vec<&str> = v["sharing"]["authorized"]
+                .as_array()
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            if removed.is_empty() {
+                format!("{} unchanged; none of those were recipients\n", s("content_id"))
+            } else {
+                format!(
+                    "{} removed {}\nstill sealed to {}\nnote: {}\n",
+                    s("content_id"),
+                    removed.join(", "),
+                    remaining.join(", "),
+                    v["note"].as_str().unwrap_or("")
+                )
+            }
+        }
         "export" => format!(
             "{} {} bytes -> {}\nnote: that file is plaintext and yours; read it and unlink it\n",
             s("content_id"),
@@ -509,6 +565,7 @@ fn parse_args(args: &[String]) -> Result<Options, Error> {
             "--visibility" => opts.visibility = Some(next(&mut it, "--visibility")?),
             "--derived-from" => opts.derived_from.push(next(&mut it, "--derived-from")?),
             "--recipient" => opts.recipients.push(next(&mut it, "--recipient")?),
+            "--node" => opts.nodes.push(next(&mut it, "--node")?),
             "--id-socket" => opts.id_socket = Some(next(&mut it, "--id-socket")?.into()),
             "--json" => opts.json = true,
             other if other.starts_with('-') => return Err(Error::Usage(format!("unknown option {other}"))),
@@ -627,6 +684,44 @@ mod tests {
         // key, and the daemon checks the signature for itself.
         assert_eq!(params["recipients"], json!([binding]));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn granting_to_nobody_is_a_usage_error() {
+        let err = build_call(&opts(&["grant", "abc"]), &[]).unwrap_err();
+        match err {
+            Error::Usage(m) => assert!(m.contains("--recipient"), "{m}"),
+            other => panic!("expected a usage error naming --recipient, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn revoking_nobody_is_a_usage_error_not_a_no_op() {
+        // A `revoke` that quietly did nothing would read, in a shell history, exactly like a
+        // revoke that worked.
+        let err = build_call(&opts(&["revoke", "abc"]), &[]).unwrap_err();
+        match err {
+            Error::Usage(m) => assert!(m.contains("--node"), "{m}"),
+            other => panic!("expected a usage error naming --node, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn grant_asks_for_the_unwrap_capability_and_revoke_does_not() {
+        // Not symmetry for its own sake: widening needs the content key, which needs
+        // opening the object; narrowing needs no key at all (ADR-0019 §5b).
+        let binding = json!({ "node_id": "otw1someone", "public_key": "a", "sharing_public_key": "b", "signature": "c" });
+        let (method, params, action) =
+            build_call(&opts(&["grant", "abc"]), std::slice::from_ref(&binding)).unwrap();
+        assert_eq!(method, "store.add_recipients");
+        assert_eq!(action, Some("id.unwrap_shared"));
+        assert_eq!(params["recipients"], json!([binding]));
+
+        let (method, params, action) =
+            build_call(&opts(&["revoke", "abc", "--node", "otw1someone"]), &[]).unwrap();
+        assert_eq!(method, "store.remove_recipients");
+        assert_eq!(action, Some("store.write"));
+        assert_eq!(params["node_ids"], json!(["otw1someone"]));
     }
 
     #[test]

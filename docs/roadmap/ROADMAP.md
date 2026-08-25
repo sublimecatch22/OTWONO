@@ -182,7 +182,7 @@ GPU/NPU backends, and the tiered assistant shapes.
    once per recipient to a *signed* sharing binding, and the unwrapping key is a third node
    key held by `otwono-idd`. Serving a `SHARED` object to the peers it names works over a
    real link host-side but has not run between two booted nodes. Adding and removing
-   recipients (§5) does not exist.
+   recipients (§5) is implemented and tested over three real daemons, not yet booted.
 3. ~~Egress enforcement in `otwono-netd`, duplicated as defence in depth.~~ **done** —
    ADR-0017 gave the ONM content-fetch protocol; `otwono-netd` calls `store.serve` and
    re-checks the label itself, with deliberately different code (`may_leave_a_node` is an

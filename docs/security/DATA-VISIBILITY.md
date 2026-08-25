@@ -110,8 +110,17 @@ can make that returns a `PRIVATE` object even if both checks failed at once.
   wire sends each recipient only their own copy of the key, but a node holding a `SHARED`
   object it cannot read can still read who can (**OQ-28**, unsolved).
 
-  What is still missing: adding and removing recipients after the fact (ADR-0019 §5), and
-  any variant of the share and accept calls for objects past the control plane's inline cap.
+  Adding and removing recipients after the fact (ADR-0019 §5) is now built — and carries
+  its own honesty requirement, which is where this section's second sentence stops being a
+  design note and starts being a UI obligation. `store.remove_recipients` deletes the named
+  recipients' wrapped copies of the content key and **nothing else**. It stops future
+  serving and future discovery, exactly as `demote` does; it does not reach a recipient who
+  already fetched, and the reply says so in words. Removing every recipient is refused
+  rather than performed, because after ADR-0019 §5a the owner is on that list. Genuinely
+  revoking access means re-encrypting under a new content key and re-sharing.
+
+  What is still missing: any variant of the share and accept calls for objects past the
+  control plane's inline cap.
 - `PUBLIC`/`REPLICATED`: unencrypted but signed, so peers verify authenticity and detect
   tampering.
 

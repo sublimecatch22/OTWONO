@@ -25,9 +25,13 @@
   `tests/control-plane/tests/content_over_a_link.rs`, but both ends of that are one process
   tree. Also here: `store.share_file`, and `node.pub`'s published binding.
 
-- **SPECIFIED, no code:** §5, adding and removing recipients — so a shared object's recipient
-  set is fixed when it is created. No file variant of `share` or `accept_shared`, so an
-  object past the control plane's inline cap can be sealed only in memory.
+- **IMPLEMENTED, not booted.** §5, adding and removing recipients: `store.add_recipients`
+  and `store.remove_recipients`, `otwono-storectl grant` and `revoke`, covered by unit tests
+  in `crates/otwono-store` and five integration tests over three real daemons in
+  `tests/control-plane/tests/shared_objects.rs`. Neither has run on a booted node.
+
+- **SPECIFIED, no code:** no file variant of `share` or `accept_shared`, so an object past
+  the control plane's inline cap can be sealed only in memory.
 
 - **A gap this ADR did not anticipate, since closed.** A recipient had no way to *discover*
   what had been shared with it: a `SHARED` object's id is over ciphertext keyed by a fresh
@@ -207,6 +211,37 @@ copy and nothing else: they may already hold the ciphertext and their key. The A
 in its reply, the way `store.demote` already does, and a UI that implies otherwise is lying.
 Genuinely revoking access means re-encrypting under a new content key and re-sharing — a
 different, more expensive operation, and not this one.
+
+### 5b. What implementing §5 settled
+
+**Amended 2026-08-25, on building it.** Four things §5 left open, each of which had a wrong
+answer that would have looked reasonable:
+
+- **You can only widen access to something you can already open.** `store.add_recipients`
+  needs the content key, and the only way to have it is to be a recipient. That is the whole
+  access control, and it needs no new check: `otwono-stored` obtains the key by the same
+  `id.unwrap_shared` path `store.open_shared` uses, so a node that cannot open an object
+  cannot grant it either. The method is therefore guarded by `id.unwrap_shared` rather than
+  `store.write`, and forwards the caller's own token, exactly as §4's serving path does.
+
+- **A duplicate recipient is refused, not re-sealed.** `Sharing::validate` already rejects
+  two copies for one name, and silently replacing the first would discard a key somebody may
+  already be relying on.
+
+- **Removing the last recipient is refused.** After §5a the owner is on that list, so
+  "revoke everybody" would destroy the owner's access to their own file — the data loss §5a
+  exists to prevent, arrived at from the other direction. An object nobody can open is not a
+  shared object.
+
+- **The reply names who was actually removed**, and removing somebody who was never a
+  recipient is not an error: the caller asked for them to be absent and they are absent.
+  The reply also carries, in words, that nothing was recalled — the same discipline
+  `store.demote` applies, because this is the moment a person is most likely to believe
+  otherwise.
+
+The id does not change. The chunks are the same ciphertext under the same content key; all
+that changes is who holds a wrapped copy of that key. Keeping the id is the point — somebody
+added later can be told the same name everybody else already has.
 
 ## Consequences
 

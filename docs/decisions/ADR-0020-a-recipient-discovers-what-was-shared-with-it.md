@@ -134,8 +134,10 @@ the wrong design.
 - **It says nothing about `PUBLIC` content.** A peer still cannot discover what a node
   publishes; that is a catalogue, it is a different problem with a different privacy
   analysis, and this ADR deliberately does not start it.
-- **It does not solve revocation.** Removing a recipient (ADR-0019 §5, still unbuilt) will
-  have to remove the entry too, and a recipient that already fetched keeps what it has.
+- **It does not solve revocation.** ADR-0019 §5 is now built, and `store.remove_recipients`
+  edits the object record the index is computed from — so a removed recipient stops seeing
+  the entry with no separate index to keep in step, which is §5 of this ADR paying off. What
+  it cannot undo is a fetch that already happened: a recipient keeps what it has.
 
 ## Alternatives rejected
 

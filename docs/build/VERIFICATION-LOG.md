@@ -3572,3 +3572,77 @@ It is 132 now.
 - Adding and removing recipients (ADR-0019 §5) does not exist, so a shared object's recipient
   set is fixed at creation.
 - **amd64 only**, TCG, two nodes, one segment, no real hardware, no radio.
+
+---
+
+## ADR-0019 §5 — a shared object's recipient list stops being fixed at creation
+
+**Workspace only. Nothing here has booted.** No image was built and no QEMU run was made for
+this slice. Neither `otwono-storectl grant` nor `revoke` has been run on a booted node, and
+the mesh boot check is unchanged — it still shares an object with a fixed recipient list.
+The claims below are backed by `cargo test --workspace` and by integration tests that run
+`otwono-permd`, `otwono-idd` and `otwono-stored` as real daemons over real Unix sockets in a
+temp directory.
+
+`SHARED` has been usable since ADR-0020 and un-shareable since it existed. `store.share`
+fixed the recipient list at creation, so a household could seal a file to a neighbour and had
+no way to add a second one, and no way to stop serving it to the first.
+
+### Workspace
+
+```
+cargo test --workspace                                   907 passed, 0 failed
+cargo clippy --workspace --all-targets -- -D warnings     clean
+cargo fmt --all --check                                   clean
+shellcheck -S warning tools/*.sh build/stages/*.sh \
+  build/qemu/*.sh build/lib/*.sh build/files/*            clean
+cargo build --workspace --target aarch64-unknown-linux-gnu   ok
+```
+
+907 from 893 at the previous entry: six store unit tests, five integration tests over the
+three daemons, and three CLI tests.
+
+### What the tests force
+
+- **A recipient added after the fact opens the same id.** Not a copy under a new name — the
+  same object, the same ciphertext, the same content id. That is what makes adding useful:
+  somebody added later can be told the name everybody else already has.
+- **A node cannot widen access to something it cannot open.** The integration test runs a
+  second harness under a policy with no `id.unwrap_shared` rule and confirms the grant is
+  refused. This is not a check in `add_recipients`; it falls out of needing the content key,
+  which is only obtainable by unwrapping this node's own copy.
+- **Revoking says, in the reply, that it recalls nothing.** Asserted on the wire, not left to
+  a UI: the reply carries both what was actually removed and the sentence saying their copy
+  of the key is gone and nothing else is.
+- **Revoking everybody is refused.** After §5a the owner is on the recipient list, so
+  "remove all" would delete the owner's own access to their own file. The test asserts the
+  object is intact afterwards and the owner can still open it.
+- **Revoking a non-recipient changes nothing and says so.** An empty `removed` list, not an
+  error: the caller asked for that node to be absent and it is absent.
+- **A duplicate recipient is refused rather than re-sealed**, at the store layer, because
+  quietly replacing a wrapped key would discard one somebody may be relying on.
+
+### What is not tested
+
+- **Neither method has run on a booted node.** Everything above is host-side.
+- **Nothing large.** `grant` re-wraps a key and never touches the ciphertext, so object size
+  should be irrelevant to it — *should be*, on reading the code, not measured.
+- **No peer has been served after a revoke.** The serve path reads the same object record, so
+  removing an entry ought to stop serving and stop appearing in ADR-0020's index. Both are
+  the same record and the same code path, and neither has been exercised across a link.
+- **Concurrency.** `add_recipients` and `remove_recipients` are read-modify-write on the
+  object record. Two simultaneous grants could lose one. The store has no locking here and
+  this slice did not add any.
+
+### One thing worth recording
+
+`store.add_recipients` is guarded by `id.unwrap_shared`, not by `store.share` or
+`store.write`, and that looked wrong until it did not. A capability token names one action —
+the constraint that forced `store.open_shared` to be guarded by the unwrap capability so a
+single token could satisfy both daemons. Adding a recipient needs the same unwrap, for the
+same reason, so it takes the same guard and forwards the caller's own token. Guarding it by
+`store.write` would have meant this daemon obtaining a key on its own authority rather than
+the caller's, which is the thing that design exists to prevent.
+
+`remove_recipients` needs no key at all, so it is `store.write` — the asymmetry is the point,
+and a CLI test pins it so a later tidy-up cannot make the two symmetrical for neatness.

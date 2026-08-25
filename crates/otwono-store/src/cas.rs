@@ -94,6 +94,14 @@ fn io(path: &Path, e: std::io::Error) -> StoreError {
     }
 }
 
+/// A sharing envelope the caller asked for something impossible with.
+///
+/// Spelled out at ten call sites before this existed, which made the long ones wrap in a
+/// way that read as if the message mattered less than the type path around it.
+fn bad_envelope(reason: impl Into<String>) -> StoreError {
+    StoreError::Object(crate::object::ObjectError::BadEnvelope(reason.into()))
+}
+
 impl Store {
     /// A store that writes chunks in the clear.
     ///
@@ -418,9 +426,7 @@ impl Store {
         recipients: &[Recipient],
     ) -> Result<(Object, crate::shared::ContentKey), StoreError> {
         if recipients.is_empty() {
-            return Err(StoreError::Object(crate::object::ObjectError::BadEnvelope(
-                "no recipients, so nobody could open it".to_string(),
-            )));
+            return Err(bad_envelope("no recipients, so nobody could open it"));
         }
         self.ensure_layout()?;
         let key = crate::shared::ContentKey::generate();
@@ -447,7 +453,7 @@ impl Store {
             .iter()
             .map(|r| otwono_identity::seal_to(&r.node_id, &r.sharing_public_key, key.as_bytes()))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| StoreError::Object(crate::object::ObjectError::BadEnvelope(e.to_string())))?;
+            .map_err(|e| bad_envelope(e.to_string()))?;
 
         let result = (|| {
             let file = std::fs::File::open(&staging).map_err(|e| io(&staging, e))?;
@@ -467,6 +473,93 @@ impl Store {
         // no reason for it to outlive this call — including when the call failed.
         let _ = std::fs::remove_file(&staging);
         result.map(|object| (object, key))
+    }
+
+    /// Seal an existing object's content key to further recipients (ADR-0019 §5).
+    ///
+    /// The id does not change. The chunks are the same ciphertext under the same content
+    /// key; all that grows is the list of people holding a copy of that key. Keeping the id
+    /// is the point — a recipient added later can be told the same name everybody else has.
+    ///
+    /// The caller supplies the content key, which it can only have by being a recipient
+    /// itself. That is the access control: **you can only widen access to something you can
+    /// already open.** The store does not check it against the ciphertext, because it cannot
+    /// without decrypting — a caller that supplies the wrong key seals a useless copy and
+    /// the recipient finds out when it fails to open, which is a caller error and not a
+    /// disclosure.
+    ///
+    /// A recipient already on the list is refused rather than re-sealed. Two copies for one
+    /// name is what `Sharing::validate` rejects, and quietly replacing the first would
+    /// discard a key somebody may already be relying on.
+    pub fn add_recipients(
+        &self,
+        id: &ContentId,
+        content_key: &crate::shared::ContentKey,
+        recipients: &[Recipient],
+    ) -> Result<Object, StoreError> {
+        if recipients.is_empty() {
+            return Err(bad_envelope("no recipients to add"));
+        }
+        let mut object = self.get_object(id)?;
+        let sharing = object.sharing.as_mut().ok_or(bad_envelope(
+            "this object is not sealed, so there is nobody to add",
+        ))?;
+
+        for r in recipients {
+            if sharing.names(&r.node_id) {
+                return Err(bad_envelope(format!("{} is already a recipient", r.node_id)));
+            }
+        }
+        for r in recipients {
+            let sealed = otwono_identity::seal_to(&r.node_id, &r.sharing_public_key, content_key.as_bytes())
+                .map_err(|e| bad_envelope(e.to_string()))?;
+            sharing.sealed_keys.push(sealed);
+        }
+        self.put_object(&object)?;
+        Ok(object)
+    }
+
+    /// Delete named recipients' copies of the content key (ADR-0019 §5).
+    ///
+    /// **This does not un-share anything.** It deletes their wrapped copy and nothing else:
+    /// they may already hold the ciphertext, and they certainly still hold their own key. A
+    /// recipient who fetched yesterday keeps what they fetched. What this stops is *future*
+    /// serving and future discovery, exactly as `demote` stops future serving — and the
+    /// caller is told so, because a UI that implies otherwise is lying.
+    ///
+    /// Genuinely revoking access means re-encrypting under a new content key and re-sharing,
+    /// which is a different and more expensive operation and is not this one.
+    ///
+    /// Returns the names actually removed. A name that was not on the list is not an error:
+    /// the caller asked for it to be absent and it is absent.
+    ///
+    /// Removing the **last** recipient is refused. An object nobody can open is not a shared
+    /// object, which is the same rule that refuses creating one — and here it would silently
+    /// destroy the owner's own access to their own file.
+    pub fn remove_recipients(
+        &self,
+        id: &ContentId,
+        node_ids: &[String],
+    ) -> Result<(Object, Vec<String>), StoreError> {
+        let mut object = self.get_object(id)?;
+        let sharing = object.sharing.as_mut().ok_or(bad_envelope(
+            "this object is not sealed, so there is nobody to remove",
+        ))?;
+
+        let removed: Vec<String> = node_ids.iter().filter(|n| sharing.names(n)).cloned().collect();
+        if removed.is_empty() {
+            return Ok((object, removed));
+        }
+        if removed.len() == sharing.sealed_keys.len() {
+            return Err(bad_envelope(
+                "removing every recipient would leave an object nobody can open, including \
+                 whoever shared it; re-encrypt under a new key instead"
+                    .to_string(),
+            ));
+        }
+        sharing.sealed_keys.retain(|k| !removed.contains(&k.recipient));
+        self.put_object(&object)?;
+        Ok((object, removed))
     }
 
     /// The objects in this store sealed to `recipient`, by content id (ADR-0020).
@@ -593,21 +686,16 @@ impl Store {
         key: &crate::shared::ContentKey,
         out: W,
     ) -> Result<u64, StoreError> {
-        let sharing =
-            object
-                .sharing
-                .as_ref()
-                .ok_or(StoreError::Object(crate::object::ObjectError::BadEnvelope(
-                    "this object is not sealed".to_string(),
-                )))?;
+        let sharing = object
+            .sharing
+            .as_ref()
+            .ok_or(bad_envelope("this object is not sealed"))?;
         sharing.validate().map_err(StoreError::Object)?;
         let prefix = data_encoding::BASE64
             .decode(sharing.nonce_prefix.as_bytes())
             .ok()
             .and_then(|b| crate::shared::decode_prefix(&b).ok())
-            .ok_or(StoreError::Object(crate::object::ObjectError::BadEnvelope(
-                "the nonce prefix is not usable".to_string(),
-            )))?;
+            .ok_or(bad_envelope("the nonce prefix is not usable"))?;
 
         let mut failure = None;
         let reader = ChunkReader::new(self, object, &mut failure);
@@ -840,6 +928,171 @@ mod tests {
             },
             key,
         )
+    }
+
+    #[test]
+    fn adding_a_recipient_keeps_the_objects_name_and_lets_them_open_it() {
+        // The id must not change: a recipient added later has to be told the same name
+        // everybody else already has, and the chunks are the same ciphertext regardless.
+        let d = tmp("add-recip");
+        let s = Store::new(&d);
+        let plaintext = data(50_000, 120);
+        let (alice, alice_key) = recipient("otw1alice", 40);
+        let (bob, bob_key) = recipient("otw1bob", 41);
+
+        let (object, content_key) = s
+            .put_shared_reader(plaintext.as_slice(), std::slice::from_ref(&alice))
+            .unwrap();
+        assert!(bob_key
+            .open(&object.sharing.as_ref().unwrap().sealed_keys[0])
+            .is_err());
+
+        let grown = s
+            .add_recipients(&object.content_id, &content_key, &[bob])
+            .unwrap();
+        assert_eq!(grown.content_id, object.content_id, "adding must not rename it");
+        assert_eq!(grown.chunks, object.chunks, "and must not touch the bytes");
+
+        let sharing = grown.sharing.as_ref().unwrap();
+        assert_eq!(sharing.authorized_nodes(), vec!["otw1alice", "otw1bob"]);
+        for (name, key) in [("otw1alice", &alice_key), ("otw1bob", &bob_key)] {
+            let copy = sharing.copy_for(name).unwrap();
+            let opened = crate::shared::ContentKey::from_bytes(*key.open(copy).unwrap());
+            let mut out = Vec::new();
+            s.open_shared(&grown, &opened, &mut out).unwrap();
+            assert_eq!(out, plaintext, "{name} could not open it");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn adding_somebody_who_is_already_a_recipient_is_refused() {
+        // Quietly re-sealing would discard a key somebody may already be relying on, and two
+        // copies under one name is what the envelope's own validation rejects.
+        let d = tmp("add-dup");
+        let s = Store::new(&d);
+        let (alice, _) = recipient("otw1alice", 42);
+        let (object, key) = s
+            .put_shared_reader(data(1_000, 121).as_slice(), std::slice::from_ref(&alice))
+            .unwrap();
+
+        let err = s.add_recipients(&object.content_id, &key, &[alice]).unwrap_err();
+        assert!(err.to_string().contains("already a recipient"), "{err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn removing_a_recipient_stops_future_serving_and_nothing_else() {
+        // The honest half of ADR-0019 §5: their copy of the key is gone from this record,
+        // and everything they already fetched is still theirs.
+        let d = tmp("remove-recip");
+        let s = Store::new(&d);
+        let plaintext = data(30_000, 122);
+        let (alice, alice_key) = recipient("otw1alice", 43);
+        let (bob, bob_key) = recipient("otw1bob", 44);
+        let (object, _) = s.put_shared_reader(plaintext.as_slice(), &[alice, bob]).unwrap();
+
+        // Bob takes his copy before he is removed, as a real recipient would have.
+        let bobs_copy = object
+            .sharing
+            .as_ref()
+            .unwrap()
+            .copy_for("otw1bob")
+            .unwrap()
+            .clone();
+
+        let (after, removed) = s
+            .remove_recipients(&object.content_id, &["otw1bob".to_string()])
+            .unwrap();
+        assert_eq!(removed, vec!["otw1bob".to_string()]);
+        assert_eq!(after.content_id, object.content_id, "removing must not rename it");
+        let sharing = after.sharing.as_ref().unwrap();
+        assert_eq!(sharing.authorized_nodes(), vec!["otw1alice"]);
+        assert!(sharing.copy_for("otw1bob").is_none());
+
+        // Alice is untouched.
+        let hers = sharing.copy_for("otw1alice").unwrap();
+        let key = crate::shared::ContentKey::from_bytes(*alice_key.open(hers).unwrap());
+        let mut out = Vec::new();
+        s.open_shared(&after, &key, &mut out).unwrap();
+        assert_eq!(out, plaintext);
+
+        // And the point the API has to be honest about: the copy Bob already took still
+        // opens the bytes he already has. Removal recalls nothing.
+        let still = crate::shared::ContentKey::from_bytes(*bob_key.open(&bobs_copy).unwrap());
+        let mut theirs = Vec::new();
+        s.open_shared(&after, &still, &mut theirs).unwrap();
+        assert_eq!(
+            theirs, plaintext,
+            "removal cannot un-share what was already taken"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn removing_the_last_recipient_is_refused() {
+        // It would leave an object nobody can open -- including whoever shared it, who since
+        // ADR-0019 §5a is always on the list. The same rule that refuses creating one.
+        let d = tmp("remove-last");
+        let s = Store::new(&d);
+        let (alice, _) = recipient("otw1alice", 45);
+        let (object, _) = s
+            .put_shared_reader(data(1_000, 123).as_slice(), &[alice])
+            .unwrap();
+
+        let err = s
+            .remove_recipients(&object.content_id, &["otw1alice".to_string()])
+            .unwrap_err();
+        assert!(err.to_string().contains("nobody can open"), "{err}");
+        // And it really did not write the change.
+        let reread = s.get_object(&object.content_id).unwrap();
+        assert_eq!(
+            reread.sharing.as_ref().unwrap().authorized_nodes(),
+            vec!["otw1alice"]
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn removing_somebody_who_was_never_a_recipient_is_not_an_error() {
+        // The caller asked for them to be absent and they are absent. Reporting what was
+        // actually removed is how a UI can say "nothing changed" without guessing.
+        let d = tmp("remove-absent");
+        let s = Store::new(&d);
+        let (alice, _) = recipient("otw1alice", 46);
+        let (object, _) = s
+            .put_shared_reader(data(1_000, 124).as_slice(), &[alice])
+            .unwrap();
+
+        let (after, removed) = s
+            .remove_recipients(&object.content_id, &["otw1nobody".to_string()])
+            .unwrap();
+        assert!(removed.is_empty());
+        assert_eq!(
+            after.sharing.as_ref().unwrap().authorized_nodes(),
+            vec!["otw1alice"]
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_removed_recipient_stops_being_offered_the_object() {
+        // Removal has to reach ADR-0020's index too, or the node would go on advertising
+        // something the serve path then refuses.
+        let d = tmp("remove-index");
+        let s = Store::new(&d);
+        let (alice, _) = recipient("otw1alice", 47);
+        let (bob, _) = recipient("otw1bob", 48);
+        let (object, _) = s
+            .put_shared_reader(data(1_000, 125).as_slice(), &[alice, bob])
+            .unwrap();
+        assert_eq!(s.shared_with("otw1bob", None, 10).unwrap().len(), 1);
+
+        s.remove_recipients(&object.content_id, &["otw1bob".to_string()])
+            .unwrap();
+        assert_eq!(s.shared_with("otw1bob", None, 10).unwrap(), vec![]);
+        assert_eq!(s.shared_with("otw1alice", None, 10).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

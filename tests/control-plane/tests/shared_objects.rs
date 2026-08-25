@@ -431,6 +431,166 @@ fn every_named_recipient_gets_a_copy_and_nobody_else_does() {
     }
 }
 
+#[test]
+fn a_recipient_added_later_can_open_the_same_object() {
+    // ADR-0019 §5 across the daemons: the object keeps its name, and somebody added
+    // afterwards opens exactly what everybody else has.
+    let h = Harness::start("grant", POLICY);
+    let plaintext = payload(30, 20_000);
+    let (bob, bob_key) = stranger(30);
+
+    let out = h
+        .call(
+            "store.share",
+            json!({
+                "data": data_encoding::BASE64.encode(&plaintext),
+                "recipients": [h.my_binding()],
+            }),
+            "store.share",
+        )
+        .unwrap();
+    let id = out["content_id"].as_str().unwrap().to_string();
+
+    let grown = h
+        .call(
+            "store.add_recipients",
+            json!({ "content_id": id, "recipients": [bob.clone()] }),
+            "id.unwrap_shared",
+        )
+        .expect("this node can open it, so it can widen it");
+    assert_eq!(grown["content_id"], id, "adding must not rename the object");
+
+    let sealed: Vec<otwono_identity::SealedKey> =
+        serde_json::from_value(grown["sharing"]["sealed_keys"].clone()).unwrap();
+    let his = sealed
+        .iter()
+        .find(|k| k.recipient == bob.node_id.to_text())
+        .expect("bob has a copy now");
+    assert!(bob_key.open(his).is_ok(), "and it is his to open");
+}
+
+#[test]
+fn a_node_cannot_widen_access_to_something_it_cannot_open() {
+    // The access control, stated as a test: adding a recipient needs the content key, and
+    // the only way to have it is to be a recipient. A node holding somebody else's sealed
+    // object must not be able to hand it on.
+    let h = Harness::start("grantnotmine", POLICY);
+    let (theirs, their_key) = stranger(31);
+    let (bob, _) = stranger(32);
+    let id = hold_an_object_for(&h, &theirs.node_id.to_text(), &their_key, &payload(31, 5_000));
+
+    let err = h
+        .call(
+            "store.add_recipients",
+            json!({ "content_id": id, "recipients": [bob] }),
+            "id.unwrap_shared",
+        )
+        .expect_err("no key here means no widening");
+    assert!(
+        err.message.contains("not shared with this node"),
+        "{}",
+        err.message
+    );
+}
+
+#[test]
+fn revoking_says_plainly_that_it_recalls_nothing() {
+    // The honest half of §5. A caller that reported this as "access revoked" would be
+    // lying, and it is this daemon's job to give them the words not to.
+    let h = Harness::start("revoke", POLICY);
+    let (bob, _) = stranger(33);
+    let out = h
+        .call(
+            "store.share",
+            json!({
+                "data": data_encoding::BASE64.encode(&payload(33, 4_000)),
+                "recipients": [h.my_binding(), bob.clone()],
+            }),
+            "store.share",
+        )
+        .unwrap();
+    let id = out["content_id"].as_str().unwrap().to_string();
+
+    let after = h
+        .call(
+            "store.remove_recipients",
+            json!({ "content_id": id, "node_ids": [bob.node_id.to_text()] }),
+            "store.write",
+        )
+        .expect("removing is narrowing and always allowed");
+    assert_eq!(after["removed"], json!([bob.node_id.to_text()]));
+    assert_eq!(after["sharing"]["authorized"], json!([h.node_id()]));
+
+    let note = after["note"].as_str().unwrap();
+    assert!(note.contains("already hold"), "{note}");
+    assert!(note.contains("re-encrypting"), "{note}");
+
+    // And the object is no longer offered to them.
+    assert!(!after["sharing"]["authorized"]
+        .as_array()
+        .unwrap()
+        .contains(&json!(bob.node_id.to_text())));
+}
+
+#[test]
+fn revoking_everybody_is_refused_rather_than_destroying_the_owners_access() {
+    let h = Harness::start("revokeall", POLICY);
+    let out = h
+        .call(
+            "store.share",
+            json!({
+                "data": data_encoding::BASE64.encode(&payload(34, 2_000)),
+                "recipients": [h.my_binding()],
+            }),
+            "store.share",
+        )
+        .unwrap();
+    let id = out["content_id"].as_str().unwrap().to_string();
+
+    let err = h
+        .call(
+            "store.remove_recipients",
+            json!({ "content_id": id, "node_ids": [h.node_id()] }),
+            "store.write",
+        )
+        .expect_err("an object nobody can open is not a shared object");
+    assert!(err.message.contains("nobody can open"), "{}", err.message);
+
+    // Still openable afterwards, so the refusal really did not half-apply.
+    h.call(
+        "store.open_shared",
+        json!({ "content_id": id }),
+        "id.unwrap_shared",
+    )
+    .expect("the owner still has their key");
+}
+
+#[test]
+fn revoking_somebody_who_was_never_a_recipient_changes_nothing_and_says_so() {
+    let h = Harness::start("revokeabsent", POLICY);
+    let out = h
+        .call(
+            "store.share",
+            json!({
+                "data": data_encoding::BASE64.encode(&payload(35, 2_000)),
+                "recipients": [h.my_binding()],
+            }),
+            "store.share",
+        )
+        .unwrap();
+    let id = out["content_id"].as_str().unwrap().to_string();
+
+    let after = h
+        .call(
+            "store.remove_recipients",
+            json!({ "content_id": id, "node_ids": ["otw1nobodyatall"] }),
+            "store.write",
+        )
+        .unwrap();
+    assert_eq!(after["removed"], json!([]));
+    assert_eq!(after["sharing"]["authorized"], json!([h.node_id()]));
+}
+
 /// Share `plaintext` with one stranger and return (content id, their NodeID).
 fn shared_with_a_stranger(h: &Harness, seed: u8, plaintext: &[u8]) -> (String, String) {
     let (binding, _) = stranger(seed);
