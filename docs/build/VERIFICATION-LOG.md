@@ -4111,40 +4111,50 @@ re-reading rather than by CI or by a deliberate mutation.
 - amd64 only, TCG, single node.
 
 
+
 ---
 
 ## Two nodes, after all of it: no regression, and two wallets
 
 **STATUS: VERIFIED between two booted nodes.** A regression check rather than a new feature,
-run because this session rewrote a large part of stage 30 and gave  — the
+run because this session rewrote a large part of stage 30 and gave `otwono-permd` — the
 security kernel — a second socket. None of that had been exercised multi-node, and a mesh
 regression would be invisible to a single-node boot.
 
 ```
 OTWONO-MESH-CONTENT-OK node=1/2 public=45df7afd815dc66cdc46e897a55f332d2cdc95a35ebb6bf8d7fc1647751a9102 large=afc9c4b30193fe51060631cc23d21d8a061ba2cee183b5ab83c01c17d27d6adc large_served=1 private_refused=fdadceaec830951dbcc57cc41a5b74f4b8b51506c59b651d132d12b62bc65036 cache_budget=536870912 cache_held=1 shared_to_peer=2a56acd24926a7af6bdc8f29658d8fc41055b9f5d663dae3f278088f849d6d99 granted=ced7e6af2508d28d3113a6319321ba9a5b4d69407bb65218d33e8532d19d7831 discovered=306c36eafa71a58ed6de157979887b13e098cb29dd0a6769335007ec70bdb8e8
 
-
 node-a: OTWONO-CONTROL-PLANE-OK tier=T0_MICRO audit_records=12 wallet_ns=isolated wallet_status=present confirm_socket=present confirmed=yes wallet_created=yes
-
 node-b: OTWONO-CONTROL-PLANE-OK tier=T0_MICRO audit_records=12 wallet_ns=isolated wallet_status=present confirm_socket=present confirmed=yes wallet_created=yes
-
 ```
 
 Nothing regressed, and two things are stronger than any previous run:
 
-- **Each node created its own wallet, through its own confirmation.**  on both, on two machines with different identities that have never
+- **Each node created its own wallet, through its own confirmation.** `confirmed=yes
+  wallet_created=yes` on both, on two machines with different identities that have never
   shared state. Every previous wallet result was one node.
 - **ADR-0019 §5 and ADR-0020 still hold across the link.** The ids cross — A's
-   is B's  and the reverse — and each node has a distinct
-  , so adding and removing recipients still works on a machine after four commits
+  `shared_to_peer` is B's `discovered` and the reverse — and each node has a distinct
+  `granted`, so adding and removing recipients still works on a machine after four commits
   of unrelated change to the daemon that serves it.
 
 That the mesh, the content loop, the neighbourhood cache and the sharing index are all
 untouched by a rewritten permission broker is the point of running this: the claim was
 plausible from reading the diff and is now observed.
 
+### A note on how this entry was nearly written
+
+The first attempt at it was generated through an **unquoted** shell heredoc, so every
+backticked term in the markdown was executed as a command substitution and replaced with
+nothing. The result read as fluent prose with the technical nouns silently deleted — "gave
+ — the security kernel — a second socket" — and it was committed before being read back.
+
+Recorded because the failure mode is the interesting part: it produces *plausible* text
+rather than an error, and a document is exactly the artifact where nobody notices. The same
+mistake in a script would have failed loudly.
+
 ### What this run does not add
 
 Nothing new is tested here. Every caveat from the entries above stands unchanged: no
-signing, no chain,  never run, the no-echo prompt never exercised, expiry only
+signing, no chain, `export-seed` never run, the no-echo prompt never exercised, expiry only
 against an injected clock, nothing notifying anybody, amd64 only, TCG, two nodes.
