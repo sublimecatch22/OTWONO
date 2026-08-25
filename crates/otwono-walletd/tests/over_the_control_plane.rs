@@ -174,11 +174,36 @@ fn status_describes_the_vault_and_never_anything_secret() {
     assert_eq!(out["kdf"], json!("argon2id"));
     assert_eq!(out["cipher"], json!("xchacha20poly1305"));
 
-    // Nothing secret, checked against the actual secret rather than against a guess at what
-    // the reply might contain.
+    // Structural, not substring. The first version of this asserted that no individual
+    // recovery word appeared anywhere in the reply -- which fails 20% of the time, because
+    // the reply's own prose ("address", "public key", "this", "use", "because"...) contains
+    // 19 BIP-39 words, and a random 24-word phrase hits one of them one run in five. It
+    // passed locally and went red in CI, which is the only reason it was caught.
+    //
+    // Checking the field set is both deterministic and stronger: it catches a *new* field
+    // that leaks something, which per-word matching never could.
+    const ALLOWED: [&str; 9] = [
+        "exists", "path", "version", "kdf", "cipher", "m_cost", "t_cost", "p_cost", "note",
+    ];
+    for field in out.as_object().unwrap().keys() {
+        assert!(
+            ALLOWED.contains(&field.as_str()),
+            "wallet.status grew a field, {field:?}. Everything it returns is readable by \
+             anyone who can read the vault file; a new one may not be"
+        );
+    }
+
+    // And the secrets themselves, by whole phrase rather than by word. Three consecutive
+    // BIP-39 words occurring in prose by chance is not a thing that happens.
     let shown = out.to_string();
-    for word in phrase.split_whitespace() {
-        assert!(!shown.contains(word), "status leaked a recovery word: {shown}");
+    assert!(
+        !shown.contains(&phrase),
+        "status leaked the whole recovery phrase"
+    );
+    let words: Vec<&str> = phrase.split_whitespace().collect();
+    for window in words.windows(3) {
+        let run = window.join(" ");
+        assert!(!shown.contains(&run), "status leaked part of the phrase: {run}");
     }
     assert!(
         !shown.contains("correct horse"),

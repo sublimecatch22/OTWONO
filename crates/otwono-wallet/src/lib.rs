@@ -187,10 +187,14 @@ mod tests {
 
     #[test]
     fn debug_never_prints_the_words() {
+        // Exact match, not per-word substring. Asserting that no individual recovery word
+        // appears in the output looks stricter and is in fact flaky: "redacted" contains
+        // "act" and "words" contains "word", both BIP-39 words, so a random phrase trips it
+        // about one run in forty. Pinning the whole string is deterministic and says
+        // exactly what this type is allowed to reveal.
         let m = Mnemonic::generate();
         let shown = format!("{m:?}");
-        for word in m.phrase().split_whitespace() {
-            assert!(!shown.contains(word), "{shown} leaked {word}");
-        }
+        assert_eq!(shown, "Mnemonic(24 words, redacted)");
+        assert!(!shown.contains(m.phrase()));
     }
 }
