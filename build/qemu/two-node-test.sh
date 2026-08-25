@@ -18,10 +18,18 @@
 # Usage: build/qemu/two-node-test.sh --image IMG [--arch amd64|arm64] [--out DIR]
 set -euo pipefail
 
+# shellcheck source=build/qemu/common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+
 IMAGE=""; ARCH="amd64"; OUT=""; TIMEOUT="${OTWONO_TWO_NODE_TIMEOUT:-900}"
 # Separate from the mesh timeout: the content check only starts working once a peer exists,
 # so this is measured from mesh formation and not from boot.
-CONTENT_TIMEOUT="${OTWONO_CONTENT_TIMEOUT:-300}"
+# The content check waits for a mesh, then fetches several objects with generous retries;
+# under TCG it can legitimately take well past five minutes, and a timeout shorter than the
+# work reports a failure that is only slowness. Raised after a run reached 363s with the
+# check still running and nothing in the log to say so -- which is also why the check now
+# prints a line per section.
+CONTENT_TIMEOUT="${OTWONO_CONTENT_TIMEOUT:-900}"
 usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 while [ $# -gt 0 ]; do
@@ -142,9 +150,9 @@ start_node() { # node netdev-spec logfile mac
 : > "$OUT/node-a.log"; : > "$OUT/node-b.log"
 # Locally-administered unicast addresses (the 0x02 bit set in the first octet), distinct
 # per node.
-PID_A=$(start_node a "socket,id=seg,listen=127.0.0.1:$SEGMENT_PORT" "$OUT/node-a.log" "52:54:00:07:11:01")
+PID_A=$(start_node a "socket,id=seg,listen=127.0.0.1:$SEGMENT_PORT" "$OUT/node-a.log" "$(segment_mac 2 1)")
 sleep 2
-PID_B=$(start_node b "socket,id=seg,connect=127.0.0.1:$SEGMENT_PORT" "$OUT/node-b.log" "52:54:00:07:11:02")
+PID_B=$(start_node b "socket,id=seg,connect=127.0.0.1:$SEGMENT_PORT" "$OUT/node-b.log" "$(segment_mac 2 2)")
 
 cleanup() {
     kill "$PID_A" "$PID_B" 2>/dev/null || true

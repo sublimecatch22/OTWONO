@@ -11,6 +11,12 @@
   `id.unwrap_shared` to `uid:0` and nothing wider. Relabelling plaintext to `shared` is
   refused. `otwono-storectl share` and `open` are how a person reaches it.
 
+- **VERIFIED between two booted nodes:** a node takes a connected peer's signed sharing
+  binding off the wire — it travels in the `Hello` after every Noise handshake — and
+  encrypts an object to it; it cannot open what it sealed to somebody else; and a binding
+  whose signature has been tampered with is refused rather than sealed to
+  (`out/amd64-qemu-ubuntu/two-node/node-{a,b}.log`).
+
 - **IMPLEMENTED, not booted.** §4's serving: `store.serve`, `store.serve_manifest` and
   `store.serve_chunk` hand a `Shared` object to a peer named in its envelope, out of this
   node's own store only; the ONM manifest carries that peer's own sealed key and no other;
@@ -32,7 +38,8 @@
   told, and ONM has no method that tells it. Sharing therefore works today only alongside a
   channel outside the mesh, which is most of the problem node identity exists to solve. This
   is **OQ-29**, and it is the reason `SHARED` has not been demonstrated crossing a link
-  between two booted nodes even though every piece needed to carry it now exists.
+  between two booted nodes even though every piece needed to carry it now exists — the
+  sealing half has run between two VMs; the fetching half has nothing to ask for.
 
 ## Context
 

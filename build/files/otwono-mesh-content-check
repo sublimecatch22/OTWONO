@@ -26,6 +26,15 @@ WORK=/var/lib/otwono/mesh-content-check
 
 fail() { echo "OTWONO-MESH-CONTENT-FAIL $*" >&2; exit 1; }
 
+# Say where we are as we go.
+#
+# This check prints one marker at the end and can legitimately run for many minutes: it
+# waits for a mesh to form, then fetches several objects with generous retries. When it does
+# not finish, a log with nothing in it says only "somewhere in there" -- which is exactly the
+# position a run left me in, with no way to tell a hang from a slow boot without another
+# ten-minute cycle. A line per section costs nothing and turns that into a reading.
+step() { echo "OTWONO-MESH-CONTENT-STEP $*"; }
+
 # How many nodes are on this segment, and which one this is. The harness encodes both in the
 # MAC -- octet 5 is the count, octet 6 the 1-based ordinal -- because every node boots the
 # same image and has no other way to know. A node booted outside the multi-node harness sees
@@ -123,6 +132,7 @@ prv_id=$(otwono-storectl put --file "$WORK/private.txt" --visibility private | a
 # is anybody to ask; "no connected peer" is the expected answer for the first minute or two.
 # Every peer, not merely one. With disjoint shares a fetch needs all of them, and starting
 # before the last neighbour arrives would fail for a reason that is not a defect.
+step "waiting for $(( node_total - 1 )) peer(s)"
 i=0
 while [ "$i" -lt 150 ]; do
     seen=$(otwono-netd --status --socket /run/otwono/net.sock 2>/dev/null \
@@ -133,6 +143,7 @@ while [ "$i" -lt 150 ]; do
     sleep 5
 done
 
+step "fetching the small public object"
 got=""
 i=0
 while [ "$i" -lt 120 ]; do
@@ -167,6 +178,7 @@ while [ "$i" -lt 60 ]; do
 done
 [ -n "$big" ] || fail "a multi-chunk object would not cross the link within 300s"
 echo "$big" | grep -q "$big_id" || fail "the peer served the wrong large object: $big"
+step "large object fetched"
 big_size=$(wc -c < "$WORK/large.bin")
 echo "$big" | grep -q " $big_size bytes " \
     || fail "the large object arrived at the wrong size (wanted $big_size): $big"
@@ -222,6 +234,7 @@ fi
 # The neighbourhood cache, which on these nodes exists only because the test image overrides
 # the storage axis. Reported rather than asserted beyond being answerable: what matters here
 # is that a node with a real budget opens a real cache and can be asked about it.
+step "checking the neighbourhood cache"
 cache_state=none
 cache_held=0
 if cache=$(otwono-storectl cache-status 2>&1); then
@@ -254,6 +267,7 @@ fi
 # What this does NOT prove, and the marker says so by naming only an id: the peer cannot
 # fetch it. A recipient has no way to discover what has been shared with it (OQ-29), so
 # there is no id to hand the other side without a channel outside the mesh.
+step "sealing to a peer learned over the mesh"
 shared_to_peer=none
 if otwono-netd --peer-binding "$WORK/peer.binding" --socket /run/otwono/net.sock \
         >/dev/null 2>&1; then

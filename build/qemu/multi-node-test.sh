@@ -19,6 +19,9 @@
 # Usage: build/qemu/multi-node-test.sh --image IMG [--nodes N] [--arch amd64|arm64] [--out DIR]
 set -euo pipefail
 
+# shellcheck source=build/qemu/common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+
 IMAGE=""; ARCH="amd64"; OUT=""; NODES=3
 TIMEOUT="${OTWONO_MULTI_NODE_TIMEOUT:-1200}"
 CONTENT_TIMEOUT="${OTWONO_CONTENT_TIMEOUT:-420}"
@@ -107,7 +110,7 @@ for i in $(seq 1 "$NODES"); do
     # is the 1-based ordinal. A guest has no other way to know -- every node boots the same
     # image -- and it needs both to take a distinct share of an object's chunks and to know
     # how many peers to wait for. Reading its own MAC costs nothing and adds no interface.
-    mac=$(printf '52:54:00:07:%02x:%02x' "$NODES" "$i")
+    mac=$(segment_mac "$NODES" "$i")
     "$QEMU" "${MACHINE[@]}" \
         -m 2048 -smp 2 \
         -drive if=pflash,format=raw,unit=0,readonly=on,file="$OUT/code-$n.fd" \

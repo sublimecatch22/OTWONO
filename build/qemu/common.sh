@@ -14,6 +14,20 @@
 # finished; a marker that has not appeared by then is not going to. Waiting the full
 # timeout in that case turned a broken one-line unit into a ten-minute feedback loop, so
 # after the prompt appears the harness allows a short grace period and then gives up.
+# The MAC a guest reads its position on the segment from.
+#
+# Every node boots the same image, so a node has no way to know how many others are on the
+# segment or which one it is. Both are encoded here: octet 5 is the node count, octet 6 the
+# 1-based ordinal, both hex. `build/files/otwono-mesh-content-check` parses it back.
+#
+# One definition, in one place, because there were two: the two-node harness had been
+# writing a literal 52:54:00:07:11:01 since before the encoding existed, so a guest read it
+# as "node 1 of 17" and waited twelve minutes for sixteen neighbours that were never coming.
+# It looked like slowness rather than a wrong answer, which is why it survived.
+segment_mac() { # total ordinal
+    printf '52:54:00:07:%02x:%02x' "$1" "$2"
+}
+
 run_boot_test() { # log-file timeout qemu-binary args...
     local log="$1" timeout_s="$2" qemu="$3"; shift 3
     local settle="${OTWONO_BOOT_SETTLE:-15}"

@@ -3410,3 +3410,74 @@ OTWONO-MESH-OK            node=otw1:psee-539r-dk5f-mgvg addr=10.0.2.15/24
 
 The release artifact still carries no first-boot state — no identity, no profile, no audit
 log, no seeded machine-id — and its checksum matched after the run.
+
+---
+
+## Two booted nodes, and one of them seals to the other
+
+`out/amd64-qemu-ubuntu/two-node/node-{a,b}.log`, TCG. The mesh half of ADR-0019 reaching a
+machine: a node takes a *connected peer's* signed sharing binding off the wire — it now
+travels in the `Hello` that follows every Noise handshake — and encrypts an object to it.
+
+```
+node A  otw1:307a-mk6r-kjnn-1fxr   169.254.116.110/16
+node B  otw1:5av8-zm85-jwd3-8sya   169.254.93.176/16
+
+[  238.405] mesh-content-check: OTWONO-MESH-CONTENT-OK node=1/2
+  public=45df7afd… large=afc9c4b3… large_served=1 private_refused=fdadceae…
+  cache_budget=536870912 cache_held=1 shared_to_peer=a991e488…
+[  238.116] mesh-content-check: OTWONO-MESH-CONTENT-OK node=2/2
+  … shared_to_peer=228d9402…
+```
+
+Both nodes did it and the two ids differ, because each sealed to the other under its own
+fresh content key. No DHCP, IPv4 link-local, mDNS discovery, Noise XX.
+
+The check also asserts two things that would each make the recipient list meaningless: a
+node **cannot open** what it sealed to its peer, because it holds no copy of that key; and a
+binding with one character of its signature changed is refused rather than sealed to.
+
+### What this still does not prove
+
+**The peer cannot fetch it.** Every piece needed to carry a `SHARED` object between two
+nodes now exists and works host-side — the manifest carries the recipient's own sealed key,
+`otwono-netd` re-checks it against the NodeID it authenticated, and a chunk will not go out
+to a peer that has not already been given that manifest. What is missing is the far end
+knowing *what to ask for*: a `SHARED` object's id is over ciphertext keyed by a fresh
+per-object key, so unlike a `PUBLIC` object it cannot be derived from the content. The
+recipient has to be told, and ONM has no method that tells it. That is **OQ-29**, and it is
+why this entry stops where it does.
+
+### Defect 46: two harnesses, two meanings for the same MAC field
+
+The run before this one timed out, and the reason is worth recording because of how it hid.
+
+Each guest boots the same image, so it learns how many nodes are on the segment and which
+one it is from its MAC: octet 5 is the count, octet 6 the ordinal. `multi-node-test.sh`
+introduced that encoding. `two-node-test.sh` had been passing a literal `52:54:00:07:11:01`
+since before the encoding existed — and `0x11` is 17, so each guest read itself as **node 1
+of 17** and settled in to wait for sixteen neighbours that were never coming.
+
+It never failed. The wait is bounded at 150 × 5s, after which the check falls through and
+does its work correctly, so the only symptom was that the whole thing took twelve minutes
+instead of eighteen seconds — and the harness's 300-second content timeout called that a
+failure to exchange content. A wrong answer wearing slowness as a disguise.
+
+`segment_mac()` now lives in `build/qemu/common.sh` and both harnesses call it. One
+definition, because the bug was that there were two.
+
+### Defect 47: a check that printed nothing until it was done
+
+Finding defect 46 took an extra ten-minute cycle for no reason: the check emits a single
+marker at the end, so a run that does not finish leaves a log with nothing in it. "Somewhere
+in those twelve minutes" is not a diagnosis.
+
+It now prints a line per section. The very next run named the problem in its first line —
+`OTWONO-MESH-CONTENT-STEP waiting for 16 peer(s)` — which is the entire cost of the fix
+repaid immediately.
+
+The harness's content timeout went from 300s to 900s at the same time. That was the wrong
+lever on its own, and worth saying so: raising a timeout to accommodate a bug hides the bug.
+It is right *now*, because the check genuinely can take minutes under TCG, but it was reached
+for first and it would have papered over defect 46 if the step markers had not gone in
+alongside it.
