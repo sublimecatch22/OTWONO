@@ -35,4 +35,63 @@ fi
     exit 1
 }
 
-echo "OTWONO-CONTROL-PLANE-OK tier=$tier audit_records=$records"
+# --- the wallet daemon (ADR-0022 §2, ADR-0023 §4) ------------------------------------
+# Three things, and the first is the one a document cannot establish on its own.
+#
+# 1. It really has no network. PrivateNetwork=yes is a line in a unit file until something
+#    observes its effect, so this compares the daemon's network namespace against PID 1's.
+#    They differ only if the isolation actually took hold. A unit that lost the line, or a
+#    systemd that ignored it, shows up here and nowhere else.
+# 2. It started and bound its socket. That is what the socket's existence shows, and it is
+#    all it shows -- this is not a brokered call, because there is no wallet CLI to make
+#    one with. Said plainly rather than dressed up: the daemon's own methods are covered by
+#    integration tests against a real broker, and what a boot adds here is that the unit,
+#    the sandbox and the socket path work on a real system.
+# 3. It reports no wallet -- the correct state for a node nobody has set one up on, and the
+#    only thing it *can* report, because wallet.create needs a confirmation channel that
+#    does not exist yet.
+#
+# The unit requires otwono-walletd and is ordered after it, so none of these can pass by
+# running before the daemon exists.
+# Fails closed at every step. A check that reported "unchecked" and carried on would be a
+# green result proving nothing, which is precisely how an isolation regression would reach
+# an image unnoticed.
+wallet_status=none
+wpid=$(systemctl show -p MainPID --value otwono-walletd.service 2>/dev/null || echo 0)
+[ -n "$wpid" ] && [ "$wpid" != 0 ] || {
+    echo "OTWONO-CONTROL-PLANE-FAIL otwono-walletd has no running process to check" >&2
+    exit 1
+}
+mine=$(readlink "/proc/$wpid/ns/net" 2>/dev/null || echo unknown)
+init=$(readlink /proc/1/ns/net 2>/dev/null || echo unknown)
+[ "$mine" != unknown ] && [ "$init" != unknown ] || {
+    echo "OTWONO-CONTROL-PLANE-FAIL cannot read the network namespaces to compare" >&2
+    exit 1
+}
+[ "$mine" != "$init" ] || {
+    echo "OTWONO-CONTROL-PLANE-FAIL otwono-walletd shares PID 1's network namespace;" \
+         "PrivateNetwork did not take effect and the money key is on the network" >&2
+    exit 1
+}
+wallet_ns=isolated
+
+[ -S /run/otwono/wallet.sock ] || {
+    echo "OTWONO-CONTROL-PLANE-FAIL otwono-walletd bound no socket at /run/otwono/wallet.sock" >&2
+    exit 1
+}
+# --status reads the vault path directly; it is not a control-plane call.
+out=$(/usr/bin/otwono-walletd --status 2>&1) || {
+    echo "OTWONO-CONTROL-PLANE-FAIL otwono-walletd --status failed: $out" >&2
+    exit 1
+}
+case "$out" in
+    *"exists  false"*) wallet_status=no-wallet ;;
+    *"exists  true"*)  wallet_status=present ;;
+    *)
+        echo "OTWONO-CONTROL-PLANE-FAIL otwono-walletd --status said something this check" \
+             "does not recognise: $out" >&2
+        exit 1
+        ;;
+esac
+
+echo "OTWONO-CONTROL-PLANE-OK tier=$tier audit_records=$records wallet_ns=$wallet_ns wallet_status=$wallet_status"

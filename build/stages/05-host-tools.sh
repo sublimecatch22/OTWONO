@@ -33,6 +33,7 @@ BIN_SRC="$REPO_ROOT/target/$RUST_TARGET/release"
 BINARIES=(
     otwono-hwctl otwono-aictl otwono-storectl
     otwono-permd otwono-hwd otwono-idd otwono-netd otwono-aid otwono-fetchd otwono-stored
+    otwono-walletd
 )
 # AI backend adapters. Not in /usr/bin: nothing invokes them by hand, they are spawned by
 # otwono-aid, and discovery finds them by path (otwono_ai::discovery).

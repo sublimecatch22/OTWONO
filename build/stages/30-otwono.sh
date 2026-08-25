@@ -277,6 +277,24 @@ subjects = ["uid:0"]
 decision = "allow"
 ttl_seconds = 300
 
+# wallet.read, and nothing else in the wallet's namespace.
+#
+# Read is genuinely read here. ADR-0023 §2 stores no public key in the clear, so what this
+# grants is "is there a wallet on this node, and what parameters does its vault use" --
+# every address needs the passphrase, which this node does not have and cannot be given by
+# a policy. Without it the wallet daemon cannot answer even that, and the boot check could
+# not tell a running daemon from a broken one.
+#
+# wallet.create, wallet.sign and wallet.export_seed are NOT here and must not be added.
+# They are always_confirm, so a rule granting them would be turned into `ask` anyway
+# (policy.rs) -- but writing one would state an intent this image must not state, and the
+# next person to read this file would take it as permission to wire up an auto-confirm.
+[[rule]]
+action = "wallet.read"
+subjects = ["uid:0"]
+decision = "allow"
+ttl_seconds = 300
+
 # store.serve and net.content are deliberately NOT granted, and they are the two that
 # matter. store.serve is the network boundary: it is what otwono-netd calls to hand an
 # object to a peer, and granting it is the decision to let this node serve the street.
@@ -364,6 +382,13 @@ log "installing the daemon units"
 #     directory in ReadWritePaths.
 #   * PrivateNetwork is safe for the broker (AF_UNIX is not network-namespaced) but NOT
 #     for otwono-hwd, which must see the host's interfaces to classify the network axis.
+#   * ReadWritePaths must name a directory that exists *at boot*. Stage 50 builds the data
+#     partition empty -- mkfs.ext4 on a blank file, nothing copied from the rootfs -- so
+#     /var/lib/otwono is bare on first boot and every subdirectory under it is made at
+#     runtime by whichever daemon owns it. Naming a subdirectory here fails the unit during
+#     namespace setup, before ExecStart runs, and presents as a service that logs
+#     "Starting..." and then nothing: no "Started", no error on the console, because the
+#     failure is in the journal only. Name /var/lib/otwono and let the daemon mkdir its own.
 cat > "$ROOTFS/etc/systemd/system/otwono-permd.service" <<'UNIT'
 [Unit]
 Description=OTWONO permission broker
@@ -485,6 +510,65 @@ AmbientCapabilities=
 [Install]
 WantedBy=multi-user.target
 UNIT
+
+log "installing the wallet daemon unit"
+# ADR-0022 §2 and ADR-0023. This daemon holds the household's money key, and the two
+# hardening lines that matter are PrivateNetwork and RestrictAddressFamilies: it signs,
+# otwono-fetchd carries (ADR-0014), and a compromised chain endpoint cannot reach the
+# signing key because the signing key is in a process with no way to reach a socket.
+#
+# Deliberately NOT Requires= by anything else, and nothing requires it. A node with no
+# wallet is the normal case, and the mesh, the store and the identity must all work
+# without this daemon ever having been useful.
+cat > "$ROOTFS/etc/systemd/system/otwono-walletd.service" <<'UNIT'
+[Unit]
+Description=OTWONO wallet daemon
+Documentation=file:/usr/share/doc/otwono/WALLET.md
+After=otwono-permd.service systemd-tmpfiles-setup.service
+Requires=otwono-permd.service
+RequiresMountsFor=/var/lib/otwono
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/otwono-walletd --socket /run/otwono/wallet.sock --perm-socket /run/otwono/perm.sock --vault /var/lib/otwono/wallet/seed.vault
+Restart=on-failure
+RestartSec=2
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# The two that carry ADR-0022 §2. The boot check asserts the first as an observable fact
+# rather than trusting this line: it compares this daemon's network namespace against PID
+# 1's, which differ only if PrivateNetwork actually took effect.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+# /var/lib/otwono, not /var/lib/otwono/wallet. The data partition is created empty by
+# stage 50 -- mkfs.ext4 on a blank file, with nothing copied in from the rootfs -- so every
+# subdirectory under it comes into existence at runtime, when a daemon makes it. Naming a
+# subdirectory here makes systemd fail the unit at namespace setup before ExecStart ever
+# runs, which presents as a service that says "Starting..." and then nothing at all. This
+# daemon creates the wallet directory itself, 0700, when it first writes a vault.
+ReadWritePaths=/run/otwono /var/lib/otwono
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+install -d -m 0700 "$ROOTFS/var/lib/otwono/wallet"
 
 cat > "$ROOTFS/etc/systemd/system/otwono-netd.service" <<'UNIT'
 [Unit]
@@ -617,8 +701,12 @@ install -m 0755 "$BUILD_DIR/files/otwono-control-plane-check" \
 cat > "$ROOTFS/etc/systemd/system/otwono-control-plane-check.service" <<'UNIT'
 [Unit]
 Description=OTWONO control-plane self check
-After=otwono-hwd.service
-Requires=otwono-hwd.service
+# otwono-walletd is ordered before this, and required, so the wallet assertions below
+# cannot pass by running before the daemon exists. An "unchecked" that came from a race
+# would be a green result proving nothing, which is the failure mode this repository has
+# hit more than once.
+After=otwono-hwd.service otwono-walletd.service
+Requires=otwono-hwd.service otwono-walletd.service
 RequiresMountsFor=/var/lib/otwono /var/log/otwono
 Before=multi-user.target
 
@@ -890,7 +978,7 @@ LockPersonality=yes
 WantedBy=multi-user.target
 UNIT
 
-for unit in otwono-permd otwono-hwd otwono-idd otwono-netd otwono-aid otwono-fetchd otwono-stored otwono-ai-check otwono-control-plane-check otwono-content-check otwono-mesh-check otwono-mesh-check.timer; do
+for unit in otwono-permd otwono-hwd otwono-idd otwono-netd otwono-aid otwono-fetchd otwono-stored otwono-walletd otwono-ai-check otwono-control-plane-check otwono-content-check otwono-mesh-check otwono-mesh-check.timer; do
     # The list carries a .timer as well as services, so only append .service when the
     # entry does not already name a unit type.
     case "$unit" in
