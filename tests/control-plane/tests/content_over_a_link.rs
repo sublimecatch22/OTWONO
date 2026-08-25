@@ -353,6 +353,12 @@ fn a_shared_object_cannot_even_be_created_over_the_control_plane_yet() {
     // And nothing in the store carries the label, so there is nothing to ask a peer for.
     let public = h.put(b"for one named peer only", "public");
     assert!(h.fetch(&public).is_ok(), "the same bytes as public still move");
+
+    // The store *would* now serve a shared object to a peer named in its envelope
+    // (ADR-0019 §4), but otwono-netd still refuses it on the way out, because the wire
+    // cannot yet carry the sealed key and nonce a recipient needs. Serving it would put
+    // ciphertext on a link that nobody could open.
+    assert!(!otwono_netd::content::may_leave_a_node(Some("shared")));
 }
 
 #[test]

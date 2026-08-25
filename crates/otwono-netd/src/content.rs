@@ -116,13 +116,21 @@ impl ContentResponder {
     fn translate(&self, request: &Request, reply: &serde_json::Value) -> Option<Response> {
         let label = reply.get("visibility").and_then(|v| v.as_str());
         if !may_leave_a_node(label) {
-            // Only reachable if otwono-stored regressed. Loud, because it means the two
-            // checks disagree and one of them is broken.
-            eprintln!(
-                "otwono-netd: refusing to serve {}: the store offered it labelled {:?}",
-                request.content_id(),
-                label.unwrap_or("<absent>")
-            );
+            // `shared` reaches here legitimately now: since ADR-0019 §4 the store will hand
+            // over an object to a peer named in its envelope, and this daemon names the
+            // peer it authenticated. It is still refused, because the wire cannot yet carry
+            // the sealed key and nonce a recipient needs — serving it would put ciphertext
+            // on a link that nobody, including the intended recipient, could open.
+            //
+            // Any other label means otwono-stored regressed and the two independent checks
+            // disagree, which is worth saying out loud.
+            if label != Some("shared") {
+                eprintln!(
+                    "otwono-netd: refusing to serve {}: the store offered it labelled {:?}",
+                    request.content_id(),
+                    label.unwrap_or("<absent>")
+                );
+            }
             return None;
         }
         let content_id = reply.get("content_id")?.as_str()?.to_string();

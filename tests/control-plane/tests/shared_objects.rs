@@ -400,36 +400,151 @@ fn every_named_recipient_gets_a_copy_and_nobody_else_does() {
     }
 }
 
-#[test]
-fn a_shared_object_still_cannot_be_served_to_a_peer() {
-    // ADR-0019 §4 is not built. Until per-peer authorization exists, a shared object must
-    // be refused exactly like a private one -- and it must be refused with the same words,
-    // or the refusal itself says this node holds something.
-    let h = Harness::start("noserve", POLICY);
+/// Share `plaintext` with one stranger and return (content id, their NodeID).
+fn shared_with_a_stranger(h: &Harness, seed: u8, plaintext: &[u8]) -> (String, String) {
+    let (binding, _) = stranger(seed);
     let out = h
         .call(
             "store.share",
             json!({
-                "data": data_encoding::BASE64.encode(&payload(10, 8_000)),
-                "recipients": [h.my_binding()],
+                "data": data_encoding::BASE64.encode(plaintext),
+                "recipients": [binding.clone()],
             }),
             "store.share",
         )
         .unwrap();
-    let shared_id = out["content_id"].as_str().unwrap().to_string();
+    (
+        out["content_id"].as_str().unwrap().to_string(),
+        binding.node_id.to_text(),
+    )
+}
+
+#[test]
+fn a_named_peer_is_served_and_an_unnamed_one_is_not() {
+    // ADR-0019 §4. The named peer gets the object; everybody else gets exactly what a peer
+    // asking for something this node does not hold gets.
+    let h = Harness::start("serveshared", POLICY);
+    let plaintext = payload(10, 8_000);
+    let (id, them) = shared_with_a_stranger(&h, 12, &plaintext);
+    let (outsider, _) = stranger(13);
     let absent = "0".repeat(64);
 
+    let served = h
+        .call(
+            "store.serve",
+            json!({ "content_id": id, "peer": them }),
+            "store.serve",
+        )
+        .expect("a peer named in the envelope is served");
+    let bytes = data_encoding::BASE64
+        .decode(served["data"].as_str().unwrap().as_bytes())
+        .unwrap();
+    assert_ne!(bytes, plaintext, "what leaves is ciphertext, not the document");
+
     let refused = h
-        .call("store.serve", json!({ "content_id": shared_id }), "store.serve")
-        .expect_err("shared must fail closed until §4 exists");
+        .call(
+            "store.serve",
+            json!({ "content_id": id, "peer": outsider.node_id.to_text() }),
+            "store.serve",
+        )
+        .expect_err("a peer not in the envelope must not be served");
     let missing = h
         .call("store.serve", json!({ "content_id": absent }), "store.serve")
         .expect_err("an absent object is refused too");
     assert_eq!(
-        refused.message.replace(&shared_id, "<id>"),
+        refused.message.replace(&id, "<id>"),
         missing.message.replace(&absent, "<id>"),
         "a held-but-unauthorized object and an absent one must be indistinguishable"
     );
+}
+
+#[test]
+fn an_anonymous_request_never_matches_a_recipient_list() {
+    // Leaving the peer out must fail closed rather than matching everyone -- the mistake
+    // that would make every shared object public to anything that can call store.serve.
+    let h = Harness::start("anon", POLICY);
+    let (id, _) = shared_with_a_stranger(&h, 14, &payload(11, 4_000));
+    for params in [
+        json!({ "content_id": id }),
+        json!({ "content_id": id, "peer": null }),
+        json!({ "content_id": id, "peer": "" }),
+    ] {
+        assert!(
+            h.call("store.serve", params.clone(), "store.serve").is_err(),
+            "{params} was served"
+        );
+    }
+}
+
+#[test]
+fn the_manifest_and_chunk_methods_apply_the_same_rule() {
+    // store.serve is the small-object path. A peer fetching a large object uses these two,
+    // and an admission rule that only covered one of the three would be no rule at all.
+    let h = Harness::start("servechunks", POLICY);
+    let (id, them) = shared_with_a_stranger(&h, 15, &payload(12, 300_000));
+    let (outsider, _) = stranger(16);
+
+    let manifest = h
+        .call(
+            "store.serve_manifest",
+            json!({ "content_id": id, "from_chunk": 0, "max_chunks": 8, "peer": them }),
+            "store.serve",
+        )
+        .expect("the named peer gets a manifest");
+    assert_eq!(manifest["visibility"], "shared");
+    let digest = manifest["chunks"][0]["blake3"].as_str().unwrap().to_string();
+
+    h.call(
+        "store.serve_chunk",
+        json!({
+            "content_id": id, "digest": digest, "offset": 0,
+            "max_bytes": 262_144, "peer": them,
+        }),
+        "store.serve",
+    )
+    .expect("and its chunks");
+
+    for method in ["store.serve_manifest", "store.serve_chunk"] {
+        let params = json!({
+            "content_id": id, "from_chunk": 0, "max_chunks": 8,
+            "digest": digest, "offset": 0, "max_bytes": 262_144,
+            "peer": outsider.node_id.to_text(),
+        });
+        assert!(
+            h.call(method, params, "store.serve").is_err(),
+            "{method} served an outsider"
+        );
+    }
+}
+
+#[test]
+fn a_private_object_is_still_refused_however_it_is_asked_for() {
+    // The new rule must not have opened a door for the label it was never about. A private
+    // object has no envelope, so no peer name can ever be on its list.
+    let h = Harness::start("privstill", POLICY);
+    let out = h
+        .call(
+            "store.put",
+            json!({
+                "data": data_encoding::BASE64.encode(&payload(13, 2_000)),
+                "visibility": "private",
+            }),
+            "store.write",
+        )
+        .unwrap();
+    let id = out["content_id"].as_str().unwrap().to_string();
+    let (anyone, _) = stranger(17);
+    for peer in [json!(null), json!(anyone.node_id.to_text()), json!(h.node_id())] {
+        assert!(
+            h.call(
+                "store.serve",
+                json!({ "content_id": id, "peer": peer }),
+                "store.serve"
+            )
+            .is_err(),
+            "private was served to {peer}"
+        );
+    }
 }
 
 #[test]

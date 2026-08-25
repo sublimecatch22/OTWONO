@@ -228,9 +228,11 @@ struct OpenSharedParams {
 #[derive(Debug, Deserialize)]
 struct ServeParams {
     content_id: String,
-    /// Which peer is asking. Recorded in the audit log; it does not affect the decision,
-    /// because `Public` and `Replicated` are public to everyone by definition and `Shared`
-    /// needs a per-peer authorization this daemon cannot yet make.
+    /// Which peer is asking, as `otwono-netd` authenticated it.
+    ///
+    /// It does not affect the decision for `Public` or `Replicated`, which are public to
+    /// everyone by definition. For `Shared` it *is* the decision — see
+    /// [`StoreService::may_go_to`] for what that means and what it does not.
     #[serde(default)]
     peer: Option<String>,
 }
@@ -583,7 +585,7 @@ impl StoreService {
     /// check to audit rather than three that must be kept in step. It returns the same
     /// error for absent, private, shared, and unreadable, because a peer that can tell
     /// those apart can enumerate what this node holds.
-    fn servable(&self, id: &ContentId) -> Result<(Object, Source), RpcError> {
+    fn servable(&self, id: &ContentId, peer: Option<&str>) -> Result<(Object, Source), RpcError> {
         let own = self.store.get_object(id).ok().map(|o| (o, Source::Own));
         // The node's own copy first, then the cache. Both are subject to the same label
         // check below — a cached object carries the label it was served under, and an
@@ -595,8 +597,46 @@ impl StoreService {
                 .map(|o| (o, Source::Cached))
         });
         found
-            .filter(|(o, _)| o.visibility.may_leave_the_node_unattended())
+            .filter(|(o, source)| Self::may_go_to(o, *source, peer))
             .ok_or_else(|| not_available(id))
+    }
+
+    /// Whether this object may go to this peer (ADR-0019 §4).
+    ///
+    /// `Public` and `Replicated` go to anybody, which is what the label means.
+    ///
+    /// `Shared` goes only to a peer named in its own envelope, and only out of this node's
+    /// own store — never out of the cache. A cached object came from somewhere else, and
+    /// `Shared` is not cacheable in the first place; refusing here as well means a bug in
+    /// the cache cannot turn into a disclosure.
+    ///
+    /// **Who says which peer this is.** The name is asserted by `otwono-netd`, after it has
+    /// authenticated the peer's NodeID through the Noise handshake. `otwono-netd` is the Z3
+    /// hostile-input daemon, so it is worth being precise about what its compromise would
+    /// cost here: a compromised `otwono-netd` naming an authorized peer obtains the object's
+    /// **ciphertext** and a sealed key it cannot open, because it does not hold the sharing
+    /// key (ADR-0010, ADR-0019 §3). The confidentiality of a `SHARED` object is carried by
+    /// the encryption; this check limits who can obtain the ciphertext at all, which bounds
+    /// offline attack and keeps the recipient list from being enumerable. It is defence in
+    /// depth, and it is not the thing standing between a peer and the plaintext.
+    ///
+    /// A peer that is not named gets exactly what a peer asking for an object this node does
+    /// not have gets. Distinguishing them would let anyone enumerate both what a node holds
+    /// and who it shares with.
+    fn may_go_to(object: &Object, source: Source, peer: Option<&str>) -> bool {
+        if object.visibility.may_leave_the_node_unattended() {
+            return true;
+        }
+        if object.visibility != Visibility::Shared || source != Source::Own {
+            return false;
+        }
+        match (peer, &object.sharing) {
+            (Some(peer), Some(sharing)) => sharing.names(peer),
+            // An anonymous request cannot be on anybody's list. This is the case a local
+            // caller hits by leaving `peer` out, and it must fail closed rather than
+            // matching everyone.
+            _ => false,
+        }
     }
 
     /// Read one chunk from wherever the object was found.
@@ -645,7 +685,7 @@ impl StoreService {
             return Err(RpcError::invalid_params("max_chunks must be greater than zero"));
         }
         let id = Self::parse_id(&p.content_id)?;
-        let (object, _) = self.servable(&id)?;
+        let (object, _) = self.servable(&id, p.peer.as_deref())?;
 
         // Saturating rather than indexing: a peer naming a window past the end gets an
         // empty one, which is a true answer, not an error worth distinguishing.
@@ -683,7 +723,7 @@ impl StoreService {
             return Err(RpcError::invalid_params("max_bytes must be greater than zero"));
         }
         let id = Self::parse_id(&p.content_id)?;
-        let (object, source) = self.servable(&id)?;
+        let (object, source) = self.servable(&id, p.peer.as_deref())?;
 
         let entry = object
             .chunks
@@ -735,7 +775,7 @@ impl StoreService {
             .map_err(|e| RpcError::invalid_params(format!("store.serve: {e}")))?;
         let id = Self::parse_id(&p.content_id)?;
 
-        let (object, source) = self.servable(&id)?;
+        let (object, source) = self.servable(&id, p.peer.as_deref())?;
         // A peer asking for something too large for one line is told the object is not
         // available, like every other refusal here: the chunk-at-a-time methods are what a
         // peer uses, and telling one that this node holds something too big to inline would

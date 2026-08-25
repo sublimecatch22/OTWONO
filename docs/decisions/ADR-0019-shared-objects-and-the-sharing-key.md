@@ -12,10 +12,14 @@
   record carries a `sharing` envelope, and the schema describes it. `otwono-stored` exposes
   `store.share`, `store.share_file` and `store.open_shared`, the last of which asks
   `otwono-idd` to unwrap on the caller's own capability.
-- **SPECIFIED, no code:** §4's authorized serving, and §5 (adding and removing recipients).
-  `store.serve` still refuses `Shared` with the same words it refuses an absent object, so
-  a `SHARED` object can be created and read by its recipients on the node that holds it and
-  **has still never crossed a link**.
+  §4's admission rule is implemented in `otwono-stored`: `store.serve`,
+  `store.serve_manifest` and `store.serve_chunk` hand a `Shared` object to a peer named in
+  its envelope, out of this node's own store only, and refuse everybody else with the words
+  they use for an object that is not here.
+- **SPECIFIED, no code:** carrying a `SHARED` object over ONM — the wire manifest has no
+  room for the sealed key and nonce a recipient needs, so `otwono-netd` still refuses
+  `shared` on the way out and a `SHARED` object **has still never crossed a link**. And §5,
+  adding and removing recipients.
 
 ## Context
 
@@ -109,6 +113,24 @@ who it shares with.
 Egress of `SHARED` requires confirmation at `otwono-permd`, per `DATA-VISIBILITY.md` §4.
 That is a separate capability from `store.serve`, because serving public content unattended
 and serving shared content are different decisions.
+
+**Amended again when §4's admission rule was implemented.** There is no separate capability
+for serving shared content, and there cannot usefully be one: a capability token names one
+action, so a serving method would have to look the object up *before* deciding which
+capability to demand — and choosing the demand from the object is itself the probe oracle
+ADR-0017 closed. The knob this section wanted is better expressed as a policy rule on
+`store.serve` with a resource pattern, which the policy engine already supports.
+
+**What the check is, and is not.** The peer's name is asserted by `otwono-netd` after it has
+authenticated the NodeID through the Noise handshake, and `otwono-netd` is the Z3
+hostile-input daemon. So: a compromised `otwono-netd` naming an authorized peer obtains the
+object's **ciphertext** and a sealed key it cannot open, because it holds no sharing key
+(ADR-0010, §3 above). The confidentiality of a `SHARED` object is carried by the encryption.
+This check limits who can obtain the ciphertext at all — which bounds offline attack and
+keeps the recipient list from being enumerable — and it is defence in depth, not the thing
+standing between a peer and the plaintext. Stating that plainly is the point: a design that
+quietly relied on Z3's honesty for confidentiality would be a worse design than this one,
+and it would be easy to mistake this for that.
 
 **Amended when §1–§3 were implemented.** Creating a shared object — `store.share` — is *not*
 confirmed, and the reasoning is worth stating because it looks like a weakening. §8's
