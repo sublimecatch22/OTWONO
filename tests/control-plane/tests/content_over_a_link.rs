@@ -722,6 +722,85 @@ fn a_shared_object_crosses_a_real_link_and_opens_at_the_other_end() {
 }
 
 #[test]
+fn a_fetched_shared_object_can_be_kept_and_opened_later() {
+    // The last step of the recipient's path: fetch, keep what arrived, and read it back out
+    // of the store afterwards -- without re-sealing it, which would produce a different
+    // object under a key its sender never issued.
+    let h = Harness::start("acceptshared");
+    let plaintext = b"a document that outlives the session it arrived in".repeat(30);
+    let id = h.share_with_myself(&plaintext);
+    let fetched = h.fetch(&id).expect("served to a named recipient");
+    let envelope = fetched.sharing.clone().expect("the envelope came with it");
+
+    let token = h.token("store.write");
+    let kept = Client::connect(&h.store_socket)
+        .unwrap()
+        .call_with_capability(
+            "store.accept_shared",
+            json!({
+                "content_id": id,
+                "data": data_encoding::BASE64.encode(&fetched.bytes),
+                "encryption": envelope.encryption,
+                "nonce_prefix": envelope.nonce_prefix,
+                "plaintext_size_bytes": envelope.plaintext_size_bytes,
+                "sealed_key": envelope.sealed_key,
+            }),
+            &token,
+        )
+        .unwrap()
+        .unwrap_or_else(|e| panic!("store.accept_shared refused: {}", e.message));
+    assert_eq!(kept["content_id"], id, "keeping it must not rename it");
+    assert_eq!(kept["visibility"], "shared");
+    // One recipient, itself. It does not learn who else was on the sender's list.
+    assert_eq!(kept["sharing"]["authorized"].as_array().unwrap().len(), 1);
+
+    // And the stored object opens with the key that came with it.
+    let sharing_key = SharingKeystore::new(h.identity_dir()).load().unwrap();
+    let content_key = otwono_store::ContentKey::from_bytes(*sharing_key.open(&envelope.sealed_key).unwrap());
+    let prefix = data_encoding::BASE64
+        .decode(envelope.nonce_prefix.as_bytes())
+        .unwrap();
+    let mut opened = Vec::new();
+    otwono_store::shared::open(
+        &content_key,
+        &otwono_store::shared::decode_prefix(&prefix).unwrap(),
+        fetched.bytes.as_slice(),
+        &mut opened,
+    )
+    .unwrap();
+    assert_eq!(opened, plaintext);
+}
+
+#[test]
+fn keeping_bytes_that_are_not_the_object_asked_for_is_refused() {
+    // Chunking is deterministic, so the same ciphertext must reproduce the same id. A
+    // mismatch means the peer sent something else, and the record is not written.
+    let h = Harness::start("acceptwrong");
+    let id = h.share_with_myself(b"the real one");
+    let fetched = h.fetch(&id).unwrap();
+    let envelope = fetched.sharing.clone().unwrap();
+
+    let token = h.token("store.write");
+    let err = Client::connect(&h.store_socket)
+        .unwrap()
+        .call_with_capability(
+            "store.accept_shared",
+            json!({
+                "content_id": "0".repeat(64),
+                "data": data_encoding::BASE64.encode(&fetched.bytes),
+                "encryption": envelope.encryption,
+                "nonce_prefix": envelope.nonce_prefix,
+                "plaintext_size_bytes": envelope.plaintext_size_bytes,
+                "sealed_key": envelope.sealed_key,
+            }),
+            &token,
+        )
+        .unwrap()
+        .expect_err("bytes that are not the object asked for must not be kept under its name");
+    assert!(err.message.contains(&id), "{}", err.message);
+}
+
+#[test]
 fn a_shared_object_is_not_served_to_a_peer_that_is_not_named() {
     // The same object, asked for by a node that is not on its list. The refusal must be the
     // one every other refusal is, or asking becomes a way to learn who a node shares with.

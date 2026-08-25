@@ -225,6 +225,21 @@ struct OpenSharedParams {
     content_id: String,
 }
 
+/// Keep a sealed object fetched from a peer, with the one key that came with it.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcceptSharedParams {
+    /// The id this node asked a peer for. Chunking is deterministic, so storing the same
+    /// ciphertext must reproduce it; a mismatch is refused.
+    content_id: String,
+    /// Base64 ciphertext, exactly as it arrived.
+    data: String,
+    encryption: String,
+    nonce_prefix: String,
+    plaintext_size_bytes: u64,
+    sealed_key: otwono_identity::SealedKey,
+}
+
 #[derive(Debug, Deserialize)]
 struct ServeParams {
     content_id: String,
@@ -452,6 +467,42 @@ impl StoreService {
         let mut out = record(&object);
         out["imported_from"] = json!(p.path);
         Ok(out)
+    }
+
+    /// Keep what a peer served, sealed as it arrived (ADR-0019).
+    ///
+    /// The bytes are ciphertext and are stored as ciphertext. Sealing them again would
+    /// produce a different object under a key the sender never issued, and a recipient
+    /// holding that would have something its sender could not recognise.
+    ///
+    /// Only the copy of the key that came with it is kept, so this node's record names one
+    /// recipient — itself.
+    fn handle_accept_shared(&self, params: Value) -> Result<Value, RpcError> {
+        let p: AcceptSharedParams = serde_json::from_value(params)
+            .map_err(|e| RpcError::invalid_params(format!("store.accept_shared: {e}")))?;
+        let bytes = data_encoding::BASE64
+            .decode(p.data.as_bytes())
+            .map_err(|e| RpcError::invalid_params(format!("data must be base64: {e}")))?;
+        if bytes.len() > MAX_INLINE_BYTES {
+            return Err(RpcError::invalid_params(format!(
+                "{} bytes is over the {MAX_INLINE_BYTES}-byte inline cap",
+                bytes.len()
+            )));
+        }
+        let object = self
+            .store
+            .accept_shared(
+                bytes.as_slice(),
+                &Self::parse_id(&p.content_id)?,
+                otwono_store::object::Sharing {
+                    encryption: p.encryption,
+                    nonce_prefix: p.nonce_prefix,
+                    plaintext_size_bytes: p.plaintext_size_bytes,
+                    sealed_keys: vec![p.sealed_key],
+                },
+            )
+            .map_err(rpc)?;
+        Ok(record(&object))
     }
 
     /// Open an object that was shared *with* this node.
@@ -1102,6 +1153,11 @@ impl Service for StoreService {
                     CAPABILITY_SHARE,
                 ),
                 MethodDescription::guarded(
+                    "store.accept_shared",
+                    "Keep a sealed object fetched from a peer, with the key that came with it",
+                    CAPABILITY_WRITE,
+                ),
+                MethodDescription::guarded(
                     "store.open_shared",
                     "Open an object shared with this node, asking otwono-idd for the key",
                     CAPABILITY_UNWRAP,
@@ -1223,6 +1279,13 @@ impl Service for StoreService {
             // decision being made: opening what somebody shared with this node is the
             // unwrap. The same token is forwarded to otwono-idd, so a caller who can read
             // the store cannot open a shared object by asking the store instead.
+            // store.write, not store.share: this stores bytes a peer already handed over,
+            // under a key this node was given. It names one recipient -- itself -- so it
+            // makes nothing reachable that was not already.
+            "store.accept_shared" => {
+                self.authorize(ctx, CAPABILITY_WRITE)?;
+                self.handle_accept_shared(params)
+            }
             "store.open_shared" => {
                 self.authorize(ctx, CAPABILITY_UNWRAP)?;
                 self.handle_open_shared(ctx, params)

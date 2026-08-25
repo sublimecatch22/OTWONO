@@ -16,9 +16,10 @@
   `Shared` object to a peer named in its envelope, out of this node's own store only, the
   ONM manifest carries that peer's own sealed key, and a shared object has crossed a real
   TCP link and been opened at the other end under test.
-- **SPECIFIED, no code:** §5, adding and removing recipients. A fetched `SHARED` object
-  also has nowhere to go: `store.put` refuses the label and `store.share` re-encrypts under
-  a new key, so a recipient can read what it fetched but cannot keep it as the same object.
+  A recipient keeps what it fetched with `store.accept_shared`, which stores the ciphertext
+  as it arrived along with the one key that came with it — so the object keeps its name and
+  the recipient's own record names one recipient, itself.
+- **SPECIFIED, no code:** §5, adding and removing recipients.
 
 ## Context
 

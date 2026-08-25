@@ -469,6 +469,39 @@ impl Store {
         result.map(|object| (object, key))
     }
 
+    /// Store a sealed object this node received, keeping the key it was given.
+    ///
+    /// The counterpart of [`put_shared_reader`](Self::put_shared_reader) on the receiving
+    /// side. The bytes are already ciphertext and must not be sealed again: re-sealing would
+    /// produce a different object under a key the sender never issued, and the recipient
+    /// would end up holding something its sender could not recognise.
+    ///
+    /// Only the copy of the content key that was given travels into the record, so a
+    /// recipient's own store names one recipient — itself. It does not learn, and cannot
+    /// re-serve to, anybody else on the original list.
+    ///
+    /// `expected` is the id the caller asked a peer for. Chunking is deterministic, so
+    /// storing the same ciphertext must reproduce it; a mismatch means the bytes are not the
+    /// object that was asked for and the record is not written.
+    pub fn accept_shared<R: std::io::Read>(
+        &self,
+        ciphertext: R,
+        expected: &ContentId,
+        sharing: crate::object::Sharing,
+    ) -> Result<Object, StoreError> {
+        sharing.validate().map_err(StoreError::Object)?;
+        let refs = self.chunk_from_reader(ciphertext)?;
+        let object = Object::new(&refs, crate::Visibility::Shared).with_sharing(sharing);
+        if object.content_id != *expected {
+            return Err(StoreError::Corrupt {
+                name: expected.to_hex(),
+                actual: object.content_id.to_hex(),
+            });
+        }
+        self.put_object(&object)?;
+        Ok(object)
+    }
+
     /// Reassemble a sealed object and open it, a frame at a time.
     ///
     /// Verifies each chunk against its digest on the way through, as every read does, and
