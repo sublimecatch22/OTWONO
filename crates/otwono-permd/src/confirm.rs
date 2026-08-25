@@ -4,8 +4,15 @@
 //! caller is told to come back with its id. Somebody on the confirmation socket approves or
 //! denies it; the caller then claims it and gets a token, or does not.
 //!
-//! The security property lives in [`PendingStore::approve`]: **the subject that asked may
-//! not confirm.** Everything else in this module is bookkeeping around that one rule.
+//! The security property lives in [`PendingStore::decide`]: **only a subject in the
+//! confirmer set may answer.** Everything else in this module is bookkeeping around that one
+//! rule.
+//!
+//! The set defaults to empty, so an unconfigured node confirms nothing. That is deliberate
+//! (ADR-0024 §3a): an agent is kept out by not being in the set, which refuses it more
+//! completely than the "must be somebody else" rule this replaced — that one would have let
+//! an agent approve a *different* subject's request, and would have refused a person
+//! approving their own, which is the normal flow.
 
 use serde::Serialize;
 use std::collections::HashMap;
@@ -37,7 +44,7 @@ pub enum State {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Pending {
     pub id: String,
-    /// The subject that asked. An approval from this uid is refused (ADR-0024 §3).
+    /// The subject that asked.
     pub subject: String,
     pub action: String,
     pub resource: Option<String>,
@@ -68,8 +75,8 @@ pub enum ConfirmError {
     /// No such id, or it was consumed.
     Unknown,
     Expired,
-    /// The approver is the subject that asked. ADR-0024 §3 — the one rule that matters.
-    SelfConfirmation {
+    /// The approver is not in the confirmer set. ADR-0024 §3a — the one rule that matters.
+    NotAConfirmer {
         subject: String,
     },
     /// Already approved or denied; a decision is not revisited.
@@ -90,10 +97,10 @@ impl std::fmt::Display for ConfirmError {
             ConfirmError::Expired => f.write_str(
                 "that confirmation expired; nothing was authorised and the request must be made again",
             ),
-            ConfirmError::SelfConfirmation { subject } => write!(
+            ConfirmError::NotAConfirmer { subject } => write!(
                 f,
-                "{subject} asked for this and may not confirm it: a subject agreeing with \
-                 itself is not a confirmation"
+                "{subject} may not answer confirmations on this node. Only a configured \
+                 confirmer can, and an agent is never one"
             ),
             ConfirmError::AlreadyDecided(s) => write!(f, "that confirmation was already {s:?}"),
             ConfirmError::StillPending => f.write_str("nobody has confirmed this yet"),
@@ -170,9 +177,16 @@ impl PendingStore {
     /// Approve or deny, as `by`.
     ///
     /// **Refuses when `by` is the subject that asked** (ADR-0024 §3). The record stays
-    /// pending in that case rather than being consumed: a self-confirmation attempt must not
-    /// also destroy a request a real confirmer could still answer.
-    pub fn decide(&self, id: &str, by: &str, approve: bool, now_ms: u64) -> Result<Pending, ConfirmError> {
+    /// pending in that case rather than being consumed: a refused attempt must not also
+    /// destroy a request a real confirmer could still answer.
+    pub fn decide(
+        &self,
+        id: &str,
+        by: &str,
+        confirmers: &[String],
+        approve: bool,
+        now_ms: u64,
+    ) -> Result<Pending, ConfirmError> {
         let mut map = self.inner.lock().expect("pending store poisoned");
         let p = map.get_mut(id).ok_or(ConfirmError::Unknown)?;
         if p.is_expired_at(now_ms) {
@@ -181,8 +195,8 @@ impl PendingStore {
         if p.state != State::Pending {
             return Err(ConfirmError::AlreadyDecided(p.state));
         }
-        if p.subject == by {
-            return Err(ConfirmError::SelfConfirmation {
+        if !confirmers.iter().any(|c| c == by) {
+            return Err(ConfirmError::NotAConfirmer {
                 subject: by.to_string(),
             });
         }
@@ -253,33 +267,75 @@ mod tests {
         (s, p)
     }
 
-    #[test]
-    fn the_subject_that_asked_cannot_confirm_its_own_request() {
-        // ADR-0024 §3, and the only rule in this module that is a security property rather
-        // than bookkeeping. A subject agreeing with itself is not a confirmation.
-        let (s, _) = store_with_one();
-        match s.decide("c1", "uid:1000", true, T0 + 1) {
-            Err(ConfirmError::SelfConfirmation { subject }) => assert_eq!(subject, "uid:1000"),
-            other => panic!("a subject confirmed its own request: {other:?}"),
-        }
-        // And the attempt did not consume it: a real confirmer can still answer.
-        assert_eq!(s.list(T0 + 1).len(), 1);
-        assert!(s.decide("c1", "uid:1001", true, T0 + 2).is_ok());
+    /// Who may answer, in the tests below.
+    const CONFIRMERS: [&str; 1] = ["uid:1001"];
+
+    fn confirmers() -> Vec<String> {
+        CONFIRMERS.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
-    fn a_self_confirmation_attempt_does_not_authorise_anything() {
-        // The failure that would matter: refusing the approval but leaving the record
-        // approved anyway. Claiming after the refusal must still say "nobody has confirmed".
+    fn only_a_designated_confirmer_may_answer() {
+        // ADR-0024 §3a, and the one rule in this module that is a security property rather
+        // than bookkeeping. An agent is kept out by not being in the set.
         let (s, _) = store_with_one();
-        let _ = s.decide("c1", "uid:1000", true, T0 + 1);
+        match s.decide("c1", "uid:9999", &confirmers(), true, T0 + 1) {
+            Err(ConfirmError::NotAConfirmer { subject }) => assert_eq!(subject, "uid:9999"),
+            other => panic!("somebody outside the set answered: {other:?}"),
+        }
+        // And the refusal did not consume it: a real confirmer can still answer.
+        assert_eq!(s.list(T0 + 1).len(), 1);
+        assert!(s.decide("c1", "uid:1001", &confirmers(), true, T0 + 2).is_ok());
+    }
+
+    #[test]
+    fn an_empty_confirmer_set_refuses_everybody() {
+        // The default, and the honest version of "this node cannot confirm anything". A set
+        // that fell back to "anyone" would turn an unconfigured node into an open door.
+        let (s, _) = store_with_one();
+        assert!(matches!(
+            s.decide("c1", "uid:1001", &[], true, T0 + 1),
+            Err(ConfirmError::NotAConfirmer { .. })
+        ));
+    }
+
+    #[test]
+    fn a_confirmer_may_answer_their_own_request() {
+        // The flow the first version of §3 broke. A person runs otwono-storectl, is shown
+        // what it will do, and says yes; asking and approving are two real acts by one
+        // party, and the second is where they see the consequence. Requiring a second human
+        // would refuse every confirmation on a one-person node.
+        let s = PendingStore::new();
+        s.open(
+            "own".into(),
+            "uid:1001".into(),
+            "fs.delete".into(),
+            Some("/home/u/x".into()),
+            None,
+            T0,
+            DEFAULT_TTL_MS,
+        )
+        .unwrap();
+        let decided = s
+            .decide("own", "uid:1001", &confirmers(), true, T0 + 1)
+            .expect("a confirmer approving their own request is the normal flow");
+        assert_eq!(decided.state, State::Approved);
+        assert!(s.claim("own", "uid:1001", T0 + 2).is_ok());
+    }
+
+    #[test]
+    fn a_refused_answer_authorises_nothing() {
+        // The failure that would matter: refusing the approval but leaving the record
+        // approved anyway.
+        let (s, _) = store_with_one();
+        let _ = s.decide("c1", "uid:9999", &confirmers(), true, T0 + 1);
         assert_eq!(s.claim("c1", "uid:1000", T0 + 2), Err(ConfirmError::StillPending));
     }
 
     #[test]
     fn an_approved_confirmation_is_claimed_once_and_only_by_its_asker() {
         let (s, _) = store_with_one();
-        s.decide("c1", "uid:1001", true, T0 + 1).unwrap();
+        s.decide("c1", "uid:1001", &confirmers(), true, T0 + 1).unwrap();
 
         // Somebody else holding the id gets nothing.
         assert_eq!(s.claim("c1", "uid:1002", T0 + 2), Err(ConfirmError::NotYours));
@@ -295,7 +351,7 @@ mod tests {
     #[test]
     fn a_denial_is_a_denial_and_is_not_re_readable() {
         let (s, _) = store_with_one();
-        s.decide("c1", "uid:1001", false, T0 + 1).unwrap();
+        s.decide("c1", "uid:1001", &confirmers(), false, T0 + 1).unwrap();
         assert_eq!(s.claim("c1", "uid:1000", T0 + 2), Err(ConfirmError::Denied));
         assert_eq!(s.claim("c1", "uid:1000", T0 + 3), Err(ConfirmError::Unknown));
     }
@@ -303,8 +359,8 @@ mod tests {
     #[test]
     fn a_decision_is_not_revisited() {
         let (s, _) = store_with_one();
-        s.decide("c1", "uid:1001", false, T0 + 1).unwrap();
-        match s.decide("c1", "uid:1001", true, T0 + 2) {
+        s.decide("c1", "uid:1001", &confirmers(), false, T0 + 1).unwrap();
+        match s.decide("c1", "uid:1001", &confirmers(), true, T0 + 2) {
             Err(ConfirmError::AlreadyDecided(State::Denied)) => {}
             other => panic!("a denial was overturned: {other:?}"),
         }
@@ -315,7 +371,7 @@ mod tests {
         let (s, _) = store_with_one();
         let after = T0 + DEFAULT_TTL_MS;
         assert_eq!(
-            s.decide("c1", "uid:1001", true, after),
+            s.decide("c1", "uid:1001", &confirmers(), true, after),
             Err(ConfirmError::Expired)
         );
         assert_eq!(s.claim("c1", "uid:1000", after), Err(ConfirmError::Expired));
@@ -327,7 +383,7 @@ mod tests {
         // The ordering that matters: approved in time, claimed too late. ADR-0024 §5 says
         // expiry is a denial, so "it was approved" must not rescue it.
         let (s, _) = store_with_one();
-        s.decide("c1", "uid:1001", true, T0 + 1).unwrap();
+        s.decide("c1", "uid:1001", &confirmers(), true, T0 + 1).unwrap();
         assert_eq!(
             s.claim("c1", "uid:1000", T0 + DEFAULT_TTL_MS),
             Err(ConfirmError::Expired)
@@ -393,7 +449,7 @@ mod tests {
         let ids: Vec<String> = s.list(T0 + 30).into_iter().map(|p| p.id).collect();
         assert_eq!(ids, vec!["a", "b", "c"]);
 
-        s.decide("b", "uid:1001", true, T0 + 30).unwrap();
+        s.decide("b", "uid:1001", &confirmers(), true, T0 + 30).unwrap();
         let ids: Vec<String> = s.list(T0 + 31).into_iter().map(|p| p.id).collect();
         assert_eq!(ids, vec!["a", "c"], "an answered request still wants an answer");
     }

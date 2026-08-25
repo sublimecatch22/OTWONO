@@ -4,11 +4,13 @@
 //! point of the split is that a caller reaching one cannot use the other, and a test that
 //! called both through one object would prove nothing about that.
 //!
-//! Most of these run everything as one uid, which is exactly the situation ADR-0024 §3
-//! refuses — so the refusal is directly observable. The approval path cannot be reached that
-//! way, and asserting it with a stub would prove nothing about `SO_PEERCRED`, so
-//! `a_second_user_can_approve_and_then_the_asker_gets_its_token` connects as a **different
-//! real uid** over the socket and is skipped when the test is not run as root.
+//! Under ADR-0024 §3a only a subject in the configured confirmer set may answer. These
+//! harnesses run as one uid, so a test either designates that uid a confirmer (and the
+//! approval path works) or does not (and every answer is refused). Both are exercised.
+//!
+//! `a_second_user_can_approve_and_then_the_asker_gets_its_token` goes further and connects
+//! as a **different real uid** over the socket, because the rule is about `SO_PEERCRED` and
+//! a stubbed subject would prove nothing about it. It is skipped when not run as root.
 
 use otwono_permd::{ActionRegistry, AuditLog, Broker, Policy};
 use otwono_proto::{Client, Server, Shutdown};
@@ -38,7 +40,13 @@ struct Harness {
 }
 
 impl Harness {
+    /// A node where nobody is designated to confirm — the default, and the fail-closed one.
     fn start(tag: &str) -> Harness {
+        Harness::start_with(tag, Vec::new())
+    }
+
+    /// A node where `confirmers` may answer.
+    fn start_with(tag: &str, confirmers: Vec<String>) -> Harness {
         let dir = std::env::temp_dir().join(format!("otw-cf{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("policy.d")).unwrap();
@@ -50,10 +58,9 @@ impl Harness {
 
         let policy = Policy::load_dir(&dir.join("policy.d")).expect("policy must load");
         policy.validate(&ActionRegistry::builtin()).unwrap();
-        let broker = Arc::new(Broker::new(
-            policy,
-            AuditLog::open(dir.join("audit.jsonl")).unwrap(),
-        ));
+        let broker = Arc::new(
+            Broker::new(policy, AuditLog::open(dir.join("audit.jsonl")).unwrap()).with_confirmers(confirmers),
+        );
         let confirmations = Arc::new(broker.confirmations());
 
         let ps = Server::bind(&perm).unwrap();
@@ -146,17 +153,17 @@ fn nothing_is_authorised_until_somebody_answers() {
 }
 
 #[test]
-fn the_subject_that_asked_cannot_approve_its_own_request() {
-    // ADR-0024 §3. In this harness both sides are the same uid, which is precisely the
-    // situation the rule refuses -- so the refusal is observable here, and on a real node
-    // it is what would happen if the agent and the confirmer shared a user.
-    let h = Harness::start("self");
+fn nobody_can_answer_on_a_node_with_no_confirmer_configured() {
+    // The default, and the honest version of "this node cannot confirm anything" (ADR-0024
+    // §3a). A set that fell back to "anyone" would turn an unconfigured node into an open
+    // door on the exact actions that most need a person.
+    let h = Harness::start("noconfirmer");
     let id = h.ask("/home/u/b");
 
     let err = h
         .call(&h.confirm, "confirm.approve", json!({ "confirmation_id": id }))
-        .expect_err("a subject agreeing with itself is not a confirmation");
-    assert!(err.message.contains("may not confirm"), "{}", err.message);
+        .expect_err("nobody is designated, so nobody may answer");
+    assert!(err.message.contains("may not answer"), "{}", err.message);
 
     // And nothing was authorised by the attempt.
     let claim = h
@@ -168,29 +175,61 @@ fn the_subject_that_asked_cannot_approve_its_own_request() {
         claim.message
     );
 
-    // The attempt is in the audit chain, because "something tried to approve its own
-    // request" is exactly what an audit reader is looking for.
+    // The refusal is in the audit chain: "something tried to answer and was not allowed to"
+    // is exactly what an audit reader is looking for.
     let refused = h
         .audit_lines()
         .into_iter()
         .filter(|l| l.contains("confirmation_decided") && l.contains("refused"))
         .count();
-    assert_eq!(refused, 1, "the self-confirmation attempt was not recorded");
+    assert_eq!(refused, 1, "the refused answer was not recorded");
 }
 
 #[test]
-fn a_denial_is_final_and_authorises_nothing() {
-    let h = Harness::start("deny");
+fn a_confirmer_may_answer_their_own_request() {
+    // The flow the first version of ADR-0024 §3 would have refused, and the normal one on a
+    // household node with one person: they run a CLI, are shown what it will do, and say
+    // yes. Asking and approving are two real acts by one party, and the second is where the
+    // consequence is seen.
+    let me = format!("uid:{}", unsafe { libc_geteuid() });
+    let h = Harness::start_with("ownreq", vec![me.clone()]);
+    let id = h.ask("/home/u/own");
+
+    let ok = h
+        .call(&h.confirm, "confirm.approve", json!({ "confirmation_id": id }))
+        .expect("a designated confirmer may answer their own request");
+    assert_eq!(ok["state"], json!("approved"));
+    assert_eq!(ok["decided_by"], json!(me));
+
+    let token = h
+        .call(&h.perm, "perm.claim", json!({ "confirmation_id": id }))
+        .expect("and the token follows");
+    assert!(token["token"].as_str().is_some(), "{token}");
+    assert_eq!(token["one_shot"], json!(true), "{token}");
+}
+
+#[test]
+fn a_denial_by_a_confirmer_is_final() {
+    let me = format!("uid:{}", unsafe { libc_geteuid() });
+    let h = Harness::start_with("denyreal", vec![me]);
     let id = h.ask("/home/u/c");
-    // Denying is not subject to the self-confirmation rule in this harness either -- it is,
-    // and that is correct: refusing to let a subject deny its own request would let a
-    // caller keep a confirmation alive that a person wanted gone. Here the same-uid
-    // constraint means the deny is refused too, so this asserts the refusal rather than
-    // pretending a second user exists.
+
+    h.call(&h.confirm, "confirm.deny", json!({ "confirmation_id": id }))
+        .expect("a confirmer may say no");
     let err = h
-        .call(&h.confirm, "confirm.deny", json!({ "confirmation_id": id }))
-        .expect_err("same subject");
-    assert!(err.message.contains("may not confirm"), "{}", err.message);
+        .call(&h.perm, "perm.claim", json!({ "confirmation_id": id }))
+        .expect_err("a denial authorises nothing");
+    assert!(err.message.contains("denied"), "{}", err.message);
+
+    // And it is not re-readable: a caller cannot sit on a "no" and retry it.
+    let again = h
+        .call(&h.perm, "perm.claim", json!({ "confirmation_id": id }))
+        .expect_err("consumed");
+    assert!(
+        again.message.contains("no such confirmation"),
+        "{}",
+        again.message
+    );
 }
 
 #[test]
@@ -348,7 +387,7 @@ fn a_second_user_can_approve_and_then_the_asker_gets_its_token() {
     }
     use std::os::unix::fs::PermissionsExt;
 
-    let h = Harness::start("twouid");
+    let h = Harness::start_with("twouid", vec!["uid:65534".to_string()]);
     let id = h.ask("/home/u/two-uid");
 
     // Let another uid reach the confirmation socket. On a real node this is what the

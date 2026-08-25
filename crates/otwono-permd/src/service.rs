@@ -18,7 +18,7 @@ pub const DESCRIBE_SCHEMA_VERSION: &str = "1.0.0";
 ///
 /// There are two because ADR-0024 §3 needs them on **different sockets**: the control-plane
 /// socket every daemon must reach cannot also be the socket only a person may reach, or the
-/// self-confirmation rule has nothing to stand on. They share this.
+/// rule about who may answer has nothing to stand on. They share this.
 struct Core {
     registry: ActionRegistry,
     policy: Policy,
@@ -26,6 +26,13 @@ struct Core {
     audit: AuditLog,
     /// Requests waiting for a person (ADR-0024).
     pending: PendingStore,
+    /// Who may answer them (ADR-0024 §3a).
+    ///
+    /// Empty by default, so an unconfigured node confirms nothing. That is the same
+    /// fail-closed state as before the channel existed, reached honestly rather than by
+    /// having no mechanism — and it is what keeps an agent out: an agent's subject is simply
+    /// never in this list.
+    confirmers: Vec<String>,
 }
 
 impl Core {
@@ -109,6 +116,7 @@ impl Broker {
                 tokens: Arc::new(TokenStore::new()),
                 audit,
                 pending: PendingStore::new(),
+                confirmers: Vec::new(),
             }),
         }
     }
@@ -121,6 +129,20 @@ impl Broker {
             .unwrap_or_else(|_| panic!("with_registry must be called before confirmations()"));
         Broker {
             core: Arc::new(Core { registry, ..core }),
+        }
+    }
+
+    /// Designate who may answer confirmations (ADR-0024 §3a).
+    ///
+    /// Subjects as the control plane spells them, e.g. `uid:1000`. Must be called before
+    /// `confirmations()`, for the same reason `with_registry` must: the core is shared with
+    /// the confirmation surface, and a set that could change underneath it would mean the
+    /// two disagreed about who is allowed to answer.
+    pub fn with_confirmers(self, confirmers: Vec<String>) -> Self {
+        let core = Arc::try_unwrap(self.core)
+            .unwrap_or_else(|_| panic!("with_confirmers must be called before confirmations()"));
+        Broker {
+            core: Arc::new(Core { confirmers, ..core }),
         }
     }
 
@@ -461,7 +483,11 @@ impl ConfirmService {
         let by = ctx.peer.subject();
         let now = now_unix_ms();
 
-        match self.core.pending.decide(&p.confirmation_id, &by, approve, now) {
+        match self
+            .core
+            .pending
+            .decide(&p.confirmation_id, &by, &self.core.confirmers, approve, now)
+        {
             Ok(decided) => {
                 self.core.record(AuditEntry {
                     event: "confirmation_decided".into(),
@@ -478,8 +504,8 @@ impl ConfirmService {
                 }))
             }
             Err(e) => {
-                // A self-confirmation attempt is the one an audit reader most wants to see:
-                // it means something tried to approve its own request.
+                // A refused answer is the one an audit reader most wants to see: it means
+                // something not designated as a confirmer tried to approve an action.
                 self.core.record(AuditEntry {
                     event: "confirmation_decided".into(),
                     subject: by.clone(),

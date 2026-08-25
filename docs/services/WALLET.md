@@ -41,10 +41,11 @@ On a booted node: **read, and nothing else** — though the reason has changed s
 `otwono-permd` opens a pending confirmation rather than issuing a token. Somebody can now
 answer it, on `/run/otwono/confirm.sock`.
 
-What still blocks the wallet is the half ADR-0024 deliberately did not deliver: **an approval
-from the uid that asked is refused**, and on the shipped image everything runs as `uid:0`. So
-the channel exists, is tested, and cannot yet authorise anything on a real node. The wallet's
-remaining dependency is the agent running under its own uid, not the channel. A policy saying `wallet.* = allow`, which is what an operator would actually write,
+What still blocks the wallet is the half ADR-0024 deliberately did not deliver: **only a
+subject in the configured confirmer set may answer** (§3a), and the shipped image configures
+nobody. So the channel exists, is tested, and cannot yet authorise anything on a real node.
+The wallet's remaining dependencies are a designated confirmer and an agent running under its
+own uid — not the channel. A policy saying `wallet.* = allow`, which is what an operator would actually write,
 still gets `ask` on all three and `allow` on `wallet.read`. That is tested at three levels:
 the registry, the policy evaluation, and end to end through the broker.
 

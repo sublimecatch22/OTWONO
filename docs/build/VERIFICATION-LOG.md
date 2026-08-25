@@ -3884,3 +3884,23 @@ under its own uid**, which is separate work this did not do.
   node with a real uid split, the confirmation socket's ownership would also need to be
   right, and nothing here checks that.
 - amd64 only, TCG, single node.
+
+### Correction, same day: the rule above was wrong
+
+**The entry above describes ADR-0024 §3 — "an approval from the uid that asked is refused" —
+and that rule was superseded within hours by §3a.** The run it records happened and its
+numbers stand; the design it describes did not survive contact with the question *who
+actually calls `perm.request`*.
+
+The answer is: CLIs, whose subject is the uid of the person who ran them. So a person running
+`otwono-storectl`, shown "delete `/home/u/tax-2025.ods`?", would have been refused their own
+approval — which on a one-person household node refuses every confirmation there is.
+
+The invariant was wrong, not the implementation. §3 optimised for *two parties*; what matters
+is *a human was shown the consequence and assented*. The rule is now membership in a
+configured confirmer set, which refuses an agent more completely than the old rule did — an
+agent is not in the set, so it cannot approve anybody's request, where before it could have
+approved a different subject's.
+
+Recorded here rather than by editing the entry above, because a log that quietly acquires the
+right answer is not a log.

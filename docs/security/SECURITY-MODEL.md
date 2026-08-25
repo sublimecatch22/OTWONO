@@ -94,13 +94,16 @@ Regardless of policy or model confidence:
 **How the confirmation happens: ADR-0024.** An `Ask` decision opens a pending confirmation
 and returns its id rather than blocking; a person answers on a **separate socket**
 (`/run/otwono/confirm.sock`), and the asker then claims the token. Two properties carry the
-design: an approval from the uid that asked is **refused** — a subject agreeing with itself
-is not a confirmation — and one approval authorises exactly one request, so "yes, delete this
-file" never becomes "yes, `fs.delete`".
+design: **only a subject in the configured confirmer set may answer** (ADR-0024 §3a), and one
+approval authorises exactly one request — so "yes, delete this file" never becomes "yes,
+`fs.delete`". The set defaults to empty, so an unconfigured node confirms nothing. An agent
+is kept out by never being in it, which also means an agent cannot approve *anybody's*
+request, not merely its own.
 
-The limit is stated in the ADR rather than left to be discovered: this proves a *different
-uid*, not a human, and on a node where the agent runs as root it stops nothing. The agent
-running under its own uid is a prerequisite the ADR imposes and does not deliver.
+The limit is stated in the ADR rather than left to be discovered: this proves a *designated
+uid*, not a human, and on a node where the agent runs as root it stops nothing. A configured
+confirmer and an agent under its own uid are prerequisites the ADR imposes and does not
+deliver.
 
 ### Audit log
 

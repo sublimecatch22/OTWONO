@@ -92,9 +92,10 @@ in.
 
 **Amended 2026-08-25 by ADR-0024.** The channel now exists: an `Ask` opens a pending
 confirmation and a person answers on a separate socket. The paragraph above was written when
-nothing could ask anybody, and its conclusion still holds for a different reason — ADR-0024
-refuses an approval from the uid that asked, and the shipped image runs everything as
-`uid:0`, so the wallet's signing path remains unreachable until the agent has its own uid.
+nothing could ask anybody, and its conclusion still holds for a different reason — ADR-0024 §3a
+lets only a designated confirmer answer, and the shipped image designates nobody, so the
+wallet's signing path remains unreachable until a confirmer is configured and the agent has
+its own uid.
 What changed is the name of the blocker, not the state of the wallet.
 
 `wallet.export_seed` is brokered and audited, and the UI must require **re-entering the

@@ -20,6 +20,9 @@ OPTIONS:
                           Where a person answers confirmations (default
                           $OTWONO_SOCKET_DIR/confirm.sock). Deliberately a different socket
                           from --socket: see ADR-0024.
+    --confirmer <SUBJECT> Who may answer confirmations, e.g. uid:1000. Repeatable.
+                          Defaults to nobody, so an unconfigured node confirms nothing.
+                          An agent's subject must never be listed here.
     --policy-dir <PATH>   Policy directory (default /etc/otwono/policy.d)
     --audit-log <PATH>    Audit log (default /var/log/otwono/audit.jsonl)
     --check               Load and validate the policy, then exit
@@ -60,6 +63,7 @@ enum Error {
 fn run(args: &[String]) -> Result<String, Error> {
     let mut socket: Option<PathBuf> = None;
     let mut confirm_socket: Option<PathBuf> = None;
+    let mut confirmers: Vec<String> = Vec::new();
     let mut policy_dir = PathBuf::from(DEFAULT_POLICY_DIR);
     let mut audit_log = PathBuf::from(DEFAULT_AUDIT_LOG);
     let mut check_only = false;
@@ -68,6 +72,11 @@ fn run(args: &[String]) -> Result<String, Error> {
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
+            "--confirmer" => confirmers.push(
+                it.next()
+                    .cloned()
+                    .ok_or_else(|| Error::Usage("--confirmer needs a subject".into()))?,
+            ),
             "--confirm-socket" => {
                 confirm_socket = Some(
                     it.next()
@@ -162,7 +171,7 @@ fn run(args: &[String]) -> Result<String, Error> {
         audit_log.display()
     );
 
-    let broker = Arc::new(Broker::new(policy, audit));
+    let broker = Arc::new(Broker::new(policy, audit).with_confirmers(confirmers.clone()));
 
     // The confirmation surface, on its own socket (ADR-0024 §3). It shares the broker's
     // state but serves only confirm.*, so whatever can reach it can answer requests and
@@ -175,11 +184,18 @@ fn run(args: &[String]) -> Result<String, Error> {
         .map_err(|e| Error::Startup(format!("cannot bind {}: {e}", confirm_socket.display())))?;
     eprintln!("otwono-permd: confirmations on {}", confirm_socket.display());
     // Stated plainly at startup, because a channel that cannot do its job should say so
-    // rather than look like it is working (ADR-0024 §4).
-    eprintln!(
-        "otwono-permd: a confirmation is refused when the approver's uid matches the asker's. \
-         On a node where both run as the same user this stops nothing"
-    );
+    // rather than look like it is working (ADR-0024 §3a, §4).
+    if confirmers.is_empty() {
+        eprintln!(
+            "otwono-permd: no --confirmer is configured, so nothing on this node can answer a \
+             confirmation. Every always_confirm action will stay unauthorised"
+        );
+    } else {
+        eprintln!(
+            "otwono-permd: confirmations may be answered by {}",
+            confirmers.join(", ")
+        );
+    }
     let confirmations = Arc::new(broker.confirmations());
     let shutdown = Shutdown::new();
     let s = shutdown.clone();

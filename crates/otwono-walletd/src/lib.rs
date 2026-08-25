@@ -31,9 +31,9 @@
 //! turns `Allow` into `Ask` for those, so `otwono-permd` opens a pending confirmation
 //! (ADR-0024) rather than issuing a token.
 //!
-//! The channel exists now. What still blocks the wallet is that an approval from the uid
-//! that asked is refused, and the shipped image runs everything as `uid:0` — so on a booted
-//! node today the wallet can be read and nothing else (ADR-0023 §4, ADR-0024 §4).
+//! The channel exists now. What still blocks the wallet is that only a designated confirmer
+//! may answer (ADR-0024 §3a) and the shipped image designates nobody — so on a booted node
+//! today the wallet can be read and nothing else (ADR-0023 §4, ADR-0024 §4).
 
 #![forbid(unsafe_code)]
 
@@ -195,7 +195,7 @@ impl WalletService {
     ///
     /// Guarded by `wallet.create`, which is `always_confirm` — so in practice this answers
     /// `confirmation_required` with a confirmation id (ADR-0024), and stays unreachable
-    /// while the asker and any possible approver share a uid.
+    /// while no confirmer is designated on the node.
     ///
     /// **Refuses to overwrite**, rather than confirming (ADR-0023 §3). A confirmation dialog
     /// is the wrong instrument for "this destroys the key to your funds": the answer is no,

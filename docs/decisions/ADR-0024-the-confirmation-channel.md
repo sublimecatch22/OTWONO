@@ -65,6 +65,46 @@ The socket is separate rather than a method on the existing one so that its perm
 differ from the control plane's — a control-plane socket every daemon must reach cannot also
 be the socket only a person may reach.
 
+### 3a. Correction: a confirmer set, not "somebody else"
+
+**Amended 2026-08-25, the same day, on tracing who actually calls `perm.request`.** §3 above
+is wrong, and the way it is wrong would have surfaced exactly when the uid split made it
+live — which is the worst time to find it.
+
+The askers are CLIs. `otwono-hwctl`, `otwono-aictl`, `otwono-storectl` all call
+`perm.request`, and their subject is **the uid of the person who ran them**. Under §3, a
+person who runs `otwono-storectl` and is then shown "delete `/home/u/tax-2025.ods`?" would be
+**refused their own approval**, because the asker's uid is theirs. On a household node with
+one person, that refuses every confirmation there is.
+
+The mistake was the invariant. §3 optimised for *two parties*, and the property that actually
+matters is **a human was shown the consequence and assented**. For a person at a terminal,
+asking and approving are two genuine acts by one party, and the second is the one where they
+see the resource and the blast radius. That is the value; requiring a second human to approve
+a household deleting its own file is absurd.
+
+**The rule is therefore membership, not difference:** only a subject in a configured
+**confirmer set** may approve. The set defaults to **empty**, so an unconfigured node
+confirms nothing — the same fail-closed state as before, reached honestly.
+
+This keeps everything §3 was protecting:
+
+- **An agent cannot approve its own request**, because an agent's uid is not in the set. That
+  was the real threat, and it is still refused.
+- **An agent cannot approve anything at all**, which is stronger than §3: under the old rule
+  an agent could have approved a *different* subject's request.
+- **A person may confirm their own request**, which is the normal flow and which §3 broke.
+
+It follows the precedent this project already prefers (CLAUDE.md §2.3): `sudo`'s wheel and
+polkit's admin identities both work this way, and for the same reason.
+
+**What did not survive:** the claim that a confirmation always involves two parties. It does
+not, and a design document that said so would be describing something nobody would ship.
+
+Group membership (`getgrouplist`) would be the idiomatic Unix expression of a confirmer set
+and is deliberately not built here: `PeerIdentity` carries a uid and a gid, not a group list,
+and widening it is its own change. Explicit subjects first.
+
 ### 4. What this does not achieve, stated before it is built
 
 **It cannot prove a human.** It proves a *different uid on a different connection*. Nothing
