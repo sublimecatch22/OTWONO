@@ -605,6 +605,10 @@ impl Service for NetService {
                         "visibility": meta.visibility,
                         "chunking": meta.chunking,
                         "size_bytes": meta.size_bytes,
+                        // Present when the object is shared: the file on disk is ciphertext
+                        // until this is used, so leaving it behind would hand the caller a
+                        // file they cannot read and no way to find out why.
+                        "sharing": meta.sharing,
                         "path": path.display().to_string(),
                         "owner_uid": ctx.peer.uid,
                         "asked": names,
@@ -643,6 +647,7 @@ impl Service for NetService {
                     "visibility": fetched.visibility,
                     "chunking": fetched.chunking,
                     "size_bytes": fetched.bytes.len(),
+                    "sharing": fetched.sharing,
                     "asked": names,
                     "manifest_from": report.manifest_from,
                     "chunks_from": report.chunks_from,

@@ -697,7 +697,7 @@ impl StoreService {
             .map(|c| json!({ "blake3": c.blake3, "length": c.length }))
             .collect();
 
-        Ok(json!({
+        let mut out = json!({
             "schema_version": DESCRIBE_SCHEMA_VERSION,
             "content_id": object.content_id.to_hex(),
             "size_bytes": object.size_bytes,
@@ -707,7 +707,29 @@ impl StoreService {
             "from_chunk": from,
             "chunks": chunks,
             "served_to": p.peer,
-        }))
+        });
+        // What this peer needs to open what it is about to download, and nothing more.
+        //
+        // Only *their* copy of the content key travels. The object record here holds the
+        // whole list; sending it would tell a recipient who else this node shares with,
+        // which is OQ-28's leak reaching a stranger rather than staying on disk. Sending
+        // one copy is a partial answer to it, and the part that is cheap.
+        //
+        // Unreachable unless the object is Shared and this peer is named, because
+        // `servable` already refused every other case.
+        if let (Visibility::Shared, Some(sharing), Some(peer)) =
+            (object.visibility, &object.sharing, p.peer.as_deref())
+        {
+            if let Some(copy) = sharing.copy_for(peer) {
+                out["sharing"] = json!({
+                    "encryption": sharing.encryption,
+                    "nonce_prefix": sharing.nonce_prefix,
+                    "plaintext_size_bytes": sharing.plaintext_size_bytes,
+                    "sealed_key": copy,
+                });
+            }
+        }
+        Ok(out)
     }
 
     /// One range of one chunk of one object.
@@ -754,9 +776,12 @@ impl StoreService {
             "schema_version": DESCRIBE_SCHEMA_VERSION,
             "content_id": object.content_id.to_hex(),
             "digest": entry.blake3,
-            // Sent so otwono-netd can make the same decision independently before a byte
-            // reaches a link (DATA-VISIBILITY.md §4). It is always public or replicated,
-            // because servable() already refused everything else.
+            // Sent so otwono-netd can make its own decision before a byte reaches a link
+            // (DATA-VISIBILITY.md §4). Public, replicated, or -- since ADR-0019 §4 --
+            // shared, when this peer is named in the object's envelope; servable() already
+            // refused everything else. The envelope itself is not repeated here: it travels
+            // once, with the manifest, and otwono-netd will not release a chunk of a shared
+            // object to a peer it has not already given that manifest to.
             "visibility": object.visibility.as_str(),
             "offset": from,
             "total_length": bytes.len(),

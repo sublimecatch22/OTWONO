@@ -12,14 +12,13 @@
   record carries a `sharing` envelope, and the schema describes it. `otwono-stored` exposes
   `store.share`, `store.share_file` and `store.open_shared`, the last of which asks
   `otwono-idd` to unwrap on the caller's own capability.
-  §4's admission rule is implemented in `otwono-stored`: `store.serve`,
-  `store.serve_manifest` and `store.serve_chunk` hand a `Shared` object to a peer named in
-  its envelope, out of this node's own store only, and refuse everybody else with the words
-  they use for an object that is not here.
-- **SPECIFIED, no code:** carrying a `SHARED` object over ONM — the wire manifest has no
-  room for the sealed key and nonce a recipient needs, so `otwono-netd` still refuses
-  `shared` on the way out and a `SHARED` object **has still never crossed a link**. And §5,
-  adding and removing recipients.
+  §4 is implemented in `otwono-stored` and `otwono-netd`: the serving methods hand a
+  `Shared` object to a peer named in its envelope, out of this node's own store only, the
+  ONM manifest carries that peer's own sealed key, and a shared object has crossed a real
+  TCP link and been opened at the other end under test.
+- **SPECIFIED, no code:** §5, adding and removing recipients. A fetched `SHARED` object
+  also has nowhere to go: `store.put` refuses the label and `store.share` re-encrypts under
+  a new key, so a recipient can read what it fetched but cannot keep it as the same object.
 
 ## Context
 
@@ -120,6 +119,19 @@ action, so a serving method would have to look the object up *before* deciding w
 capability to demand — and choosing the demand from the object is itself the probe oracle
 ADR-0017 closed. The knob this section wanted is better expressed as a policy rule on
 `store.serve` with a resource pattern, which the policy engine already supports.
+
+**Only the recipient's own copy travels.** The ONM manifest carries one sealed key — the
+asking peer's — and never the list. A recipient learns that it may open the object and
+nothing about who else may. That is a partial answer to OQ-28, and the part that is cheap:
+the serving node's own object record still holds the whole list.
+
+**`otwono-netd` makes its own decision, differently for the two messages.** A manifest must
+name the asking peer in its sealed key, which this daemon checks against the NodeID it
+authenticated. A chunk carries no envelope — repeating 300 bytes of it on every chunk would
+be absurd — so the rule there is that this daemon will not release a chunk of a shared object
+to a peer it has not already handed that object's manifest to, in this session. Per session,
+because a session is what the handshake authenticated; remembering across sessions would mean
+trusting a decision made against a key that may since have been rotated.
 
 **What the check is, and is not.** The peer's name is asserted by `otwono-netd` after it has
 authenticated the NodeID through the Noise handshake, and `otwono-netd` is the Z3

@@ -50,8 +50,15 @@ pub const NOISE_TAG_BYTES: usize = 16;
 /// widest possible numbers and two 64-character hex ids; `envelope_fits_reserve` pins it.
 pub const CHUNK_ENVELOPE_RESERVE: usize = 232;
 
-/// Room for a manifest reply's envelope with no entries. Measured at 262.
-pub const MANIFEST_ENVELOPE_RESERVE: usize = 272;
+/// Room for a manifest reply's envelope with no entries, worst case.
+///
+/// The worst case is a `shared` object, whose envelope also carries the recipient's sealed
+/// content key: a NodeID, two base64 blobs and a nonce prefix. Measured at 646 against 262
+/// for a public one. One constant rather than two because the *requester* does not know an
+/// object is shared until the first manifest arrives, so sizing the window by the smaller
+/// number would mean discovering the reply does not fit after asking for it.
+/// `envelope_fits_reserve` measures both and pins this.
+pub const MANIFEST_ENVELOPE_RESERVE: usize = 664;
 
 /// Ceiling on one chunk, from ADR-0016's `MAX_CHUNK`. Duplicated rather than depended on:
 /// this crate is the transport and must not pull in the store.
@@ -109,12 +116,66 @@ pub struct ManifestPage {
     /// The chunking parameter set that produced this object (ADR-0016). A peer running
     /// different parameters can *detect* the mismatch, which is all it can do about it.
     pub chunking: String,
-    /// Always `public` or `replicated` — nothing else may be served. Sent so a receiver
-    /// knows whether it may re-serve what it caches.
+    /// `public`, `replicated`, or `shared` — nothing else may be served. Sent so a receiver
+    /// knows whether it may re-serve what it caches, and `shared` is exactly the case where
+    /// it may not.
     pub visibility: String,
+    /// Present when and only when `visibility` is `shared` (ADR-0019 §4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sharing: Option<SharedEnvelope>,
     pub total_chunks: u32,
     pub from_chunk: u32,
     pub chunks: Vec<ChunkEntry>,
+}
+
+impl ManifestPage {
+    /// Check the label and the envelope agree, from the receiving side.
+    ///
+    /// A `shared` manifest with no envelope is bytes the receiver could never open, and a
+    /// non-`shared` one carrying an envelope is a peer describing an object in two
+    /// contradictory ways. Both are refused rather than reconciled.
+    ///
+    /// `me` is the receiver's own NodeID: a sealed key addressed to somebody else cannot be
+    /// opened here, so accepting it would mean downloading an object to fail at the end.
+    pub fn sharing_is_consistent(&self, me: &str) -> Result<(), ProtocolError> {
+        match (self.visibility.as_str(), &self.sharing) {
+            ("shared", None) => Err(ProtocolError::Mismatched(format!(
+                "{} is offered as shared with no sealed key, so it could never be opened",
+                self.content_id
+            ))),
+            ("shared", Some(envelope)) if envelope.sealed_key.recipient != me => {
+                Err(ProtocolError::Mismatched(format!(
+                    "{} came with a key sealed to {}, not to this node",
+                    self.content_id, envelope.sealed_key.recipient
+                )))
+            }
+            (label, Some(_)) if label != "shared" => Err(ProtocolError::Mismatched(format!(
+                "{} is offered as {label:?} and also carries a sealed content key",
+                self.content_id
+            ))),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// What a recipient needs to open a `SHARED` object it has fetched (ADR-0019).
+///
+/// **Only the asking peer's own copy of the content key travels.** A recipient learns that
+/// it may open the object and nothing about who else may — which is a real, if partial,
+/// answer to OQ-28 on the wire, even though the object record on the serving node still
+/// holds the whole list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedEnvelope {
+    /// The scheme the object was sealed with. A value the receiver does not recognise must
+    /// be refused, never guessed at.
+    pub encryption: String,
+    /// Base64 nonce prefix.
+    pub nonce_prefix: String,
+    /// What the object will be once opened. The manifest's `size_bytes` measures ciphertext.
+    pub plaintext_size_bytes: u64,
+    /// This peer's copy of the content key, and no other.
+    pub sealed_key: otwono_identity::SealedKey,
 }
 
 /// A range of one chunk.
@@ -310,7 +371,8 @@ pub fn max_chunks_per_page(link: &LinkProperties) -> u32 {
 /// Can this link carry a manifest window with even one entry in it?
 ///
 /// **Measured, and the answer for a `Trickle` link is no.** A manifest reply's envelope is
-/// 262 bytes before any entry, and one entry is 98 more; EU868 LoRa will bear 256 in total.
+/// 262 bytes before any entry — 646 if the object is shared, which is the number the reserve
+/// is sized for — and one entry is 98 more; EU868 LoRa will bear 256 in total.
 /// Chunk replies do fit, so an object could be *transferred* over such a link — but not
 /// described over one, so a fetch cannot begin. Saying so before sending anything is better
 /// than a `PayloadTooLarge` from three layers down.
@@ -500,6 +562,7 @@ mod tests {
             size_bytes: u64::MAX,
             chunking: "fastcdc-v2020-16k-64k-256k".into(),
             visibility: "replicated".into(),
+            sharing: None,
             total_chunks: u32::MAX,
             from_chunk: u32::MAX,
             chunks: vec![
@@ -558,6 +621,29 @@ mod tests {
             size_bytes: u64::MAX,
             chunking: "fastcdc-v2020-16k-64k-256k".into(),
             visibility: "replicated".into(),
+            sharing: None,
+            total_chunks: u32::MAX,
+            from_chunk: u32::MAX,
+            chunks: vec![],
+        };
+        // The worst case: a shared object, whose envelope also carries a sealed key. The
+        // strings here are as long as the real ones can be — a full NodeID, a 32-byte
+        // public key and a 48-byte ciphertext in base64.
+        let shared = ManifestPage {
+            content_id: id(0xff),
+            size_bytes: u64::MAX,
+            chunking: "fastcdc-v2020-16k-64k-256k".into(),
+            visibility: "shared".into(),
+            sharing: Some(SharedEnvelope {
+                encryption: "xchacha20poly1305-stream-be32-1MiB".into(),
+                nonce_prefix: "A".repeat(28),
+                plaintext_size_bytes: u64::MAX,
+                sealed_key: otwono_identity::SealedKey {
+                    recipient: format!("otw1{}", "z".repeat(56)),
+                    ephemeral_public_key: "A".repeat(44),
+                    sealed: "A".repeat(64),
+                },
+            }),
             total_chunks: u32::MAX,
             from_chunk: u32::MAX,
             chunks: vec![],
@@ -573,6 +659,11 @@ mod tests {
             (
                 "manifest",
                 encode(&Response::Manifest(page)).unwrap().len(),
+                MANIFEST_ENVELOPE_RESERVE,
+            ),
+            (
+                "shared manifest",
+                encode(&Response::Manifest(shared)).unwrap().len(),
                 MANIFEST_ENVELOPE_RESERVE,
             ),
             (
@@ -638,6 +729,7 @@ mod tests {
             size_bytes: 4096,
             chunking: "fastcdc-v2020-16k-64k-256k".into(),
             visibility: "public".into(),
+            sharing: None,
             total_chunks: 1,
             from_chunk: 0,
             chunks: vec![ChunkEntry {

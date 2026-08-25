@@ -69,8 +69,15 @@ worth stating rather than quietly dropping:
 | Noise session proof (handshake) | 447 | no |
 | Manifest reply, no entries | 262 | no |
 | Manifest reply, one entry | 360 | no |
+| Manifest reply for a `SHARED` object, no entries | 646 | no |
 | Chunk reply, empty body | 229 | yes, with 11 bytes to spare |
 | Chunk request, largest | 225 | yes |
+
+The shared row was added when ADR-0019 §4 put a sealed content key in the manifest. It is
+the number `MANIFEST_ENVELOPE_RESERVE` is sized for, because a requester does not learn that
+an object is shared until the first manifest arrives — sizing the window by the smaller
+number would mean discovering the reply does not fit only after asking for it. On a link
+that already carries a manifest at all, the cost is a few fewer entries per window.
 
 So a `Trickle` link can carry chunk traffic — at about six bytes of payload per
 transmission — but cannot carry a manifest window, and the Noise handshake does not

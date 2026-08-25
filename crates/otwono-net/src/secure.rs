@@ -33,7 +33,7 @@
 //! continue unauthenticated.
 
 use crate::link::{LinkAdapter, LinkError};
-use otwono_identity::{AgreementBinding, SessionSigner, SignerError, VerifiedPeer};
+use otwono_identity::{AgreementBinding, NodeId, SessionSigner, SignerError, VerifiedPeer};
 use serde::{Deserialize, Serialize};
 
 pub use otwono_identity::{session_proof_message, SESSION_DOMAIN};
@@ -59,6 +59,13 @@ pub struct SecureChannel<L: LinkAdapter> {
     link: L,
     transport: snow::TransportState,
     peer: VerifiedPeer,
+    /// This node, taken from the signer that authenticated the handshake.
+    ///
+    /// Recorded because some things carried over a channel are addressed to one side by
+    /// name — a content key sealed to a recipient, since ADR-0019 — and the code that
+    /// checks that should not have to be handed the answer separately by every caller. It
+    /// comes from the signer, so it cannot disagree with what the peer authenticated.
+    local: NodeId,
 }
 
 impl<L: LinkAdapter> std::fmt::Debug for SecureChannel<L> {
@@ -86,6 +93,7 @@ impl<L: LinkAdapter> SecureChannel<L> {
         let params = NOISE_PATTERN
             .parse()
             .map_err(|e| HandshakeError::Noise(format!("{e:?}")))?;
+        let local = signer.node_id();
         let static_secret = signer.agreement_secret();
         let builder = snow::Builder::new(params).local_private_key(static_secret.as_ref());
         let mut state = if initiator {
@@ -139,6 +147,7 @@ impl<L: LinkAdapter> SecureChannel<L> {
             link,
             transport,
             peer,
+            local,
         })
     }
 
@@ -146,6 +155,11 @@ impl<L: LinkAdapter> SecureChannel<L> {
     /// user-visible decision.
     pub fn peer(&self) -> &VerifiedPeer {
         &self.peer
+    }
+
+    /// This node, as the signer that completed the handshake names it.
+    pub fn local(&self) -> &NodeId {
+        &self.local
     }
 
     pub fn send(&mut self, message: &[u8]) -> Result<(), HandshakeError> {

@@ -53,6 +53,11 @@ decision = "allow"
 ttl_seconds = 300
 
 [[rule]]
+action = "store.share"
+decision = "allow"
+ttl_seconds = 300
+
+[[rule]]
 action = "net.content"
 decision = "allow"
 ttl_seconds = 300
@@ -66,6 +71,7 @@ struct Harness {
     dir: PathBuf,
     perm_socket: PathBuf,
     store_socket: PathBuf,
+    id_socket: PathBuf,
     /// The asking node's own control-plane socket, where `net.fetch` lives.
     net_socket: PathBuf,
     /// The serving node's overlay address and the NodeID that answers there.
@@ -163,11 +169,16 @@ impl Harness {
             dir,
             perm_socket,
             store_socket,
+            id_socket,
             server_addr,
             server_node,
             client,
             shutdown,
         }
+    }
+
+    fn identity_dir(&self) -> PathBuf {
+        self.dir.join("identity")
     }
 
     fn candidate(&self) -> Candidate {
@@ -224,6 +235,38 @@ impl Harness {
             )
             .unwrap()
             .expect("demote must succeed");
+    }
+
+    /// Encrypt bytes to this harness's own node and store them. Returns the content id.
+    ///
+    /// Both ends of this harness are fronted by one signing key, so the serving node's
+    /// recipient and the fetching node's identity are the same NodeID — which is what makes
+    /// a single-process test of the shared path possible at all.
+    fn share_with_myself(&self, bytes: &[u8]) -> String {
+        let binding: otwono_identity::SharingBinding = serde_json::from_value(
+            Client::connect(&self.id_socket)
+                .unwrap()
+                .call("id.sharing_binding", json!({}))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let token = self.token("store.share");
+        Client::connect(&self.store_socket)
+            .unwrap()
+            .call_with_capability(
+                "store.share",
+                json!({
+                    "data": data_encoding::BASE64.encode(bytes),
+                    "recipients": [binding],
+                }),
+                &token,
+            )
+            .unwrap()
+            .unwrap_or_else(|e| panic!("store.share refused: {}", e.message))["content_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
     }
 
     /// Ask the serving node for an object over a real TCP link.
@@ -354,10 +397,9 @@ fn a_shared_object_cannot_even_be_created_over_the_control_plane_yet() {
     let public = h.put(b"for one named peer only", "public");
     assert!(h.fetch(&public).is_ok(), "the same bytes as public still move");
 
-    // The store *would* now serve a shared object to a peer named in its envelope
-    // (ADR-0019 §4), but otwono-netd still refuses it on the way out, because the wire
-    // cannot yet carry the sealed key and nonce a recipient needs. Serving it would put
-    // ciphertext on a link that nobody could open.
+    // `shared` is still not on the unattended allow-list: it never leaves a node except to
+    // a peer named in its own envelope, which is a different question and a different
+    // function (`may_go_to_peer`).
     assert!(!otwono_netd::content::may_leave_a_node(Some("shared")));
 }
 
@@ -396,6 +438,7 @@ fn a_chunk_of_a_private_object_cannot_be_reached_through_a_public_one() {
 
     let responder = h.responder();
     let peer = h.client.node_id();
+    let mut session = otwono_netd::content::Session::default();
     for entry in &guessed {
         // Named under the public object: the digest is not in its chunk list.
         let through_public = responder.answer(
@@ -406,6 +449,7 @@ fn a_chunk_of_a_private_object_cannot_be_reached_through_a_public_one() {
                 offset: 0,
                 max_bytes: 1024,
             },
+            &mut session,
         );
         assert!(
             matches!(through_public, Response::NotAvailable { .. }),
@@ -421,6 +465,7 @@ fn a_chunk_of_a_private_object_cannot_be_reached_through_a_public_one() {
                 offset: 0,
                 max_bytes: 1024,
             },
+            &mut session,
         );
         assert!(
             matches!(direct, Response::NotAvailable { .. }),
@@ -579,6 +624,7 @@ fn a_peer_that_serves_the_wrong_bytes_is_caught() {
                         size_bytes: fake.len() as u64,
                         chunking: otwono_store::CHUNKING_VERSION.to_string(),
                         visibility: "public".into(),
+                        sharing: None,
                         total_chunks: served.len() as u32,
                         from_chunk: 0,
                         chunks: served
@@ -618,4 +664,164 @@ fn a_peer_that_serves_the_wrong_bytes_is_caught() {
     );
     drop(channel);
     let _ = hostile.join();
+}
+
+#[test]
+fn a_shared_object_crosses_a_real_link_and_opens_at_the_other_end() {
+    // ADR-0019 end to end over TCP and Noise: the serving node encrypts to a named
+    // recipient, that recipient fetches, and what arrives opens back to the original bytes.
+    // Everything before this asserted SHARED failing closed; this is the first time it
+    // actually moves.
+    let h = Harness::start("sharedlink");
+    let plaintext = b"the household accounts, for two neighbours and nobody else".repeat(40);
+    let id = h.share_with_myself(&plaintext);
+
+    let fetched = h
+        .fetch(&id)
+        .expect("the recipient is named, so the object is served");
+    assert_eq!(fetched.visibility, "shared");
+    assert_ne!(fetched.bytes, plaintext, "what crosses the link is ciphertext");
+    assert!(!fetched
+        .bytes
+        .windows(24)
+        .any(|w| w == b"the household accounts, "));
+
+    // The envelope came with it, addressed to this node, and nothing in it names anybody
+    // else -- only the asking peer's own copy travels.
+    let envelope = fetched
+        .sharing
+        .as_ref()
+        .expect("a shared object carries its envelope");
+    assert_eq!(envelope.encryption, otwono_store::SHARED_ENCRYPTION);
+    assert_eq!(
+        envelope.sealed_key.recipient,
+        h.server_node.to_text(),
+        "the copy is addressed to this node"
+    );
+    assert_eq!(envelope.plaintext_size_bytes, plaintext.len() as u64);
+
+    // And it opens. The sharing secret is read here as otwono-idd would read it.
+    let sharing_key = SharingKeystore::new(h.identity_dir()).load().unwrap();
+    let content_key = otwono_store::ContentKey::from_bytes(
+        *sharing_key
+            .open(&envelope.sealed_key)
+            .expect("this node's own copy"),
+    );
+    let prefix = data_encoding::BASE64
+        .decode(envelope.nonce_prefix.as_bytes())
+        .unwrap();
+    let mut opened = Vec::new();
+    otwono_store::shared::open(
+        &content_key,
+        &otwono_store::shared::decode_prefix(&prefix).unwrap(),
+        fetched.bytes.as_slice(),
+        &mut opened,
+    )
+    .expect("the fetched ciphertext opens with the key that crossed with it");
+    assert_eq!(opened, plaintext);
+}
+
+#[test]
+fn a_shared_object_is_not_served_to_a_peer_that_is_not_named() {
+    // The same object, asked for by a node that is not on its list. The refusal must be the
+    // one every other refusal is, or asking becomes a way to learn who a node shares with.
+    let h = Harness::start("sharedstranger");
+    let stranger = otwono_identity::NodeIdentity::from_seeds(&[77u8; 32], &[78u8; 32], 1);
+    let binding = stranger.signing().bind_sharing(&[9u8; 32]);
+    let token = h.token("store.share");
+    let id = Client::connect(&h.store_socket)
+        .unwrap()
+        .call_with_capability(
+            "store.share",
+            json!({
+                "data": data_encoding::BASE64.encode(b"not for the node asking"),
+                "recipients": [binding],
+            }),
+            &token,
+        )
+        .unwrap()
+        .unwrap()["content_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let refused = h.fetch(&id).unwrap_err();
+    let absent = h.fetch(&"0".repeat(64)).unwrap_err();
+    assert_eq!(
+        refused.replace(&id, "<id>"),
+        absent.replace(&"0".repeat(64), "<id>"),
+        "a shared object this node may not have and one that does not exist must look alike"
+    );
+}
+
+#[test]
+fn a_chunk_of_a_shared_object_is_refused_without_the_manifest_that_carries_its_key() {
+    // otwono-netd's own half of the ADR-0019 §4 check. The store holds the recipient list,
+    // so a chunk reply cannot carry an independent proof of authorization without repeating
+    // the whole envelope on every chunk. What this daemon can say by itself is that it has
+    // not given this peer the manifest for this object in this session -- and if it has not,
+    // the chunk does not go out, whatever the store answered.
+    let h = Harness::start("chunkgate");
+    let id = h.share_with_myself(&b"chunks that need a manifest first".repeat(40));
+    let responder = h.responder();
+    let peer = h.server_node;
+
+    // A fresh session that has released nothing.
+    let mut cold = otwono_netd::content::Session::default();
+    let digest = {
+        let mut warm = otwono_netd::content::Session::default();
+        match responder.answer(
+            &peer,
+            &Request::Manifest {
+                content_id: id.clone(),
+                from_chunk: 0,
+                max_chunks: 8,
+            },
+            &mut warm,
+        ) {
+            Response::Manifest(page) => page.chunks[0].blake3.clone(),
+            other => panic!("the named peer must get a manifest: {other:?}"),
+        }
+    };
+
+    let refused = responder.answer(
+        &peer,
+        &Request::Chunk {
+            content_id: id.clone(),
+            digest: digest.clone(),
+            offset: 0,
+            max_bytes: 262_144,
+        },
+        &mut cold,
+    );
+    assert!(
+        matches!(refused, Response::NotAvailable { .. }),
+        "a chunk went out in a session that had released no manifest: {refused:?}"
+    );
+
+    // The same request in a session that did release the manifest is served.
+    let mut warm = otwono_netd::content::Session::default();
+    let _ = responder.answer(
+        &peer,
+        &Request::Manifest {
+            content_id: id.clone(),
+            from_chunk: 0,
+            max_chunks: 8,
+        },
+        &mut warm,
+    );
+    let served = responder.answer(
+        &peer,
+        &Request::Chunk {
+            content_id: id,
+            digest,
+            offset: 0,
+            max_bytes: 262_144,
+        },
+        &mut warm,
+    );
+    assert!(
+        matches!(served, Response::Chunk(_)),
+        "the same request was refused after the manifest went out: {served:?}"
+    );
 }

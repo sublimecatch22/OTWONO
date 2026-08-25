@@ -60,6 +60,7 @@ fn all_three_responses_validate() {
         size_bytes: 70_000,
         chunking: otwono_store::CHUNKING_VERSION.to_string(),
         visibility: "public".into(),
+        sharing: None,
         total_chunks: 2,
         from_chunk: 0,
         chunks: vec![
@@ -87,12 +88,16 @@ fn all_three_responses_validate() {
 fn the_schema_refuses_a_label_that_may_not_leave_the_node() {
     // The one that matters. If `private` ever validates here, the schema has stopped
     // describing the boundary.
-    for label in ["private", "shared", "", "PUBLIC"] {
+    // `shared` is no longer on this list: since ADR-0019 §4 a shared object does leave the
+    // node, to the peers named in its envelope, and the schema says so. What it must still
+    // refuse is a shared manifest with nothing to open it — see the test below.
+    for label in ["private", "", "PUBLIC", "SHARED"] {
         let mut page = encoded(&Response::Manifest(ManifestPage {
             content_id: id(1),
             size_bytes: 1,
             chunking: otwono_store::CHUNKING_VERSION.to_string(),
             visibility: "public".into(),
+            sharing: None,
             total_chunks: 0,
             from_chunk: 0,
             chunks: vec![],
@@ -181,4 +186,80 @@ fn the_chunking_constant_the_schema_sees_is_the_one_the_store_writes() {
         text.contains("64 KiB average"),
         "the schema should still explain the pagination in ADR-0016's terms"
     );
+}
+
+/// A manifest for a shared object, as the code builds it.
+fn shared_manifest() -> ManifestPage {
+    ManifestPage {
+        content_id: id(1),
+        size_bytes: 65_552,
+        chunking: otwono_store::CHUNKING_VERSION.to_string(),
+        visibility: "shared".into(),
+        sharing: Some(otwono_net::content::SharedEnvelope {
+            encryption: otwono_store::SHARED_ENCRYPTION.to_string(),
+            nonce_prefix: data_encoding::BASE64.encode(&[0u8; 19]),
+            plaintext_size_bytes: 65_536,
+            sealed_key: otwono_identity::SealedKey {
+                recipient: "otw1exampleneighbour".into(),
+                ephemeral_public_key: data_encoding::BASE64.encode(&[1u8; 32]),
+                sealed: data_encoding::BASE64.encode(&[2u8; 48]),
+            },
+        }),
+        total_chunks: 1,
+        from_chunk: 0,
+        chunks: vec![ChunkEntry {
+            blake3: id(2),
+            length: 65_552,
+        }],
+    }
+}
+
+const ME: &str = "otw1exampleneighbour";
+
+#[test]
+fn a_shared_manifest_validates_with_its_envelope() {
+    let page = shared_manifest();
+    assert!(page.sharing_is_consistent(ME).is_ok());
+    assert_valid(&encoded(&Response::Manifest(page)));
+}
+
+#[test]
+fn a_shared_manifest_with_nothing_to_open_it_is_refused_by_the_code() {
+    // Bytes a recipient could never read. JSON Schema cannot say "required when visibility
+    // is shared" without a conditional, so this rule lives in the code -- and this asserts
+    // the code holds it rather than pretending the schema does.
+    let mut page = shared_manifest();
+    page.sharing = None;
+    let err = page.sharing_is_consistent(ME).unwrap_err();
+    assert!(format!("{err}").contains("could never be opened"), "{err}");
+}
+
+#[test]
+fn an_envelope_on_an_object_that_is_not_shared_is_refused_by_the_code() {
+    let mut page = shared_manifest();
+    page.visibility = "public".into();
+    assert!(page.sharing_is_consistent(ME).is_err());
+}
+
+#[test]
+fn a_key_sealed_to_somebody_else_is_refused_before_a_chunk_is_asked_for() {
+    let page = shared_manifest();
+    let err = page.sharing_is_consistent("otw1somebodyelse").unwrap_err();
+    assert!(format!("{err}").contains("not to this node"), "{err}");
+}
+
+#[test]
+fn the_schema_refuses_an_unknown_encryption_scheme() {
+    let mut page = encoded(&Response::Manifest(shared_manifest()));
+    page["sharing"]["encryption"] = serde_json::json!("aes-gcm-siv-whatever");
+    assert_invalid(&page, "a scheme this build does not implement");
+}
+
+#[test]
+fn the_schema_refuses_a_second_recipients_copy_alongside() {
+    // Only the asking peer's copy travels. A field carrying more would be OQ-28's leak
+    // reaching a stranger, so the schema forbids anything it does not name.
+    let mut page = encoded(&Response::Manifest(shared_manifest()));
+    page["sharing"]["other_recipients"] = serde_json::json!(["otw1somebodyelse"]);
+    assert_invalid(&page, "an envelope naming anybody but the asking peer");
 }

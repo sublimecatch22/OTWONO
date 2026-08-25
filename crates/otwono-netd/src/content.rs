@@ -26,7 +26,9 @@
 
 use crate::HANDSHAKE_TIMEOUT;
 use otwono_identity::NodeId;
-use otwono_net::content::{self, ChunkEntry, ChunkPart, ManifestPage, ProtocolError, Request, Response};
+use otwono_net::content::{
+    self, ChunkEntry, ChunkPart, ManifestPage, ProtocolError, Request, Response, SharedEnvelope,
+};
 use otwono_net::{LinkAdapter, LinkProperties, SecureChannel};
 use otwono_proto::{code, Client};
 use otwono_store::{ChunkRef, ContentId};
@@ -66,6 +68,24 @@ pub fn may_leave_a_node(label: Option<&str>) -> bool {
     matches!(label, Some(l) if SERVABLE_LABELS.contains(&l))
 }
 
+/// The same question for one named peer, which is the only way `shared` is ever true
+/// (ADR-0019 §4).
+///
+/// `sharing` is the envelope the store attached to its reply. This does not take the store's
+/// word for the decision: it checks that the sealed key in that envelope is addressed to the
+/// peer *this daemon* authenticated through the Noise handshake. That is what keeps the two
+/// label checks independent for `shared` as they already are for everything else — a store
+/// that started attaching somebody else's copy would be caught here rather than putting it
+/// on a link.
+pub fn may_go_to_peer(label: Option<&str>, sharing: Option<&SharedEnvelope>, peer: &NodeId) -> bool {
+    match (label, sharing) {
+        // An envelope on an object that is not shared is a reply describing itself two ways.
+        (Some(l), None) if SERVABLE_LABELS.contains(&l) => true,
+        (Some("shared"), Some(envelope)) => envelope.sealed_key.recipient == peer.to_text(),
+        _ => false,
+    }
+}
+
 /// Answers peers' content requests out of the local store.
 pub struct ContentResponder {
     store_socket: PathBuf,
@@ -79,6 +99,34 @@ impl std::fmt::Debug for ContentResponder {
         f.debug_struct("ContentResponder")
             .field("store", &self.store_socket)
             .finish_non_exhaustive()
+    }
+}
+
+/// What one peer has been given during one session.
+///
+/// Only shared objects are tracked, and only that a manifest for them went out. It exists so
+/// this daemon's check on a *chunk* of a shared object can be its own rather than an echo of
+/// the store's: the store holds the recipient list, so a chunk reply cannot carry an
+/// independent proof of authorization without repeating the whole envelope on every chunk.
+/// What this daemon can say by itself is "I have already given this peer, in this session,
+/// the manifest and sealed key for this object" — and if it has not, the chunk does not go
+/// out, whatever the store answered.
+///
+/// Per session, not per peer, and never persisted: a session is the unit the Noise handshake
+/// authenticated, and remembering across sessions would mean trusting an old decision made
+/// against a key that may since have been rotated.
+#[derive(Debug, Default)]
+pub struct Session {
+    shared_released: std::collections::HashSet<String>,
+}
+
+impl Session {
+    fn remember(&mut self, content_id: &str) {
+        self.shared_released.insert(content_id.to_string());
+    }
+
+    fn was_released(&self, content_id: &str) -> bool {
+        self.shared_released.contains(content_id)
     }
 }
 
@@ -97,14 +145,14 @@ impl ContentResponder {
     /// being malformed. A peer that could tell those apart would learn about this node's
     /// configuration, and a peer that could tell "refused" from "absent" would learn what
     /// this node holds.
-    pub fn answer(&self, peer: &NodeId, request: &Request) -> Response {
+    pub fn answer(&self, peer: &NodeId, request: &Request, session: &mut Session) -> Response {
         let id = request.content_id().to_string();
         if request.validate().is_err() {
             return Response::not_available(id);
         }
         match self.ask_store(peer, request) {
             Some(reply) => self
-                .translate(request, &reply)
+                .translate(peer, request, &reply, session)
                 .unwrap_or(Response::not_available(id)),
             None => Response::not_available(id),
         }
@@ -113,29 +161,50 @@ impl ContentResponder {
     /// Turn the store's reply into a wire reply, refusing on anything unexpected.
     ///
     /// This is where the second label check happens, on the way out.
-    fn translate(&self, request: &Request, reply: &serde_json::Value) -> Option<Response> {
+    fn translate(
+        &self,
+        peer: &NodeId,
+        request: &Request,
+        reply: &serde_json::Value,
+        session: &mut Session,
+    ) -> Option<Response> {
         let label = reply.get("visibility").and_then(|v| v.as_str());
-        if !may_leave_a_node(label) {
-            // `shared` reaches here legitimately now: since ADR-0019 §4 the store will hand
-            // over an object to a peer named in its envelope, and this daemon names the
-            // peer it authenticated. It is still refused, because the wire cannot yet carry
-            // the sealed key and nonce a recipient needs — serving it would put ciphertext
-            // on a link that nobody, including the intended recipient, could open.
-            //
-            // Any other label means otwono-stored regressed and the two independent checks
-            // disagree, which is worth saying out loud.
-            if label != Some("shared") {
-                eprintln!(
-                    "otwono-netd: refusing to serve {}: the store offered it labelled {:?}",
-                    request.content_id(),
-                    label.unwrap_or("<absent>")
-                );
-            }
+        // A malformed envelope is not an envelope. Parsed strictly here so a reply that
+        // cannot be understood is refused rather than serialised half-understood.
+        let sharing: Option<SharedEnvelope> = reply
+            .get("sharing")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        // Manifests and chunks are judged differently, because only the manifest carries
+        // the envelope. A manifest must name this peer in a sealed key; a chunk of a shared
+        // object goes out only if this daemon already gave this peer that manifest in this
+        // session. The store made its own decision from the recipient list it holds; this is
+        // the decision this daemon can make without that list, and it catches a store that
+        // answers a chunk request for an object it never advertised to this peer.
+        let allowed = match request {
+            Request::Manifest { .. } => may_go_to_peer(label, sharing.as_ref(), peer),
+            // A chunk reply carrying an envelope is a reply nobody should be sending.
+            Request::Chunk { .. } if sharing.is_some() => false,
+            Request::Chunk { .. } if label == Some("shared") => session.was_released(request.content_id()),
+            Request::Chunk { .. } => may_leave_a_node(label),
+        };
+        if !allowed {
+            // Reachable only if otwono-stored regressed: it has already applied its own
+            // version of this rule. Loud, because it means the two independent checks
+            // disagree and one of them is broken.
+            eprintln!(
+                "otwono-netd: refusing to serve {}: the store offered it labelled {:?} to {}",
+                request.content_id(),
+                label.unwrap_or("<absent>"),
+                peer.fingerprint()
+            );
             return None;
         }
         let content_id = reply.get("content_id")?.as_str()?.to_string();
         if content_id != request.content_id() {
             return None;
+        }
+        if label == Some("shared") && matches!(request, Request::Manifest { .. }) {
+            session.remember(&content_id);
         }
         match request {
             Request::Manifest { .. } => Some(Response::Manifest(ManifestPage {
@@ -143,6 +212,7 @@ impl ContentResponder {
                 size_bytes: reply.get("size_bytes")?.as_u64()?,
                 chunking: reply.get("chunking")?.as_str()?.to_string(),
                 visibility: label?.to_string(),
+                sharing,
                 total_chunks: u32::try_from(reply.get("total_chunks")?.as_u64()?).ok()?,
                 from_chunk: u32::try_from(reply.get("from_chunk")?.as_u64()?).ok()?,
                 chunks: reply
@@ -292,6 +362,9 @@ pub fn serve_session<L: LinkAdapter>(
     responder: &ContentResponder,
 ) -> Result<(), String> {
     let peer = channel.peer().node_id;
+    // Shared objects this daemon has already handed *this* peer a manifest for, in this
+    // session. See [`Session`].
+    let mut released = Session::default();
     loop {
         let frame = match channel.recv() {
             Ok(f) => f,
@@ -307,7 +380,7 @@ pub fn serve_session<L: LinkAdapter>(
                 ))
             }
         };
-        let response = responder.answer(&peer, &request);
+        let response = responder.answer(&peer, &request, &mut released);
         let encoded = content::encode(&response).map_err(|e| e.to_string())?;
         channel.send(&encoded).map_err(|e| e.to_string())?;
     }
@@ -319,6 +392,9 @@ pub struct FetchedObject {
     pub content_id: String,
     pub visibility: String,
     pub chunking: String,
+    /// Present when the object is `shared`: what this node needs to open the ciphertext it
+    /// just downloaded (ADR-0019). Checked before any chunk was asked for.
+    pub sharing: Option<SharedEnvelope>,
     pub bytes: Vec<u8>,
 }
 
@@ -380,6 +456,7 @@ pub fn fetch_object<L: LinkAdapter>(
         content_id: content_id.to_string(),
         visibility: header.visibility,
         chunking: header.chunking,
+        sharing: header.sharing,
         bytes,
     })
 }
@@ -425,6 +502,7 @@ fn fetch_manifest<L: LinkAdapter>(
     link: &LinkProperties,
     budget: &mut usize,
 ) -> Result<(ManifestPage, Vec<ChunkEntry>), ProtocolError> {
+    let me = channel.local().to_text();
     let window = content::max_chunks_per_page(link);
     let mut entries: Vec<ChunkEntry> = Vec::new();
     let mut header: Option<ManifestPage> = None;
@@ -462,12 +540,25 @@ fn fetch_manifest<L: LinkAdapter>(
         }
         // This node's own label check, on the way in. Caching content a peer has labelled
         // in a way this node does not recognise is not something to do by default.
-        if !may_leave_a_node(Some(&page.visibility)) {
+        //
+        // `shared` is accepted only when the manifest carries a key sealed to *this* node,
+        // which `sharing_is_consistent` checks. Doing it here rather than after the download
+        // is the same rule as defect 34's: everything that can be checked before asking for
+        // a chunk is checked before asking for a chunk.
+        if !may_leave_a_node(Some(&page.visibility)) && page.visibility != "shared" {
             return Err(ProtocolError::Mismatched(format!(
                 "the peer offered {content_id} labelled {:?}, which is not a label content \
                  may be served under",
                 page.visibility
             )));
+        }
+        page.sharing_is_consistent(&me)?;
+        if let Some(first) = &header {
+            if first.sharing != page.sharing {
+                return Err(ProtocolError::Mismatched(
+                    "the peer changed the sealed key between windows".into(),
+                ));
+            }
         }
         // Deliberately no size check here. Whether an object is too large is a property of
         // where it is going, not of the peer offering it — and a failure raised inside a
@@ -744,6 +835,7 @@ pub fn fetch_object_from_peers<L: LinkAdapter + Send + 'static>(
             content_id: content_id.to_string(),
             visibility: header.visibility,
             chunking: header.chunking,
+            sharing: header.sharing,
             bytes,
         },
         report,
@@ -772,6 +864,7 @@ pub fn fetch_object_to_file<L: LinkAdapter + Send + 'static>(
             visibility: header.visibility,
             chunking: header.chunking,
             size_bytes: header.size_bytes,
+            sharing: header.sharing,
         },
         report,
     ))
@@ -784,6 +877,9 @@ pub struct FetchedMeta {
     pub visibility: String,
     pub chunking: String,
     pub size_bytes: u64,
+    /// Present when the object is `shared`. The file on disk is ciphertext until this is
+    /// used, which is why it travels with the metadata rather than being left behind.
+    pub sharing: Option<SharedEnvelope>,
 }
 
 fn fan_out<L: LinkAdapter + Send + 'static>(

@@ -359,6 +359,7 @@ fn a_substituted_manifest_is_caught_before_a_single_chunk_is_fetched() {
                     size_bytes: fake.len() as u64,
                     chunking: otwono_store::CHUNKING_VERSION.to_string(),
                     visibility: "public".into(),
+                    sharing: None,
                     total_chunks: served.len() as u32,
                     from_chunk: 0,
                     chunks: served
@@ -429,6 +430,7 @@ fn a_peer_serving_rubbish_wastes_bandwidth_and_cannot_corrupt_the_result() {
                     size_bytes: total_len,
                     chunking: otwono_store::CHUNKING_VERSION.to_string(),
                     visibility: "public".into(),
+                    sharing: None,
                     total_chunks: truthful_chunks.len() as u32,
                     from_chunk: 0,
                     chunks: truthful_chunks
