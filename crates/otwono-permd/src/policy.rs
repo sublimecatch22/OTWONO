@@ -278,6 +278,35 @@ mod tests {
     }
 
     #[test]
+    fn a_wildcard_grant_over_the_wallet_still_stops_at_every_dangerous_call() {
+        // ADR-0023 §4's claim, tested rather than asserted, and with the rule an operator
+        // is most likely to actually write. `wallet.*` set to allow reads as "this node may
+        // use its wallet freely" -- and it must still stop for a person on creating,
+        // signing, and exporting, while leaving reading alone.
+        //
+        // This is also the shape a compromised policy file would take, which is why the
+        // requirement lives in the action registry and not in the policy.
+        let p = Policy::new(vec![Rule {
+            action: "wallet.*".into(),
+            subjects: vec![],
+            resource: None,
+            decision: Decision::Allow,
+            ttl_seconds: None,
+            one_shot: None,
+        }]);
+        for id in ["wallet.create", "wallet.sign", "wallet.export_seed"] {
+            let e = p.evaluate(&spec(id), "uid:0", None);
+            assert_eq!(e.decision, Decision::Ask, "{id} went through unattended");
+            assert!(e.reason.contains("always requires confirmation"), "{}", e.reason);
+        }
+        assert_eq!(
+            p.evaluate(&spec("wallet.read"), "uid:0", None).decision,
+            Decision::Allow,
+            "reading the wallet should not need a person"
+        );
+    }
+
+    #[test]
     fn a_deny_rule_stays_deny_even_for_a_confirm_action() {
         let p = Policy::new(vec![Rule {
             action: "net.egress".into(),

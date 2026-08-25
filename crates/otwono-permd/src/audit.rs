@@ -287,6 +287,50 @@ mod tests {
     }
 
     #[test]
+    fn a_record_carries_no_field_that_could_hold_a_secret() {
+        // ADR-0023 rests on this. `otwono-walletd` takes a passphrase in a call's params,
+        // and that is only survivable because params never reach the audit chain: an
+        // AuditEntry has no field for them, and `perm.request` only ever sees an action
+        // name. Both are true by construction today.
+        //
+        // What is not guaranteed by construction is that they stay true. A later change
+        // adding `params` "for debugging" would write passphrases into a hash-chained,
+        // append-only file that exists precisely so its contents are never lost. So the
+        // field set is pinned: adding one fails here, which is the moment to think.
+        let d = tmpdir("nosecrets");
+        let log = AuditLog::open(d.join("audit.jsonl")).unwrap();
+        let record = log.append(entry("wallet.create", "ask")).unwrap();
+        let json: serde_json::Value = serde_json::to_value(&record).unwrap();
+
+        // A subset check rather than an exact one: `resource` is skipped when absent, so an
+        // exact list would fail for a reason that has nothing to do with what this guards.
+        const ALLOWED: [&str; 11] = [
+            "action",
+            "event",
+            "hash",
+            "outcome",
+            "prev",
+            "reason",
+            "resource",
+            "schema_version",
+            "seq",
+            "subject",
+            "ts_unix_ms",
+        ];
+        for field in json.as_object().unwrap().keys() {
+            assert!(
+                ALLOWED.contains(&field.as_str()),
+                "the audit record grew a field, {field:?}. If it can carry call parameters, \
+                 ADR-0023's passphrase-in-params design is no longer safe: this file is \
+                 hash-chained and append-only, so anything written here is written for good"
+            );
+        }
+        // And the entry type has no way to supply one, which is the other half.
+        assert!(!json.as_object().unwrap().contains_key("params"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn an_empty_log_verifies() {
         let d = tmpdir("empty");
         let p = d.join("audit.jsonl");

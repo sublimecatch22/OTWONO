@@ -260,6 +260,55 @@ impl ActionRegistry {
                     BlastRadius::Irreversible,
                     true,
                 ),
+                // The wallet (ADR-0022 §3, ADR-0023 §3). Three of these four always
+                // confirm, which means that until Phase 7 ships a confirmation channel the
+                // wallet can be read and nothing else -- not created, not signed with, not
+                // exported. ADR-0023 §4 records that plainly rather than leaving it to be
+                // met as a surprise.
+                //
+                // Read is genuinely Read: ADR-0023 §2 keeps no public key in the clear, so
+                // this reports whether a vault exists and what parameters it uses, and
+                // anything naming an address needs the passphrase.
+                ActionSpec::new(
+                    "wallet.read",
+                    "Read the wallet's status, and derive a public key given the passphrase",
+                    BlastRadius::Read,
+                    false,
+                ),
+                // Irreversible and confirmed for two independent reasons, either enough: it
+                // returns the recovery phrase once, because somebody has to write it down --
+                // so an unattended caller learns the seed of a wallet about to be funded,
+                // which is wallet.export_seed's disclosure with different timing. And it
+                // mints the key that holds money, with no undo and a silent failure: a
+                // wallet created by somebody other than its owner looks exactly like one
+                // created by its owner.
+                //
+                // Creating *over* an existing vault is refused by the daemon rather than
+                // confirmed. A prompt invites a yes, and that yes is unrecoverable.
+                ActionSpec::new(
+                    "wallet.create",
+                    "Create a wallet and show its recovery phrase once",
+                    BlastRadius::Irreversible,
+                    true,
+                ),
+                // Irreversible rather than Egress because signing does not send -- but a
+                // signed transaction, once broadcast, cannot be recalled, and that is what
+                // irreversible means here. otwono-fetchd does the sending (ADR-0014).
+                ActionSpec::new(
+                    "wallet.sign",
+                    "Sign with a wallet key. What this signs cannot be recalled once sent",
+                    BlastRadius::Irreversible,
+                    true,
+                ),
+                // The one action that hands over everything at once. ADR-0022 §3 requires
+                // the UI re-enter the passphrase rather than accept a confirmation click;
+                // that is a UI obligation this registry cannot enforce and the ADR says so.
+                ActionSpec::new(
+                    "wallet.export_seed",
+                    "Reveal the recovery phrase or seed, which is the whole wallet",
+                    BlastRadius::Irreversible,
+                    true,
+                ),
             ],
         }
     }
@@ -360,6 +409,61 @@ mod tests {
             let spec = r.get(id).unwrap_or_else(|| panic!("{id} must be registered"));
             assert!(spec.always_confirm, "{id} must always require confirmation");
         }
+    }
+
+    #[test]
+    fn every_wallet_action_that_spends_or_reveals_requires_confirmation() {
+        // ADR-0022 §3 and ADR-0023 §3. Reading is free; everything that mints a key, spends,
+        // or hands over the phrase stops for a person. Policy cannot clear these -- policy.rs
+        // turns Allow into Ask for any always_confirm action -- so this registry is where
+        // the requirement actually lives, and a later "just for testing" edit here would
+        // silently remove the only thing standing between an agent and a household's money.
+        let r = ActionRegistry::builtin();
+        for id in ["wallet.create", "wallet.sign", "wallet.export_seed"] {
+            let spec = r.get(id).unwrap_or_else(|| panic!("{id} must be registered"));
+            assert!(spec.always_confirm, "{id} must always require confirmation");
+            assert_eq!(
+                spec.blast_radius,
+                BlastRadius::Irreversible,
+                "{id} cannot be undone once it has happened"
+            );
+        }
+    }
+
+    #[test]
+    fn reading_the_wallet_never_needs_a_confirmation_or_a_write() {
+        // The other half: if reading were confirmed too, a finance screen could not render
+        // at all, and the pressure would be to widen something that should not widen.
+        let r = ActionRegistry::builtin();
+        let read = r.get("wallet.read").expect("wallet.read must be registered");
+        assert!(!read.always_confirm);
+        assert_eq!(read.blast_radius, BlastRadius::Read);
+    }
+
+    #[test]
+    fn a_wallet_capability_is_never_satisfied_by_an_identity_one() {
+        // ADR-0022 §2 put the wallet in its own daemon so that compromising the node's name
+        // does not cost the household its money. That separation is only real if the
+        // capabilities are distinct: an id.* token must never authorise a wallet.* action.
+        // They are different strings, which is the mechanism -- this pins that nobody has
+        // aliased them, and names why it would matter.
+        let r = ActionRegistry::builtin();
+        for wallet in [
+            "wallet.read",
+            "wallet.create",
+            "wallet.sign",
+            "wallet.export_seed",
+        ] {
+            assert!(r.get(wallet).is_some(), "{wallet} must be registered");
+            assert!(
+                !wallet.starts_with("id."),
+                "{wallet} must not live in the identity daemon's namespace"
+            );
+        }
+        // And the identity daemon's own signing capability is not a wallet one.
+        assert!(r.get("id.sign").is_some());
+        assert!(r.get("wallet.sign").is_some());
+        assert_ne!("id.sign", "wallet.sign");
     }
 
     #[test]
