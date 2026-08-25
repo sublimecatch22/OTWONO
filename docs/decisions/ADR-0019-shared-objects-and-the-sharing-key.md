@@ -42,6 +42,16 @@ guess against the digest, which for a document whose contents are largely predic
 **identical** to the id of the same file stored `PUBLIC`, so merely holding a `SHARED`
 object would tell its holder which known file it is.
 
+**Framed, in implementation.** "As a whole" means the chunking sees only ciphertext; it
+does not mean one AEAD invocation over the object. A single invocation would require
+holding the object in memory to seal it and again to open it, which is what ADR-0018 exists
+to avoid — a `SHARED` video is no smaller than a `PUBLIC` one. The plaintext is therefore
+sealed in 1 MiB frames using the STREAM construction, and the concatenated frames are what
+gets chunked. Every property this section asks for survives: boundaries fall on ciphertext,
+digests are over ciphertext, the id is over ciphertext. STREAM rather than independently
+nonced frames because it is what makes truncation and reordering fail to decrypt instead of
+yielding a plausible shorter object.
+
 The cost is real and worth naming: a `SHARED` object does not deduplicate against its own
 plaintext, and sharing one file with two different recipient sets produces two unrelated
 ids. Both follow from the encryption being meaningful, and the second is arguably a feature
