@@ -68,6 +68,10 @@ Keys live in `otwono-walletd` — its own daemon, in Z1, with no network at all.
 `otwono-fetchd` carries. See ADR-0022 for why not `otwono-idd`, and for what adding money to
 this system does to its threat model.
 
+`docs/services/WALLET.md` tracks what is actually built. Today that is the key material only:
+`crates/otwono-wallet` holds the 24-word mnemonic, BIP-32/44 derivation on secp256k1, and the
+Argon2id seed vault. There is no daemon, no signing, and no address encoding yet.
+
 ## 3. Encryption, and why the node key is not enough
 
 Financial records get their own key, derived from a **user passphrase**, not the node

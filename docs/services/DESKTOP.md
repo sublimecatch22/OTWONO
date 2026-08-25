@@ -87,6 +87,7 @@ document is the shell and the surfaces; it does not restate them.
 | Surface | Where it is specified |
 |---|---|
 | Financial tracker and planner | `docs/services/FINANCE.md`, whose §2a carries the wallet (ADR-0022) |
+| Wallet keys, the vault, and what is not built | `docs/services/WALLET.md` |
 | Teacher / school system | `docs/services/EDUCATION.md` |
 | AI assistant, and driving ordinary apps | `docs/ai/AI-RUNTIME.md`, `docs/ai/APP-INTEGRATION.md` |
 | Media editing and viewing | CLAUDE.md §2.3's integration table — LibreOffice, GIMP, Krita, Inkscape, Audacity, Ardour, Kdenlive, Shotcut, mpv, ffmpeg. **Integrated, never rewritten** |

@@ -193,3 +193,5 @@ have tooling and habits for.
   ADR-0006 (node identity), ADR-0021 (receipts, the other half of the contribution story).
 - `docs/services/FINANCE.md` §2 and §3, `docs/services/DESKTOP.md` §4,
   `docs/security/SECURITY-MODEL.md` §1, CLAUDE.md §5 and §8.
+- `docs/services/WALLET.md` — what of this ADR is built, and the measured Argon2id
+  parameters, which this ADR left open.

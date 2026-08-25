@@ -19,6 +19,7 @@ members = [
     "crates/otwono-permd",
     "crates/otwono-hwd",
     "crates/otwono-idd",
+    "crates/otwono-wallet",
     "crates/otwono-aid",
     "tests/schema",
     "tests/control-plane",
@@ -50,6 +51,7 @@ otwono-storectl = { path = "crates/otwono-storectl" }
 otwono-proto = { path = "crates/otwono-proto" }
 otwono-permd = { path = "crates/otwono-permd" }
 otwono-idd = { path = "crates/otwono-idd" }
+otwono-wallet = { path = "crates/otwono-wallet" }
 
 [profile.release]
 opt-level = "z"
