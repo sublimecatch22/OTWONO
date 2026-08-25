@@ -282,11 +282,13 @@ if otwono-netd --peer-binding "$WORK/peer.binding" --socket /run/otwono/net.sock
     shared_to_peer=$(echo "$to_peer" | awk 'NR==1 {print $1}')
     [ -n "$shared_to_peer" ] || fail "sharing to a peer returned no content id"
 
-    # Sealed to the peer and not to this node: opening it here must fail, because this node
-    # holds no copy of the key. If this ever succeeds, the recipient list means nothing.
-    if otwono-storectl open "$shared_to_peer" --out "$WORK/notmine" >/dev/null 2>&1; then
-        fail "this node opened an object sealed to somebody else"
-    fi
+    # Sealed to the peer *and* to this node, which keeps a key to what it shares (ADR-0019
+    # §5) -- an owner who cannot read what they shared has lost their own file. So this
+    # opens, and must come back byte for byte.
+    otwono-storectl open "$shared_to_peer" --out "$WORK/mine-back" >/dev/null \
+        || fail "this node cannot open an object it shared"
+    cmp -s "$WORK/for-peer.txt" "$WORK/mine-back" \
+        || fail "an object this node shared came back different"
 
     # A tampered binding is refused rather than sealed to. Same file, one flipped character
     # in the signature.

@@ -242,24 +242,53 @@ fn store_get_will_not_read_a_sealed_object_as_if_it_were_plaintext() {
     assert!(!bytes.windows(21).any(|w| w == b"the quarterly figures"));
 }
 
+/// Put an object in this node's store sealed to somebody who is **not** this node.
+///
+/// `store.share` cannot produce this any more: since ADR-0019 §5 it always keeps a key for
+/// the sharing node, because an owner who cannot read what they shared has lost their file.
+/// `store.accept_shared` is how a node comes to hold an object it is not a recipient of.
+fn hold_an_object_for(
+    h: &Harness,
+    recipient: &str,
+    key: &otwono_identity::SharingKey,
+    plaintext: &[u8],
+) -> String {
+    let content_key = otwono_store::ContentKey::generate();
+    let prefix = otwono_store::shared::nonce_prefix();
+    let mut ciphertext = Vec::new();
+    otwono_store::shared::seal(&content_key, &prefix, plaintext, &mut ciphertext).unwrap();
+    let content_id = otwono_store::ContentId::of(&otwono_store::chunk::slice(&ciphertext)).to_hex();
+    let sealed = otwono_identity::seal_to(recipient, &key.public(), content_key.as_bytes()).unwrap();
+
+    h.call(
+        "store.accept_shared",
+        json!({
+            "content_id": content_id,
+            "data": data_encoding::BASE64.encode(&ciphertext),
+            "encryption": otwono_store::SHARED_ENCRYPTION,
+            "nonce_prefix": data_encoding::BASE64.encode(&prefix),
+            "plaintext_size_bytes": plaintext.len() as u64,
+            "sealed_key": sealed,
+        }),
+        "store.write",
+    )
+    .expect("accept_shared");
+    content_id
+}
+
 #[test]
 fn an_object_shared_with_somebody_else_cannot_be_opened_here() {
     // This node holds the ciphertext and the whole envelope, and still cannot read it. If
     // this ever passes trivially -- because the daemon fell back to some other key -- the
     // recipient list means nothing.
     let h = Harness::start("notmine", POLICY);
-    let (their_binding, _) = stranger(3);
-    let out = h
-        .call(
-            "store.share",
-            json!({
-                "data": data_encoding::BASE64.encode(&payload(2, 20_000)),
-                "recipients": [their_binding],
-            }),
-            "store.share",
-        )
-        .expect("sharing with somebody else is allowed; reading it back is not");
-    let id = out["content_id"].as_str().unwrap().to_string();
+    let (their_binding, their_key) = stranger(3);
+    let id = hold_an_object_for(
+        &h,
+        &their_binding.node_id.to_text(),
+        &their_key,
+        &payload(2, 20_000),
+    );
 
     let err = h
         .call(
@@ -383,9 +412,11 @@ fn every_named_recipient_gets_a_copy_and_nobody_else_does() {
         )
         .unwrap();
     let authorized = out["sharing"]["authorized"].as_array().unwrap();
-    assert_eq!(authorized.len(), 2);
+    // Three, not two: this node keeps a key to what it shares (ADR-0019 §5).
+    assert_eq!(authorized.len(), 3);
     assert!(authorized.contains(&json!(alice.node_id.to_text())));
     assert!(authorized.contains(&json!(bob.node_id.to_text())));
+    assert!(authorized.contains(&json!(h.node_id())));
 
     // Alice's own copy opens with Alice's key, and nobody else's does.
     let sealed: Vec<otwono_identity::SealedKey> =

@@ -127,7 +127,8 @@ impl Harness {
         // otwono-stored, encrypted at rest as a node's store always is.
         let store = Store::encrypted(dir.join("store"), StorageKey::generate());
         store.ensure_layout().unwrap();
-        let service = Arc::new(StoreService::new(store, perm_socket.clone()));
+        let service =
+            Arc::new(StoreService::new(store, perm_socket.clone()).with_identity(id_socket.clone()));
         let s = shutdown.clone();
         let server = Server::bind(&store_socket).unwrap();
         std::thread::spawn(move || server.serve(service, s));
@@ -267,6 +268,54 @@ impl Harness {
             .as_str()
             .unwrap()
             .to_string()
+    }
+
+    /// Put an object in the serving node's store that is sealed to somebody who is **not**
+    /// this node, and return its content id.
+    ///
+    /// `store.share` cannot produce this any more: since ADR-0019 §5 it always keeps a key
+    /// for the sharing node, because an owner who cannot read what they shared has lost
+    /// their own file. What these tests need is the other state — an object this node holds
+    /// and is not a recipient of — and `store.accept_shared` is exactly how a node comes to
+    /// hold one.
+    ///
+    /// Sealed here rather than by the daemon so the recipient list is only ever the
+    /// stranger. The content id is computed the same way the store will, which is what
+    /// `accept_shared` checks it against.
+    fn hold_an_object_for(
+        &self,
+        recipient: &str,
+        key: &otwono_identity::SharingKey,
+        plaintext: &[u8],
+    ) -> String {
+        let content_key = otwono_store::ContentKey::generate();
+        let prefix = otwono_store::shared::nonce_prefix();
+        let mut ciphertext = Vec::new();
+        otwono_store::shared::seal(&content_key, &prefix, plaintext, &mut ciphertext).unwrap();
+
+        let refs = otwono_store::chunk::slice(&ciphertext);
+        let content_id = otwono_store::ContentId::of(&refs).to_hex();
+        let sealed = otwono_identity::seal_to(recipient, &key.public(), content_key.as_bytes()).unwrap();
+
+        let token = self.token("store.write");
+        let out = Client::connect(&self.store_socket)
+            .unwrap()
+            .call_with_capability(
+                "store.accept_shared",
+                json!({
+                    "content_id": content_id,
+                    "data": data_encoding::BASE64.encode(&ciphertext),
+                    "encryption": otwono_store::SHARED_ENCRYPTION,
+                    "nonce_prefix": data_encoding::BASE64.encode(&prefix),
+                    "plaintext_size_bytes": plaintext.len() as u64,
+                    "sealed_key": sealed,
+                }),
+                &token,
+            )
+            .unwrap()
+            .unwrap_or_else(|e| panic!("store.accept_shared refused: {}", e.message));
+        assert_eq!(out["content_id"], content_id);
+        content_id
     }
 
     /// Ask the serving node for an object over a real TCP link.
@@ -861,27 +910,11 @@ fn the_index_offers_only_what_was_sealed_to_the_asker() {
     let public = h.put(b"public bytes", "public");
     let private = h.put(b"private bytes", "private");
 
-    let (stranger_binding, _) = {
-        let id = otwono_identity::NodeIdentity::from_seeds(&[61u8; 32], &[62u8; 32], 1);
-        let sharing = otwono_identity::SharingKey::from_seed(&[63u8; 32], 1);
-        (id.signing().bind_sharing(&sharing.public()), sharing)
-    };
-    let token = h.token("store.share");
-    let theirs = Client::connect(&h.store_socket)
-        .unwrap()
-        .call_with_capability(
-            "store.share",
-            json!({
-                "data": data_encoding::BASE64.encode(b"for somebody else"),
-                "recipients": [stranger_binding],
-            }),
-            &token,
-        )
-        .unwrap()
-        .unwrap()["content_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    // Held for somebody else, and this node is not on its list -- which store.share can no
+    // longer produce, since it always keeps the owner a key (ADR-0019 §5).
+    let stranger = otwono_identity::NodeIdentity::from_seeds(&[61u8; 32], &[62u8; 32], 1);
+    let their_key = otwono_identity::SharingKey::from_seed(&[63u8; 32], 1);
+    let theirs = h.hold_an_object_for(&stranger.node_id().to_text(), &their_key, b"for somebody else");
 
     let ids: Vec<String> = h
         .client
@@ -901,24 +934,13 @@ fn a_node_that_has_been_sealed_nothing_gets_the_same_answer_as_one_that_shares_w
     // "Nothing for you" and "nothing for anybody" must be indistinguishable, or asking
     // becomes a way to learn whether a node shares at all.
     let sharing_node = Harness::start("indexsome");
-    let (stranger, _) = {
-        let id = otwono_identity::NodeIdentity::from_seeds(&[71u8; 32], &[72u8; 32], 1);
-        let sharing = otwono_identity::SharingKey::from_seed(&[73u8; 32], 1);
-        (id.signing().bind_sharing(&sharing.public()), sharing)
-    };
-    let token = sharing_node.token("store.share");
-    Client::connect(&sharing_node.store_socket)
-        .unwrap()
-        .call_with_capability(
-            "store.share",
-            json!({
-                "data": data_encoding::BASE64.encode(b"for somebody who is not asking"),
-                "recipients": [stranger],
-            }),
-            &token,
-        )
-        .unwrap()
-        .unwrap();
+    let stranger = otwono_identity::NodeIdentity::from_seeds(&[71u8; 32], &[72u8; 32], 1);
+    let their_key = otwono_identity::SharingKey::from_seed(&[73u8; 32], 1);
+    sharing_node.hold_an_object_for(
+        &stranger.node_id().to_text(),
+        &their_key,
+        b"for somebody who is not asking",
+    );
 
     // This harness's client and server share a signing key, so the asker is a node the
     // serving side has sealed nothing to.
@@ -936,27 +958,16 @@ fn a_node_that_has_been_sealed_nothing_gets_the_same_answer_as_one_that_shares_w
 
 #[test]
 fn a_shared_object_is_not_served_to_a_peer_that_is_not_named() {
-    // The same object, asked for by a node that is not on its list. The refusal must be the
-    // one every other refusal is, or asking becomes a way to learn who a node shares with.
+    // An object this node holds and is not a recipient of. The refusal must be the one every
+    // other refusal is, or asking becomes a way to learn who a node shares with.
     let h = Harness::start("sharedstranger");
     let stranger = otwono_identity::NodeIdentity::from_seeds(&[77u8; 32], &[78u8; 32], 1);
-    let binding = stranger.signing().bind_sharing(&[9u8; 32]);
-    let token = h.token("store.share");
-    let id = Client::connect(&h.store_socket)
-        .unwrap()
-        .call_with_capability(
-            "store.share",
-            json!({
-                "data": data_encoding::BASE64.encode(b"not for the node asking"),
-                "recipients": [binding],
-            }),
-            &token,
-        )
-        .unwrap()
-        .unwrap()["content_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let their_key = otwono_identity::SharingKey::from_seed(&[79u8; 32], 1);
+    let id = h.hold_an_object_for(
+        &stranger.node_id().to_text(),
+        &their_key,
+        b"not for the node asking",
+    );
 
     let refused = h.fetch(&id).unwrap_err();
     let absent = h.fetch(&"0".repeat(64)).unwrap_err();

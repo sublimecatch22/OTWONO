@@ -170,6 +170,36 @@ the plaintext-to-everyone call goes through unattended would make the safer opti
 harder one, which is how a system teaches people to use the unsafe one. A registry test
 asserts the two cannot invert. The confirmation this section asks for stays on egress.
 
+### 5a. The sharing node keeps a key to what it shares
+
+**Amended 2026-08-25, while implementing §5.** As first built, `store.share` sealed the
+content key only to the named recipients. That is wrong twice over, and the second one is
+what surfaced it:
+
+- **It is data loss.** Share a file, delete the original, and it is gone — encrypted with a
+  key its own author never held. "The user owns the keys" is the project's first promise, and
+  an object whose owner cannot read it breaks it.
+- **It makes §5 impossible.** Adding a recipient means re-wrapping the content key, which
+  requires *having* the content key, which requires being a recipient. An owner who kept no
+  key can never add one.
+
+So `store.share` and `store.share_file` add this node to the recipient list. The store stays
+identity-free — it is `otwono-stored` that asks `otwono-idd` for its own binding and prepends
+it — and a caller who named this node explicitly is not duplicated.
+
+Refused, rather than silently working, when the identity daemon cannot be reached: creating
+an object whose author cannot open it is data loss, and doing it quietly is worse than not
+doing it at all.
+
+An **empty** recipient list is still an error, checked before this node is added. Adding self
+is an addition to a list somebody meant, not a substitute for one: a caller who named nobody
+meant to name somebody, and turning that into "shared with just me" would answer a question
+they did not ask.
+
+The cost is that every shared object's recipient list names its owner. That is visible to the
+recipients, who already know who shared with them, and it is invisible to anyone else —
+`store.serve` and ADR-0020's index both answer per asking peer.
+
 ### 5. Removing a recipient does not un-share
 
 Adding a recipient re-wraps the content key for them. Removing one deletes their wrapped

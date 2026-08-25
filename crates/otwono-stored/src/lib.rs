@@ -424,6 +424,52 @@ impl StoreService {
     /// two bindings for one node. Sealing to an unverified key would mean sealing to
     /// whoever claimed to be the recipient, which is the one mistake this whole mechanism
     /// exists to prevent.
+    /// This node's own sharing binding, so it keeps a key to what it shares (ADR-0019 §5).
+    fn my_sharing_binding(&self) -> Result<otwono_identity::SharingBinding, RpcError> {
+        let socket = self.id_socket()?;
+        let mut idd = Client::connect(socket).map_err(|e| {
+            RpcError::unavailable(format!(
+                "cannot reach the identity daemon at {}: {e}",
+                socket.display()
+            ))
+        })?;
+        let value = idd
+            .call("id.sharing_binding", json!({}))
+            .map_err(|e| RpcError::unavailable(format!("id.sharing_binding failed: {e}")))?
+            .map_err(|e| RpcError::unavailable(format!("id.sharing_binding refused: {}", e.message)))?;
+        serde_json::from_value(value)
+            .map_err(|e| RpcError::internal(format!("id.sharing_binding returned {e}")))
+    }
+
+    /// The caller's recipients, plus this node — because an owner who cannot read what they
+    /// shared has lost their own file (ADR-0019 §5).
+    ///
+    /// Refused rather than skipped when the identity daemon cannot be reached: creating an
+    /// object whose own author cannot open it is data loss, and doing it quietly is worse
+    /// than not doing it.
+    fn recipients_including_me(
+        &self,
+        asked: &[otwono_identity::SharingBinding],
+    ) -> Result<Vec<Recipient>, RpcError> {
+        // Refused *before* this node is added, so an empty list stays an error. Adding self
+        // is an addition to a list somebody meant, not a substitute for one: a caller who
+        // named nobody meant to name somebody, and silently turning that into "shared with
+        // just me" would answer a question they did not ask.
+        if asked.is_empty() {
+            return Err(RpcError::invalid_params(
+                "no recipients; an object nobody can open is not a shared object",
+            ));
+        }
+        let mine = self.my_sharing_binding()?;
+        let mut all: Vec<otwono_identity::SharingBinding> = asked.to_vec();
+        // Only if the caller did not already name us. `recipients` refuses a duplicate, and
+        // naming yourself explicitly is a reasonable thing for a caller to do.
+        if !all.iter().any(|b| b.node_id == mine.node_id) {
+            all.push(mine);
+        }
+        Self::recipients(&all)
+    }
+
     fn recipients(bindings: &[otwono_identity::SharingBinding]) -> Result<Vec<Recipient>, RpcError> {
         if bindings.is_empty() {
             return Err(RpcError::invalid_params(
@@ -465,7 +511,7 @@ impl StoreService {
                 bytes.len()
             )));
         }
-        let recipients = Self::recipients(&p.recipients)?;
+        let recipients = self.recipients_including_me(&p.recipients)?;
         let (object, _) = self
             .store
             .put_shared_reader(bytes.as_slice(), &recipients)
@@ -480,7 +526,7 @@ impl StoreService {
         // that is not theirs learns nothing about whether their bindings were good.
         let mut file =
             Handoff::open_owned(std::path::Path::new(&p.path), ctx.peer.uid).map_err(handoff_rpc)?;
-        let recipients = Self::recipients(&p.recipients)?;
+        let recipients = self.recipients_including_me(&p.recipients)?;
         let (object, _) = self
             .store
             .put_shared_reader(&mut file, &recipients)
