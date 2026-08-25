@@ -45,6 +45,15 @@ pub struct BrokeredSigner {
     /// Fetched once at bind time. Static until the signing key rotates, which invalidates
     /// this process's whole view and is handled by restarting rather than patching.
     binding: AgreementBinding,
+    /// Where peers may seal to this node (ADR-0019), fetched once at bind time for exactly
+    /// the same reason and with the same caveat: `id.rotate` changes the NodeID, so it
+    /// invalidates `node_id` and both bindings together and this process restarts.
+    ///
+    /// Cached rather than fetched per handshake because it goes into every `Hello`, and a
+    /// control-plane round trip on every inbound connection is a cost a mesh pays
+    /// continuously. `None` on a node whose identity daemon had no sharing key to offer —
+    /// a node nothing can be shared with, which still meshes.
+    sharing: Option<otwono_identity::SharingBinding>,
     id_socket: PathBuf,
     perm_socket: PathBuf,
     /// Cached `id.sign_session` capability. Re-requested when it expires.
@@ -98,10 +107,25 @@ impl BrokeredSigner {
             ));
         }
 
+        // Where peers may seal to this node, taken while the socket is already open.
+        // Verified here too, and against the NodeID the agreement binding just established:
+        // an idd offering a sharing binding for somebody else is broken, and advertising it
+        // would tell every peer to seal somebody else's data to a key this node cannot open.
+        //
+        // Optional. A node whose idd has no sharing key still meshes; it is simply a node
+        // nothing can be shared with, and saying so by omission is the honest form.
+        let sharing = idd
+            .call("id.sharing_binding", json!({}))
+            .ok()
+            .and_then(|r| r.ok())
+            .and_then(|v| serde_json::from_value::<otwono_identity::SharingBinding>(v).ok())
+            .filter(|b| b.node_id == verified.node_id && b.verify().is_ok());
+
         Ok(BrokeredSigner {
             agreement,
             node_id: verified.node_id,
             binding,
+            sharing,
             id_socket,
             perm_socket,
             token: Mutex::new(None),
@@ -177,6 +201,14 @@ impl SessionSigner for BrokeredSigner {
 
     fn agreement_binding(&self) -> Result<AgreementBinding, SignerError> {
         Ok(self.binding.clone())
+    }
+
+    fn sharing_binding(&self) -> Result<otwono_identity::SharingBinding, SignerError> {
+        self.sharing.clone().ok_or_else(|| {
+            SignerError::Unavailable(
+                "the identity daemon offered no sharing key when this daemon started".into(),
+            )
+        })
     }
 
     fn sign_session(&self, handshake_hash: &[u8]) -> Result<[u8; 64], SignerError> {

@@ -1065,6 +1065,7 @@ dependencies = [
  "otwono-stored",
  "rustix",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]

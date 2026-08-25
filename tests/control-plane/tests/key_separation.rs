@@ -580,8 +580,219 @@ fn two_separate_brokered_nodes_authenticate_each_other() {
     assert_eq!(proved, bob_id);
 
     // And the responder recorded alice, not something else.
-    let peers = responder.peers.lock().unwrap();
-    assert!(peers.get(&alice_id).is_some(), "bob must have recorded alice");
+    //
+    // Retried, because `dial` returns as soon as *alice* has finished her half: bob's
+    // listener thread is still running when the assertion is reached, and reading the table
+    // at that instant is a race the test would win or lose on scheduling. It won for a long
+    // time, and then adding one socket round trip to bob's hello lost it -- which is the
+    // third time on this branch a green assertion turned out to be passing on timing.
+    let alice_recorded = wait_until(Duration::from_secs(5), || {
+        responder.peers.lock().unwrap().get(&alice_id).is_some()
+    });
+    assert!(alice_recorded, "bob must have recorded alice");
+
+    // Bob learned where to seal to alice, from the hello she sent, and kept it only because
+    // the signature checked out against the NodeID the handshake authenticated (ADR-0019).
+    let sealable = wait_until(Duration::from_secs(5), || {
+        responder
+            .peers
+            .lock()
+            .unwrap()
+            .get(&alice_id)
+            .and_then(|p| p.sharing_binding.clone())
+            .is_some_and(|b| b.node_id == alice_id && b.verify().is_ok())
+    });
+    assert!(sealable, "bob must know where to seal to alice");
+}
+
+#[test]
+fn a_node_that_offers_no_sharing_binding_still_meshes() {
+    // Noise needs the agreement key and nothing else. Tying the two together would mean a
+    // node that could not share also could not talk -- and a node whose identity daemon is
+    // down, or an older build, is exactly such a node.
+    let bob = Harness::start("nosharing", MESH_POLICY);
+    let bob_signer = bob.brokered_signer("a").expect("bob binds");
+    let bob_id = bob_signer.node_id();
+
+    // Alice signs locally and holds no sharing key at all: SessionSigner's default answer
+    // for `sharing_binding` is "this node cannot be sealed to".
+    let alice = otwono_identity::NodeIdentity::generate().unwrap();
+    let alice_id = *alice.node_id();
+    assert!(
+        alice.sharing_binding().is_err(),
+        "the fixture must have no sharing key"
+    );
+
+    let listener = TcpLink::listen("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let responder = Arc::new(NetState::new(Arc::new(bob_signer)));
+    {
+        let responder = Arc::clone(&responder);
+        std::thread::spawn(move || run_listener(responder, listener));
+    }
+
+    let initiator = Arc::new(NetState::new(Arc::new(alice)));
+    initiator
+        .dial(&Candidate {
+            claimed_node_id: bob_id,
+            address: addr,
+        })
+        .expect("a node with no sharing key must still authenticate");
+
+    let recorded = wait_until(Duration::from_secs(5), || {
+        responder.peers.lock().unwrap().get(&alice_id).is_some()
+    });
+    assert!(recorded, "bob must have recorded alice");
+    assert!(
+        responder
+            .peers
+            .lock()
+            .unwrap()
+            .get(&alice_id)
+            .unwrap()
+            .sharing_binding
+            .is_none(),
+        "a peer that offered nothing must not appear sealable"
+    );
+
+    // The other direction: alice learned where to seal to bob, who does have one.
+    let bobs = wait_until(Duration::from_secs(5), || {
+        initiator
+            .peers
+            .lock()
+            .unwrap()
+            .get(&bob_id)
+            .and_then(|p| p.sharing_binding.clone())
+            .is_some()
+    });
+    assert!(bobs, "alice must know where to seal to bob");
+}
+
+/// A node that signs for itself but advertises somebody else's sharing binding.
+struct Liar {
+    me: otwono_identity::NodeIdentity,
+    claim: otwono_identity::SharingBinding,
+}
+
+impl SessionSigner for Liar {
+    fn node_id(&self) -> otwono_identity::NodeId {
+        SessionSigner::node_id(&self.me)
+    }
+    fn agreement_secret(&self) -> zeroize::Zeroizing<[u8; 32]> {
+        self.me.agreement_secret()
+    }
+    fn agreement_binding(&self) -> Result<otwono_identity::AgreementBinding, SignerError> {
+        SessionSigner::agreement_binding(&self.me)
+    }
+    fn sign_session(&self, handshake_hash: &[u8]) -> Result<[u8; 64], SignerError> {
+        self.me.sign_session(handshake_hash)
+    }
+    fn sharing_binding(&self) -> Result<otwono_identity::SharingBinding, SignerError> {
+        Ok(self.claim.clone())
+    }
+}
+
+#[test]
+fn a_peer_advertising_somebody_elses_sharing_binding_ends_the_session() {
+    // The binding is genuine -- signed by the key it names -- it is just not this peer's.
+    // Accepting it would mean this node later seals data to a stranger while believing it
+    // is sealing to the peer it authenticated. Treating the lie as an absence would be
+    // nearly as bad: it would teach this daemon to ignore signed claims that do not check
+    // out, which is the only kind worth checking.
+    let bob = Harness::start("liar", MESH_POLICY);
+    let bob_signer = bob.brokered_signer("a").expect("bob binds");
+    let bob_id = bob_signer.node_id();
+
+    let stranger = otwono_identity::NodeIdentity::from_seeds(&[41u8; 32], &[42u8; 32], 1);
+    let stranger_sharing = otwono_identity::SharingKey::from_seed(&[43u8; 32], 1);
+    let alice = Liar {
+        me: otwono_identity::NodeIdentity::generate().unwrap(),
+        claim: stranger.signing().bind_sharing(&stranger_sharing.public()),
+    };
+    let alice_id = SessionSigner::node_id(&alice);
+    assert!(
+        alice.claim.verify().is_ok(),
+        "the claim must be genuine, just not alice's"
+    );
+
+    let listener = TcpLink::listen("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let responder = Arc::new(NetState::new(Arc::new(bob_signer)));
+    {
+        let responder = Arc::clone(&responder);
+        std::thread::spawn(move || run_listener(responder, listener));
+    }
+
+    let initiator = Arc::new(NetState::new(Arc::new(alice)));
+    let outcome = initiator.dial(&Candidate {
+        claimed_node_id: bob_id,
+        address: addr,
+    });
+
+    // Bob refuses the session. Alice's own dial may well have completed its half before the
+    // link dropped -- she sends first and bob's objection comes after -- so what is asserted
+    // is bob's state, not alice's return.
+    //
+    // "Not connected" rather than "recorded as failed": an inbound peer that fails the hello
+    // was never observed, so there is nothing in the table to mark, and recording every
+    // stranger who fails a handshake would be an unbounded table anyone could grow.
+    let _ = outcome;
+    let settled = wait_until(Duration::from_secs(2), || {
+        !matches!(
+            responder.peers.lock().unwrap().get(&alice_id).map(|p| p.state),
+            None | Some(otwono_net::PeerState::Failed)
+        )
+    });
+    assert!(
+        !settled,
+        "bob accepted a peer advertising somebody else's sharing binding"
+    );
+    assert!(
+        responder
+            .peers
+            .lock()
+            .unwrap()
+            .get(&alice_id)
+            .and_then(|p| p.sharing_binding.clone())
+            .is_none(),
+        "and must not have kept the claim"
+    );
+
+    // And the refusal was about the binding, not about the harness being broken: an honest
+    // node dialling the same listener straight afterwards is accepted. Without this the
+    // assertion above would pass just as well if nothing had connected at all.
+    let honest = otwono_identity::NodeIdentity::generate().unwrap();
+    let honest_id = *honest.node_id();
+    Arc::new(NetState::new(Arc::new(honest)))
+        .dial(&Candidate {
+            claimed_node_id: bob_id,
+            address: addr,
+        })
+        .expect("an honest node must still be accepted");
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            matches!(
+                responder.peers.lock().unwrap().get(&honest_id).map(|p| p.state),
+                Some(otwono_net::PeerState::Connected)
+            )
+        }),
+        "bob's listener stopped accepting after refusing the liar"
+    );
+}
+
+/// Poll until `check` passes or the deadline expires.
+///
+/// A bounded retry, not a sleep: a sleep long enough to be safe is long enough to hide a
+/// regression, and one short enough to be quick is a race.
+fn wait_until(limit: Duration, mut check: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    while std::time::Instant::now() < deadline {
+        if check() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    check()
 }
 
 #[test]

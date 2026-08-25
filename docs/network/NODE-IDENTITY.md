@@ -63,6 +63,15 @@ one job, and the cost of each being lost is different:
 That last asymmetry is unusual enough to be worth stating twice, and `otwono-idd` says it
 on the boot where the key is generated.
 
+A peer learns where to seal by being told: the signed binding travels in the `Hello` that
+follows every Noise handshake, so a node that has authenticated another knows where to seal
+to it without a second exchange. It is public information — it is what `node.pub` publishes.
+A `Hello` carrying **no** binding is fine and means a node nothing can be shared with; a
+`Hello` carrying one that does not verify, or one that names a different NodeID than the
+handshake authenticated, ends the session. Treating that as an absence would teach the mesh
+daemon to ignore signed claims that do not check out, and the claim is about where somebody
+else's data would go.
+
 Like the agreement key, the sharing key is **vouched for**: `node.key` records which
 sharing public key the signing key stands behind, and the signed `SharingBinding` is
 published in `node.pub` and returned by `id.sharing_binding`. The binding carries its own

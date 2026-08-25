@@ -59,6 +59,19 @@ pub trait SessionSigner: Send + Sync {
 
     /// Sign `SESSION_DOMAIN || handshake_hash` with the node's Ed25519 key.
     fn sign_session(&self, handshake_hash: &[u8]) -> Result<[u8; 64], SignerError>;
+
+    /// The signed statement binding this node's *sharing* key to its NodeID (ADR-0019).
+    ///
+    /// Optional, and the default is honest about that: a signer that does not hold or cannot
+    /// reach a sharing key has no answer, and a node with no answer is simply one that
+    /// cannot be sealed to. It is not a handshake failure — Noise needs the agreement key
+    /// and nothing else, and tying the two together would mean a node that could not share
+    /// also could not mesh.
+    fn sharing_binding(&self) -> Result<crate::SharingBinding, SignerError> {
+        Err(SignerError::Unavailable(
+            "this signer holds no sharing key, so nothing can be sealed to this node".into(),
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

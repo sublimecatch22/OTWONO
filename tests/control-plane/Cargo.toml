@@ -26,4 +26,5 @@ otwono-capability = { path = "../../crates/otwono-capability", features = ["test
 serde_json = "1"
 blake3 = "1"
 data-encoding = "2"
+zeroize = "1"
 rustix = { version = "0.38", features = ["process"] }

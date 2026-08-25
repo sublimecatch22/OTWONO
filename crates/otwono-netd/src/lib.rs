@@ -58,6 +58,17 @@ pub struct Hello {
     pub node_id: String,
     pub fingerprint: String,
     pub software: String,
+    /// Where this node may be sealed to (ADR-0019), signed by its own Ed25519 key.
+    ///
+    /// Public information — it is what `node.pub` publishes — and carried here so a peer
+    /// that has completed a handshake knows where to seal without a second exchange. Absent
+    /// on a node that has no sharing key, which is a node nothing can be shared with rather
+    /// than a node that cannot mesh: Noise needs the agreement key and nothing else, and
+    /// tying the two together would mean a node that could not share also could not talk.
+    ///
+    /// `#[serde(default)]` so a peer running an older build still parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sharing_binding: Option<otwono_identity::SharingBinding>,
 }
 
 pub struct NetState {
@@ -117,16 +128,19 @@ impl NetState {
         match SecureChannel::accept(link, self.signer.as_ref()) {
             Ok(mut channel) => {
                 let node_id = channel.peer().node_id;
-                if let Err(e) = self.exchange_hello(&mut channel, false) {
-                    eprintln!("otwono-netd: hello with {} failed: {e}", node_id.fingerprint());
-                    self.peers.lock().unwrap().record_failure(&node_id, e, self.now());
-                    return;
-                }
+                let sharing = match self.exchange_hello(&mut channel, false) {
+                    Ok(sharing) => sharing,
+                    Err(e) => {
+                        eprintln!("otwono-netd: hello with {} failed: {e}", node_id.fingerprint());
+                        self.peers.lock().unwrap().record_failure(&node_id, e, self.now());
+                        return;
+                    }
+                };
                 let now = self.now();
                 self.peers
                     .lock()
                     .unwrap()
-                    .record_authenticated(node_id, address, now);
+                    .record_authenticated(node_id, address, now, sharing);
                 eprintln!(
                     "otwono-netd: inbound peer authenticated: {}",
                     node_id.fingerprint()
@@ -192,12 +206,12 @@ impl NetState {
             ));
         }
 
-        self.exchange_hello(&mut channel, true)?;
+        let sharing = self.exchange_hello(&mut channel, true)?;
         let now = self.now();
         self.peers
             .lock()
             .unwrap()
-            .record_authenticated(proved, Some(candidate.address), now);
+            .record_authenticated(proved, Some(candidate.address), now, sharing);
         Ok(proved)
     }
 
@@ -330,15 +344,23 @@ impl NetState {
         })
     }
 
+    /// Exchange `Hello` and return where the peer says it may be sealed to, verified.
+    ///
+    /// Returned rather than recorded here, because at this point the peer is not yet in the
+    /// table — the caller inserts it — and a setter called before the insert would silently
+    /// do nothing. That is exactly what the first version of this did.
     fn exchange_hello<L: LinkAdapter>(
         &self,
         channel: &mut SecureChannel<L>,
         initiator: bool,
-    ) -> Result<(), String> {
+    ) -> Result<Option<otwono_identity::SharingBinding>, String> {
         let mine = Hello {
             node_id: self.node_id.to_text(),
             fingerprint: self.node_id.fingerprint(),
             software: format!("otwono-netd/{}", env!("CARGO_PKG_VERSION")),
+            // Best effort: a node whose identity daemon cannot be reached still meshes, and
+            // simply cannot be sealed to until it can.
+            sharing_binding: self.signer.sharing_binding().ok(),
         };
         let encoded = serde_json::to_vec(&mine).map_err(|e| e.to_string())?;
         let expected = channel.peer().node_id;
@@ -361,7 +383,24 @@ impl NetState {
                 expected.to_text()
             ));
         }
-        Ok(())
+
+        // A peer that sends no binding is one nothing can be shared with, which is fine. A
+        // peer that sends one that does not check out is making a signed claim that is
+        // false, and the session ends — treating a lie as an absence would teach this
+        // daemon to ignore lies, and the claim is about where somebody's data would go.
+        if let Some(binding) = &theirs.sharing_binding {
+            if binding.node_id != expected {
+                return Err(format!(
+                    "{} offered a sharing binding for {}",
+                    expected.to_text(),
+                    binding.node_id.to_text()
+                ));
+            }
+            binding
+                .verify()
+                .map_err(|e| format!("{}'s sharing binding does not verify: {e}", expected.to_text()))?;
+        }
+        Ok(theirs.sharing_binding)
     }
 }
 

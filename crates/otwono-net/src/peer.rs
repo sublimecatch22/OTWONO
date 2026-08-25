@@ -35,6 +35,13 @@ pub struct PeerRecord {
     /// Why the last attempt failed, when it did.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Where this peer may be sealed to (ADR-0019), as it presented in its `Hello` and
+    /// **after** the signature was checked against the NodeID the handshake authenticated.
+    ///
+    /// Kept whole rather than reduced to a key, so it can be handed to whatever seals — and
+    /// so that thing can verify it again for itself rather than trusting this table.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sharing_binding: Option<otwono_identity::SharingBinding>,
 }
 
 #[derive(Debug, Default)]
@@ -57,6 +64,7 @@ impl PeerTable {
             first_seen_unix_ms: now_ms,
             last_seen_unix_ms: now_ms,
             last_error: None,
+            sharing_binding: None,
         });
         entry.last_seen_unix_ms = now_ms;
         let address = address.to_string();
@@ -84,7 +92,19 @@ impl PeerTable {
     }
 
     /// Insert a peer learned by authenticating it, which may be the first we hear of it.
-    pub fn record_authenticated(&mut self, node_id: NodeId, address: Option<SocketAddr>, now_ms: u64) {
+    ///
+    /// `sharing` is where the peer said it may be sealed to, already verified by the caller
+    /// against the NodeID the handshake authenticated. It arrives here rather than through a
+    /// setter so that a peer becomes known in exactly one place: a separate call would have
+    /// to run *after* this one, and getting that order wrong silently drops the binding
+    /// rather than failing.
+    pub fn record_authenticated(
+        &mut self,
+        node_id: NodeId,
+        address: Option<SocketAddr>,
+        now_ms: u64,
+        sharing: Option<otwono_identity::SharingBinding>,
+    ) {
         if let Some(addr) = address {
             self.observe(node_id, addr, now_ms);
         } else {
@@ -96,9 +116,16 @@ impl PeerTable {
                 first_seen_unix_ms: now_ms,
                 last_seen_unix_ms: now_ms,
                 last_error: None,
+                sharing_binding: None,
             });
         }
         self.set_state(&node_id, PeerState::Connected, now_ms);
+        // Only ever set, never cleared by a later handshake that carried none: a peer
+        // reconnecting from a build that cannot reach its own identity daemon should not
+        // make this node forget where to seal to it.
+        if let (Some(binding), Some(p)) = (sharing, self.peers.get_mut(&node_id)) {
+            p.sharing_binding = Some(binding);
+        }
     }
 
     pub fn get(&self, node_id: &NodeId) -> Option<&PeerRecord> {
@@ -195,7 +222,7 @@ mod tests {
     fn authentication_promotes_a_peer_to_connected() {
         let mut t = PeerTable::new();
         t.observe(node(2), addr(9000), 100);
-        t.record_authenticated(node(2), Some(addr(9000)), 200);
+        t.record_authenticated(node(2), Some(addr(9000)), 200, None);
         assert_eq!(t.connected().len(), 1);
     }
 
@@ -203,7 +230,7 @@ mod tests {
     fn an_inbound_peer_we_never_discovered_is_still_recorded() {
         // Discovery is not the only way to meet: a peer may dial us first.
         let mut t = PeerTable::new();
-        t.record_authenticated(node(3), None, 100);
+        t.record_authenticated(node(3), None, 100, None);
         assert_eq!(t.get(&node(3)).unwrap().state, PeerState::Connected);
     }
 
@@ -222,7 +249,7 @@ mod tests {
     fn a_connected_peer_is_not_retried() {
         let mut t = PeerTable::new();
         t.observe(node(8), addr(9000), 100);
-        t.record_authenticated(node(8), Some(addr(9000)), 200);
+        t.record_authenticated(node(8), Some(addr(9000)), 200, None);
         assert!(t.retry_candidates().is_empty(), "no need to redial a live peer");
     }
 
@@ -230,7 +257,7 @@ mod tests {
     fn a_peer_with_no_address_is_not_a_retry_candidate() {
         // Learned by being dialled, so there is nothing to dial back.
         let mut t = PeerTable::new();
-        t.record_authenticated(node(9), None, 100);
+        t.record_authenticated(node(9), None, 100, None);
         t.record_failure(&node(9), "hung up".into(), 200);
         assert!(t.retry_candidates().is_empty());
     }
