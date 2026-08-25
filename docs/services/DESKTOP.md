@@ -54,9 +54,9 @@ contribution readout feeds a reward system that is **deliberately not part of th
 Three things the UI has to get right, because they are easy to get wrong in a way that
 misleads someone about their own money and their own privacy:
 
-- **A wallet key is not the node key.** `FINANCE.md` §3 already sets the precedent: financial
-  keys come from a user passphrase, not the node identity. Losing a machine must not lose
-  money, and one person may run several nodes against one wallet.
+- **A wallet key is not the node key** (ADR-0022). Passphrase-derived, BIP-39/32/44, in
+  `otwono-walletd` — its own daemon, no network. Losing a machine must not lose money, and
+  one person may run several nodes against one wallet.
 - **Contribution records are `PRIVATE` and stay put unless exported**, and export is an
   explicit, confirmed, audited action — never a background sync. The UI says where the
   numbers are and what leaving would mean.

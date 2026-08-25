@@ -3,6 +3,11 @@
 **Status:** `SPECIFIED`. No implementation. Depends on Phase 5 (content store and
 encryption at rest) and Phase 7 (agent layer). Targeted at Phase 7.
 
+The wallet (§2a, ADR-0022) is targeted at Phase 10 and is **gated behind Phase 7 by
+construction**: `wallet.sign` always confirms, and no confirmation channel exists until then.
+Its keystore, derivation, addresses and backup can be built and tested before signing is
+reachable at all.
+
 ---
 
 ## 1. What it is
@@ -28,34 +33,40 @@ into anything a peer can query.
 Label promotion is not merely "an explicit user action" here — the UI should treat any
 attempt to promote financial data as a mistake and say so.
 
-## 2a. A crypto wallet lives here, and §2 does not yet allow it
+## 2a. The wallet, and what §2 governs
 
-**Decided 2026-08-25, and this section is a placeholder for the ADR that must resolve it.**
+**Settled by ADR-0022.** The finance surface carries a crypto wallet on **secp256k1**
+(Ethereum/Bitcoin/Cosmos family), so a household can hold what a future contribution system
+pays it for running a node.
 
-The finance surface is to carry a crypto wallet, on **secp256k1** (Ethereum/Bitcoin/Cosmos
-family), so a household can hold and spend the rewards a future contribution system pays for
-running a node.
+§2 above is right and unchanged. What it needed was a distinction it never had to make:
 
-As §2 is written, that is forbidden: everything here is `PRIVATE`, never `SHARED`, and the UI
-should treat promotion as a mistake. A wallet cannot work under that rule, because a wallet
-must broadcast signed transactions.
+- **The visibility labels govern objects in the content store.** Under that rule everything
+  here stays `PRIVATE` with no exception — keys, balances, transaction history, addresses,
+  and contribution records. No cache, no peer index, no promotion.
+- **A signed transaction is not a stored object being promoted.** It is a new artefact built
+  for the purpose of leaving, handed to `otwono-fetchd`, and never held as a labelled object.
+  There is no label on it to promote.
 
-The distinction §2 is missing, and which the ADR must draw precisely:
+**The label model governs the record; the capability model governs the act.** Sending is
+`wallet.sign`: irreversible, always confirmed, audited — a stronger gate than
+`label.promote`, not a way around it.
 
-- **Keys, balances, transaction history and the contribution record stay `PRIVATE`.** No
-  exception, no cache, no peer index — exactly as §2 says today.
-- **A signed transaction is deliberately published.** That is egress, it requires
-  confirmation, and it is audited. It is not a label promotion of stored data; it is a new
-  object created for the purpose of leaving.
+Two things this section must keep saying out loud, because both are easy to leave to a UI
+that will not say them:
 
-Also open, and pulled forward by this: **the wallet forces the encrypted backup that the
-identity keystore has been deferring.** `keystore.rs` says plainly that losing `node.key`
-loses the identity, with no encrypted export yet. Tolerable for a machine's name. Not
-tolerable for money — a wallet without seed-phrase backup eats funds.
+- **A public chain is a permanent public record.** No demotion, no deletion, no expiry. This
+  document already promises that kind of honesty about replicated content peers hold; a chain
+  is that, forever, in front of everyone. Addresses are therefore fresh per counterparty and
+  per purpose by default — reusing one makes the household's whole contribution history
+  publicly linkable to anyone who sees a single payment.
+- **Contribution counters are not proof of anything.** They are self-reported; ADR-0021's
+  receipts make them counter-signed, which is better and still not proof. A screen implying
+  the OS guarantees earnings is lying.
 
-secp256k1 also introduces a **third curve family** to a codebase that has so far used Ed25519
-for signing and X25519 for agreement. That is a new dependency and a new code path in the
-most sensitive part of the system, and it is a cost the ADR should state rather than absorb.
+Keys live in `otwono-walletd` — its own daemon, in Z1, with no network at all. It signs;
+`otwono-fetchd` carries. See ADR-0022 for why not `otwono-idd`, and for what adding money to
+this system does to its threat model.
 
 ## 3. Encryption, and why the node key is not enough
 
