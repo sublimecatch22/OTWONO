@@ -33,3 +33,4 @@ Rules:
 | 0016 | Content-defined chunking with FastCDC at 16/64/256 KiB | accepted |
 | 0017 | The ONM content-fetch protocol: ranged, object-scoped, verified per chunk | accepted |
 | 0018 | Large content moves as files handed to the caller's uid, not as bytes on the control plane | accepted |
+| 0019 | `SHARED` objects: encrypt before chunking, wrap per recipient, sharing key in `otwono-idd` | accepted |

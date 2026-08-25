@@ -88,6 +88,17 @@ can make that returns a `PRIVATE` object even if both checks failed at once.
 - `SHARED`: a per-object content key, wrapped once per authorized recipient with an X25519
   key agreement. Adding a recipient re-wraps the key; **removing one does not un-share what
   they already have**, and the UI says so.
+
+  **STATUS: SPECIFIED** — ADR-0019 settles the three questions this sentence leaves open, and
+  no code exists yet. The object is encrypted *before* chunking, so its chunks and its
+  `ContentId` are over ciphertext: chunking the plaintext and encrypting each chunk would let
+  a holder confirm a guessed plaintext against a digest, and would give a `SHARED` object the
+  same id as the same file stored `PUBLIC`. The wrap uses a fresh ephemeral sender key, so
+  the sharing node needs no long-term secret. And the unwrapping key is a **third** node key
+  held by `otwono-idd` rather than the agreement key in `otwono-netd`, because ADR-0010 keeps
+  the network-facing daemon holding only what Noise needs.
+
+  Until it is built, `SHARED` fails closed and is refused exactly as `PRIVATE` is.
 - `PUBLIC`/`REPLICATED`: unencrypted but signed, so peers verify authenticity and detect
   tampering.
 
