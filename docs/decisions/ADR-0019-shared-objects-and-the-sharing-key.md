@@ -25,10 +25,13 @@
   `tests/control-plane/tests/content_over_a_link.rs`, but both ends of that are one process
   tree. Also here: `store.share_file`, and `node.pub`'s published binding.
 
-- **IMPLEMENTED, not booted.** §5, adding and removing recipients: `store.add_recipients`
-  and `store.remove_recipients`, `otwono-storectl grant` and `revoke`, covered by unit tests
-  in `crates/otwono-store` and five integration tests over three real daemons in
-  `tests/control-plane/tests/shared_objects.rs`. Neither has run on a booted node.
+- **VERIFIED between two booted nodes.** §5, adding and removing recipients:
+  `store.add_recipients` and `store.remove_recipients`, `otwono-storectl grant` and `revoke`.
+  Each node grants a mesh-learned peer and then revokes it, the id does not change, the owner
+  can still open the object at every step, and removing the last recipient is refused
+  (`out/amd64-qemu-ubuntu/two-node/node-{a,b}.log`). Not shown on a machine: a peer being
+  refused *after* a revoke, which needs a barrier between the two nodes the harness does not
+  have.
 
 - **SPECIFIED, no code:** no file variant of `share` or `accept_shared`, so an object past
   the control plane's inline cap can be sealed only in memory.

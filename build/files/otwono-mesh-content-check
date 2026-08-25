@@ -283,7 +283,7 @@ if otwono-netd --peer-binding "$WORK/peer.binding" --socket /run/otwono/net.sock
     [ -n "$shared_to_peer" ] || fail "sharing to a peer returned no content id"
 
     # Sealed to the peer *and* to this node, which keeps a key to what it shares (ADR-0019
-    # §5) -- an owner who cannot read what they shared has lost their own file. So this
+    # §5a) -- an owner who cannot read what they shared has lost their own file. So this
     # opens, and must come back byte for byte.
     otwono-storectl open "$shared_to_peer" --out "$WORK/mine-back" >/dev/null \
         || fail "this node cannot open an object it shared"
@@ -297,6 +297,90 @@ if otwono-netd --peer-binding "$WORK/peer.binding" --socket /run/otwono/net.sock
             --recipient "$WORK/bad.binding" >/dev/null 2>&1; then
         fail "a binding whose signature does not check out was sealed to anyway"
     fi
+fi
+
+# --- Adding and removing recipients, on a booted node (ADR-0019 §5) ---------------------
+# The host-side tests cover the logic. What only a boot can show is that the *shipped* image
+# permits it: the policy in stage 30 grants id.unwrap_shared for opening, and adding a
+# recipient needs the same capability for the same reason, so a policy written for one and
+# not the other would fail here and nowhere else.
+#
+# It also seals to a binding taken off the wire rather than a synthetic one, which is the
+# other thing a boot adds.
+#
+# Deliberately self-contained: the two nodes run this script with no barrier between them,
+# so nothing here waits on the peer. What is therefore NOT shown is a peer being refused
+# after a revoke -- that needs the other node to have reached a known point, and this check
+# has no way to know that.
+step "granting and revoking on a booted node"
+granted=none
+if [ -s "$WORK/peer.binding" ]; then
+    peer_node=$(tr -d '\n' < "$WORK/peer.binding" \
+        | sed -n 's/.*"node_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    [ -n "$peer_node" ] || fail "could not read the peer's node id out of its binding"
+
+    printf 'otwono grant-revoke check %s\n' "$(date -u +%s)" > "$WORK/for-grant.txt"
+    solo=$(otwono-storectl share --file "$WORK/for-grant.txt" --recipient self) \
+        || fail "sharing to self refused"
+    solo_id=$(echo "$solo" | awk 'NR==1 {print $1}')
+    [ -n "$solo_id" ] || fail "sharing to self returned no content id"
+
+    # The peer is not on it yet, so the peer's name must not appear.
+    echo "$solo" | grep -q "$peer_node" \
+        && fail "an object shared to self alone already names the peer"
+
+    # Widen it to the peer learned over the mesh. The id must not change: the ciphertext and
+    # the content key are the same, and only the set holding a wrapped copy of that key
+    # grows. An id that changed here would mean a second object, which is the bug this
+    # method exists not to be.
+    after=$(otwono-storectl grant "$solo_id" --recipient "$WORK/peer.binding") \
+        || fail "granting to a mesh-learned peer refused"
+    echo "$after" | grep -q "$solo_id" \
+        || fail "granting changed the content id; it must not"
+    echo "$after" | grep -q "$peer_node" \
+        || fail "granting did not put the peer on the recipient list"
+    granted=$solo_id
+
+    # Granting must not have cost this node its own access.
+    otwono-storectl open "$solo_id" --out "$WORK/granted-back" >/dev/null \
+        || fail "this node cannot open an object it granted"
+    cmp -s "$WORK/for-grant.txt" "$WORK/granted-back" \
+        || fail "an object came back different after granting"
+
+    # Now take it away. The reply has to name who was removed *and* say that nothing was
+    # recalled -- a revoke that printed only success would be the UI lie ADR-0019 §5 is
+    # about.
+    revoked=$(otwono-storectl revoke "$solo_id" --node "$peer_node") \
+        || fail "revoking a recipient refused"
+    echo "$revoked" | grep -q "removed $peer_node" \
+        || fail "revoking did not report removing the peer: $revoked"
+    echo "$revoked" | grep -qi 'ciphertext' \
+        || fail "revoking did not say that it recalls nothing: $revoked"
+
+    # And the owner still holds a key to their own file. Removing the *last* recipient --
+    # which after §5a is this node -- must be refused rather than performed.
+    otwono-storectl open "$solo_id" --out "$WORK/revoked-back" >/dev/null \
+        || fail "this node lost access to its own object after revoking somebody else"
+    cmp -s "$WORK/for-grant.txt" "$WORK/revoked-back" \
+        || fail "an object came back different after revoking"
+
+    again=$(otwono-storectl revoke "$solo_id" --node "$peer_node" 2>&1)
+    echo "$again" | grep -q 'unchanged' \
+        || fail "revoking somebody twice was not reported as changing nothing: $again"
+
+    # The one that protects a person from deleting their own file. After §5a this node is on
+    # every list it made, so "revoke everybody" would destroy the owner's access -- and the
+    # name to try it with comes out of the reply above rather than from any daemon, so this
+    # asserts against whatever the record actually says.
+    me=$(echo "$revoked" | sed -n 's/^still sealed to //p' | head -1)
+    [ -n "$me" ] || fail "revoking did not report who is still sealed to: $revoked"
+    if otwono-storectl revoke "$solo_id" --node "$me" >/dev/null 2>&1; then
+        fail "removing the last recipient was allowed; the owner just lost their own object"
+    fi
+    otwono-storectl open "$solo_id" --out "$WORK/last-back" >/dev/null \
+        || fail "the object is unopenable after a refused last-recipient revoke"
+    cmp -s "$WORK/for-grant.txt" "$WORK/last-back" \
+        || fail "a refused last-recipient revoke changed the object"
 fi
 
 # --- A recipient discovers what was shared with it, and fetches it (ADR-0020) -----------
@@ -338,4 +422,4 @@ if [ "$discovered" != none ]; then
 fi
 
 rm -rf "$WORK"
-echo "OTWONO-MESH-CONTENT-OK node=$node_ordinal/$node_total public=$pub_id large=$big_id large_served=$big_served private_refused=$prv_id cache_budget=$cache_state cache_held=$cache_held shared_to_peer=$shared_to_peer discovered=$discovered"
+echo "OTWONO-MESH-CONTENT-OK node=$node_ordinal/$node_total public=$pub_id large=$big_id large_served=$big_served private_refused=$prv_id cache_budget=$cache_state cache_held=$cache_held shared_to_peer=$shared_to_peer granted=$granted discovered=$discovered"

@@ -466,7 +466,46 @@ fn a_recipient_added_later_can_open_the_same_object() {
         .iter()
         .find(|k| k.recipient == bob.node_id.to_text())
         .expect("bob has a copy now");
-    assert!(bob_key.open(his).is_ok(), "and it is his to open");
+    let bobs_key = bob_key.open(his).expect("and it is his to open");
+
+    // That it *opens* is not the assertion that matters. A grant that sealed a freshly
+    // generated key to bob would pass everything above and hand him a key that decrypts
+    // nothing -- the failure `add_recipients` cannot detect for itself, because checking
+    // would mean decrypting. So: bob's key must be the key this node already holds.
+    let mine = sealed
+        .iter()
+        .find(|k| k.recipient == h.node_id())
+        .expect("this node kept a copy when it shared");
+    let unwrapped = Client::connect(&h.id_socket)
+        .unwrap()
+        .call_with_capability(
+            "id.unwrap_shared",
+            json!({ "sealed_key": mine }),
+            &h.token("id.unwrap_shared").expect("policy allows unwrapping"),
+        )
+        .unwrap()
+        .expect("this node opens its own copy");
+    let owners_key = data_encoding::BASE64
+        .decode(unwrapped["content_key"].as_str().unwrap().as_bytes())
+        .unwrap();
+    assert_eq!(
+        bobs_key.as_ref(),
+        owners_key.as_slice(),
+        "bob was sealed a different key than the one that opens this object"
+    );
+
+    // And the owner did not lose anything by granting.
+    let reread = h
+        .call(
+            "store.open_shared",
+            json!({ "content_id": id }),
+            "id.unwrap_shared",
+        )
+        .expect("granting must not cost the owner their own access");
+    let back = data_encoding::BASE64
+        .decode(reread["data"].as_str().unwrap().as_bytes())
+        .unwrap();
+    assert_eq!(back, plaintext);
 }
 
 #[test]

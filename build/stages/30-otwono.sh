@@ -256,6 +256,15 @@ ttl_seconds = 300
 # when opening. Granting it is granting the ability to read what neighbours have shared with
 # this node; it does not grant reading anything else, and it never lets the sharing key
 # itself leave otwono-idd.
+#
+# Since ADR-0019 §5 it grants one thing more, and it is worth naming rather than leaving to
+# be discovered: store.add_recipients needs the same unwrap, because widening access means
+# re-wrapping the content key and the only way to have that key is to open the object. So
+# this rule also permits sharing on to somebody new whatever this node can already open.
+# That is the right shape -- a node that can read a thing can always pass it on, and
+# pretending otherwise would be theatre -- but a policy author narrowing this rule should
+# know both are behind it. store.remove_recipients is not: taking somebody off a list needs
+# no key, so it sits under store.write with the other narrowing operations.
 [[rule]]
 action = "store.share"
 subjects = ["uid:0"]

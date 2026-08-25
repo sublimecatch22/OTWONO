@@ -3577,12 +3577,7 @@ It is 132 now.
 
 ## ADR-0019 §5 — a shared object's recipient list stops being fixed at creation
 
-**Workspace only. Nothing here has booted.** No image was built and no QEMU run was made for
-this slice. Neither `otwono-storectl grant` nor `revoke` has been run on a booted node, and
-the mesh boot check is unchanged — it still shares an object with a fixed recipient list.
-The claims below are backed by `cargo test --workspace` and by integration tests that run
-`otwono-permd`, `otwono-idd` and `otwono-stored` as real daemons over real Unix sockets in a
-temp directory.
+**STATUS: VERIFIED on two booted nodes.** `out/amd64-qemu-ubuntu/two-node/node-{a,b}.log`.
 
 `SHARED` has been usable since ADR-0020 and un-shareable since it existed. `store.share`
 fixed the recipient list at creation, so a household could seal a file to a neighbour and had
@@ -3599,50 +3594,81 @@ shellcheck -S warning tools/*.sh build/stages/*.sh \
 cargo build --workspace --target aarch64-unknown-linux-gnu   ok
 ```
 
-907 from 893 at the previous entry: six store unit tests, five integration tests over the
-three daemons, and three CLI tests.
+907 from 893, measured at `e532d3d` by stashing and re-running rather than asserted: six
+store unit tests, five integration tests over the three daemons, and three CLI tests.
 
-### What the tests force
+### On the machines
 
-- **A recipient added after the fact opens the same id.** Not a copy under a new name — the
-  same object, the same ciphertext, the same content id. That is what makes adding useful:
-  somebody added later can be told the name everybody else already has.
-- **A node cannot widen access to something it cannot open.** The integration test runs a
-  second harness under a policy with no `id.unwrap_shared` rule and confirms the grant is
-  refused. This is not a check in `add_recipients`; it falls out of needing the content key,
-  which is only obtainable by unwrapping this node's own copy.
-- **Revoking says, in the reply, that it recalls nothing.** Asserted on the wire, not left to
-  a UI: the reply carries both what was actually removed and the sentence saying their copy
-  of the key is gone and nothing else is.
-- **Revoking everybody is refused.** After §5a the owner is on the recipient list, so
-  "remove all" would delete the owner's own access to their own file. The test asserts the
-  object is intact afterwards and the owner can still open it.
-- **Revoking a non-recipient changes nothing and says so.** An empty `removed` list, not an
-  error: the caller asked for that node to be absent and it is absent.
-- **A duplicate recipient is refused rather than re-sealed**, at the store layer, because
-  quietly replacing a wrapped key would discard one somebody may be relying on.
+Both nodes reached the end. Each grants and revokes against a binding it took off the wire:
+
+```
+A  OTWONO-MESH-CONTENT-OK node=1/2 public=45df7afd815dc66cdc46e897a55f332d2cdc95a35ebb6bf8d7fc1647751a9102 large=afc9c4b30193fe51060631cc23d21d8a061ba2cee183b5ab83c01c17d27d6adc large_served=1 private_refused=fdadceaec830951dbcc57cc41a5b74f4b8b51506c59b651d132d12b62bc65036 cache_budget=536870912 cache_held=1 shared_to_peer=68efe6008cbbc48832d6325b0505eb33ad48abf47a3009ca1e4f06c685018834 granted=09ee522d2cd6451790a3ad73bc04228fd01a37684b4e928506aa0eb560836fca discovered=29b4c70f12cf48e16bd7bfa642303416f3138c4c2c716adda60ec28040fe1ba9
+B  OTWONO-MESH-CONTENT-OK node=2/2 public=45df7afd815dc66cdc46e897a55f332d2cdc95a35ebb6bf8d7fc1647751a9102 large=afc9c4b30193fe51060631cc23d21d8a061ba2cee183b5ab83c01c17d27d6adc large_served=1 private_refused=fdadceaec830951dbcc57cc41a5b74f4b8b51506c59b651d132d12b62bc65036 cache_budget=536870912 cache_held=1 shared_to_peer=29b4c70f12cf48e16bd7bfa642303416f3138c4c2c716adda60ec28040fe1ba9 granted=29afa03338c7c6810be2b2799b6ce6f20b330370970013937dc50ba4c7d474c6 discovered=68efe6008cbbc48832d6325b0505eb33ad48abf47a3009ca1e4f06c685018834
+```
+
+`granted=` is new here, and it is a third distinct id on each node — neither the object that
+node sealed to its peer nor the one it discovered. The rest of the line is unchanged from the
+previous run, which is the point: adding §5 did not disturb anything ADR-0020 established.
+
+The boot check's §5 section is deliberately self-contained — the two nodes run the script with
+no barrier between them, so nothing in it waits on the peer. What it asserts, in order:
+
+- An object shared to self alone does not name the peer.
+- Granting it to the mesh-learned peer **does not change the content id**, and puts the peer
+  on the list. An id that changed would mean a second object, which is the bug the method
+  exists not to be.
+- The owner can still open it after granting.
+- Revoking reports **who was removed** and says, in the reply, that nothing was recalled. The
+  check greps for both; a revoke that printed only success would be the UI lie §5 is about.
+- The owner can still open it after revoking, byte for byte.
+- Revoking the same peer twice reports *unchanged* rather than an error.
+- **Revoking the last recipient is refused**, and the object is still openable and unchanged
+  afterwards — so the refusal did not half-apply. The name used for that attempt is parsed out
+  of the previous reply rather than asked of any daemon, so it tests against whatever the
+  record actually says.
+
+Booting is what proves the *shipped* image permits this. The policy in stage 30 grants
+`id.unwrap_shared` for opening; adding a recipient needs the same capability for the same
+reason, and a policy written for one and not the other would have failed here and nowhere
+else. That comment in stage 30 was understating what the rule grants, and now says so.
+
+### What the host-side tests force
+
+Five integration tests over `otwono-permd`, `otwono-idd` and `otwono-stored` as real
+daemons on real sockets. The one worth naming:
+
+**A grant must hand over the *same* key, and asserting that it "opens" does not check it.**
+The first version of `a_recipient_added_later_can_open_the_same_object` unwrapped the new
+recipient's sealed copy and asserted the unwrap succeeded. A grant that sealed a freshly
+generated key would have passed it — and `add_recipients` cannot detect that for itself,
+because checking would mean decrypting. So the test now unwraps this node's own copy through
+`id.unwrap_shared` and compares the bytes. Confirmed by breaking it on purpose: with
+`add_recipients` sealing a fresh key, the run fails with *"bob was sealed a different key
+than the one that opens this object"*, and the old assertion still passed. That is the third
+time on this branch a green assertion turned out to be checking less than it read as.
 
 ### What is not tested
 
-- **Neither method has run on a booted node.** Everything above is host-side.
+- **No peer has been served after a revoke.** `may_go_to` and `shared_with` both authorize
+  through `sharing.names(...)` on the record `remove_recipients` rewrites, so removal ought
+  to stop both serving and discovery. That is a reading of the code; neither has been
+  exercised across a link, and doing it needs a barrier between the two nodes that this
+  harness does not have.
 - **Nothing large.** `grant` re-wraps a key and never touches the ciphertext, so object size
-  should be irrelevant to it — *should be*, on reading the code, not measured.
-- **No peer has been served after a revoke.** The serve path reads the same object record, so
-  removing an entry ought to stop serving and stop appearing in ADR-0020's index. Both are
-  the same record and the same code path, and neither has been exercised across a link.
-- **Concurrency.** `add_recipients` and `remove_recipients` are read-modify-write on the
-  object record. Two simultaneous grants could lose one. The store has no locking here and
-  this slice did not add any.
+  should be irrelevant — again on reading, not measured.
+- **Concurrency.** Both methods are read-modify-write on the object record with no locking;
+  two simultaneous grants could lose one.
+- **amd64 only**, TCG, two nodes, one segment, no real hardware, no radio.
 
 ### One thing worth recording
 
-`store.add_recipients` is guarded by `id.unwrap_shared`, not by `store.share` or
-`store.write`, and that looked wrong until it did not. A capability token names one action —
-the constraint that forced `store.open_shared` to be guarded by the unwrap capability so a
-single token could satisfy both daemons. Adding a recipient needs the same unwrap, for the
-same reason, so it takes the same guard and forwards the caller's own token. Guarding it by
-`store.write` would have meant this daemon obtaining a key on its own authority rather than
-the caller's, which is the thing that design exists to prevent.
+`store.add_recipients` is guarded by `id.unwrap_shared`, not `store.write`, and that looked
+wrong until it did not. A capability token names one action — the constraint that forced
+`store.open_shared` to carry the unwrap guard so a single token could satisfy both daemons.
+Adding a recipient needs the same unwrap for the same reason, so it takes the same guard and
+forwards the caller's own token. Guarding it by `store.write` would have meant this daemon
+obtaining a key on its own authority rather than the caller's, which is what that design
+exists to prevent.
 
-`remove_recipients` needs no key at all, so it is `store.write` — the asymmetry is the point,
+`remove_recipients` needs no key at all, so it is `store.write`. The asymmetry is the point,
 and a CLI test pins it so a later tidy-up cannot make the two symmetrical for neatness.

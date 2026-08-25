@@ -110,7 +110,8 @@ can make that returns a `PRIVATE` object even if both checks failed at once.
   wire sends each recipient only their own copy of the key, but a node holding a `SHARED`
   object it cannot read can still read who can (**OQ-28**, unsolved).
 
-  Adding and removing recipients after the fact (ADR-0019 §5) is now built — and carries
+  Adding and removing recipients after the fact (ADR-0019 §5) is now built and booted
+  (`out/amd64-qemu-ubuntu/two-node/node-{a,b}.log`) — and carries
   its own honesty requirement, which is where this section's second sentence stops being a
   design note and starts being a UI obligation. `store.remove_recipients` deletes the named
   recipients' wrapped copies of the content key and **nothing else**. It stops future
