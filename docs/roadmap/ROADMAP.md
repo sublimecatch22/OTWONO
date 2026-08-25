@@ -177,7 +177,12 @@ GPU/NPU backends, and the tiered assistant shapes.
    anything but `PUBLIC` and `REPLICATED`, and refuses identically whether an object is
    private or absent. Encryption at rest, uniformly. Provenance propagation, so derived
    content cannot launder a label. Demotion, which stops future serving and says plainly
-   that it recalls nothing.~~ **done**; per-recipient `SHARED` key wrapping remains
+   that it recalls nothing.~~ **done**, and per-recipient `SHARED` key wrapping with it —
+   ADR-0019, booted: the object is encrypted before it is chunked, the content key is sealed
+   once per recipient to a *signed* sharing binding, and the unwrapping key is a third node
+   key held by `otwono-idd`. Serving a `SHARED` object to the peers it names works over a
+   real link host-side but has not run between two booted nodes. Adding and removing
+   recipients (§5) does not exist.
 3. ~~Egress enforcement in `otwono-netd`, duplicated as defence in depth.~~ **done** —
    ADR-0017 gave the ONM content-fetch protocol; `otwono-netd` calls `store.serve` and
    re-checks the label itself, with deliberately different code (`may_leave_a_node` is an
@@ -197,10 +202,16 @@ link**: two booted VMs on a segment with no DHCP, mutually authenticated over No
 refusing the other a `PRIVATE` object it demonstrably holds, with the refusal byte-identical
 to the one an absent object gets. See `docs/build/VERIFICATION-LOG.md`.
 
-**Still outstanding here**, and named rather than folded into a later phase: per-recipient
-`SHARED` key wrapping (item 2), which needs the identity daemon's agreement keys, and the
-`REPLICATED` replication policy (item 4). Both fail closed today, which is the right way for
-a feature to be missing but is not the same as being done.
+**Still outstanding here**, and named rather than folded into a later phase: the
+`REPLICATED` replication policy (item 4), which does not exist and fails closed. That is the
+right way for a feature to be missing but is not the same as being done.
+
+`SHARED` is no longer on that list, but two things about it are worth carrying forward
+rather than declaring finished. It has never passed between two booted nodes — the
+`PRIVATE` case has that evidence and this does not, and on this branch three separate
+defects were things that passed on a host and failed on a machine. And a recipient set
+cannot be changed after the fact, so today sharing with somebody new means sharing the file
+again as a new object.
 
 ---
 

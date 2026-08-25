@@ -3317,3 +3317,96 @@ on a step outside it is a service that will come apart quietly.
   a privacy object nothing protects (OQ-28).
 - **No TPM sealing**, and no encrypted backup — so this is now a third file whose loss is
   permanent and which nothing backs up.
+
+---
+
+## ADR-0019 on a booted node — `SHARED` is real on a machine
+
+**A boot log exists.** `out/amd64-qemu-ubuntu/boot.log`, TCG (no `/dev/kvm` in this
+environment). Every part of ADR-0019 up to this point had been proven only by tests on a
+build host; this is the first time any of it ran on a booted system, through the real
+daemons, the real sockets, the real shipped policy and the real systemd units.
+
+### The line
+
+```
+[   62.743808] content-check[378]: OTWONO-CONTENT-OK
+  id=3f2334405ffd9609c6d72ee536d4b3259b3a8f2e2ba26c1d4679c94e706e84a2
+  large=669e8743c80a77b86c3892742605cf8384b73b2986dacb51d0ef2b1e4ac0976c
+  cache=budget=536870912
+  shared=d84c81b0c23f51c23d9341dc12eb66006dfdd3e09097662df444c4c0d566ff79
+```
+
+`shared=` is new, and the check could not have printed it without all of the following
+happening on the machine:
+
+- `otwono-idd` generated an X25519 sharing key at first boot, vouched for it with the node's
+  Ed25519 key, and served the binding through `id.sharing_binding`.
+- `otwono-storectl share --recipient self` fetched that binding, `otwono-stored` **verified
+  the signature itself**, sealed a fresh content key to the vouched-for key, encrypted the
+  object, chunked the ciphertext, and wrote a record naming one recipient.
+- `store.stat` reported the object as `shared`.
+- The plaintext's first 32 bytes appear nowhere under `/var/lib/otwono/store/chunks`.
+- The same bytes stored `public` produced a **different** content id — the property that
+  stops a holder confirming a guess at what a shared object contains. Encryption before
+  chunking is what makes that true, and it is now true on a disk rather than in a test.
+- `otwono-storectl open` returned the bytes byte-for-byte identical.
+- `store.demote --visibility shared` on the plaintext object was **refused**, so relabelling
+  cannot claim a protection the bytes do not have.
+
+### The audit chain says the forwarded token works
+
+52 records, chain intact. The interesting four:
+
+```
+seq 46  request        id.unwrap_shared  allow   rule 11; caller reason: otwono-storectl store.open_shared
+seq 47  token_issued   id.unwrap_shared  issued  ttl 300s, one_shot false
+seq 48  token_verified id.unwrap_shared  valid
+seq 49  token_verified id.unwrap_shared  valid
+```
+
+**One issue, two verifications.** That is the design in ADR-0019 §3 working on a machine:
+`otwono-stored` verifies the caller's token for `store.open_shared`, then forwards the *same*
+token to `otwono-idd`, which verifies it again for `id.unwrap_shared`. A capability token
+names one action, so this only works because both daemons demand the same one — and the
+alternative, having the store request a token of its own, would have let anyone holding
+`store.read` open everything ever shared with this node. The two verifications are what
+that decision looks like from the audit log.
+
+`store.share` appears once, issued `one_shot true`.
+
+### What is now VERIFIED, and what is not
+
+`STATUS: VERIFIED` for: the sharing key's generation and binding at first boot; encrypt
+before chunk; sealing to a verified binding; the unwrap round trip across `otwono-stored`
+and `otwono-idd`; the shipped policy granting exactly the two new capabilities; and the
+refusal of relabelling.
+
+**Still `IMPLEMENTED` and not `VERIFIED`:**
+
+- **`SHARED` has never crossed a link between two booted nodes.** It crosses a real TCP
+  link under Noise in `tests/control-plane/tests/content_over_a_link.rs`, but both ends of
+  that are in one process tree. The `PRIVATE` case has two-VM evidence and this does not,
+  and that gap is not a formality: defects 38, 43 and 44 on this branch were all things that
+  passed on a host and failed on a machine.
+- **One node, so one recipient.** The object on this boot was shared with the node itself.
+  Nothing has yet been shared *to* a different node's key on a booted system.
+- **`store.serve` is still ungranted on a stock node**, so a shared object there cannot
+  reach the peers it names even now.
+- **Nothing large.** The boot check shares a one-line file; there is no file variant of
+  `share` or `accept_shared`, so the framing that exists for objects bigger than memory has
+  never been exercised on a machine.
+- **amd64 only**, TCG, one segment, no real hardware, no radio.
+- Adding and removing recipients (ADR-0019 §5) still does not exist.
+
+### The rest of the boot, unchanged
+
+```
+OTWONO-CAPABILITY-OK      tier=T0_MICRO
+OTWONO-CONTROL-PLANE-OK   tier=T0_MICRO audit_records=3
+OTWONO-AI-OK              local_inference=available backends=llama-cpp-cpu sandbox=full
+OTWONO-MESH-OK            node=otw1:psee-539r-dk5f-mgvg addr=10.0.2.15/24
+```
+
+The release artifact still carries no first-boot state — no identity, no profile, no audit
+log, no seeded machine-id — and its checksum matched after the run.

@@ -1,25 +1,30 @@
 # ADR-0019 — `SHARED` objects: encrypt before chunking, wrap per recipient, and put the unwrapping key in `otwono-idd`
 
-**Status:** accepted · **Date:** 2026-08-25 · **STATUS: partly IMPLEMENTED**
+**Status:** accepted · **Date:** 2026-08-25 · **STATUS: partly VERIFIED, partly IMPLEMENTED**
 
-- **IMPLEMENTED (unit and integration tested, never booted):** §2's sealed box
-  (`seal_to`/`open_with`), and §3's third key — generated at startup by `otwono-idd`,
-  vouched for under its own signing domain, recorded in `node.key`, published in `node.pub`
-  and by the open `id.sharing_binding` method.
-  `id.unwrap_shared` exists behind its own capability. No shipped policy grants it, or
-  `store.share`, because nothing on a booted node calls either yet.
-  §1 is implemented in `otwono-store`: `put_shared_reader` seals then chunks, the object
-  record carries a `sharing` envelope, and the schema describes it. `otwono-stored` exposes
-  `store.share`, `store.share_file` and `store.open_shared`, the last of which asks
-  `otwono-idd` to unwrap on the caller's own capability.
-  §4 is implemented in `otwono-stored` and `otwono-netd`: the serving methods hand a
-  `Shared` object to a peer named in its envelope, out of this node's own store only, the
-  ONM manifest carries that peer's own sealed key, and a shared object has crossed a real
-  TCP link and been opened at the other end under test.
-  A recipient keeps what it fetched with `store.accept_shared`, which stores the ciphertext
-  as it arrived along with the one key that came with it — so the object keeps its name and
-  the recipient's own record names one recipient, itself.
-- **SPECIFIED, no code:** §5, adding and removing recipients.
+- **VERIFIED on a booted node** (`out/amd64-qemu-ubuntu/boot.log`, TCG): `otwono-idd`
+  generates and vouches for the sharing key at first boot; §1's encrypt-then-chunk and §2's
+  seal produce an object whose plaintext appears nowhere in the chunk store and whose content
+  id differs from the same bytes stored `public`; and §3's unwrap works across two daemons,
+  with `otwono-stored` forwarding the caller's own token to `otwono-idd` — one token issued,
+  two verifications in the audit chain. The shipped policy grants `store.share` and
+  `id.unwrap_shared` to `uid:0` and nothing wider. Relabelling plaintext to `shared` is
+  refused. `otwono-storectl share` and `open` are how a person reaches it.
+
+- **IMPLEMENTED, not booted.** §4's serving: `store.serve`, `store.serve_manifest` and
+  `store.serve_chunk` hand a `Shared` object to a peer named in its envelope, out of this
+  node's own store only; the ONM manifest carries that peer's own sealed key and no other;
+  `otwono-netd` re-checks the manifest against the NodeID it authenticated and will not
+  release a chunk to a peer it has not already given that manifest to in this session. A
+  shared object crosses a real TCP link under Noise and opens at the far end in
+  `tests/control-plane/tests/content_over_a_link.rs` — but both ends of that are one process
+  tree, and `store.serve` is ungranted on a stock node. `SHARED` has **not** crossed a link
+  between two booted nodes, which is the evidence the `PRIVATE` case already has. Also here:
+  `store.accept_shared`, `store.share_file`, and the published binding in `node.pub`.
+
+- **SPECIFIED, no code:** §5, adding and removing recipients. No file variant of `share` or
+  `accept_shared`, so an object past the control plane's inline cap can be sealed only in
+  memory.
 
 ## Context
 

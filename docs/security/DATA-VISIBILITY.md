@@ -89,16 +89,26 @@ can make that returns a `PRIVATE` object even if both checks failed at once.
   key agreement. Adding a recipient re-wraps the key; **removing one does not un-share what
   they already have**, and the UI says so.
 
-  **STATUS: SPECIFIED** — ADR-0019 settles the three questions this sentence leaves open, and
-  no code exists yet. The object is encrypted *before* chunking, so its chunks and its
-  `ContentId` are over ciphertext: chunking the plaintext and encrypting each chunk would let
-  a holder confirm a guessed plaintext against a digest, and would give a `SHARED` object the
-  same id as the same file stored `PUBLIC`. The wrap uses a fresh ephemeral sender key, so
-  the sharing node needs no long-term secret. And the unwrapping key is a **third** node key
-  held by `otwono-idd` rather than the agreement key in `otwono-netd`, because ADR-0010 keeps
-  the network-facing daemon holding only what Noise needs.
+  **STATUS: partly VERIFIED** — ADR-0019 settled the three questions this sentence leaves
+  open, and a booted node has now sealed an object to itself, kept the plaintext out of the
+  chunk store, and opened it again (`out/amd64-qemu-ubuntu/boot.log`). What has *not* booted
+  is the serving half: no `SHARED` object has passed between two machines. The object is encrypted *before* chunking,
+  so its chunks and its `ContentId` are over ciphertext: chunking the plaintext and
+  encrypting each chunk would let a holder confirm a guessed plaintext against a digest, and
+  would give a `SHARED` object the same id as the same file stored `PUBLIC`. The wrap uses a
+  fresh ephemeral sender key, so the sharing node needs no long-term secret. And the
+  unwrapping key is a **third** node key held by `otwono-idd` rather than the agreement key
+  in `otwono-netd`, because ADR-0010 keeps the network-facing daemon holding only what Noise
+  needs.
 
-  Until it is built, `SHARED` fails closed and is refused exactly as `PRIVATE` is.
+  Two consequences the UI must not hide. A `SHARED` object does not deduplicate and is not
+  cacheable, so a household sharing one large video with three neighbours stores it four
+  times. And the recipient list is itself a social graph living in the object record — the
+  wire sends each recipient only their own copy of the key, but a node holding a `SHARED`
+  object it cannot read can still read who can (**OQ-28**, unsolved).
+
+  What is still missing: adding and removing recipients after the fact (ADR-0019 §5), and
+  any variant of the share and accept calls for objects past the control plane's inline cap.
 - `PUBLIC`/`REPLICATED`: unencrypted but signed, so peers verify authenticity and detect
   tampering.
 
@@ -116,7 +126,8 @@ Negative tests are the point of this subsystem:
 
 ### Where each of those stands
 
-**STATUS: VERIFIED** for the first, third and fourth; **SPECIFIED** for the second.
+**STATUS: VERIFIED** for the first, third and fourth; **IMPLEMENTED**, not booted, for the
+second.
 
 | Property | Where it is proven |
 |---|---|
@@ -124,9 +135,13 @@ Negative tests are the point of this subsystem:
 | A refusal is indistinguishable from not-found | **On an actual link**, byte-identical replies for refused and absent; and host-side in the same file |
 | Derived content inherits the most restrictive label | `tests/control-plane/tests/store_labels.rs` |
 | Demotion stops future serving | proven over a link, not only at the method |
+| A `SHARED` object reaches only the peers named in it | `tests/control-plane/tests/content_over_a_link.rs`, host-side over TCP and Noise. Not yet between booted nodes |
 
-The `SHARED` case is stated as specified rather than tested because `SHARED` is not
-implemented: it needs the per-recipient key wrapping of §5, which needs the identity
-daemon's agreement keys. Until it exists it fails closed and is refused exactly as `PRIVATE`
-is, which is the right way for a feature to be missing but is not the same as the property
-above being met.
+The `SHARED` case is now proven, but on a host and not on a machine.
+`tests/control-plane/tests/content_over_a_link.rs` shares an object with one node, fetches
+it from another over a real TCP link under Noise, opens it back to the original bytes, and
+asserts that a peer *not* named in the envelope gets a refusal byte-identical to the one an
+absent object gets. Every link in that test is a socket in one process tree. Until it has
+run between two booted VMs — as the `PRIVATE` case has — this row is `IMPLEMENTED` and not
+`VERIFIED`, and the difference is not a formality: defects 38, 43 and 44 on this branch were
+all things that passed on a host and failed on a machine.
