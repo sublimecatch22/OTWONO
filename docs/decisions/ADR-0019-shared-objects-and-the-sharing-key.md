@@ -26,6 +26,14 @@
   `accept_shared`, so an object past the control plane's inline cap can be sealed only in
   memory.
 
+- **A gap this ADR did not anticipate.** A recipient has no way to *discover* what has been
+  shared with it. A `SHARED` object's id is over ciphertext keyed by a fresh per-object key,
+  so unlike a `PUBLIC` object it cannot be derived from the content — the recipient has to be
+  told, and ONM has no method that tells it. Sharing therefore works today only alongside a
+  channel outside the mesh, which is most of the problem node identity exists to solve. This
+  is **OQ-29**, and it is the reason `SHARED` has not been demonstrated crossing a link
+  between two booted nodes even though every piece needed to carry it now exists.
+
 ## Context
 
 `SHARED` is the one visibility label that does not work. `DATA-VISIBILITY.md` §1 defines it

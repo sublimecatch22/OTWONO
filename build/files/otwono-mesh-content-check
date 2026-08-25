@@ -245,5 +245,43 @@ if cache=$(otwono-storectl cache-status 2>&1); then
         || fail "the cache holds $cache_held object(s) after a caching fetch"
 fi
 
+# --- A peer learned over the mesh can be sealed to (ADR-0019) ---------------------------
+# Until now a node could only be shared with by somebody who already held its binding out of
+# band. The binding now travels in the hello after every Noise handshake, so this asserts
+# what that makes possible on two machines: this node takes a *connected peer's* signed
+# sharing binding off the wire and encrypts an object to it.
+#
+# What this does NOT prove, and the marker says so by naming only an id: the peer cannot
+# fetch it. A recipient has no way to discover what has been shared with it (OQ-29), so
+# there is no id to hand the other side without a channel outside the mesh.
+shared_to_peer=none
+if otwono-netd --peer-binding "$WORK/peer.binding" --socket /run/otwono/net.sock \
+        >/dev/null 2>&1; then
+    # The binding is signed, and otwono-stored verifies it again for itself -- so a garbled
+    # or substituted file is refused rather than sealed to.
+    grep -q '"sharing_public_key"' "$WORK/peer.binding" \
+        || fail "--peer-binding wrote something that is not a binding"
+
+    printf 'otwono shared-to-peer check %s\n' "$(date -u +%s)" > "$WORK/for-peer.txt"
+    to_peer=$(otwono-storectl share --file "$WORK/for-peer.txt" \
+        --recipient "$WORK/peer.binding") || fail "sharing to a mesh-learned peer refused"
+    shared_to_peer=$(echo "$to_peer" | awk 'NR==1 {print $1}')
+    [ -n "$shared_to_peer" ] || fail "sharing to a peer returned no content id"
+
+    # Sealed to the peer and not to this node: opening it here must fail, because this node
+    # holds no copy of the key. If this ever succeeds, the recipient list means nothing.
+    if otwono-storectl open "$shared_to_peer" --out "$WORK/notmine" >/dev/null 2>&1; then
+        fail "this node opened an object sealed to somebody else"
+    fi
+
+    # A tampered binding is refused rather than sealed to. Same file, one flipped character
+    # in the signature.
+    sed 's/"signature": "./"signature": "Z/' "$WORK/peer.binding" > "$WORK/bad.binding"
+    if otwono-storectl share --file "$WORK/for-peer.txt" \
+            --recipient "$WORK/bad.binding" >/dev/null 2>&1; then
+        fail "a binding whose signature does not check out was sealed to anyway"
+    fi
+fi
+
 rm -rf "$WORK"
-echo "OTWONO-MESH-CONTENT-OK node=$node_ordinal/$node_total public=$pub_id large=$big_id large_served=$big_served private_refused=$prv_id cache_budget=$cache_state cache_held=$cache_held"
+echo "OTWONO-MESH-CONTENT-OK node=$node_ordinal/$node_total public=$pub_id large=$big_id large_served=$big_served private_refused=$prv_id cache_budget=$cache_state cache_held=$cache_held shared_to_peer=$shared_to_peer"

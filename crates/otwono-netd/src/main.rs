@@ -31,6 +31,9 @@ OPTIONS:
     --no-discovery         Do not announce or browse on the LAN
     --status               Query a running daemon and print its overlay status, then exit
     --peers                Query a running daemon and print its peer table, then exit
+    --peer-binding <PATH>  Write the first connected peer's sharing binding to PATH, so
+                           something can seal to it (ADR-0019). Exits non-zero if no
+                           connected peer has published one.
     --fetch <CONTENT_ID>   Fetch one object from every connected peer, then exit
     --to-file              Write the fetched object to a file instead of returning its
                            bytes. Required above the control-plane's inline cap (ADR-0018).
@@ -90,6 +93,7 @@ fn run(args: &[String]) -> Result<String, Error> {
     let mut discovery_enabled = true;
     let mut status_only = false;
     let mut peers_only = false;
+    let mut peer_binding: Option<PathBuf> = None;
     let mut fetch_id: Option<String> = None;
     let mut fetch_to_file = false;
     let mut fetch_cache = false;
@@ -108,6 +112,7 @@ fn run(args: &[String]) -> Result<String, Error> {
             "--no-discovery" => discovery_enabled = false,
             "--status" => status_only = true,
             "--peers" => peers_only = true,
+            "--peer-binding" => peer_binding = Some(next(&mut it, "--peer-binding")?.into()),
             "--fetch" => fetch_id = Some(next(&mut it, "--fetch")?),
             "--to-file" => fetch_to_file = true,
             "--cache" => fetch_cache = true,
@@ -161,6 +166,12 @@ fn run(args: &[String]) -> Result<String, Error> {
         let socket = socket.unwrap_or_else(|| otwono_proto::socket_path("net"));
         let perm_socket = perm_socket.unwrap_or_else(|| otwono_proto::socket_path("perm"));
         return peer_report(&socket, &perm_socket);
+    }
+
+    if let Some(path) = peer_binding {
+        let socket = socket.unwrap_or_else(|| otwono_proto::socket_path("net"));
+        let perm_socket = perm_socket.unwrap_or_else(|| otwono_proto::socket_path("perm"));
+        return write_peer_binding(&socket, &perm_socket, &path);
     }
 
     // Only the agreement half. This daemon has no way to open node.key and no code path
@@ -370,7 +381,50 @@ fn fetch_from_a_peer(
 }
 
 /// Print one line per known peer: state, address, and the last failure if there was one.
-fn peer_report(socket: &std::path::Path, perm_socket: &std::path::Path) -> Result<String, Error> {
+/// Write the first connected peer's sharing binding out, so something can seal to it.
+///
+/// The peer is chosen here rather than named by the caller, for the reason `--fetch` does
+/// the same: the caller that needs this is a shell script on a booted node, which has no way
+/// to know a neighbour's NodeID until the mesh has formed.
+///
+/// What is written is the *signed* binding, verbatim. Whatever seals to it verifies it
+/// again for itself — this daemon checked it when the peer offered it, and a second check
+/// costs nothing next to sealing somebody's data to a key nobody vouched for.
+fn write_peer_binding(
+    socket: &std::path::Path,
+    perm_socket: &std::path::Path,
+    out: &std::path::Path,
+) -> Result<String, Error> {
+    let peers = peer_table(socket, perm_socket, "otwono-netd --peer-binding")?;
+    let chosen = peers
+        .iter()
+        .find(|p| {
+            p.get("state").and_then(|s| s.as_str()) == Some("connected") && p.get("sharing_binding").is_some()
+        })
+        .ok_or_else(|| {
+            Error::Startup(
+                "no connected peer has published a sharing binding, so there is nobody to \
+                 seal to"
+                    .into(),
+            )
+        })?;
+    let binding = chosen.get("sharing_binding").expect("filtered above");
+    let text = serde_json::to_string_pretty(binding)
+        .map_err(|e| Error::Startup(format!("cannot render the binding: {e}")))?;
+    std::fs::write(out, text + "\n").map_err(|e| Error::Startup(format!("{}: {e}", out.display())))?;
+    Ok(format!(
+        "{} -> {}\n",
+        chosen.get("fingerprint").and_then(|f| f.as_str()).unwrap_or("?"),
+        out.display()
+    ))
+}
+
+/// Ask a running daemon for its peer table.
+fn peer_table(
+    socket: &std::path::Path,
+    perm_socket: &std::path::Path,
+    reason: &str,
+) -> Result<Vec<serde_json::Value>, Error> {
     let mut broker = otwono_proto::Client::connect_waiting(perm_socket, std::time::Duration::from_secs(5))
         .map_err(|e| {
             Error::Startup(format!(
@@ -381,7 +435,7 @@ fn peer_report(socket: &std::path::Path, perm_socket: &std::path::Path) -> Resul
     let token = broker
         .call(
             "perm.request",
-            serde_json::json!({ "action": "net.read", "reason": "otwono-netd --peers" }),
+            serde_json::json!({ "action": "net.read", "reason": reason }),
         )
         .map_err(|e| Error::Startup(format!("perm.request transport failure: {e}")))?
         .map_err(|e| Error::Startup(format!("perm.request refused: {}", e.message)))?;
@@ -397,12 +451,15 @@ fn peer_report(socket: &std::path::Path, perm_socket: &std::path::Path) -> Resul
         .call_with_capability("net.peers", serde_json::json!({}), &token)
         .map_err(|e| Error::Startup(format!("net.peers transport failure: {e}")))?
         .map_err(|e| Error::Startup(format!("net.peers refused: {}", e.message)))?;
-
-    let peers = value
+    Ok(value
         .get("peers")
         .and_then(|p| p.as_array())
         .cloned()
-        .unwrap_or_default();
+        .unwrap_or_default())
+}
+
+fn peer_report(socket: &std::path::Path, perm_socket: &std::path::Path) -> Result<String, Error> {
+    let peers = peer_table(socket, perm_socket, "otwono-netd --peers")?;
     if peers.is_empty() {
         return Ok("no peers known\n".to_string());
     }
@@ -420,6 +477,11 @@ fn peer_report(socket: &std::path::Path, perm_socket: &std::path::Path) -> Resul
             addresses
         };
         out.push_str(&format!("{} {} {}", get("fingerprint"), get("state"), addresses));
+        // Whether this peer can be sealed to, not the key itself: a fingerprint list is
+        // something a person reads, and a base64 public key in it is noise.
+        if peer.get("sharing_binding").is_some() {
+            out.push_str(" sealable");
+        }
         if let Some(err) = peer.get("last_error").and_then(|e| e.as_str()) {
             out.push_str(&format!(" error={err}"));
         }
