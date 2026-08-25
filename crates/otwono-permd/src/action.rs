@@ -139,6 +139,21 @@ impl ActionRegistry {
                     BlastRadius::Reversible,
                     false,
                 ),
+                // Unwrapping is where the sharing key of ADR-0019 gets used, and it is
+                // its own capability rather than id.sign for the reason every other split
+                // here exists: otwono-stored must be able to open what was shared with
+                // this node without being able to sign as it. Read, because a successful
+                // call changes nothing and sends nothing — it hands back a key for
+                // ciphertext the caller already holds, which is a read of user data.
+                // Anyone granted this can open every SHARED object they can obtain, so the
+                // grant is the decision, not the individual call: a prompt per unwrap
+                // would fire once per object on a node doing anything at all.
+                ActionSpec::new(
+                    "id.unwrap_shared",
+                    "Open a content key that was sealed to this node's sharing key",
+                    BlastRadius::Read,
+                    false,
+                ),
                 ActionSpec::new(
                     "id.rotate",
                     "Replace this node's identity key, changing its NodeID",

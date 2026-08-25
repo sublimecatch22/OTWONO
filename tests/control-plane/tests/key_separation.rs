@@ -34,6 +34,25 @@ decision = "allow"
 ttl_seconds = 300
 "#;
 
+/// The mesh capabilities plus the one ADR-0019 adds, as a node that can open what was
+/// shared with it would have.
+const SHARING_POLICY: &str = r#"
+[[rule]]
+action = "id.sign_session"
+decision = "allow"
+ttl_seconds = 300
+
+[[rule]]
+action = "id.bind_agreement"
+decision = "allow"
+ttl_seconds = 300
+
+[[rule]]
+action = "id.unwrap_shared"
+decision = "allow"
+ttl_seconds = 300
+"#;
+
 struct Harness {
     dir: PathBuf,
     perm_socket: PathBuf,
@@ -91,6 +110,20 @@ impl Harness {
             id_socket,
             shutdown,
         }
+    }
+
+    fn token(&self, action: &str) -> Option<String> {
+        let mut broker = Client::connect(&self.perm_socket).unwrap();
+        broker
+            .call(
+                "perm.request",
+                serde_json::json!({ "action": action, "reason": "test" }),
+            )
+            .unwrap()
+            .ok()?
+            .get("token")
+            .and_then(|t| t.as_str())
+            .map(str::to_string)
     }
 
     fn identity_dir(&self) -> PathBuf {
@@ -327,6 +360,116 @@ fn a_peer_can_seal_a_content_key_to_what_the_daemon_publishes() {
     // Opened by the secret on disk, which is where otwono-idd will unwrap from.
     let held = SharingKeystore::new(h.identity_dir()).load().unwrap();
     assert_eq!(held.open(&sealed).unwrap().as_ref(), &content_key);
+}
+
+/// Seal a content key to whatever the daemon says it is.
+fn seal_to_the_node(h: &Harness, content_key: &[u8; 32]) -> otwono_identity::SealedKey {
+    let mut client = Client::connect(&h.id_socket).unwrap();
+    let value = client
+        .call("id.sharing_binding", serde_json::json!({}))
+        .unwrap()
+        .unwrap();
+    let binding: otwono_identity::SharingBinding = serde_json::from_value(value).unwrap();
+    let key = binding.verify().unwrap();
+    otwono_identity::seal_to(&binding.node_id.to_text(), &key, content_key).unwrap()
+}
+
+#[test]
+fn the_daemon_unwraps_a_content_key_sealed_to_it() {
+    // What otwono-stored will do to open a SHARED object: hand over one recipient's copy
+    // and get the content key back, without the sharing secret ever leaving otwono-idd.
+    let h = Harness::start("unwrap", SHARING_POLICY);
+    h.brokered_signer("a").unwrap();
+
+    let content_key = [17u8; 32];
+    let sealed = seal_to_the_node(&h, &content_key);
+    let token = h.token("id.unwrap_shared").expect("policy allows unwrapping");
+
+    let value = Client::connect(&h.id_socket)
+        .unwrap()
+        .call_with_capability(
+            "id.unwrap_shared",
+            serde_json::json!({ "sealed_key": sealed }),
+            &token,
+        )
+        .unwrap()
+        .expect("the node's own copy must open");
+    let returned = data_encoding::BASE64
+        .decode(value["content_key"].as_str().unwrap().as_bytes())
+        .unwrap();
+    assert_eq!(returned, content_key);
+}
+
+#[test]
+fn unwrapping_without_the_capability_is_refused() {
+    // MESH_POLICY grants the two handshake capabilities and nothing else. A node that can
+    // authenticate peers must not thereby be able to read what was shared with it.
+    let h = Harness::start("unwrapdenied", MESH_POLICY);
+    h.brokered_signer("a").unwrap();
+    let content_key = [18u8; 32];
+    let sealed = seal_to_the_node(&h, &content_key);
+
+    assert!(
+        h.token("id.unwrap_shared").is_none(),
+        "the broker issued a token the policy does not grant"
+    );
+    let err = Client::connect(&h.id_socket)
+        .unwrap()
+        .call("id.unwrap_shared", serde_json::json!({ "sealed_key": sealed }))
+        .unwrap()
+        .expect_err("an unauthenticated unwrap must be refused");
+    assert!(
+        err.message.contains("capability"),
+        "the refusal should say what is missing: {}",
+        err.message
+    );
+}
+
+#[test]
+fn a_copy_sealed_to_another_node_is_refused_by_name() {
+    // Not merely "did not decrypt": a caller handed the wrong recipient's copy needs to
+    // know it will never work, not retry.
+    let h = Harness::start("unwrapother", SHARING_POLICY);
+    h.brokered_signer("a").unwrap();
+
+    let stranger = otwono_identity::SharingKey::generate().unwrap();
+    let theirs = otwono_identity::seal_to("otw1somebodyelse", &stranger.public(), &[19u8; 32]).unwrap();
+    let token = h.token("id.unwrap_shared").unwrap();
+
+    let err = Client::connect(&h.id_socket)
+        .unwrap()
+        .call_with_capability(
+            "id.unwrap_shared",
+            serde_json::json!({ "sealed_key": theirs }),
+            &token,
+        )
+        .unwrap()
+        .expect_err("someone else's copy must not open");
+    assert!(err.message.contains("otw1somebodyelse"), "{}", err.message);
+}
+
+#[test]
+fn a_tampered_seal_does_not_open() {
+    let h = Harness::start("unwraptamper", SHARING_POLICY);
+    h.brokered_signer("a").unwrap();
+
+    let mut sealed = seal_to_the_node(&h, &[20u8; 32]);
+    // Substitute an ephemeral public key of the attacker's choosing, which is the shape of
+    // an attempt to make the node derive a key the attacker also knows.
+    sealed.ephemeral_public_key =
+        data_encoding::BASE64.encode(&otwono_identity::SharingKey::generate().unwrap().public());
+    let token = h.token("id.unwrap_shared").unwrap();
+
+    let err = Client::connect(&h.id_socket)
+        .unwrap()
+        .call_with_capability(
+            "id.unwrap_shared",
+            serde_json::json!({ "sealed_key": sealed }),
+            &token,
+        )
+        .unwrap()
+        .expect_err("a substituted ephemeral key must not open the seal");
+    assert!(err.message.contains("does not open"), "{}", err.message);
 }
 
 #[test]

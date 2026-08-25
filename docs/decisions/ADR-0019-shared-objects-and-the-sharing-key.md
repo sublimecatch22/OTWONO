@@ -6,10 +6,11 @@
   (`seal_to`/`open_with`), and §3's third key — generated at startup by `otwono-idd`,
   vouched for under its own signing domain, recorded in `node.key`, published in `node.pub`
   and by the open `id.sharing_binding` method.
+  `id.unwrap_shared` exists behind its own capability, which no shipped policy grants
+  because nothing calls it yet.
 - **SPECIFIED, no code:** §1 (encrypt then chunk), §4 (authorized serving and the
-  confirmation for `SHARED` egress), §5 (adding and removing recipients), and
-  `id.unwrap_shared`. Until those exist `SHARED` still fails closed everywhere, exactly as
-  described under Context.
+  confirmation for `SHARED` egress), and §5 (adding and removing recipients). Until those
+  exist `SHARED` still fails closed everywhere, exactly as described under Context.
 
 ## Context
 

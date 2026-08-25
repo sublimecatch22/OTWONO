@@ -23,7 +23,7 @@
 | Zone | Contents | Privilege | Hardening |
 |---|---|---|---|
 | Z0 | Kernel, firmware, TPM | Full | Verified boot, lockdown, module signing |
-| Z1 | `otwono-permd`, `otwono-idd`, `otwono-updated` | Root, minimal | Small enough to audit; strict systemd hardening; no network. **Sole holder of the node's Ed25519 signing key.** |
+| Z1 | `otwono-permd`, `otwono-idd`, `otwono-updated` | Root, minimal | Small enough to audit; strict systemd hardening; no network. **Sole holder of the node's Ed25519 signing key, and of the X25519 sharing key that opens `SHARED` content (ADR-0019).** |
 | Z2 | `otwono-hwd`, `otwono-aid`, `otwono-stored`, `otwono-svcd` | Dedicated users | Landlock-scoped filesystem, seccomp, no `exec` except declared backends |
 | Z3 | `otwono-netd` | Dedicated user | **Hostile-input boundary.** No filesystem write outside its spool, no `exec`, narrow seccomp, memory-safe language mandatory. Holds only the X25519 agreement key — never the key its NodeID names. |
 | Z3 | `otwono-fetchd` | Dedicated user | **Hostile-input boundary, separate process from the mesh daemon** so a compromise of one does not yield the other's keys. The only component that makes outbound client connections to hosts outside the mesh, and the only network-facing one that **holds no keys at all** (ADR-0014). `IPAddressDeny=localhost link-local multicast`; no `AF_NETLINK`. |
@@ -41,6 +41,12 @@ The two boundaries that matter most:
   construction: `id.sign_session` signs a fixed-length handshake hash under a fixed domain,
   and `id.bind_agreement` vouches for a public key. Neither hands anything back that lets
   the caller sign something of its own choosing (ADR-0010).
+- **Z2 → Z1.** The store daemon asking to open a content key sealed to this node.
+  `id.unwrap_shared` returns exactly one 32-byte key, for one recipient copy, and only when
+  that copy names this node. The sharing secret stays in Z1; the content key goes to the
+  daemon that already holds the storage key, so no new boundary is crossed. `otwono-netd`
+  is deliberately not in this path: unwrapping in Z3 would put plaintext content keys in
+  the process that parses hostile input, which is the trade ADR-0010 refused.
 
 ## 2. The permission broker
 

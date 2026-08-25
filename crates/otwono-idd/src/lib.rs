@@ -38,6 +38,7 @@ pub const CAPABILITY_SIGN: &str = "id.sign";
 pub const CAPABILITY_SIGN_SESSION: &str = "id.sign_session";
 pub const CAPABILITY_BIND: &str = "id.bind_agreement";
 pub const CAPABILITY_ROTATE: &str = "id.rotate";
+pub const CAPABILITY_UNWRAP: &str = "id.unwrap_shared";
 
 /// Domain prefix for anything signed on a caller's behalf.
 ///
@@ -66,6 +67,12 @@ struct SignParams {
 struct SignSessionParams {
     /// Base64 Noise handshake hash.
     handshake_hash: String,
+}
+
+/// One recipient's copy of a content key, as it appears in a `SHARED` object record.
+#[derive(Debug, Deserialize)]
+struct UnwrapParams {
+    sealed_key: otwono_identity::SealedKey,
 }
 
 #[derive(Debug, Deserialize)]
@@ -211,6 +218,42 @@ impl IdentityService {
         serde_json::to_value(identity.bind_agreement(&key)).map_err(|e| RpcError::internal(e.to_string()))
     }
 
+    /// Open a content key that was sealed to this node (ADR-0019).
+    ///
+    /// The sharing secret never leaves this daemon, and neither does anything derived from
+    /// it except the one 32-byte content key the caller asked about. `otwono-stored` calls
+    /// this, holds the key long enough to decrypt, and drops it.
+    ///
+    /// A copy addressed to another node is refused by name before any key agreement is
+    /// attempted. It could not open anyway — the recipient is bound as additional data and
+    /// the derivation includes the recipient's public key — but "this is not your copy" is
+    /// a different fact from "this did not decrypt", and a caller that cannot tell them
+    /// apart will retry forever against a copy that can never work.
+    fn handle_unwrap_shared(&self, ctx: &CallContext, params: Value) -> Result<Value, RpcError> {
+        self.authorize(ctx, CAPABILITY_UNWRAP)?;
+        let p: UnwrapParams = serde_json::from_value(params)
+            .map_err(|e| RpcError::invalid_params(format!("id.unwrap_shared: {e}")))?;
+
+        let me = self.current().node_id().to_text();
+        if p.sealed_key.recipient != me {
+            return Err(RpcError::invalid_params(format!(
+                "that copy is sealed to {}, and this node is {me}",
+                p.sealed_key.recipient
+            )));
+        }
+        let content_key = self.sharing.open(&p.sealed_key).map_err(|e| {
+            // Deliberately not the underlying error: whether a seal failed on the tag or
+            // on the encoding is not something a caller needs, and AEAD failures are the
+            // classic place to leak a distinction worth an oracle.
+            RpcError::invalid_params(format!(
+                "this sealed key does not open with this node's sharing key ({e})"
+            ))
+        })?;
+        Ok(json!({
+            "content_key": data_encoding::BASE64.encode(content_key.as_ref()),
+        }))
+    }
+
     fn handle_rotate(&self, ctx: &CallContext) -> Result<Value, RpcError> {
         self.authorize(ctx, CAPABILITY_ROTATE)?;
         let (new, record) = self
@@ -279,6 +322,11 @@ impl Service for IdentityService {
                     CAPABILITY_BIND,
                 ),
                 MethodDescription::guarded(
+                    "id.unwrap_shared",
+                    "Open a content key sealed to this node, without the sharing secret leaving",
+                    CAPABILITY_UNWRAP,
+                ),
+                MethodDescription::guarded(
                     "id.rotate",
                     "Generate a new node identity, endorsed by the outgoing key",
                     CAPABILITY_ROTATE,
@@ -330,6 +378,7 @@ impl Service for IdentityService {
             "id.sign" => self.handle_sign(ctx, params),
             "id.sign_session" => self.handle_sign_session(ctx, params),
             "id.bind_agreement" => self.handle_bind_agreement(ctx, params),
+            "id.unwrap_shared" => self.handle_unwrap_shared(ctx, params),
             "id.rotate" => self.handle_rotate(ctx),
             other => Err(unknown_method(other)),
         }
