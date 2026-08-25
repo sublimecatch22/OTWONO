@@ -3238,3 +3238,82 @@ shellcheck -S warning ...  clean
 - **`SHARED` has still never been served to anybody**, and the `REPLICATED` replication
   policy does not exist. Both are named outstanding in `ROADMAP.md` under Phase 5.
 - **amd64 only**, three nodes, one segment, no real hardware, no radio.
+
+---
+
+## ADR-0019 slice 2 — the sharing key, published
+
+**Workspace only. Nothing here has booted.** No image was built and no QEMU run was made
+for this slice; the claims below are backed by `cargo test --workspace` and by integration
+tests that run the real daemons over real Unix sockets in a temp directory.
+
+A node now has three keys. `otwono-idd` generates an X25519 sharing key at startup, vouches
+for it with the node's Ed25519 key under a domain string of its own, records the public
+half in `node.key`, and publishes the signed binding in `node.pub` and through the open
+`id.sharing_binding` method.
+
+### Workspace
+
+```
+cargo test --workspace     816 passed, 0 failed
+cargo clippy --workspace --all-targets -- -D warnings   clean
+cargo fmt --all --check    clean
+cargo build --workspace --target aarch64-unknown-linux-gnu   ok
+```
+
+### What the tests force
+
+- A content key sealed to what `id.sharing_binding` returns is opened by the secret on
+  disk. That is the whole path a `SHARED` object will use, minus the object.
+- The binding is verified before anything seals to it. A published identity carrying
+  someone else's *genuine* binding is refused on the NodeID check, and one whose sharing
+  key has been swapped is refused on the signature.
+- `id.sign` cannot be used as an oracle to forge a sharing binding: the same attack that
+  ADR-0010's domain separation stops for agreement bindings is tested here for sharing
+  ones, with `otwono-sharing-binding-v1:` as a distinct domain.
+- No secret crosses the control plane. Every open method is called and its response
+  searched for the sharing secret, not just the two methods that mention sharing.
+- Re-binding the agreement key does not un-vouch for the sharing key. `otwono-netd`
+  re-binds on every boot, so without this a node would stop being shareable-with after its
+  first restart and would say so only by peers silently failing to seal to it.
+- A matrix over all three secrets and all four files asserts that no key file contains
+  another's secret.
+
+### Defect 45: `node.pub` outlived the identity it named
+
+Found while adding the rotation test, and pre-existing: `SigningKeystore::persist` wrote
+`node.pub` only when there was an agreement key to publish, and rotation deliberately
+passes none. So after `id.rotate` the file stayed on disk naming the *previous* NodeID,
+with the previous key inside it, indefinitely — until `otwono-netd` happened to re-bind.
+Anyone reading the file in that window got a confident, well-formed, wrong answer about who
+the node was.
+
+Now the file is removed when there is nothing to publish. No file is a state a reader can
+handle; a stale one is not.
+
+Nothing in the repository read `node.pub` except a test, which is why this survived. Peers
+and humans are the intended readers, and neither is in a position to notice.
+
+### The construction is what vouches
+
+`IdentityService::new` records the binding and returns a `Result`, rather than leaving the
+step to whoever parsed the arguments. The first version of this slice did it in `main`, and
+the integration test caught the consequence immediately: the daemon answered
+`id.sharing_binding` correctly while `node.pub` said nothing, because the test harness
+builds the service directly and never runs `main`. A service whose published state depends
+on a step outside it is a service that will come apart quietly.
+
+### What this does not prove
+
+- **No node has booted with a sharing key.** The startup path in `otwono-idd`'s `main` is
+  covered only by the integration harness constructing the same service; the image has not
+  been rebuilt and no boot log exists for this.
+- **Nothing uses the key.** There is no `id.unwrap_shared`, no capability governing it, and
+  `otwono-stored` does not encrypt anything. `SHARED` fails closed at every boundary
+  exactly as it did before this slice.
+- **No peer has ever learned another node's sharing key over a link.** Both ends of every
+  test here are the same process tree.
+- **Sharing-key rotation is undesigned** (OQ-27), and the authorized-recipient list remains
+  a privacy object nothing protects (OQ-28).
+- **No TPM sealing**, and no encrypted backup — so this is now a third file whose loss is
+  permanent and which nothing backs up.

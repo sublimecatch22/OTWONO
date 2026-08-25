@@ -177,6 +177,7 @@ impl SigningIdentity {
             node_id: self.node_id,
             public_key: base64_encode(&self.public_key_bytes()),
             agreement_public_key: base64_encode(agreement_public_key),
+            sharing_binding: None,
             created_at_unix_ms: self.created_at_unix_ms,
         }
     }
@@ -338,6 +339,16 @@ pub struct PublicIdentity {
     pub public_key: String,
     /// Base64 X25519 agreement public key.
     pub agreement_public_key: String,
+    /// The node's *signed* sharing binding (ADR-0019), absent on a node that has none.
+    ///
+    /// The whole binding rather than a bare key, because nothing signs a `PublicIdentity`
+    /// as a whole: its `node_id` can be checked against its `public_key`, and that is all.
+    /// A bare `sharing_public_key` field would therefore be a key anyone could substitute,
+    /// and sealing to it would seal to them. The binding carries its own signature, so
+    /// [`verified_sharing_key`](PublicIdentity::verified_sharing_key) can answer the only
+    /// question a sender has: which key may I seal to for this NodeID?
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sharing_binding: Option<SharingBinding>,
     pub created_at_unix_ms: u64,
 }
 
@@ -347,11 +358,38 @@ impl PublicIdentity {
     }
 
     /// Check the NodeID actually names the key. Always call this on anything received.
+    ///
+    /// This says nothing about `agreement_public_key`, which carries no signature here —
+    /// the trustworthy form of that is an [`AgreementBinding`]. It says nothing about the
+    /// sharing key either; use [`verified_sharing_key`](Self::verified_sharing_key).
     pub fn is_self_consistent(&self) -> bool {
         match self.public_key_bytes() {
             Ok(k) => self.node_id.matches_public_key(&k),
             Err(_) => false,
         }
+    }
+
+    /// The key it is safe to seal a content key to for this node, if it published one.
+    ///
+    /// Verifies the binding and checks it belongs to *this* identity, so a published
+    /// record cannot carry someone else's perfectly valid binding and have a sender seal
+    /// to them instead. `Ok(None)` means the node has no sharing key — a node that cannot
+    /// be shared with, which is different from one whose binding does not check out.
+    pub fn verified_sharing_key(&self) -> Result<Option<[u8; 32]>, IdentityError> {
+        let Some(binding) = &self.sharing_binding else {
+            return Ok(None);
+        };
+        if binding.node_id != self.node_id {
+            return Err(IdentityError::NodeIdMismatch);
+        }
+        binding.verify().map(Some)
+    }
+
+    /// Publish a sharing binding alongside this identity.
+    #[must_use]
+    pub fn with_sharing_binding(mut self, binding: SharingBinding) -> Self {
+        self.sharing_binding = Some(binding);
+        self
     }
 }
 
@@ -591,6 +629,53 @@ mod tests {
         assert!(public.is_self_consistent());
         public.node_id = *identity(14).node_id();
         assert!(!public.is_self_consistent());
+    }
+
+    #[test]
+    fn a_published_identity_carrying_someone_elses_binding_is_refused() {
+        // The binding is valid — it is just not this node's. Without the ownership check,
+        // a sender would seal to the other node's key and the named recipient could never
+        // open it, while the substituting party could.
+        let mine = identity(16);
+        let theirs = identity(17);
+        let theirs_sharing = SharingKey::from_seed(&[17u8; 32], 1_700_000_000_000);
+        let borrowed = theirs.signing().bind_sharing(&theirs_sharing.public());
+        assert!(borrowed.verify().is_ok(), "the binding itself is genuine");
+
+        let public = mine.to_public().with_sharing_binding(borrowed);
+        assert_eq!(public.verified_sharing_key(), Err(IdentityError::NodeIdMismatch));
+    }
+
+    #[test]
+    fn a_published_identity_with_a_swapped_sharing_key_is_refused() {
+        let mine = identity(18);
+        let sharing = SharingKey::from_seed(&[18u8; 32], 1_700_000_000_000);
+        let mut binding = mine.signing().bind_sharing(&sharing.public());
+        let attacker = SharingKey::from_seed(&[19u8; 32], 1_700_000_000_000);
+        binding.sharing_public_key = base64_encode(&attacker.public());
+
+        let public = mine.to_public().with_sharing_binding(binding);
+        assert_eq!(public.verified_sharing_key(), Err(IdentityError::BadSignature));
+    }
+
+    #[test]
+    fn a_published_identity_without_a_binding_is_unshareable_not_broken() {
+        let public = identity(20).to_public();
+        assert!(public.is_self_consistent());
+        assert_eq!(public.verified_sharing_key(), Ok(None));
+    }
+
+    #[test]
+    fn a_published_identity_round_trips_with_its_binding() {
+        let mine = identity(21);
+        let sharing = SharingKey::from_seed(&[21u8; 32], 1_700_000_000_000);
+        let public = mine
+            .to_public()
+            .with_sharing_binding(mine.signing().bind_sharing(&sharing.public()));
+        let json = serde_json::to_string(&public).unwrap();
+        let back: PublicIdentity = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, public);
+        assert_eq!(back.verified_sharing_key(), Ok(Some(sharing.public())));
     }
 
     #[test]

@@ -14,7 +14,7 @@
 //! being tested.
 
 use otwono_idd::IdentityService;
-use otwono_identity::{AgreementKeystore, NodeIdentity, SessionSigner, SigningKeystore};
+use otwono_identity::{AgreementKeystore, NodeIdentity, SessionSigner, SharingKeystore, SigningKeystore};
 use otwono_net::content::{ProtocolError, Request, Response};
 use otwono_net::{Candidate, LinkProperties, MemoryLink, SecureChannel, TcpLink};
 use otwono_netd::{BrokeredSigner, ContentResponder, NetService, NetState};
@@ -103,8 +103,17 @@ impl Harness {
         // otwono-idd. Both nodes are fronted by one signing key here: what is under test is
         // what crosses the link, not who is on each end of it.
         let keystore = SigningKeystore::new(dir.join("identity"));
+        let sharing_store = SharingKeystore::new(dir.join("identity"));
         let (signing, _) = keystore.load_or_generate().unwrap();
-        let idd = Arc::new(IdentityService::new(keystore, signing, perm_socket.clone()));
+        let idd = Arc::new(
+            IdentityService::new(
+                keystore,
+                signing,
+                sharing_store.load_or_generate().unwrap().0,
+                perm_socket.clone(),
+            )
+            .unwrap(),
+        );
         let s = shutdown.clone();
         let server = Server::bind(&id_socket).unwrap();
         std::thread::spawn(move || server.serve(idd, s));

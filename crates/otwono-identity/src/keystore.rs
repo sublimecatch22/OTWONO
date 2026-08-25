@@ -63,6 +63,11 @@ pub struct StoredSigningKey {
     /// Base64 X25519 public key this signing key has vouched for, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agreement_public_key: Option<String>,
+    /// Base64 X25519 *sharing* public key this signing key has vouched for, if any
+    /// (ADR-0019). Public halves only, for the same reason as above: this file records
+    /// what the signing key stands behind, never a secret it has no use for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sharing_public_key: Option<String>,
     /// Present only in a pre-split keystore. Read for migration, never written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agreement_seed: Option<String>,
@@ -259,6 +264,14 @@ impl SigningKeystore {
         Ok(stored)
     }
 
+    /// The sharing public key this signing key has vouched for, if any (ADR-0019).
+    pub fn bound_sharing_public_key(&self) -> Result<Option<[u8; 32]>, KeystoreError> {
+        match self.load_stored()?.sharing_public_key {
+            Some(text) => Ok(Some(decode_seed(&text)?)),
+            None => Ok(None),
+        }
+    }
+
     /// The agreement public key this signing key has vouched for, if any.
     pub fn bound_agreement_public_key(&self) -> Result<Option<[u8; 32]>, KeystoreError> {
         match self.load_stored()?.agreement_public_key {
@@ -268,10 +281,29 @@ impl SigningKeystore {
     }
 
     /// Write the signing key, recording which agreement key it vouches for.
+    ///
+    /// Any recorded sharing key is preserved: writing the agreement binding must not
+    /// silently un-vouch for the other one. Use [`persist_all`](Self::persist_all) to say
+    /// what happens to both.
     pub fn persist(
         &self,
         identity: &SigningIdentity,
         agreement_public_key: Option<&[u8; 32]>,
+    ) -> Result<(), KeystoreError> {
+        let sharing = if self.exists() {
+            self.bound_sharing_public_key()?
+        } else {
+            None
+        };
+        self.persist_all(identity, agreement_public_key, sharing.as_ref())
+    }
+
+    /// Write the signing key and say explicitly what it vouches for, in both directions.
+    pub fn persist_all(
+        &self,
+        identity: &SigningIdentity,
+        agreement_public_key: Option<&[u8; 32]>,
+        sharing_public_key: Option<&[u8; 32]>,
     ) -> Result<(), KeystoreError> {
         ensure_dir(&self.dir)?;
         let stored = StoredSigningKey {
@@ -279,6 +311,7 @@ impl SigningKeystore {
             algorithm: "ed25519".to_string(),
             signing_seed: base64_encode(identity.seed().as_ref()),
             agreement_public_key: agreement_public_key.map(|k| base64_encode(k)),
+            sharing_public_key: sharing_public_key.map(|k| base64_encode(k)),
             agreement_seed: None,
             created_at_unix_ms: identity.created_at_unix_ms(),
             hardware_backed: false,
@@ -291,12 +324,27 @@ impl SigningKeystore {
         // The published file can only be written once there is an agreement key to
         // publish. Before that the node has a name but nothing to handshake with.
         if let Some(agreement) = agreement_public_key {
-            let public = serde_json::to_string_pretty(&identity.to_public(agreement))
+            let mut published = identity.to_public(agreement);
+            if let Some(sharing) = sharing_public_key {
+                published = published.with_sharing_binding(identity.bind_sharing(sharing));
+            }
+            let public = serde_json::to_string_pretty(&published)
                 .map_err(|e| KeystoreError::Malformed(e.to_string()))?;
             std::fs::write(self.public_path(), public + "\n")
                 .map_err(|e| KeystoreError::Io(format!("{}: {e}", self.public_path().display())))?;
             std::fs::set_permissions(self.public_path(), std::fs::Permissions::from_mode(0o644))
                 .map_err(|e| KeystoreError::Io(format!("{}: {e}", self.public_path().display())))?;
+        } else if let Err(e) = std::fs::remove_file(self.public_path()) {
+            // Nothing to publish. After a rotation there *is* a node.pub on disk, and it
+            // names the identity this node no longer has — a file that answers "who are
+            // you?" with a dead NodeID is worse than no file at all. Removing it is the
+            // only honest state until something re-binds.
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(KeystoreError::Io(format!(
+                    "{}: {e}",
+                    self.public_path().display()
+                )));
+            }
         }
         Ok(())
     }
@@ -316,11 +364,31 @@ impl SigningKeystore {
         self.persist(identity, Some(agreement_public_key))
     }
 
+    /// Record which sharing key this node now uses, and republish `node.pub` (ADR-0019).
+    ///
+    /// Unlike the agreement key, this one lives in the same daemon that holds the signing
+    /// key, so nothing has to ask across the control plane to be vouched for. It is still
+    /// recorded here rather than re-derived, because `node.pub` must say what the signing
+    /// key stood behind, not what happens to be on disk when someone reads it.
+    pub fn bind_sharing(
+        &self,
+        identity: &SigningIdentity,
+        sharing_public_key: &[u8; 32],
+    ) -> Result<(), KeystoreError> {
+        let agreement = self.bound_agreement_public_key()?;
+        self.persist_all(identity, agreement.as_ref(), Some(sharing_public_key))
+    }
+
     /// Replace the signing key with a fresh one, endorsed by the outgoing key.
     ///
-    /// The agreement binding does not survive: the new key has vouched for nothing yet, so
-    /// `otwono-netd` must re-bind before the node can handshake again. Saying that out
-    /// loud is better than carrying a binding the new key never made.
+    /// Neither binding survives: the new key has vouched for nothing yet, so `otwono-netd`
+    /// must re-bind the agreement key before the node can handshake again, and `otwono-idd`
+    /// must re-bind the sharing key before anyone can seal to it. Saying that out loud is
+    /// better than carrying a binding the new key never made.
+    ///
+    /// What happens to content keys already wrapped to the old sharing key is **OQ-27** and
+    /// is not answered here. The secret itself is untouched, so nothing already shared to
+    /// this node becomes unreadable — only the published vouching goes stale.
     pub fn rotate(&self, now_unix_ms: u64) -> Result<(SigningIdentity, SuccessionRecord), KeystoreError> {
         let previous = self.load()?;
         let new = SigningIdentity::generate().map_err(KeystoreError::Identity)?;
@@ -349,7 +417,7 @@ impl SigningKeystore {
         file.sync_all()
             .map_err(|e| KeystoreError::Io(format!("{}: {e}", self.succession_path().display())))?;
 
-        self.persist(&new, None)?;
+        self.persist_all(&new, None, None)?;
         Ok((new, record))
     }
 
@@ -623,6 +691,105 @@ mod tests {
         let (signing, agreement) = provisioned(dir);
         let (sharing, _) = SharingKeystore::new(dir).load_or_generate().unwrap();
         (signing, agreement, sharing)
+    }
+
+    use crate::PublicIdentity;
+
+    /// Read `node.pub` back as a peer would.
+    fn published(dir: &Path) -> PublicIdentity {
+        let raw = std::fs::read_to_string(SigningKeystore::new(dir).public_path()).unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    #[test]
+    fn a_bound_sharing_key_is_published_and_verifies() {
+        let dir = tmpdir("sharing-publish");
+        let (signing, _, sharing) = provisioned_with_sharing(&dir);
+        SigningKeystore::new(&dir)
+            .bind_sharing(&signing, &sharing.public())
+            .unwrap();
+
+        let public = published(&dir);
+        assert_eq!(
+            public.verified_sharing_key().unwrap(),
+            Some(sharing.public()),
+            "a peer must be able to get from this node's name to a key it may seal to"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_node_that_has_not_bound_a_sharing_key_publishes_no_binding() {
+        // Not an error, and not a guess: a node nobody can share with yet.
+        let dir = tmpdir("sharing-unbound");
+        provisioned(&dir);
+        let public = published(&dir);
+        assert!(public.sharing_binding.is_none());
+        assert_eq!(public.verified_sharing_key().unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rebinding_the_agreement_key_does_not_un_vouch_for_the_sharing_key() {
+        // otwono-netd re-binds on every boot. If that dropped the sharing binding, a node
+        // would stop being shareable-with after its first restart, and would say so only
+        // by peers silently failing to seal to it.
+        let dir = tmpdir("sharing-rebind");
+        let store = SigningKeystore::new(&dir);
+        let (signing, _, sharing) = provisioned_with_sharing(&dir);
+        store.bind_sharing(&signing, &sharing.public()).unwrap();
+
+        let fresh = AgreementKey::generate().unwrap();
+        store.bind_agreement(&signing, &fresh.public()).unwrap();
+
+        assert_eq!(store.bound_sharing_public_key().unwrap(), Some(sharing.public()));
+        let public = published(&dir);
+        assert_eq!(public.verified_sharing_key().unwrap(), Some(sharing.public()));
+        assert_eq!(public.agreement_public_key, base64_encode(&fresh.public()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotation_drops_both_bindings_and_the_stale_published_file() {
+        // A node.pub naming a NodeID this node no longer has would answer "who are you?"
+        // with a dead name. No file is the honest state until something re-binds.
+        let dir = tmpdir("sharing-rotate");
+        let store = SigningKeystore::new(&dir);
+        let (signing, _, sharing) = provisioned_with_sharing(&dir);
+        store.bind_sharing(&signing, &sharing.public()).unwrap();
+        assert!(store.public_path().exists());
+
+        let (new, _) = store.rotate(1_700_000_000_000).unwrap();
+        assert_ne!(new.node_id(), signing.node_id());
+        assert_eq!(store.bound_sharing_public_key().unwrap(), None);
+        assert_eq!(store.bound_agreement_public_key().unwrap(), None);
+        assert!(
+            !store.public_path().exists(),
+            "node.pub still names the rotated-away identity"
+        );
+
+        // The secret itself is untouched: nothing already sealed to this node is lost.
+        assert_eq!(
+            SharingKeystore::new(&dir).load().unwrap().public(),
+            sharing.public()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_published_file_never_contains_a_sharing_secret() {
+        let dir = tmpdir("sharing-pubsecret");
+        let (signing, _, sharing) = provisioned_with_sharing(&dir);
+        SigningKeystore::new(&dir)
+            .bind_sharing(&signing, &sharing.public())
+            .unwrap();
+        let raw = std::fs::read_to_string(SigningKeystore::new(&dir).public_path()).unwrap();
+        assert!(
+            !raw.contains(&base64_encode(sharing.secret_bytes().as_ref())),
+            "{raw}"
+        );
+        assert!(raw.contains(&base64_encode(&sharing.public())), "{raw}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

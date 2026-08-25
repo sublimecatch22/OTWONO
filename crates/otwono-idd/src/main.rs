@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 use otwono_idd::IdentityService;
-use otwono_identity::{migrate_combined, SigningKeystore, DEFAULT_IDENTITY_DIR};
+use otwono_identity::{migrate_combined, SharingKeystore, SigningKeystore, DEFAULT_IDENTITY_DIR};
 use otwono_proto::{Server, Shutdown};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -102,13 +102,30 @@ fn run(args: &[String]) -> Result<String, Error> {
         );
     }
 
+    // ADR-0019: the third key. Generated on first boot even on a node that never shares
+    // anything, because being sealable-to is what makes a node addressable as a recipient
+    // — somebody else has to be able to seal to it before it knows it wants them to.
+    let sharing_store = SharingKeystore::new(&identity_dir);
+    let (sharing, sharing_generated) = sharing_store
+        .load_or_generate()
+        .map_err(|e| Error::Startup(format!("sharing keystore: {e}")))?;
+    if sharing_generated {
+        eprintln!(
+            "otwono-idd: generated a sharing key at {}\n  \
+             Losing it makes everything shared *to* this node unreadable; things shared \
+             *by* it are unaffected. Not backed up, not hardware-sealed.",
+            sharing_store.key_path().display()
+        );
+    }
+
     if show {
         return Ok(format!(
-            "node_id     {}\nfingerprint {}\ncreated     {}\nkeystore    {}\n",
+            "node_id     {}\nfingerprint {}\ncreated     {}\nkeystore    {}\nsharing_key {}\n",
             identity.node_id(),
             identity.node_id().fingerprint(),
             identity.created_at_unix_ms(),
-            keystore.key_path().display()
+            keystore.key_path().display(),
+            data_encoding::BASE64.encode(&sharing.public()),
         ));
     }
 
@@ -123,7 +140,11 @@ fn run(args: &[String]) -> Result<String, Error> {
         perm_socket.display()
     );
 
-    let service = Arc::new(IdentityService::new(keystore, identity, perm_socket));
+    // Constructing the service is what vouches for the sharing key on disk.
+    let service = Arc::new(
+        IdentityService::new(keystore, identity, sharing, perm_socket)
+            .map_err(|e| Error::Startup(format!("cannot vouch for the sharing key: {e}")))?,
+    );
     server
         .serve(service, Shutdown::new())
         .map_err(|e| Error::Startup(format!("serve failed: {e}")))?;

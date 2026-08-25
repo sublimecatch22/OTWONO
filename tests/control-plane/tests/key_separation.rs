@@ -10,7 +10,8 @@
 
 use otwono_idd::IdentityService;
 use otwono_identity::{
-    AgreementKeystore, NodeIdentity, SessionSigner, SignerError, SigningKeystore, HANDSHAKE_HASH_LEN,
+    AgreementKeystore, NodeIdentity, SessionSigner, SharingKeystore, SignerError, SigningKeystore,
+    HANDSHAKE_HASH_LEN,
 };
 use otwono_net::{Candidate, TcpLink};
 use otwono_netd::{run_listener, BrokeredSigner, NetState};
@@ -65,9 +66,18 @@ impl Harness {
 
         // otwono-idd, holding the one and only copy of the signing key.
         let keystore = SigningKeystore::new(dir.join("identity"));
+        let sharing_store = SharingKeystore::new(dir.join("identity"));
         let (signing, generated) = keystore.load_or_generate().unwrap();
         assert!(generated);
-        let idd = Arc::new(IdentityService::new(keystore, signing, perm_socket.clone()));
+        let idd = Arc::new(
+            IdentityService::new(
+                keystore,
+                signing,
+                sharing_store.load_or_generate().unwrap().0,
+                perm_socket.clone(),
+            )
+            .unwrap(),
+        );
         let server = Server::bind(&id_socket).unwrap();
         let s = shutdown.clone();
         std::thread::spawn(move || server.serve(idd, s));
@@ -292,6 +302,83 @@ fn the_identity_daemon_publishes_the_key_the_mesh_daemon_registered() {
     .unwrap();
     assert!(public.is_self_consistent());
     assert_eq!(public.agreement_public_key, mine.agreement_public_key);
+}
+
+#[test]
+fn a_peer_can_seal_a_content_key_to_what_the_daemon_publishes() {
+    // The whole point of ADR-0019's third key, end to end over the control plane: a peer
+    // asks the daemon who to seal to, seals, and the node's own sharing secret opens it.
+    // Nothing here trusts an unsigned field — the binding is verified first, and that
+    // verification is what turns a NodeID into a key.
+    let h = Harness::start("seal", MESH_POLICY);
+    h.brokered_signer("a").unwrap();
+
+    let mut client = Client::connect(&h.id_socket).unwrap();
+    let value = client
+        .call("id.sharing_binding", serde_json::json!({}))
+        .unwrap()
+        .expect("the sharing binding is an open method, like the agreement one");
+    let binding: otwono_identity::SharingBinding = serde_json::from_value(value).unwrap();
+    let recipient_key = binding.verify().expect("the daemon must vouch for its own key");
+
+    let content_key = [42u8; 32];
+    let sealed = otwono_identity::seal_to(&binding.node_id.to_text(), &recipient_key, &content_key).unwrap();
+
+    // Opened by the secret on disk, which is where otwono-idd will unwrap from.
+    let held = SharingKeystore::new(h.identity_dir()).load().unwrap();
+    assert_eq!(held.open(&sealed).unwrap().as_ref(), &content_key);
+}
+
+#[test]
+fn the_published_identity_carries_a_binding_that_names_this_node() {
+    let h = Harness::start("sharepub", MESH_POLICY);
+    let signer = h.brokered_signer("a").unwrap();
+
+    let mut client = Client::connect(&h.id_socket).unwrap();
+    let value = client.call("id.node", serde_json::json!({})).unwrap().unwrap();
+    let published: otwono_identity::PublicIdentity = serde_json::from_value(value).unwrap();
+    assert_eq!(published.node_id, signer.node_id());
+
+    let key = published
+        .verified_sharing_key()
+        .expect("the published binding must check out")
+        .expect("a node that has booted has a sharing key");
+
+    // node.pub on disk says the same thing, so a peer handed the file and a peer asking
+    // the daemon seal to the same key.
+    let on_disk: otwono_identity::PublicIdentity = serde_json::from_str(
+        &std::fs::read_to_string(SigningKeystore::new(h.identity_dir()).public_path()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(on_disk.verified_sharing_key().unwrap(), Some(key));
+}
+
+#[test]
+fn the_sharing_secret_never_crosses_the_control_plane() {
+    // Every open method is checked, not just the two that mention sharing: the secret must
+    // not be reachable by asking politely for anything at all.
+    let h = Harness::start("sharesecret", MESH_POLICY);
+    h.brokered_signer("a").unwrap();
+    let held = SharingKeystore::new(h.identity_dir()).load().unwrap();
+    let secret = data_encoding::BASE64.encode(held.secret_bytes().as_ref());
+
+    let mut client = Client::connect(&h.id_socket).unwrap();
+    for method in [
+        "describe",
+        "id.node",
+        "id.fingerprint",
+        "id.agreement_binding",
+        "id.sharing_binding",
+        "id.succession",
+    ] {
+        let value = client.call(method, serde_json::json!({})).unwrap().unwrap();
+        let text = serde_json::to_string(&value).unwrap();
+        assert!(!text.contains(&secret), "{method} returned the sharing secret");
+    }
+
+    // And the file the node hands out does not carry it either.
+    let public = std::fs::read_to_string(SigningKeystore::new(h.identity_dir()).public_path()).unwrap();
+    assert!(!public.contains(&secret), "{public}");
 }
 
 #[test]

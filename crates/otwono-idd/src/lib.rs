@@ -23,7 +23,7 @@
 
 #![forbid(unsafe_code)]
 
-use otwono_identity::{SigningIdentity, SigningKeystore};
+use otwono_identity::{SharingKey, SigningIdentity, SigningKeystore};
 use otwono_proto::{
     unknown_method, CallContext, Client, MethodDescription, RpcError, Service, ServiceDescription,
 };
@@ -50,6 +50,9 @@ pub const APPLICATION_DOMAIN: &[u8] = b"otwono-application-v1:";
 pub struct IdentityService {
     keystore: SigningKeystore,
     identity: Mutex<Arc<SigningIdentity>>,
+    /// The node's sharing key (ADR-0019). Held here rather than in `otwono-netd` so that a
+    /// content key never exists in the process that parses input from the network.
+    sharing: SharingKey,
     perm_socket: PathBuf,
 }
 
@@ -72,12 +75,36 @@ struct BindParams {
 }
 
 impl IdentityService {
-    pub fn new(keystore: SigningKeystore, identity: SigningIdentity, perm_socket: PathBuf) -> Self {
-        IdentityService {
+    /// Build the service, vouching for the sharing key as part of doing so.
+    ///
+    /// The binding is recorded here rather than by whoever parsed the arguments, so that
+    /// "this service is running" and "this node's published identity names the key it
+    /// would actually unwrap with" cannot come apart. A caller that forgot the step would
+    /// otherwise get a daemon that answers `id.sharing_binding` correctly while `node.pub`
+    /// on disk says nothing — and only a peer reading the file would ever notice.
+    pub fn new(
+        keystore: SigningKeystore,
+        identity: SigningIdentity,
+        sharing: SharingKey,
+        perm_socket: PathBuf,
+    ) -> Result<Self, otwono_identity::KeystoreError> {
+        keystore.bind_sharing(&identity, &sharing.public())?;
+        Ok(IdentityService {
             keystore,
             identity: Mutex::new(Arc::new(identity)),
+            sharing,
             perm_socket,
-        }
+        })
+    }
+
+    /// The sharing binding this node currently stands behind.
+    ///
+    /// Derived live from the two keys this daemon holds rather than read back from
+    /// `node.key`, so it cannot disagree with the key that would actually do the
+    /// unwrapping. What is recorded on disk exists so `node.pub` is right for a peer
+    /// reading the file; this is what a peer asking the daemon gets.
+    fn sharing_binding(&self) -> otwono_identity::SharingBinding {
+        self.current().bind_sharing(&self.sharing.public())
     }
 
     fn current(&self) -> Arc<SigningIdentity> {
@@ -190,13 +217,21 @@ impl IdentityService {
             .keystore
             .rotate(otwono_identity::now_unix_ms())
             .map_err(|e| RpcError::internal(format!("rotation failed: {e}")))?;
+        // Rotation drops both bindings. The sharing one this daemon can restore itself,
+        // because it holds both halves; the agreement key lives in otwono-netd, which has
+        // to be told. Re-binding here rather than waiting for a restart means a rotated
+        // node does not silently stop being shareable-with.
+        self.keystore
+            .bind_sharing(&new, &self.sharing.public())
+            .map_err(|e| RpcError::internal(format!("cannot re-bind the sharing key: {e}")))?;
         let response = json!({
             "node_id": new.node_id().to_text(),
             "fingerprint": new.node_id().fingerprint(),
             "succession": record,
-            // Rotation drops the binding: the new key has vouched for nothing. Saying so
-            // is what tells otwono-netd it must re-bind before it can handshake again.
+            // Saying so is what tells otwono-netd it must re-bind before it can handshake
+            // again. Nothing republishes node.pub until it does.
             "agreement_rebind_required": true,
+            "sharing_rebound": true,
         });
         *self.identity.lock().expect("identity lock poisoned") = Arc::new(new);
         Ok(response)
@@ -222,6 +257,10 @@ impl Service for IdentityService {
                 MethodDescription::open(
                     "id.agreement_binding",
                     "The signed binding between this NodeID and its X25519 agreement key",
+                ),
+                MethodDescription::open(
+                    "id.sharing_binding",
+                    "The signed binding between this NodeID and the X25519 key to seal to",
                 ),
                 MethodDescription::open("id.succession", "Signed key-rotation history"),
                 MethodDescription::guarded(
@@ -261,8 +300,11 @@ impl Service for IdentityService {
                              identity; otwono-netd binds one at startup",
                         )
                     })?;
-                serde_json::to_value(self.current().to_public(&bound))
-                    .map_err(|e| RpcError::internal(e.to_string()))
+                let published = self
+                    .current()
+                    .to_public(&bound)
+                    .with_sharing_binding(self.sharing_binding());
+                serde_json::to_value(published).map_err(|e| RpcError::internal(e.to_string()))
             }
             "id.fingerprint" => {
                 let identity = self.current();
@@ -273,6 +315,9 @@ impl Service for IdentityService {
             }
             "id.agreement_binding" => {
                 serde_json::to_value(self.binding()?).map_err(|e| RpcError::internal(e.to_string()))
+            }
+            "id.sharing_binding" => {
+                serde_json::to_value(self.sharing_binding()).map_err(|e| RpcError::internal(e.to_string()))
             }
             "id.succession" => {
                 let records = self
@@ -331,8 +376,10 @@ mod tests {
         let domain = String::from_utf8_lossy(APPLICATION_DOMAIN).to_string();
         for internal in [
             "otwono-agreement-binding-v1:",
+            "otwono-sharing-binding-v1:",
             "otwono-succession-v1:",
             "otwono-session-v1:",
+            "otwono-shared-key-seal-v1",
         ] {
             assert_ne!(domain, internal);
             assert!(
@@ -344,6 +391,29 @@ mod tests {
                 "the app domain must not extend {internal}"
             );
         }
+    }
+
+    #[test]
+    fn the_signing_oracle_cannot_forge_a_sharing_binding() {
+        // The same attack as above aimed at ADR-0019: a caller with id.sign asks for a
+        // signature over the bytes a sharing binding signs, then presents the result as
+        // this node's binding — which would name a key the attacker holds as the one to
+        // seal to. Domain separation is the only thing standing in the way.
+        let identity = NodeIdentity::generate().unwrap();
+        let attacker_key = [9u8; 32];
+        let forged_payload = otwono_identity::sharing_binding_message(&attacker_key);
+        let oracle_signature = identity.sign(&domain_separated(&forged_payload));
+
+        let forged = otwono_identity::SharingBinding {
+            node_id: *identity.node_id(),
+            public_key: data_encoding::BASE64.encode(&identity.public_key_bytes()),
+            sharing_public_key: data_encoding::BASE64.encode(&attacker_key),
+            signature: data_encoding::BASE64.encode(&oracle_signature.to_bytes()),
+        };
+        assert!(
+            forged.verify().is_err(),
+            "an application signature satisfied a sharing binding"
+        );
     }
 
     #[test]
