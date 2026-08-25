@@ -51,6 +51,8 @@ COMMANDS:
     export <CONTENT_ID>       Write an object out as a file this user owns
     stat <CONTENT_ID>         Size, chunk count, label, and whether every chunk is present
     demote <CONTENT_ID>       Make an object more restrictive. Widening needs a person.
+    share                     Encrypt a file to named recipients and store it (ADR-0019)
+    open <CONTENT_ID>         Open an object shared with this node, writing the plaintext
     cache-status              The neighbourhood cache's budget, usage and contents
     cache-purge               Empty the neighbourhood cache. The node's own store is untouched.
 
@@ -61,8 +63,21 @@ OPTIONS:
     --out <PATH>              Where get writes its bytes; stdout is never used for binary
     --visibility <LABEL>      private (default), shared, public or replicated
     --derived-from <ID>       An object this content was derived from. Repeatable.
+    --recipient <SELF|PATH>   Who may open a shared object. `self` asks this node's identity
+                              daemon for its own binding; a path reads one from a file.
+                              Repeatable; share needs at least one.
+    --id-socket <PATH>        Identity daemon socket (default $OTWONO_SOCKET_DIR/id.sock),
+                              used only to resolve `--recipient self`
     --json                    Print the daemon's reply verbatim
     -h, --help                Show this message
+
+SHARING:
+    A shared object is encrypted before it is chunked, so its bytes on the wire and on any
+    other node are ciphertext, and its content id is over that ciphertext. It therefore does
+    not deduplicate, and sharing one file with two recipient sets makes two unrelated
+    objects. A recipient is named by a *signed* binding: a bare key says nothing about whose
+    it is. Removing a recipient later deletes their copy of the key and nothing else -- they
+    may already hold both the ciphertext and their key.
 
 INLINE VERSUS FILE:
     put and get carry the bytes on the control plane and are capped at its line limit.
@@ -109,6 +124,8 @@ struct Options {
     out: Option<PathBuf>,
     visibility: Option<String>,
     derived_from: Vec<String>,
+    recipients: Vec<String>,
+    id_socket: Option<PathBuf>,
     json: bool,
 }
 
@@ -126,17 +143,20 @@ fn run(args: &[String]) -> Result<String, Error> {
         .clone()
         .unwrap_or_else(|| otwono_proto::socket_path("perm"));
 
-    let (method, params, action) = build_call(&opts)?;
+    let recipients = resolve_recipients(&opts)?;
+    let (method, params, action) = build_call(&opts, &recipients)?;
     let value = call(&store_socket, &perm_socket, &method, params, action)?;
 
     // `get` returns base64 on the wire. Writing it to a named file rather than stdout is
     // deliberate: a terminal is not a place to put arbitrary bytes, and a shell script that
     // captured them would have to decode them itself.
-    if opts.command == "get" {
+    // `open` returns the plaintext base64, like `get`, and for the same reason is written
+    // to a file rather than a terminal.
+    if opts.command == "get" || opts.command == "open" {
         let out = opts
             .out
             .clone()
-            .ok_or_else(|| Error::Usage("get needs --out".into()))?;
+            .ok_or_else(|| Error::Usage(format!("{} needs --out", opts.command)))?;
         let data = value
             .get("data")
             .and_then(Value::as_str)
@@ -168,11 +188,46 @@ fn render_json(value: &Value) -> Result<String, Error> {
         .map_err(|e| Error::Runtime(e.to_string()))
 }
 
+/// Turn each `--recipient` into a signed binding the daemon will accept.
+///
+/// `self` asks this node's identity daemon for its own binding; anything else is a path to
+/// one somebody handed over. Either way what reaches `otwono-stored` is a **signed** binding,
+/// which it verifies for itself — this resolves a name, it does not vouch for a key.
+fn resolve_recipients(opts: &Options) -> Result<Vec<Value>, Error> {
+    let mut out = Vec::with_capacity(opts.recipients.len());
+    for name in &opts.recipients {
+        if name == "self" {
+            let socket = opts
+                .id_socket
+                .clone()
+                .unwrap_or_else(|| otwono_proto::socket_path("id"));
+            let mut client = otwono_proto::Client::connect(&socket).map_err(|e| {
+                Error::Runtime(format!(
+                    "cannot reach the identity daemon at {}: {e}",
+                    socket.display()
+                ))
+            })?;
+            let value = client
+                .call("id.sharing_binding", json!({}))
+                .map_err(|e| Error::Runtime(format!("id.sharing_binding failed: {e}")))?
+                .map_err(|e| Error::Runtime(format!("id.sharing_binding refused: {}", e.message)))?;
+            out.push(value);
+        } else {
+            let text = std::fs::read_to_string(name).map_err(|e| Error::Runtime(format!("{name}: {e}")))?;
+            out.push(
+                serde_json::from_str(&text)
+                    .map_err(|e| Error::Runtime(format!("{name} is not a sharing binding: {e}")))?,
+            );
+        }
+    }
+    Ok(out)
+}
+
 /// Turn parsed options into the call to make: method, params, and the capability it needs.
 ///
 /// Separated from the socket work so every command's request shape is unit-testable without
 /// a daemon anywhere.
-fn build_call(opts: &Options) -> Result<(String, Value, Option<&'static str>), Error> {
+fn build_call(opts: &Options, recipients: &[Value]) -> Result<(String, Value, Option<&'static str>), Error> {
     let need_target = |what: &str| -> Result<String, Error> {
         opts.target
             .clone()
@@ -252,6 +307,43 @@ fn build_call(opts: &Options) -> Result<(String, Value, Option<&'static str>), E
                     .ok_or_else(|| Error::Usage("demote needs --visibility".into()))?,
             }),
             Some("store.write"),
+        ),
+        "share" => {
+            let path = need_file("share")?;
+            let bytes =
+                std::fs::read(&path).map_err(|e| Error::Runtime(format!("{}: {e}", path.display())))?;
+            if bytes.len() > otwono_stored::MAX_INLINE_BYTES {
+                return Err(Error::Usage(format!(
+                    "{} is {} bytes, over the {}-byte inline cap; there is no file variant \
+                     of share on this CLI yet",
+                    path.display(),
+                    bytes.len(),
+                    otwono_stored::MAX_INLINE_BYTES
+                )));
+            }
+            if recipients.is_empty() {
+                return Err(Error::Usage(
+                    "share needs at least one --recipient; an object nobody can open is not \
+                     a shared object"
+                        .into(),
+                ));
+            }
+            (
+                "store.share".into(),
+                json!({
+                    "data": data_encoding::BASE64.encode(&bytes),
+                    "recipients": recipients,
+                }),
+                Some("store.share"),
+            )
+        }
+        // Guarded by id.unwrap_shared, not store.read: opening what somebody shared with
+        // this node *is* the unwrap, and otwono-stored forwards this same token to
+        // otwono-idd. See ADR-0019 §3.
+        "open" => (
+            "store.open_shared".into(),
+            json!({ "content_id": need_target("open")? }),
+            Some("id.unwrap_shared"),
         ),
         "cache-status" => ("cache.status".into(), json!({}), Some("cache.read")),
         "cache-purge" => ("cache.purge".into(), json!({}), Some("cache.write")),
@@ -334,6 +426,24 @@ fn render(command: &str, v: &Value) -> String {
             }
             out
         }
+        "share" => {
+            let who: Vec<&str> = v["sharing"]["authorized"]
+                .as_array()
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            format!(
+                "{} {} bytes shared\nplaintext {} bytes, sealed to {}\nnote: removing a \
+                 recipient later deletes their copy of the key and nothing else\n",
+                s("content_id"),
+                n("size_bytes"),
+                v["sharing"]["plaintext_size_bytes"].as_u64().unwrap_or(0),
+                if who.is_empty() {
+                    "nobody".to_string()
+                } else {
+                    who.join(", ")
+                }
+            )
+        }
         "export" => format!(
             "{} {} bytes -> {}\nnote: that file is plaintext and yours; read it and unlink it\n",
             s("content_id"),
@@ -398,6 +508,8 @@ fn parse_args(args: &[String]) -> Result<Options, Error> {
             "--out" => opts.out = Some(next(&mut it, "--out")?.into()),
             "--visibility" => opts.visibility = Some(next(&mut it, "--visibility")?),
             "--derived-from" => opts.derived_from.push(next(&mut it, "--derived-from")?),
+            "--recipient" => opts.recipients.push(next(&mut it, "--recipient")?),
+            "--id-socket" => opts.id_socket = Some(next(&mut it, "--id-socket")?.into()),
             "--json" => opts.json = true,
             other if other.starts_with('-') => return Err(Error::Usage(format!("unknown option {other}"))),
             positional => {
@@ -435,8 +547,14 @@ mod tests {
             (vec!["export", "ab"], "store.export", Some("store.read")),
             (vec!["cache-status"], "cache.status", Some("cache.read")),
             (vec!["cache-purge"], "cache.purge", Some("cache.write")),
+            // Opening asks for the unwrap capability, not store.read. otwono-stored
+            // forwards this very token to otwono-idd, and a token names one action -- so
+            // asking for store.read here would make every open fail, and "fixing" that by
+            // having the store request its own token would let anyone with store.read open
+            // everything shared with this node.
+            (vec!["open", "ab"], "store.open_shared", Some("id.unwrap_shared")),
         ] {
-            let (m, _, a) = build_call(&opts(&args)).expect("builds");
+            let (m, _, a) = build_call(&opts(&args), &[]).expect("builds");
             assert_eq!(m, method);
             assert_eq!(a, action, "{args:?}");
         }
@@ -445,7 +563,7 @@ mod tests {
     #[test]
     fn reading_never_needs_a_write_capability() {
         for args in [vec!["get", "ab"], vec!["stat", "ab"], vec!["export", "ab"]] {
-            let (_, _, action) = build_call(&opts(&args)).unwrap();
+            let (_, _, action) = build_call(&opts(&args), &[]).unwrap();
             assert_eq!(action, Some("store.read"), "{args:?}");
         }
     }
@@ -458,7 +576,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("f");
         std::fs::write(&f, b"x").unwrap();
-        let (_, params, _) = build_call(&opts(&["put", "--file", f.to_str().unwrap()])).unwrap();
+        let (_, params, _) = build_call(&opts(&["put", "--file", f.to_str().unwrap()]), &[]).unwrap();
         assert_eq!(params["visibility"], "private");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -469,7 +587,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("big");
         std::fs::write(&f, vec![0u8; otwono_stored::MAX_INLINE_BYTES + 1]).unwrap();
-        let err = build_call(&opts(&["put", "--file", f.to_str().unwrap()])).unwrap_err();
+        let err = build_call(&opts(&["put", "--file", f.to_str().unwrap()]), &[]).unwrap_err();
         match err {
             Error::Usage(m) => assert!(m.contains("import"), "{m}"),
             other => panic!("expected a usage error naming import, got {other:?}"),
@@ -478,17 +596,54 @@ mod tests {
     }
 
     #[test]
+    fn sharing_with_nobody_is_a_usage_error_not_an_unopenable_object() {
+        let dir = std::env::temp_dir().join(format!("otwono-storectl-share-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("f");
+        std::fs::write(&f, b"x").unwrap();
+        let err = build_call(&opts(&["share", "--file", f.to_str().unwrap()]), &[]).unwrap_err();
+        match err {
+            Error::Usage(m) => assert!(m.contains("--recipient"), "{m}"),
+            other => panic!("expected a usage error naming --recipient, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn share_sends_the_bindings_it_was_given_and_asks_for_store_share() {
+        let dir = std::env::temp_dir().join(format!("otwono-storectl-shb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("f");
+        std::fs::write(&f, b"hello").unwrap();
+        let binding = json!({ "node_id": "otw1someone", "public_key": "a", "sharing_public_key": "b", "signature": "c" });
+        let (method, params, action) = build_call(
+            &opts(&["share", "--file", f.to_str().unwrap()]),
+            std::slice::from_ref(&binding),
+        )
+        .unwrap();
+        assert_eq!(method, "store.share");
+        assert_eq!(action, Some("store.share"));
+        // Verbatim. This CLI resolves a name to a signed binding; it does not vouch for a
+        // key, and the daemon checks the signature for itself.
+        assert_eq!(params["recipients"], json!([binding]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn demote_without_a_label_is_a_usage_error_not_a_guess() {
         // Guessing here would mean picking how restrictive to make somebody's data.
         assert!(matches!(
-            build_call(&opts(&["demote", "abc"])),
+            build_call(&opts(&["demote", "abc"]), &[]),
             Err(Error::Usage(_))
         ));
     }
 
     #[test]
     fn an_unknown_command_is_refused() {
-        assert!(matches!(build_call(&opts(&["frobnicate"])), Err(Error::Usage(_))));
+        assert!(matches!(
+            build_call(&opts(&["frobnicate"]), &[]),
+            Err(Error::Usage(_))
+        ));
     }
 
     #[test]
@@ -497,15 +652,18 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("f");
         std::fs::write(&f, b"x").unwrap();
-        let (_, params, _) = build_call(&opts(&[
-            "put",
-            "--file",
-            f.to_str().unwrap(),
-            "--derived-from",
-            "aa",
-            "--derived-from",
-            "bb",
-        ]))
+        let (_, params, _) = build_call(
+            &opts(&[
+                "put",
+                "--file",
+                f.to_str().unwrap(),
+                "--derived-from",
+                "aa",
+                "--derived-from",
+                "bb",
+            ]),
+            &[],
+        )
         .unwrap();
         assert_eq!(params["derived_from"], json!(["aa", "bb"]));
         let _ = std::fs::remove_dir_all(&dir);

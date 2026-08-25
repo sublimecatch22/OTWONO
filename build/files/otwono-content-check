@@ -93,5 +93,52 @@ else
     esac
 fi
 
+# --- 6. A SHARED object, sealed to this node and opened again (ADR-0019) ----------------
+# Until this ran on a booted node, every part of SHARED was proven only by tests on a build
+# host. This exercises the whole of it through the real daemons: otwono-idd generates and
+# vouches for the sharing key, otwono-stored encrypts before chunking and seals the content
+# key to the recipient, and opening it goes back through otwono-idd for the unwrap on the
+# caller's own capability. The sharing key never leaves otwono-idd at any point.
+printf 'otwono shared check %s\n' "$(date -u +%s)" > "$WORK/shared.txt"
+shared=$(otwono-storectl share --file "$WORK/shared.txt" --recipient self) \
+    || fail "store.share refused"
+shared_id=$(echo "$shared" | awk 'NR==1 {print $1}')
+[ -n "$shared_id" ] || fail "store.share returned no content id"
+
+# The label is shared, and the object names exactly one recipient: this node.
+case "$shared" in
+    *"sealed to otw1"*) : ;;
+    *) fail "store.share named no recipient: $shared" ;;
+esac
+share_stat=$(otwono-storectl stat "$shared_id") || fail "store.stat refused for the shared object"
+case "$share_stat" in
+    *shared*) : ;;
+    *) fail "an object stored as shared came back as: $share_stat" ;;
+esac
+
+# What is on disk is ciphertext, and not merely because the store is encrypted at rest: the
+# object is encrypted BEFORE it is chunked, so its content id is over ciphertext too. The
+# same plaintext stored public therefore gets a different id -- which is the property that
+# stops a holder confirming a guess at what a shared object contains.
+share_marker=$(head -c 32 "$WORK/shared.txt")
+if grep -rqF "$share_marker" /var/lib/otwono/store/chunks 2>/dev/null; then
+    fail "the shared object is on disk in the clear"
+fi
+plain=$(otwono-storectl put --file "$WORK/shared.txt" --visibility public) \
+    || fail "store.put refused the same bytes as public"
+plain_id=$(echo "$plain" | awk '{print $1}')
+[ "$plain_id" != "$shared_id" ] \
+    || fail "the shared object has the same id as the same bytes stored public"
+
+# And it opens, back to the byte.
+otwono-storectl open "$shared_id" --out "$WORK/shared.back" >/dev/null \
+    || fail "store.open_shared refused"
+cmp -s "$WORK/shared.txt" "$WORK/shared.back" || fail "the shared object came back different"
+
+# Relabelling cannot make plaintext shared: the bytes would have to be sealed and are not.
+if otwono-storectl demote "$plain_id" --visibility shared >/dev/null 2>&1; then
+    fail "a plaintext object became shared by being relabelled"
+fi
+
 rm -rf "$WORK"
-echo "OTWONO-CONTENT-OK id=$id large=$large_id cache=$cache_state"
+echo "OTWONO-CONTENT-OK id=$id large=$large_id cache=$cache_state shared=$shared_id"

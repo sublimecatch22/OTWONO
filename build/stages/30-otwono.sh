@@ -241,6 +241,33 @@ subjects = ["uid:0"]
 decision = "allow"
 ttl_seconds = 300
 
+# Sharing, and opening what was shared with this node (ADR-0019). Both are granted for the
+# reason store.read and store.write are: they are the node's own operator acting on the
+# node's own store, and without them the boot-time content check cannot exercise SHARED at
+# all -- which is how store.write came to be missing once already.
+#
+# store.share does not move any bytes. It encrypts an object to recipients named by signed
+# bindings, which is strictly narrower than store.put with visibility "public" -- and that
+# needs only store.write and no confirmation. Making the safer call the harder one is how a
+# system teaches people to use the unsafe one. What is still not granted is store.serve,
+# below, so a shared object on a stock node cannot reach the peers it names.
+#
+# id.unwrap_shared is what otwono-stored forwards to otwono-idd on the caller's own token
+# when opening. Granting it is granting the ability to read what neighbours have shared with
+# this node; it does not grant reading anything else, and it never lets the sharing key
+# itself leave otwono-idd.
+[[rule]]
+action = "store.share"
+subjects = ["uid:0"]
+decision = "allow"
+ttl_seconds = 300
+
+[[rule]]
+action = "id.unwrap_shared"
+subjects = ["uid:0"]
+decision = "allow"
+ttl_seconds = 300
+
 # store.serve and net.content are deliberately NOT granted, and they are the two that
 # matter. store.serve is the network boundary: it is what otwono-netd calls to hand an
 # object to a peer, and granting it is the decision to let this node serve the street.
