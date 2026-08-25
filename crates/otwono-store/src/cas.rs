@@ -469,6 +469,86 @@ impl Store {
         result.map(|object| (object, key))
     }
 
+    /// The objects in this store sealed to `recipient`, by content id (ADR-0020).
+    ///
+    /// Answers the one question a recipient cannot answer for itself: a `SHARED` object's id
+    /// is over ciphertext keyed by a fresh per-object key, so unlike a `PUBLIC` object it
+    /// cannot be derived from the content. Without this, sharing needs a channel outside the
+    /// mesh to carry the id.
+    ///
+    /// **Scoped by computation, not by filtering.** Nothing is assembled and then narrowed;
+    /// an object is only ever added if its own envelope names this recipient. A global list
+    /// with a filter over it would put the whole store one bug away from being published.
+    ///
+    /// Ordered by content id — deterministic, stable across calls, and needing no state this
+    /// store does not already have. Deliberately not by time: sharing time is metadata the
+    /// record does not carry and a recipient has not asked for.
+    ///
+    /// `after` continues a previous page. `limit` bounds the reply; the scan itself is over
+    /// every object either way, which is why ADR-0020 has the caller do it once per session.
+    ///
+    /// A damaged or unreadable record is skipped, not raised: one bad file must not stop a
+    /// recipient discovering everything else that is theirs.
+    pub fn shared_with(
+        &self,
+        recipient: &str,
+        after: Option<&ContentId>,
+        limit: usize,
+    ) -> Result<Vec<SharedEntry>, StoreError> {
+        let mut found = Vec::new();
+        let shards = match std::fs::read_dir(self.objects_dir()) {
+            Ok(d) => d,
+            // No objects directory is an empty store, not a failure.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(found),
+            Err(e) => return Err(io(&self.objects_dir(), e)),
+        };
+        for shard in shards.flatten() {
+            let entries = match std::fs::read_dir(shard.path()) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let Ok(object) = serde_json::from_str::<Object>(&text) else {
+                    continue;
+                };
+                if object.visibility != crate::Visibility::Shared {
+                    continue;
+                }
+                let Some(sharing) = &object.sharing else {
+                    continue;
+                };
+                if !sharing.names(recipient) {
+                    continue;
+                }
+                // Checked last, and against the record rather than the filename: a record
+                // whose chunks do not hash to its own id is damage, and advertising it would
+                // send a recipient after bytes that will not verify.
+                if object.validate().is_err() {
+                    continue;
+                }
+                found.push(SharedEntry {
+                    content_id: object.content_id,
+                    plaintext_size_bytes: sharing.plaintext_size_bytes,
+                });
+            }
+        }
+        found.sort_by_key(|e| e.content_id);
+        if let Some(after) = after {
+            // Strictly after, so a caller paging with the last id it saw does not see it
+            // twice.
+            found.retain(|e| e.content_id > *after);
+        }
+        found.truncate(limit);
+        Ok(found)
+    }
+
     /// Store a sealed object this node received, keeping the key it was given.
     ///
     /// The counterpart of [`put_shared_reader`](Self::put_shared_reader) on the receiving
@@ -557,6 +637,17 @@ impl Store {
         self.put_object(&object)?;
         Ok(object)
     }
+}
+
+/// One object a recipient may ask for, in the reply to "what have you sealed to me?".
+///
+/// The plaintext size travels with it because it is what a recipient needs to decide whether
+/// to fetch now — the object's own `size_bytes` measures ciphertext, which is larger by a
+/// tag per frame and is not the number a person recognises.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedEntry {
+    pub content_id: ContentId,
+    pub plaintext_size_bytes: u64,
 }
 
 /// Who a `SHARED` object is sealed for.
@@ -749,6 +840,159 @@ mod tests {
             },
             key,
         )
+    }
+
+    #[test]
+    fn a_recipient_is_told_only_what_was_sealed_to_it() {
+        // The whole point of ADR-0020, and the property that has to hold before anything
+        // else about it matters.
+        let d = tmp("shared-index");
+        let s = Store::new(&d);
+        let (alice, _) = recipient("otw1alice", 20);
+        let (bob, _) = recipient("otw1bob", 21);
+
+        let (for_alice, _) = s
+            .put_shared_reader(data(1_000, 80).as_slice(), std::slice::from_ref(&alice))
+            .unwrap();
+        let (for_bob, _) = s
+            .put_shared_reader(data(1_000, 81).as_slice(), std::slice::from_ref(&bob))
+            .unwrap();
+        let (for_both, _) = s
+            .put_shared_reader(data(1_000, 82).as_slice(), &[alice.clone(), bob.clone()])
+            .unwrap();
+        // Two objects that are not shared at all, which must never appear.
+        let public = s.put_bytes(&data(1_000, 83), Visibility::Public).unwrap();
+        let private = s.put_bytes(&data(1_000, 84), Visibility::Private).unwrap();
+
+        let hers: Vec<ContentId> = s
+            .shared_with("otw1alice", None, 100)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.content_id)
+            .collect();
+        assert!(hers.contains(&for_alice.content_id));
+        assert!(hers.contains(&for_both.content_id));
+        assert!(!hers.contains(&for_bob.content_id), "alice was told about bob's");
+        assert!(!hers.contains(&public.content_id));
+        assert!(!hers.contains(&private.content_id));
+        assert_eq!(hers.len(), 2);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_stranger_is_told_nothing_and_it_looks_like_an_empty_store() {
+        // "Nothing for you" and "nothing for anybody" must be the same answer, or asking
+        // becomes a way to find out whether a node shares with people at all.
+        let d = tmp("shared-index-stranger");
+        let s = Store::new(&d);
+        let (alice, _) = recipient("otw1alice", 22);
+        s.put_shared_reader(data(1_000, 85).as_slice(), &[alice]).unwrap();
+
+        assert_eq!(s.shared_with("otw1stranger", None, 100).unwrap(), vec![]);
+        let empty = Store::new(tmp("shared-index-empty"));
+        assert_eq!(empty.shared_with("otw1stranger", None, 100).unwrap(), vec![]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_index_pages_without_repeating_or_skipping() {
+        // Ordered by content id, strictly after the cursor. Getting the boundary wrong
+        // either loops forever or silently loses an object a recipient was told about.
+        let d = tmp("shared-index-page");
+        let s = Store::new(&d);
+        let (alice, _) = recipient("otw1alice", 23);
+        let mut all = Vec::new();
+        for seed in 0..7u64 {
+            let (o, _) = s
+                .put_shared_reader(data(1_000, 90 + seed).as_slice(), std::slice::from_ref(&alice))
+                .unwrap();
+            all.push(o.content_id);
+        }
+        all.sort();
+
+        let mut paged = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = s.shared_with("otw1alice", cursor.as_ref(), 3).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            cursor = Some(page.last().unwrap().content_id);
+            paged.extend(page.into_iter().map(|e| e.content_id));
+        }
+        assert_eq!(paged, all, "paging must visit every object exactly once");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_index_reports_the_plaintext_size_not_the_ciphertext_size() {
+        // What a recipient needs to decide whether to fetch. size_bytes is the ciphertext,
+        // which is larger by a tag per frame and is not the number a person recognises.
+        let d = tmp("shared-index-size");
+        let s = Store::new(&d);
+        let (alice, _) = recipient("otw1alice", 24);
+        let plaintext = data(200_000, 95);
+        let (object, _) = s.put_shared_reader(plaintext.as_slice(), &[alice]).unwrap();
+
+        let entry = &s.shared_with("otw1alice", None, 10).unwrap()[0];
+        assert_eq!(entry.plaintext_size_bytes, plaintext.len() as u64);
+        assert!(object.size_bytes > entry.plaintext_size_bytes);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_damaged_record_is_skipped_rather_than_stopping_the_answer() {
+        // One bad file must not stop a recipient discovering everything else that is theirs,
+        // and a record whose chunks do not hash to its own id must not be advertised at all.
+        let d = tmp("shared-index-damaged");
+        let s = Store::new(&d);
+        let (alice, _) = recipient("otw1alice", 25);
+        let (good, _) = s
+            .put_shared_reader(data(1_000, 96).as_slice(), std::slice::from_ref(&alice))
+            .unwrap();
+        let (doomed, _) = s
+            .put_shared_reader(data(1_000, 97).as_slice(), std::slice::from_ref(&alice))
+            .unwrap();
+
+        // Not JSON at all.
+        let (garbage, _) = s
+            .put_shared_reader(data(1_000, 98).as_slice(), std::slice::from_ref(&alice))
+            .unwrap();
+        std::fs::write(s.object_path(&garbage.content_id), b"{ not json").unwrap();
+
+        // Well-formed, but its size no longer matches its chunks.
+        let mut lying = s.get_object(&doomed.content_id).unwrap();
+        lying.size_bytes += 1;
+        std::fs::write(
+            s.object_path(&doomed.content_id),
+            serde_json::to_string(&lying).unwrap(),
+        )
+        .unwrap();
+
+        let ids: Vec<ContentId> = s
+            .shared_with("otw1alice", None, 100)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.content_id)
+            .collect();
+        assert_eq!(ids, vec![good.content_id], "{ids:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_demoted_object_is_no_longer_offered_to_its_recipient() {
+        // Demotion stops future serving, so it must stop future advertising too -- an index
+        // naming something the serve path then refuses would send a recipient after bytes
+        // it cannot have.
+        let d = tmp("shared-index-demote");
+        let s = Store::new(&d);
+        let (alice, _) = recipient("otw1alice", 26);
+        let (object, _) = s.put_shared_reader(data(1_000, 99).as_slice(), &[alice]).unwrap();
+        assert_eq!(s.shared_with("otw1alice", None, 10).unwrap().len(), 1);
+
+        s.demote(&object.content_id, Visibility::Private).unwrap();
+        assert_eq!(s.shared_with("otw1alice", None, 10).unwrap(), vec![]);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

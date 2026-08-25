@@ -20,9 +20,10 @@ pub mod content;
 pub mod signer;
 
 pub use content::{
-    fetch_object, fetch_object_from_peers, fetch_object_to_file, serve_session, ContentResponder,
-    FanOutReport, FetchedMeta, FetchedObject, PeerSource,
+    fetch_object, fetch_object_from_peers, fetch_object_to_file, fetch_shared_index, serve_session,
+    ContentResponder, FanOutReport, FetchedMeta, FetchedObject, PeerSource,
 };
+pub use otwono_net::content::SharedIndexEntry;
 pub use signer::{BindError, BrokeredSigner};
 
 use otwono_identity::{NodeId, SessionSigner};
@@ -241,6 +242,32 @@ impl NetState {
         }
         self.exchange_hello(&mut channel, true)?;
         content::fetch_object(&mut channel, content_id, &properties).map_err(|e| e.to_string())
+    }
+
+    /// Ask one peer what it has sealed to this node (ADR-0020).
+    ///
+    /// The one question a recipient cannot answer for itself: a `SHARED` object's id is over
+    /// ciphertext keyed by a fresh per-object key, so it cannot be derived from the content
+    /// the way a `PUBLIC` object's can.
+    pub fn shared_with_me(&self, candidate: &Candidate) -> Result<Vec<SharedIndexEntry>, String> {
+        let link = TcpLink::connect(candidate.address, content::FETCH_TIMEOUT)
+            .map_err(|e| format!("connect to {}: {e}", candidate.address))?;
+        link.set_timeout(Some(content::FETCH_TIMEOUT))
+            .map_err(|e| e.to_string())?;
+        let properties = link.properties();
+
+        let mut channel = SecureChannel::initiate(link, self.signer.as_ref()).map_err(|e| e.to_string())?;
+        let proved = channel.peer().node_id;
+        if proved != candidate.claimed_node_id {
+            return Err(format!(
+                "{} advertised {} but authenticated as {}",
+                candidate.address,
+                candidate.claimed_node_id.fingerprint(),
+                proved.fingerprint()
+            ));
+        }
+        self.exchange_hello(&mut channel, true)?;
+        content::fetch_shared_index(&mut channel, &properties).map_err(|e| e.to_string())
     }
 
     /// Fetch one object from several peers at once (ADR-0015).
@@ -577,6 +604,11 @@ impl Service for NetService {
                     CAPABILITY_CONNECT,
                 ),
                 MethodDescription::guarded(
+                    "net.shared_with_me",
+                    "Ask one peer what it has sealed to this node (ADR-0020)",
+                    CAPABILITY_CONTENT,
+                ),
+                MethodDescription::guarded(
                     "net.fetch",
                     "Fetch one content-addressed object from a peer, verified on arrival",
                     CAPABILITY_CONTENT,
@@ -612,6 +644,27 @@ impl Service for NetService {
                     .dial(&candidate)
                     .map_err(|e| RpcError::new(otwono_proto::code::UNAVAILABLE, e))?;
                 Ok(json!({ "node_id": proved.to_text(), "fingerprint": proved.fingerprint() }))
+            }
+            // net.content, the same capability a fetch needs: every id in the reply is one
+            // this node could then fetch, so being allowed to ask is being allowed to fetch.
+            "net.shared_with_me" => {
+                self.authorize(ctx, CAPABILITY_CONTENT)?;
+                let candidate = Self::candidate(&params)?;
+                let entries = self
+                    .state
+                    .shared_with_me(&candidate)
+                    .map_err(|e| RpcError::new(otwono_proto::code::UNAVAILABLE, e))?;
+                Ok(json!({
+                    "schema_version": DESCRIBE_SCHEMA_VERSION,
+                    "peer": candidate.claimed_node_id.to_text(),
+                    "entries": entries
+                        .iter()
+                        .map(|e| json!({
+                            "content_id": e.content_id,
+                            "plaintext_size_bytes": e.plaintext_size_bytes,
+                        }))
+                        .collect::<Vec<_>>(),
+                }))
             }
             "net.fetch" => {
                 self.authorize(ctx, CAPABILITY_CONTENT)?;

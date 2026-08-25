@@ -3498,3 +3498,77 @@ lever on its own, and worth saying so: raising a timeout to accommodate a bug hi
 It is right *now*, because the check genuinely can take minutes under TCG, but it was reached
 for first and it would have papered over defect 46 if the step markers had not gone in
 alongside it.
+
+---
+
+## OQ-29 settled, and `SHARED` completes the loop between two booted nodes
+
+`out/amd64-qemu-ubuntu/two-node/node-{a,b}.log`, TCG. ADR-0020 built and booted.
+
+Every other object in this check has an id both nodes derive independently, because a
+`PUBLIC` object's id is the hash of its content. A `SHARED` object's is over ciphertext keyed
+by a fresh per-object key, so the recipient could not derive it, could not guess it, and had
+no way to ask. **Nothing in this run passes an id between the VMs.**
+
+```
+node A  otw1:es0w-zg0a-vc1h-ycyy
+node B  otw1:fayx-6g8k-pbz2-tc37
+
+A: shared_to_peer=1acf0c96…   discovered=d515c9c2…
+B: shared_to_peer=d515c9c2…   discovered=1acf0c96…
+```
+
+The ids cross. A sealed `1acf0c96…` to B and discovered `d515c9c2…`, which is exactly what B
+sealed to A — and B's line is the mirror image. Each node asked its peer what that peer had
+sealed to *it*, was told, and fetched it. The check asserts the two are different, because a
+node discovering its own outbound object would mean the index was answering with what it
+holds rather than what it was given.
+
+The step markers from defect 47 make the shape of it readable:
+
+```
+[  212.9] STEP sealing to a peer learned over the mesh
+[  214.4] STEP asking the peer what it has sealed to this node
+[  217.0] STEP fetched an object discovered over the mesh
+[  217.1] OTWONO-MESH-CONTENT-OK node=1/2 …
+```
+
+Four seconds from "I know who you are" to "I have what you sent me", on emulated hardware
+with no acceleration.
+
+### What ADR-0020's privacy claims cost to check
+
+The claims are narrow enough to test directly, which was the point of scoping them that way:
+
+- The request has **no field naming the asker**, and a schema test refuses `peer`, `node_id`,
+  `recipient` and `for` so a second implementation cannot add one and stay conformant.
+- A stranger, a peer with nothing sealed to it, and a refusal all produce the **same empty
+  page** — checked host-side against two harnesses, one that shares with somebody else and
+  one that shares with nobody, whose answers are asserted equal.
+- The index offers nothing but what was sealed to the asker: checked against a store holding
+  a public object, a private one, one sealed to the asker and one sealed to a stranger.
+- An index entry carrying a sealed key is refused by the schema. The manifest already carries
+  the asker's; an entry that carried *other* recipients' copies would be the leak the design
+  exists to avoid.
+
+### The measurement caught an estimate by one byte
+
+`SHARED_ENTRY_JSON_BYTES` was guessed at 124 and measured at 125 for the widest possible
+size. The test that pins it failed on the first run, which is the entire reason that class of
+test exists — an entry one byte over the page arithmetic means a reply the link refuses, and
+it would have shown up as an unexplained failure on a narrow link rather than as a number.
+It is 132 now.
+
+### What is still not proven
+
+- **One object each, both small.** No paging has happened on a machine: both nodes had
+  exactly one object to offer, so the cursor path, the per-session snapshot's staleness, and
+  the 256-entry page ceiling are exercised only host-side.
+- **The per-session snapshot's cost is invisible here.** An object shared during a session is
+  not visible to that session; these nodes reconnect often enough that the retry loop never
+  had to wait. On a long-lived link it is a real delay and nothing has measured it.
+- **The scan is O(objects) and these stores hold a handful.** ADR-0020 defers a maintained
+  index until there is a number; there is still no number.
+- Adding and removing recipients (ADR-0019 §5) does not exist, so a shared object's recipient
+  set is fixed at creation.
+- **amd64 only**, TCG, two nodes, one segment, no real hardware, no radio.

@@ -263,3 +263,77 @@ fn the_schema_refuses_a_second_recipients_copy_alongside() {
     page["sharing"]["other_recipients"] = serde_json::json!(["otw1somebodyelse"]);
     assert_invalid(&page, "an envelope naming anybody but the asking peer");
 }
+
+#[test]
+fn the_index_request_and_reply_validate() {
+    assert_valid(&encoded(&Request::SharedWithMe {
+        after: None,
+        max_entries: 64,
+    }));
+    assert_valid(&encoded(&Request::SharedWithMe {
+        after: Some(id(4)),
+        max_entries: 1,
+    }));
+    assert_valid(&encoded(&Response::SharedWithYou(
+        otwono_net::content::SharedIndexPage {
+            entries: vec![otwono_net::content::SharedIndexEntry {
+                content_id: id(5),
+                plaintext_size_bytes: 65_536,
+            }],
+        },
+    )));
+    // An empty page is the answer to "nothing for you", "nothing for anybody" and "I will
+    // not say", so it has to be a legal reply and not an omission.
+    assert_valid(&encoded(&Response::SharedWithYou(
+        otwono_net::content::SharedIndexPage { entries: vec![] },
+    )));
+}
+
+#[test]
+fn the_schema_refuses_an_index_request_that_names_who_is_asking() {
+    // The property ADR-0020 rests on. The asker is the NodeID the handshake authenticated;
+    // a field for it would be an enumeration oracle for the whole recipient graph, so a
+    // second implementation must not be able to add one and stay conformant.
+    for field in ["peer", "node_id", "recipient", "for"] {
+        let mut request = encoded(&Request::SharedWithMe {
+            after: None,
+            max_entries: 8,
+        });
+        request[field] = serde_json::json!("otw1somebodyelse");
+        assert_invalid(&request, &format!("an index request naming {field:?}"));
+    }
+}
+
+#[test]
+fn the_schema_refuses_an_index_reply_carrying_sealed_keys() {
+    // The manifest already carries the asker's key. Duplicating it here would bloat a reply
+    // meant to page over a narrow link, and an entry that carried *other* recipients' copies
+    // would be the leak the whole design avoids.
+    let mut page = encoded(&Response::SharedWithYou(otwono_net::content::SharedIndexPage {
+        entries: vec![otwono_net::content::SharedIndexEntry {
+            content_id: id(6),
+            plaintext_size_bytes: 1,
+        }],
+    }));
+    page["entries"][0]["sealed_key"] = serde_json::json!({ "recipient": "otw1someone" });
+    assert_invalid(&page, "an index entry carrying a sealed key");
+}
+
+#[test]
+fn the_schema_bounds_an_index_request_the_way_the_code_does() {
+    for entries in [0u32, 257] {
+        let mut request = encoded(&Request::SharedWithMe {
+            after: None,
+            max_entries: 8,
+        });
+        request["max_entries"] = serde_json::json!(entries);
+        assert_invalid(&request, &format!("max_entries {entries}"));
+        // And the code agrees, rather than only the schema saying so.
+        assert!(Request::SharedWithMe {
+            after: None,
+            max_entries: entries
+        }
+        .validate()
+        .is_err());
+    }
+}

@@ -89,10 +89,13 @@ can make that returns a `PRIVATE` object even if both checks failed at once.
   key agreement. Adding a recipient re-wraps the key; **removing one does not un-share what
   they already have**, and the UI says so.
 
-  **STATUS: partly VERIFIED** — ADR-0019 settled the three questions this sentence leaves
-  open, and a booted node has now sealed an object to itself, kept the plaintext out of the
-  chunk store, and opened it again (`out/amd64-qemu-ubuntu/boot.log`). What has *not* booted
-  is the serving half: no `SHARED` object has passed between two machines. The object is encrypted *before* chunking,
+  **STATUS: VERIFIED** — ADR-0019 settled the three questions this sentence leaves open, and
+  ADR-0020 settled the one it did not anticipate: a recipient could not *discover* what had
+  been shared with it, because a `SHARED` object's id is over ciphertext and cannot be
+  derived from the content. Two booted nodes now complete the whole loop — each seals to the
+  other, each asks what it has been sent, and each fetches and opens it, with no id passing
+  between the machines by any other route
+  (`out/amd64-qemu-ubuntu/two-node/node-{a,b}.log`). The object is encrypted *before* chunking,
   so its chunks and its `ContentId` are over ciphertext: chunking the plaintext and
   encrypting each chunk would let a holder confirm a guessed plaintext against a digest, and
   would give a `SHARED` object the same id as the same file stored `PUBLIC`. The wrap uses a
@@ -126,8 +129,7 @@ Negative tests are the point of this subsystem:
 
 ### Where each of those stands
 
-**STATUS: VERIFIED** for the first, third and fourth; **IMPLEMENTED**, not booted, for the
-second.
+**STATUS: VERIFIED** for all four.
 
 | Property | Where it is proven |
 |---|---|
@@ -135,13 +137,15 @@ second.
 | A refusal is indistinguishable from not-found | **On an actual link**, byte-identical replies for refused and absent; and host-side in the same file |
 | Derived content inherits the most restrictive label | `tests/control-plane/tests/store_labels.rs` |
 | Demotion stops future serving | proven over a link, not only at the method |
-| A `SHARED` object reaches only the peers named in it | `tests/control-plane/tests/content_over_a_link.rs`, host-side over TCP and Noise. Not yet between booted nodes |
+| A `SHARED` object reaches only the peers named in it | **Between two booted nodes**, each sealing to the other and fetching what it discovered; and host-side for the refusals, in `tests/control-plane/tests/content_over_a_link.rs` |
+| Asking what was shared with you reveals nothing else | A stranger, a peer with nothing, and a refusal all give the same empty page (ADR-0020). Host-side; the schema also refuses a request naming who is asking |
 
-The `SHARED` case is now proven, but on a host and not on a machine.
-`tests/control-plane/tests/content_over_a_link.rs` shares an object with one node, fetches
-it from another over a real TCP link under Noise, opens it back to the original bytes, and
-asserts that a peer *not* named in the envelope gets a refusal byte-identical to the one an
-absent object gets. Every link in that test is a socket in one process tree. Until it has
-run between two booted VMs — as the `PRIVATE` case has — this row is `IMPLEMENTED` and not
-`VERIFIED`, and the difference is not a formality: defects 38, 43 and 44 on this branch were
-all things that passed on a host and failed on a machine.
+The `SHARED` case is proven on machines as well as on a host. Two booted VMs each seal an
+object to the other, each discovers what it was sent, and each fetches and opens it —
+nothing passes an id between them by any other route. `content_over_a_link.rs` covers what
+the boot run does not reach: a peer *not* named in the envelope gets a refusal
+byte-identical to the one an absent object gets, and a stranger asking what has been sealed
+to it gets the same empty answer a node that shares with nobody gives.
+
+What the machines have not yet exercised: paging an index or a manifest across several
+windows, and any object larger than the control plane's inline cap.

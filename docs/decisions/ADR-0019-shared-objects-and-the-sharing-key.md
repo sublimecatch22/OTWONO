@@ -11,35 +11,29 @@
   `id.unwrap_shared` to `uid:0` and nothing wider. Relabelling plaintext to `shared` is
   refused. `otwono-storectl share` and `open` are how a person reaches it.
 
-- **VERIFIED between two booted nodes:** a node takes a connected peer's signed sharing
-  binding off the wire — it travels in the `Hello` after every Noise handshake — and
-  encrypts an object to it; it cannot open what it sealed to somebody else; and a binding
-  whose signature has been tampered with is refused rather than sealed to
-  (`out/amd64-qemu-ubuntu/two-node/node-{a,b}.log`).
+- **VERIFIED between two booted nodes** (`.../two-node/node-{a,b}.log`): a node takes a
+  connected peer's signed sharing binding off the wire — it travels in the `Hello` after
+  every Noise handshake — and seals an object to it; it cannot open what it sealed to
+  somebody else; a binding with a tampered signature is refused rather than sealed to; and,
+  with **ADR-0020** settling OQ-29, a recipient discovers what was sealed to it, fetches it,
+  and opens it, with no id passing between the machines by any other route.
 
-- **IMPLEMENTED, not booted.** §4's serving: `store.serve`, `store.serve_manifest` and
-  `store.serve_chunk` hand a `Shared` object to a peer named in its envelope, out of this
-  node's own store only; the ONM manifest carries that peer's own sealed key and no other;
-  `otwono-netd` re-checks the manifest against the NodeID it authenticated and will not
-  release a chunk to a peer it has not already given that manifest to in this session. A
-  shared object crosses a real TCP link under Noise and opens at the far end in
-  `tests/control-plane/tests/content_over_a_link.rs` — but both ends of that are one process
-  tree, and `store.serve` is ungranted on a stock node. `SHARED` has **not** crossed a link
-  between two booted nodes, which is the evidence the `PRIVATE` case already has. Also here:
-  `store.accept_shared`, `store.share_file`, and the published binding in `node.pub`.
+- **IMPLEMENTED, not booted.** The parts of §4 those runs do not reach: paging a manifest
+  across several windows to a peer, the session gate that refuses a chunk to a peer not yet
+  given that object's manifest, and serving anything larger than the inline cap. All are
+  covered over a real TCP link under Noise in
+  `tests/control-plane/tests/content_over_a_link.rs`, but both ends of that are one process
+  tree. Also here: `store.share_file`, and `node.pub`'s published binding.
 
-- **SPECIFIED, no code:** §5, adding and removing recipients. No file variant of `share` or
-  `accept_shared`, so an object past the control plane's inline cap can be sealed only in
-  memory.
+- **SPECIFIED, no code:** §5, adding and removing recipients — so a shared object's recipient
+  set is fixed when it is created. No file variant of `share` or `accept_shared`, so an
+  object past the control plane's inline cap can be sealed only in memory.
 
-- **A gap this ADR did not anticipate.** A recipient has no way to *discover* what has been
-  shared with it. A `SHARED` object's id is over ciphertext keyed by a fresh per-object key,
-  so unlike a `PUBLIC` object it cannot be derived from the content — the recipient has to be
-  told, and ONM has no method that tells it. Sharing therefore works today only alongside a
-  channel outside the mesh, which is most of the problem node identity exists to solve. This
-  is **OQ-29**, and it is the reason `SHARED` has not been demonstrated crossing a link
-  between two booted nodes even though every piece needed to carry it now exists — the
-  sealing half has run between two VMs; the fetching half has nothing to ask for.
+- **A gap this ADR did not anticipate, since closed.** A recipient had no way to *discover*
+  what had been shared with it: a `SHARED` object's id is over ciphertext keyed by a fresh
+  per-object key, so unlike a `PUBLIC` object it cannot be derived from the content. Sharing
+  therefore worked only alongside a channel outside the mesh, which is most of the problem
+  node identity exists to solve. That was **OQ-29**, and **ADR-0020** settles it.
 
 ## Context
 

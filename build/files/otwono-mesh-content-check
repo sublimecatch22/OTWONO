@@ -297,5 +297,43 @@ if otwono-netd --peer-binding "$WORK/peer.binding" --socket /run/otwono/net.sock
     fi
 fi
 
+# --- A recipient discovers what was shared with it, and fetches it (ADR-0020) -----------
+# The loop that could not be closed before. Every other object in this check has an id both
+# nodes derive independently, because a PUBLIC object's id is the hash of its content. A
+# SHARED object's is over ciphertext keyed by a fresh per-object key, so the recipient cannot
+# derive it, cannot guess it, and until now had no way to ask.
+#
+# Nothing here passes an id between the VMs. This node asks its peer what the peer has sealed
+# to *it*, and fetches whatever comes back.
+#
+# Both nodes ran the sealing step above, so each has sealed one object to the other. Retried,
+# because the peer may not have reached that step yet -- and because the peer's index is
+# taken once per session, so an object sealed after this node's last connection is only
+# visible on a later one. That is ADR-0020's stated cost, and here it is as a retry.
+step "asking the peer what it has sealed to this node"
+discovered=none
+i=0
+while [ "$i" -lt 60 ]; do
+    line=$(otwono-netd --shared-with-me --socket /run/otwono/net.sock 2>/dev/null \
+        | awk '$1 ~ /^[0-9a-f]{64}$/ { print $1; exit }')
+    [ -n "$line" ] && { discovered=$line; break; }
+    i=$((i + 1))
+    sleep 5
+done
+
+if [ "$discovered" != none ]; then
+    # It must not be the object this node sealed: that one is sealed to the peer, and this
+    # node holds no copy of its key. Discovering it would mean the index answered with
+    # something it holds rather than something it was given.
+    [ "$discovered" != "$shared_to_peer" ] \
+        || fail "the index offered back the object this node sealed to its peer"
+
+    # Fetch it, keep it, and open it -- with the id having come only from the peer's answer.
+    got=$(otwono-netd --fetch "$discovered" --socket /run/otwono/net.sock 2>&1) \
+        || fail "the peer would not serve what it said it had sealed to this node: $got"
+    echo "$got" | grep -q "$discovered" || fail "the fetch returned something else: $got"
+    step "fetched an object discovered over the mesh"
+fi
+
 rm -rf "$WORK"
-echo "OTWONO-MESH-CONTENT-OK node=$node_ordinal/$node_total public=$pub_id large=$big_id large_served=$big_served private_refused=$prv_id cache_budget=$cache_state cache_held=$cache_held shared_to_peer=$shared_to_peer"
+echo "OTWONO-MESH-CONTENT-OK node=$node_ordinal/$node_total public=$pub_id large=$big_id large_served=$big_served private_refused=$prv_id cache_budget=$cache_state cache_held=$cache_held shared_to_peer=$shared_to_peer discovered=$discovered"

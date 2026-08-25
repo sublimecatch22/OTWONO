@@ -28,6 +28,7 @@ use crate::HANDSHAKE_TIMEOUT;
 use otwono_identity::NodeId;
 use otwono_net::content::{
     self, ChunkEntry, ChunkPart, ManifestPage, ProtocolError, Request, Response, SharedEnvelope,
+    SharedIndexEntry, SharedIndexPage,
 };
 use otwono_net::{LinkAdapter, LinkProperties, SecureChannel};
 use otwono_proto::{code, Client};
@@ -118,6 +119,18 @@ impl std::fmt::Debug for ContentResponder {
 #[derive(Debug, Default)]
 pub struct Session {
     shared_released: std::collections::HashSet<String>,
+    /// What this node has sealed to this peer, taken once and paged from thereafter
+    /// (ADR-0020). `None` until the peer first asks.
+    ///
+    /// Once per session, because producing it means scanning every object record, and a peer
+    /// that could force a fresh scan per request would have a cheap way to make an
+    /// SD-card-backed node miserable. A peer wanting a fresher answer opens a new session,
+    /// and a new session costs a Noise handshake — the right price, with no rate limiter, no
+    /// timer and no configuration.
+    ///
+    /// The cost, stated where it will be read: an object shared *during* a session is not
+    /// visible to that session.
+    shared_index: Option<Vec<SharedIndexEntry>>,
 }
 
 impl Session {
@@ -146,16 +159,92 @@ impl ContentResponder {
     /// configuration, and a peer that could tell "refused" from "absent" would learn what
     /// this node holds.
     pub fn answer(&self, peer: &NodeId, request: &Request, session: &mut Session) -> Response {
-        let id = request.content_id().to_string();
+        // Two shapes of refusal, because there are two shapes of question. One about a named
+        // object is refused with `not_available` naming it. One asking *which* objects is
+        // refused with an empty page — the same answer a peer with nothing sealed to it
+        // gets, so asking cannot tell "I will not tell you" from "there is nothing"
+        // (ADR-0020).
+        let refuse = || match request.content_id() {
+            Some(id) => Response::not_available(id),
+            None => Response::SharedWithYou(SharedIndexPage { entries: Vec::new() }),
+        };
         if request.validate().is_err() {
-            return Response::not_available(id);
+            return refuse();
+        }
+        if let Request::SharedWithMe { after, max_entries } = request {
+            return self.shared_with(peer, after.as_deref(), *max_entries, session);
         }
         match self.ask_store(peer, request) {
             Some(reply) => self
                 .translate(peer, request, &reply, session)
-                .unwrap_or(Response::not_available(id)),
-            None => Response::not_available(id),
+                .unwrap_or_else(refuse),
+            None => refuse(),
         }
+    }
+
+    /// Answer "what have you sealed to me?" out of this session's snapshot (ADR-0020).
+    fn shared_with(
+        &self,
+        peer: &NodeId,
+        after: Option<&str>,
+        max_entries: u32,
+        session: &mut Session,
+    ) -> Response {
+        let empty = || Response::SharedWithYou(SharedIndexPage { entries: Vec::new() });
+        if session.shared_index.is_none() {
+            // Taken for the peer this daemon authenticated, never for one a request named:
+            // a peer that could ask on somebody else's behalf would be enumerating the
+            // recipient graph.
+            let Some(entries) = self.ask_shared_index(peer) else {
+                // The store is unreachable or refused. Reported as "nothing", like every
+                // other refusal on this path -- a peer that could tell this apart from an
+                // empty answer would learn about this node's configuration.
+                return empty();
+            };
+            session.shared_index = Some(entries);
+        }
+        let all = session.shared_index.as_ref().expect("set just above");
+        let start = match after {
+            // Strictly after, so a caller paging with the last id it saw does not see it
+            // twice. An unknown cursor yields nothing rather than starting over, which is
+            // the honest answer to "continue after something that is not in this list".
+            Some(after) => match all.iter().position(|e| e.content_id == after) {
+                Some(i) => i + 1,
+                None => return empty(),
+            },
+            None => 0,
+        };
+        let take = (max_entries as usize).min(content::MAX_SHARED_ENTRIES_PER_REQUEST as usize);
+        Response::SharedWithYou(SharedIndexPage {
+            entries: all.iter().skip(start).take(take).cloned().collect(),
+        })
+    }
+
+    /// Ask the store what it has sealed to this peer. `None` if it could not be asked.
+    fn ask_shared_index(&self, peer: &NodeId) -> Option<Vec<SharedIndexEntry>> {
+        let reply = self.call_store(
+            "store.shared_with",
+            json!({
+                "peer": peer.to_text(),
+                "max_entries": content::MAX_SHARED_ENTRIES_PER_REQUEST,
+            }),
+        )?;
+        let entries = reply.get("entries")?.as_array()?;
+        entries
+            .iter()
+            .map(|e| {
+                let content_id = e.get("content_id")?.as_str()?.to_string();
+                // Checked here as well as at the store: this daemon puts it on a wire, and a
+                // malformed id would be a request a peer cannot make sense of.
+                if !content::is_hex_digest(&content_id) {
+                    return None;
+                }
+                Some(SharedIndexEntry {
+                    content_id,
+                    plaintext_size_bytes: e.get("plaintext_size_bytes")?.as_u64()?,
+                })
+            })
+            .collect()
     }
 
     /// Turn the store's reply into a wire reply, refusing on anything unexpected.
@@ -184,8 +273,12 @@ impl ContentResponder {
             Request::Manifest { .. } => may_go_to_peer(label, sharing.as_ref(), peer),
             // A chunk reply carrying an envelope is a reply nobody should be sending.
             Request::Chunk { .. } if sharing.is_some() => false,
-            Request::Chunk { .. } if label == Some("shared") => session.was_released(request.content_id()),
+            Request::Chunk { .. } if label == Some("shared") => {
+                request.content_id().is_some_and(|id| session.was_released(id))
+            }
             Request::Chunk { .. } => may_leave_a_node(label),
+            // Never reaches translate: answered from the session snapshot in `answer`.
+            Request::SharedWithMe { .. } => false,
         };
         if !allowed {
             // Reachable only if otwono-stored regressed: it has already applied its own
@@ -193,14 +286,14 @@ impl ContentResponder {
             // disagree and one of them is broken.
             eprintln!(
                 "otwono-netd: refusing to serve {}: the store offered it labelled {:?} to {}",
-                request.content_id(),
+                request.content_id().unwrap_or("<no object>"),
                 label.unwrap_or("<absent>"),
                 peer.fingerprint()
             );
             return None;
         }
         let content_id = reply.get("content_id")?.as_str()?.to_string();
-        if content_id != request.content_id() {
+        if Some(content_id.as_str()) != request.content_id() {
             return None;
         }
         if label == Some("shared") && matches!(request, Request::Manifest { .. }) {
@@ -227,6 +320,7 @@ impl ContentResponder {
                     })
                     .collect::<Option<Vec<_>>>()?,
             })),
+            Request::SharedWithMe { .. } => None,
             Request::Chunk { digest, .. } => {
                 let served = reply.get("digest")?.as_str()?;
                 if served != digest {
@@ -273,8 +367,15 @@ impl ContentResponder {
                     "peer": peer.to_text(),
                 }),
             ),
+            // Answered from a session snapshot, not per request (ADR-0020), so it never
+            // reaches here.
+            Request::SharedWithMe { .. } => return None,
         };
+        self.call_store(method, params)
+    }
 
+    /// One guarded call to `otwono-stored`, with the token retry every path here needs.
+    fn call_store(&self, method: &str, params: serde_json::Value) -> Option<serde_json::Value> {
         let mut token = self.token()?;
         for attempt in 0..2 {
             let mut client = Client::connect(&self.store_socket).ok()?;
@@ -397,6 +498,84 @@ pub struct FetchedObject {
     pub sharing: Option<SharedEnvelope>,
     pub bytes: Vec<u8>,
 }
+
+/// Ask one peer what it has sealed to this node (ADR-0020).
+///
+/// Pages until the peer stops offering, so the caller gets the whole answer or the failure
+/// that stopped it. Bounded twice over: by what the link will carry in one reply, and by a
+/// ceiling on the total, because a peer that answered forever would otherwise be a way to
+/// make this node allocate forever.
+///
+/// An empty answer is not an error. It means either that nothing has been sealed to this
+/// node or that the peer will not say — deliberately indistinguishable, so that asking is
+/// not a way to learn whether a node shares with anyone (ADR-0020).
+pub fn fetch_shared_index<L: LinkAdapter>(
+    channel: &mut SecureChannel<L>,
+    link: &LinkProperties,
+) -> Result<Vec<SharedIndexEntry>, ProtocolError> {
+    let window = content::max_shared_entries_per_page(link);
+    let mut all: Vec<SharedIndexEntry> = Vec::new();
+    let mut budget = MAX_ROUND_TRIPS;
+
+    loop {
+        let after = all.last().map(|e| e.content_id.clone());
+        let page = match round_trip(
+            channel,
+            &Request::SharedWithMe {
+                after,
+                max_entries: window,
+            },
+            &mut budget,
+        )? {
+            Response::SharedWithYou(p) => p,
+            Response::NotAvailable { .. } => return Ok(all),
+            Response::Manifest(_) | Response::Chunk(_) => {
+                return Err(ProtocolError::Mismatched(
+                    "content in place of an index page".into(),
+                ))
+            }
+        };
+        if page.entries.is_empty() {
+            return Ok(all);
+        }
+        if page.entries.len() > window as usize {
+            return Err(ProtocolError::TooLarge {
+                field: "entries",
+                asked: page.entries.len() as u64,
+                ceiling: window as u64,
+            });
+        }
+        for entry in &page.entries {
+            if !content::is_hex_digest(&entry.content_id) {
+                return Err(ProtocolError::NotHex { field: "content_id" });
+            }
+        }
+        // A peer that keeps sending the same ids would page forever. Ids are ordered, so
+        // anything not strictly after the last one this node holds is a peer that is not
+        // making progress -- which is the same judgement `fetch_manifest` makes about a
+        // window that adds nothing.
+        if let Some(last) = all.last() {
+            if page.entries[0].content_id <= last.content_id {
+                return Err(ProtocolError::NoProgress);
+            }
+        }
+        all.extend(page.entries.iter().cloned());
+        if all.len() > MAX_SHARED_INDEX_ENTRIES {
+            return Err(ProtocolError::TooLarge {
+                field: "entries",
+                asked: all.len() as u64,
+                ceiling: MAX_SHARED_INDEX_ENTRIES as u64,
+            });
+        }
+    }
+}
+
+/// Ceiling on how much of one peer's index this node will assemble.
+///
+/// A peer answering forever is a peer making this node allocate forever. Sixteen thousand
+/// objects sealed to one node is far past any household, and a recipient that genuinely has
+/// more can page again after fetching what it has.
+pub const MAX_SHARED_INDEX_ENTRIES: usize = 16_384;
 
 /// Fetch one object from a peer over an established channel.
 ///
@@ -524,6 +703,11 @@ fn fetch_manifest<L: LinkAdapter>(
             Response::Chunk(_) => {
                 return Err(ProtocolError::Mismatched("a chunk in place of a manifest".into()))
             }
+            Response::SharedWithYou(_) => {
+                return Err(ProtocolError::Mismatched(
+                    "an index page in place of a manifest".into(),
+                ))
+            }
         };
 
         if page.content_id != content_id {
@@ -641,6 +825,11 @@ fn fetch_chunk<L: LinkAdapter>(
             Response::NotAvailable { .. } => return Err(ProtocolError::NotAvailable(content_id.to_string())),
             Response::Manifest(_) => {
                 return Err(ProtocolError::Mismatched("a manifest in place of a chunk".into()))
+            }
+            Response::SharedWithYou(_) => {
+                return Err(ProtocolError::Mismatched(
+                    "an index page in place of a chunk".into(),
+                ))
             }
         };
 

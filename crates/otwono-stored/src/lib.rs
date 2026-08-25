@@ -46,6 +46,13 @@ pub const CAPABILITY_READ: &str = "store.read";
 pub const CAPABILITY_WRITE: &str = "store.write";
 pub const CAPABILITY_SERVE: &str = "store.serve";
 pub const CAPABILITY_SHARE: &str = "store.share";
+
+/// Ceiling on one `store.shared_with` reply.
+///
+/// The scan behind it is over every object either way (ADR-0020), so this bounds the *reply*
+/// rather than the work: a page has to fit one control-plane line, and a recipient with
+/// thousands of objects pages rather than being handed a megabyte of ids.
+pub const MAX_SHARED_ENTRIES: usize = 256;
 /// The capability `otwono-idd` requires to unwrap a content key, named here because
 /// `store.open_shared` is guarded by the *same* one and forwards the caller's token.
 ///
@@ -238,6 +245,20 @@ struct AcceptSharedParams {
     nonce_prefix: String,
     plaintext_size_bytes: u64,
     sealed_key: otwono_identity::SealedKey,
+}
+
+/// What has this node sealed to one peer (ADR-0020)?
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SharedWithParams {
+    /// The peer asking, as `otwono-netd` authenticated it. Not optional, and there is no
+    /// anonymous form: "what have you sealed to nobody" is not a question.
+    peer: String,
+    /// Continue after this content id. Absent starts at the beginning.
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default)]
+    max_entries: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -846,6 +867,46 @@ impl StoreService {
     /// The label is checked **before** the store is consulted, so that "you may not have
     /// this" and "this is not here" are the same answer and take the same path. A peer
     /// learns nothing about what this node holds by asking.
+    /// Answer "what have you sealed to me?" for one peer (ADR-0020).
+    ///
+    /// Out of this node's own store only, never the cache: a cached object came from
+    /// somewhere else, and `Shared` is not cacheable in the first place.
+    ///
+    /// A peer with nothing gets an empty list, and so does a peer this node has never shared
+    /// with — the same answer, so asking cannot distinguish "nothing for you" from "nothing
+    /// for anybody". That is the discipline `not_available` already applies to one object,
+    /// applied to the question of whether there are any.
+    fn handle_shared_with(&self, params: Value) -> Result<Value, RpcError> {
+        let p: SharedWithParams = serde_json::from_value(params)
+            .map_err(|e| RpcError::invalid_params(format!("store.shared_with: {e}")))?;
+        let after = match &p.after {
+            Some(raw) => Some(Self::parse_id(raw)?),
+            None => None,
+        };
+        let limit = p
+            .max_entries
+            .unwrap_or(MAX_SHARED_ENTRIES)
+            .min(MAX_SHARED_ENTRIES);
+        if limit == 0 {
+            return Err(RpcError::invalid_params("max_entries must be greater than zero"));
+        }
+        let entries = self
+            .store
+            .shared_with(&p.peer, after.as_ref(), limit)
+            .map_err(rpc)?;
+        Ok(json!({
+            "schema_version": DESCRIBE_SCHEMA_VERSION,
+            "peer": p.peer,
+            "entries": entries
+                .iter()
+                .map(|e| json!({
+                    "content_id": e.content_id.to_hex(),
+                    "plaintext_size_bytes": e.plaintext_size_bytes,
+                }))
+                .collect::<Vec<_>>(),
+        }))
+    }
+
     fn handle_serve(&self, params: Value) -> Result<Value, RpcError> {
         let p: ServeParams = serde_json::from_value(params)
             .map_err(|e| RpcError::invalid_params(format!("store.serve: {e}")))?;
@@ -1173,6 +1234,11 @@ impl Service for StoreService {
                     CAPABILITY_SERVE,
                 ),
                 MethodDescription::guarded(
+                    "store.shared_with",
+                    "List what this node has sealed to one peer, and nothing else",
+                    CAPABILITY_SERVE,
+                ),
+                MethodDescription::guarded(
                     "store.serve_manifest",
                     "One window of a servable object's chunk list, for a peer",
                     CAPABILITY_SERVE,
@@ -1238,6 +1304,14 @@ impl Service for StoreService {
             "store.demote" => {
                 self.authorize(ctx, CAPABILITY_WRITE)?;
                 self.handle_demote(params)
+            }
+            // store.serve, not a capability of its own. It is the same decision -- may this
+            // daemon hand things to peers -- and every id in the reply is one the asking
+            // peer could already fetch with this very capability. A separate one would also
+            // mean otwono-netd carrying two tokens for one conversation (ADR-0019 §4).
+            "store.shared_with" => {
+                self.authorize(ctx, CAPABILITY_SERVE)?;
+                self.handle_shared_with(params)
             }
             "store.serve" => {
                 self.authorize(ctx, CAPABILITY_SERVE)?;

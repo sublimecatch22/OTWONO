@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://otwono.org/schemas/onm-content-1.1.0.json",
+  "$id": "https://otwono.org/schemas/onm-content-1.2.0.json",
   "title": "OTWONO ONM Content-Fetch Protocol",
   "description": "The messages two nodes exchange to move content over an authenticated ONM channel (ADR-0017). Every message travels inside one Noise transport frame after the Hello exchange, so every one is bounded: a requester asks for a range, a responder may answer with less, and the requester loops. There is exactly one error shape \u2014 absent, private, shared, damaged, and not-part-of-that-object all produce not_available, because any finer answer tells a stranger what this node holds. A chunk request names the object the chunk belongs to; a bare digest would be a probe against a content-addressed store.",
   "oneOf": [
@@ -28,6 +28,9 @@
         },
         {
           "$ref": "#/$defs/chunk_request"
+        },
+        {
+          "$ref": "#/$defs/shared_index_request"
         }
       ]
     },
@@ -111,6 +114,9 @@
         },
         {
           "$ref": "#/$defs/not_available"
+        },
+        {
+          "$ref": "#/$defs/shared_index_response"
         }
       ]
     },
@@ -295,6 +301,68 @@
               "description": "Base64 ciphertext of the 32-byte content key."
             }
           }
+        }
+      }
+    },
+    "shared_index_request": {
+      "type": "object",
+      "description": "What has this node sealed to me? (ADR-0020). THERE IS NO FIELD NAMING THE ASKER, and there must never be one: the asker is the NodeID the Noise handshake authenticated. A peer that could ask on somebody else's behalf would be enumerating the recipient graph, which is a different and much worse question than this one.",
+      "required": [
+        "method",
+        "max_entries"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "method": {
+          "const": "content.shared_with_me"
+        },
+        "after": {
+          "$ref": "#/$defs/digest",
+          "description": "Continue strictly after this content id. Absent starts at the beginning. Entries are ordered by content id, which is deterministic and needs no timestamp \u2014 sharing time is metadata this system does not record and a recipient has not asked for."
+        },
+        "max_entries": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256
+        }
+      }
+    },
+    "shared_index_response": {
+      "type": "object",
+      "description": "A page of what this node has sealed to the asking peer. An empty page from a node that has sealed nothing to this peer is identical to an empty page from a node that shares with nobody, and identical to a refusal \u2014 deliberately, so that asking is not a way to find out whether a node shares at all. Every id here is one the asker could already fetch, with a key it can already open, so the page reveals no id it was not already entitled to.",
+      "required": [
+        "reply",
+        "entries"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "reply": {
+          "const": "shared_with_you"
+        },
+        "entries": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/shared_index_entry"
+          }
+        }
+      }
+    },
+    "shared_index_entry": {
+      "type": "object",
+      "required": [
+        "content_id",
+        "plaintext_size_bytes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "content_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "plaintext_size_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "What the object becomes once opened, so a recipient can decide whether to fetch now. The manifest's size_bytes measures ciphertext and is a larger, different number."
         }
       }
     }

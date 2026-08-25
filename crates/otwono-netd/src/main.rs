@@ -34,6 +34,8 @@ OPTIONS:
     --peer-binding <PATH>  Write the first connected peer's sharing binding to PATH, so
                            something can seal to it (ADR-0019). Exits non-zero if no
                            connected peer has published one.
+    --shared-with-me       Ask every connected peer what it has sealed to this node, print
+                           one content id and plaintext size per line, then exit (ADR-0020)
     --fetch <CONTENT_ID>   Fetch one object from every connected peer, then exit
     --to-file              Write the fetched object to a file instead of returning its
                            bytes. Required above the control-plane's inline cap (ADR-0018).
@@ -93,6 +95,7 @@ fn run(args: &[String]) -> Result<String, Error> {
     let mut discovery_enabled = true;
     let mut status_only = false;
     let mut peers_only = false;
+    let mut shared_with_me = false;
     let mut peer_binding: Option<PathBuf> = None;
     let mut fetch_id: Option<String> = None;
     let mut fetch_to_file = false;
@@ -112,6 +115,7 @@ fn run(args: &[String]) -> Result<String, Error> {
             "--no-discovery" => discovery_enabled = false,
             "--status" => status_only = true,
             "--peers" => peers_only = true,
+            "--shared-with-me" => shared_with_me = true,
             "--peer-binding" => peer_binding = Some(next(&mut it, "--peer-binding")?.into()),
             "--fetch" => fetch_id = Some(next(&mut it, "--fetch")?),
             "--to-file" => fetch_to_file = true,
@@ -166,6 +170,12 @@ fn run(args: &[String]) -> Result<String, Error> {
         let socket = socket.unwrap_or_else(|| otwono_proto::socket_path("net"));
         let perm_socket = perm_socket.unwrap_or_else(|| otwono_proto::socket_path("perm"));
         return peer_report(&socket, &perm_socket);
+    }
+
+    if shared_with_me {
+        let socket = socket.unwrap_or_else(|| otwono_proto::socket_path("net"));
+        let perm_socket = perm_socket.unwrap_or_else(|| otwono_proto::socket_path("perm"));
+        return shared_index_report(&socket, &perm_socket);
     }
 
     if let Some(path) = peer_binding {
@@ -381,6 +391,75 @@ fn fetch_from_a_peer(
 }
 
 /// Print one line per known peer: state, address, and the last failure if there was one.
+/// Ask every connected peer what it has sealed to this node (ADR-0020).
+///
+/// Every peer, not the first: what a recipient wants is everything that is theirs, and which
+/// neighbour happens to hold a given object is not something it can know in advance. Output
+/// is one `<content_id> <plaintext_bytes> <peer>` per line, which is what a shell script can
+/// read and what a person can skim.
+///
+/// A peer that answers nothing contributes nothing and is not an error: "nothing for you"
+/// and "nothing for anybody" are the same answer by design, so there is no failure here to
+/// report.
+fn shared_index_report(socket: &std::path::Path, perm_socket: &std::path::Path) -> Result<String, Error> {
+    let peers = peer_table(socket, perm_socket, "otwono-netd --shared-with-me")?;
+    let connected: Vec<&serde_json::Value> = peers
+        .iter()
+        .filter(|p| p.get("state").and_then(|s| s.as_str()) == Some("connected"))
+        .collect();
+    if connected.is_empty() {
+        return Ok("no connected peers\n".to_string());
+    }
+
+    let token = request_token(perm_socket, "net.content", "otwono-netd --shared-with-me")?;
+    let mut client = otwono_proto::Client::connect_waiting(socket, std::time::Duration::from_secs(5))
+        .map_err(|e| Error::Startup(format!("cannot reach otwono-netd at {}: {e}", socket.display())))?;
+
+    let mut out = String::new();
+    for peer in connected {
+        let Some(node_id) = peer.get("node_id").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        let Some(address) = peer
+            .get("addresses")
+            .and_then(|a| a.as_array())
+            .and_then(|a| a.first())
+            .and_then(|a| a.as_str())
+        else {
+            continue;
+        };
+        let reply = client
+            .call_with_capability(
+                "net.shared_with_me",
+                serde_json::json!({ "node_id": node_id, "address": address }),
+                &token,
+            )
+            .map_err(|e| Error::Startup(format!("net.shared_with_me transport failure: {e}")))?;
+        // One unreachable peer must not lose the answers from the others.
+        let Ok(reply) = reply else { continue };
+        for entry in reply
+            .get("entries")
+            .and_then(|e| e.as_array())
+            .cloned()
+            .unwrap_or_default()
+        {
+            out.push_str(&format!(
+                "{} {} {}\n",
+                entry.get("content_id").and_then(|v| v.as_str()).unwrap_or("?"),
+                entry
+                    .get("plaintext_size_bytes")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                node_id
+            ));
+        }
+    }
+    if out.is_empty() {
+        out.push_str("nothing has been shared with this node\n");
+    }
+    Ok(out)
+}
+
 /// Write the first connected peer's sharing binding out, so something can seal to it.
 ///
 /// The peer is chosen here rather than named by the caller, for the reason `--fetch` does
@@ -419,12 +498,8 @@ fn write_peer_binding(
     ))
 }
 
-/// Ask a running daemon for its peer table.
-fn peer_table(
-    socket: &std::path::Path,
-    perm_socket: &std::path::Path,
-    reason: &str,
-) -> Result<Vec<serde_json::Value>, Error> {
+/// Ask the broker for one capability, on this caller's own authority.
+fn request_token(perm_socket: &std::path::Path, action: &str, reason: &str) -> Result<String, Error> {
     let mut broker = otwono_proto::Client::connect_waiting(perm_socket, std::time::Duration::from_secs(5))
         .map_err(|e| {
             Error::Startup(format!(
@@ -432,19 +507,26 @@ fn peer_table(
                 perm_socket.display()
             ))
         })?;
-    let token = broker
+    broker
         .call(
             "perm.request",
-            serde_json::json!({ "action": "net.read", "reason": reason }),
+            serde_json::json!({ "action": action, "reason": reason }),
         )
         .map_err(|e| Error::Startup(format!("perm.request transport failure: {e}")))?
-        .map_err(|e| Error::Startup(format!("perm.request refused: {}", e.message)))?;
-    let token = token
+        .map_err(|e| Error::Startup(format!("perm.request refused: {}", e.message)))?
         .get("token")
         .and_then(|t| t.as_str())
-        .ok_or_else(|| Error::Startup("perm.request returned no token".into()))?
-        .to_string();
+        .map(str::to_string)
+        .ok_or_else(|| Error::Startup("perm.request returned no token".into()))
+}
 
+/// Ask a running daemon for its peer table.
+fn peer_table(
+    socket: &std::path::Path,
+    perm_socket: &std::path::Path,
+    reason: &str,
+) -> Result<Vec<serde_json::Value>, Error> {
+    let token = request_token(perm_socket, "net.read", reason)?;
     let mut client = otwono_proto::Client::connect_waiting(socket, std::time::Duration::from_secs(5))
         .map_err(|e| Error::Startup(format!("cannot reach otwono-netd at {}: {e}", socket.display())))?;
     let value = client

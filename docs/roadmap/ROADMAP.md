@@ -206,12 +206,14 @@ to the one an absent object gets. See `docs/build/VERIFICATION-LOG.md`.
 `REPLICATED` replication policy (item 4), which does not exist and fails closed. That is the
 right way for a feature to be missing but is not the same as being done.
 
-`SHARED` is no longer on that list, but two things about it are worth carrying forward
-rather than declaring finished. It has never passed between two booted nodes — the
-`PRIVATE` case has that evidence and this does not, and on this branch three separate
-defects were things that passed on a host and failed on a machine. And a recipient set
-cannot be changed after the fact, so today sharing with somebody new means sharing the file
-again as a new object.
+`SHARED` is no longer on that list. It has now passed between two booted nodes end to end:
+each seals an object to the other, each asks what it has been sent, and each fetches and
+opens it — with no id passing between the machines by any other route (ADR-0020, which
+settled the discovery gap ADR-0019 did not anticipate).
+
+One thing about it is still worth carrying forward rather than declaring finished: a
+recipient set cannot be changed after the fact, so sharing with somebody new today means
+sharing the file again as a new object, and removing somebody does not exist at all.
 
 ---
 

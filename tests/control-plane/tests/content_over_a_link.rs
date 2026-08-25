@@ -618,6 +618,10 @@ fn a_peer_that_serves_the_wrong_bytes_is_caught() {
             // Always answers, always about the wrong content, always claiming the id it was
             // asked for. Only the digests give it away.
             let response = match request {
+                // This liar shares nothing, so the honest answer is an empty page.
+                Request::SharedWithMe { .. } => {
+                    Response::SharedWithYou(otwono_net::content::SharedIndexPage { entries: Vec::new() })
+                }
                 Request::Manifest { content_id, .. } => {
                     Response::Manifest(otwono_net::content::ManifestPage {
                         content_id,
@@ -798,6 +802,136 @@ fn keeping_bytes_that_are_not_the_object_asked_for_is_refused() {
         .unwrap()
         .expect_err("bytes that are not the object asked for must not be kept under its name");
     assert!(err.message.contains(&id), "{}", err.message);
+}
+
+#[test]
+fn a_recipient_discovers_what_was_shared_with_it_and_fetches_it() {
+    // ADR-0020, and the loop it exists to close. Until now a recipient could be sealed to
+    // and had no way to learn the id, because a SHARED object's id is over ciphertext keyed
+    // by a fresh per-object key -- unlike a PUBLIC object, it cannot be derived from the
+    // content. Nothing here passes an id from one side to the other.
+    let h = Harness::start("discover");
+    let plaintext = b"a document the recipient was never told the name of".repeat(30);
+    let expected = h.share_with_myself(&plaintext);
+
+    let found = h
+        .client
+        .shared_with_me(&h.candidate())
+        .expect("asking must succeed");
+    let ids: Vec<&str> = found.iter().map(|e| e.content_id.as_str()).collect();
+    assert!(ids.contains(&expected.as_str()), "{ids:?}");
+    let entry = found
+        .iter()
+        .find(|e| e.content_id == expected)
+        .expect("just checked");
+    assert_eq!(entry.plaintext_size_bytes, plaintext.len() as u64);
+
+    // And what was discovered can be fetched and opened, with the id having come only from
+    // the peer's own answer.
+    let fetched = h
+        .fetch(&entry.content_id)
+        .expect("what was offered must be servable");
+    let envelope = fetched
+        .sharing
+        .as_ref()
+        .expect("a shared object carries its envelope");
+    let sharing_key = SharingKeystore::new(h.identity_dir()).load().unwrap();
+    let content_key = otwono_store::ContentKey::from_bytes(*sharing_key.open(&envelope.sealed_key).unwrap());
+    let prefix = data_encoding::BASE64
+        .decode(envelope.nonce_prefix.as_bytes())
+        .unwrap();
+    let mut opened = Vec::new();
+    otwono_store::shared::open(
+        &content_key,
+        &otwono_store::shared::decode_prefix(&prefix).unwrap(),
+        fetched.bytes.as_slice(),
+        &mut opened,
+    )
+    .unwrap();
+    assert_eq!(opened, plaintext);
+}
+
+#[test]
+fn the_index_offers_only_what_was_sealed_to_the_asker() {
+    // A node holding public, private, and objects sealed to somebody else must offer none of
+    // them. This is the reply's whole privacy story, so it is checked against a store that
+    // has one of each.
+    let h = Harness::start("indexscope");
+    let mine = h.share_with_myself(b"for the node asking");
+    let public = h.put(b"public bytes", "public");
+    let private = h.put(b"private bytes", "private");
+
+    let (stranger_binding, _) = {
+        let id = otwono_identity::NodeIdentity::from_seeds(&[61u8; 32], &[62u8; 32], 1);
+        let sharing = otwono_identity::SharingKey::from_seed(&[63u8; 32], 1);
+        (id.signing().bind_sharing(&sharing.public()), sharing)
+    };
+    let token = h.token("store.share");
+    let theirs = Client::connect(&h.store_socket)
+        .unwrap()
+        .call_with_capability(
+            "store.share",
+            json!({
+                "data": data_encoding::BASE64.encode(b"for somebody else"),
+                "recipients": [stranger_binding],
+            }),
+            &token,
+        )
+        .unwrap()
+        .unwrap()["content_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let ids: Vec<String> = h
+        .client
+        .shared_with_me(&h.candidate())
+        .unwrap()
+        .into_iter()
+        .map(|e| e.content_id)
+        .collect();
+    assert_eq!(ids, vec![mine], "{ids:?}");
+    assert!(!ids.contains(&public));
+    assert!(!ids.contains(&private));
+    assert!(!ids.contains(&theirs), "the asker was told about somebody else's");
+}
+
+#[test]
+fn a_node_that_has_been_sealed_nothing_gets_the_same_answer_as_one_that_shares_with_nobody() {
+    // "Nothing for you" and "nothing for anybody" must be indistinguishable, or asking
+    // becomes a way to learn whether a node shares at all.
+    let sharing_node = Harness::start("indexsome");
+    let (stranger, _) = {
+        let id = otwono_identity::NodeIdentity::from_seeds(&[71u8; 32], &[72u8; 32], 1);
+        let sharing = otwono_identity::SharingKey::from_seed(&[73u8; 32], 1);
+        (id.signing().bind_sharing(&sharing.public()), sharing)
+    };
+    let token = sharing_node.token("store.share");
+    Client::connect(&sharing_node.store_socket)
+        .unwrap()
+        .call_with_capability(
+            "store.share",
+            json!({
+                "data": data_encoding::BASE64.encode(b"for somebody who is not asking"),
+                "recipients": [stranger],
+            }),
+            &token,
+        )
+        .unwrap()
+        .unwrap();
+
+    // This harness's client and server share a signing key, so the asker is a node the
+    // serving side has sealed nothing to.
+    let asked_a_sharer = sharing_node
+        .client
+        .shared_with_me(&sharing_node.candidate())
+        .unwrap();
+
+    let quiet_node = Harness::start("indexnone");
+    let asked_a_non_sharer = quiet_node.client.shared_with_me(&quiet_node.candidate()).unwrap();
+
+    assert_eq!(asked_a_sharer, vec![]);
+    assert_eq!(asked_a_sharer, asked_a_non_sharer);
 }
 
 #[test]

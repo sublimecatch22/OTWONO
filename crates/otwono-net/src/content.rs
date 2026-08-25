@@ -86,6 +86,19 @@ pub enum Request {
         /// How many chunks the requester can receive in one reply.
         max_chunks: u32,
     },
+    /// What has this node sealed to me? (ADR-0020)
+    ///
+    /// There is no field naming the asker. It is the NodeID the handshake authenticated, and
+    /// a peer that could ask on somebody else's behalf would be asking a different and much
+    /// worse question — an enumeration oracle for the whole recipient graph.
+    #[serde(rename = "content.shared_with_me")]
+    SharedWithMe {
+        /// Continue after this content id. Absent starts at the beginning.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+        /// How many entries the requester can receive in one reply.
+        max_entries: u32,
+    },
     /// One range of one chunk of one object.
     #[serde(rename = "content.chunk")]
     Chunk {
@@ -158,6 +171,50 @@ impl ManifestPage {
     }
 }
 
+/// One object a peer may ask for, in the answer to "what have you sealed to me?".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedIndexEntry {
+    pub content_id: String,
+    /// What the object becomes once opened, so a recipient can decide whether to fetch now.
+    /// The manifest's `size_bytes` measures ciphertext and is a different number.
+    pub plaintext_size_bytes: u64,
+}
+
+/// A page of what one node has sealed to the peer asking (ADR-0020).
+///
+/// Ordered by content id, so paging is stable and needs no timestamp — sharing time is
+/// metadata this system does not record and a recipient has not asked for.
+///
+/// An empty page from a node that has sealed nothing to this peer is identical to an empty
+/// page from a node that shares with nobody. That is deliberate: asking must not be a way to
+/// find out whether a node shares at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedIndexPage {
+    pub entries: Vec<SharedIndexEntry>,
+}
+
+/// Ceiling on one index page, whatever the link would allow. A responder builds the page in
+/// memory, so an unbounded request is an allocation a peer chooses.
+pub const MAX_SHARED_ENTRIES_PER_REQUEST: u32 = 256;
+
+/// Bytes of JSON one [`SharedIndexEntry`] costs: 64 hex characters, the field names, a size
+/// and the punctuation. Measured at 125 for the widest possible size;
+/// `shared_entry_fits_estimate` pins it. Being wrong here means an over-long frame, so it
+/// rounds up — and the first guess here was 124, which the measurement rejected by one byte.
+const SHARED_ENTRY_JSON_BYTES: usize = 132;
+
+/// Room for an index reply's envelope with no entries. Measured at 44.
+pub const SHARED_INDEX_ENVELOPE_RESERVE: usize = 64;
+
+/// How many index entries fit in one reply on this link.
+pub fn max_shared_entries_per_page(link: &LinkProperties) -> u32 {
+    let body = plaintext_budget(link).saturating_sub(SHARED_INDEX_ENVELOPE_RESERVE);
+    let n = body / SHARED_ENTRY_JSON_BYTES;
+    n.clamp(1, MAX_SHARED_ENTRIES_PER_REQUEST as usize) as u32
+}
+
 /// What a recipient needs to open a `SHARED` object it has fetched (ADR-0019).
 ///
 /// **Only the asking peer's own copy of the content key travels.** A recipient learns that
@@ -199,6 +256,8 @@ pub enum Response {
     Manifest(ManifestPage),
     #[serde(rename = "chunk")]
     Chunk(ChunkPart),
+    #[serde(rename = "shared_with_you")]
+    SharedWithYou(SharedIndexPage),
     /// Absent, refused, damaged, or not part of that object. One answer for all of them.
     #[serde(rename = "not_available")]
     NotAvailable { content_id: String },
@@ -290,17 +349,27 @@ pub fn is_hex_digest(s: &str) -> bool {
 }
 
 impl Request {
-    /// The content id this request is about, whatever its shape.
-    pub fn content_id(&self) -> &str {
+    /// The content id this request is about, when it is about one.
+    ///
+    /// `None` for [`Request::SharedWithMe`], which asks *which* objects rather than about a
+    /// named one. An `Option` rather than an empty string because the difference decides how
+    /// a refusal is shaped: a request about an object is refused with `not_available` naming
+    /// that object, and one that asks which objects is refused with an **empty page** — the
+    /// same answer a peer with nothing gets, so asking cannot distinguish the two
+    /// (ADR-0020).
+    pub fn content_id(&self) -> Option<&str> {
         match self {
-            Request::Manifest { content_id, .. } | Request::Chunk { content_id, .. } => content_id,
+            Request::Manifest { content_id, .. } | Request::Chunk { content_id, .. } => Some(content_id),
+            Request::SharedWithMe { .. } => None,
         }
     }
 
     /// Check a request from the wire before acting on any part of it.
     pub fn validate(&self) -> Result<(), ProtocolError> {
-        if !is_hex_digest(self.content_id()) {
-            return Err(ProtocolError::NotHex { field: "content_id" });
+        if let Some(id) = self.content_id() {
+            if !is_hex_digest(id) {
+                return Err(ProtocolError::NotHex { field: "content_id" });
+            }
         }
         match self {
             Request::Manifest { max_chunks, .. } => {
@@ -329,6 +398,23 @@ impl Request {
                         field: "max_bytes",
                         asked: *max_bytes as u64,
                         ceiling: MAX_CHUNK_BYTES as u64,
+                    });
+                }
+            }
+            Request::SharedWithMe { after, max_entries } => {
+                if let Some(after) = after {
+                    if !is_hex_digest(after) {
+                        return Err(ProtocolError::NotHex { field: "after" });
+                    }
+                }
+                if *max_entries == 0 {
+                    return Err(ProtocolError::ZeroLength { field: "max_entries" });
+                }
+                if *max_entries > MAX_SHARED_ENTRIES_PER_REQUEST {
+                    return Err(ProtocolError::TooLarge {
+                        field: "max_entries",
+                        asked: *max_entries as u64,
+                        ceiling: MAX_SHARED_ENTRIES_PER_REQUEST as u64,
                     });
                 }
             }
@@ -677,6 +763,100 @@ mod tests {
                 "the {name} envelope is {len} bytes, over the {reserve} reserved"
             );
         }
+    }
+
+    #[test]
+    fn shared_entry_fits_estimate() {
+        // The same discipline as chunk_entry_fits_estimate: if an entry ever grows past what
+        // the page arithmetic assumes, a reply sized by that arithmetic is over-long and the
+        // link refuses it.
+        let entry = SharedIndexEntry {
+            content_id: id(0xff),
+            plaintext_size_bytes: u64::MAX,
+        };
+        let len = serde_json::to_vec(&entry).unwrap().len();
+        assert!(
+            len <= SHARED_ENTRY_JSON_BYTES,
+            "a shared index entry is {len} bytes, over the {SHARED_ENTRY_JSON_BYTES} assumed"
+        );
+
+        let empty = encode(&Response::SharedWithYou(SharedIndexPage { entries: vec![] }))
+            .unwrap()
+            .len();
+        assert!(
+            empty <= SHARED_INDEX_ENVELOPE_RESERVE,
+            "the index envelope is {empty} bytes, over the {SHARED_INDEX_ENVELOPE_RESERVE} reserved"
+        );
+    }
+
+    #[test]
+    fn an_index_page_sized_for_a_link_fits_it() {
+        let link = LinkProperties::internet();
+        let n = max_shared_entries_per_page(&link) as usize;
+        let reply = Response::SharedWithYou(SharedIndexPage {
+            entries: vec![
+                SharedIndexEntry {
+                    content_id: id(0xff),
+                    plaintext_size_bytes: u64::MAX,
+                };
+                n
+            ],
+        });
+        let len = encode(&reply).unwrap().len() + NOISE_TAG_BYTES;
+        let bears = link.bandwidth_class.max_reasonable_payload();
+        assert!(
+            len <= bears,
+            "a page sized for this link is {len} bytes and the link bears {bears}"
+        );
+    }
+
+    #[test]
+    fn an_index_request_names_nobody() {
+        // The property the whole design rests on: a peer cannot ask what somebody *else* has
+        // been sent. If a field for it ever appears, this fails.
+        let request = Request::SharedWithMe {
+            after: None,
+            max_entries: 10,
+        };
+        let json = String::from_utf8(encode(&request).unwrap()).unwrap();
+        assert!(!json.contains("peer"), "{json}");
+        assert!(!json.contains("node_id"), "{json}");
+        assert!(!json.contains("recipient"), "{json}");
+        assert_eq!(request.content_id(), None, "it is not about one object");
+    }
+
+    #[test]
+    fn an_index_request_is_bounded_like_every_other() {
+        assert!(matches!(
+            Request::SharedWithMe {
+                after: None,
+                max_entries: 0
+            }
+            .validate(),
+            Err(ProtocolError::ZeroLength { .. })
+        ));
+        assert!(matches!(
+            Request::SharedWithMe {
+                after: None,
+                max_entries: MAX_SHARED_ENTRIES_PER_REQUEST + 1
+            }
+            .validate(),
+            Err(ProtocolError::TooLarge { .. })
+        ));
+        assert!(matches!(
+            Request::SharedWithMe {
+                after: Some("not a digest".into()),
+                max_entries: 10
+            }
+            .validate(),
+            Err(ProtocolError::NotHex { field: "after" })
+        ));
+        assert!(Request::SharedWithMe {
+            after: Some(id(3)),
+            max_entries: 10
+        }
+        .validate()
+        .is_ok());
     }
 
     #[test]
