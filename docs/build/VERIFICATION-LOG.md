@@ -3763,6 +3763,29 @@ Two, both found by breaking the code on purpose rather than by reading it.
   want of a person. Clearing `always_confirm` on `wallet.create` fails both this and the
   registry test, which is the defence in depth working.
 
+And a third, which the other two did not have in common: **a test that was flaky by
+construction, and only CI found it.**
+
+`status_describes_the_vault_and_never_anything_secret` asserted that no individual recovery
+word appeared anywhere in `wallet.status`'s reply. The reply's own prose contains **19
+BIP-39 words** — *address, public, key, this, use, because, one, will, pass, phrase* among
+them — so a random 24-word phrase collides with one of them **one run in five**. Measured
+against the wordlist rather than estimated: 19 of 2048, p(at least one of 24) = 0.20. It
+passed locally several times and went red on its first CI run.
+`debug_never_prints_the_words` had the same flaw at 2.3%: "redacted" contains *act*, "words"
+contains *word*.
+
+The replacement is deterministic **and** stronger, which is the part worth taking away.
+Per-word substring matching could never catch a *new* field leaking something; a field
+allow-list does, in the same shape the audit record already uses. The secrets are still
+checked, by whole phrase and by three-word windows — three consecutive BIP-39 words
+occurring in prose by chance is not a thing that happens. Thirty consecutive runs are clean;
+at the old rate the probability of that is about 0.1%.
+
+The lesson is not "write less flaky tests". It is that **a redaction test written as
+substring matching against generated secrets is measuring the wrong thing**, and the version
+that reads as paranoid was the weak one.
+
 ### What is not tested
 
 - **No wallet has been created on a node, and none can be until Phase 7.** `wallet.create`,
