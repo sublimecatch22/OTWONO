@@ -298,6 +298,15 @@ impl Store {
                 to,
             });
         }
+        // Relabelling cannot turn plaintext into a shared object: its bytes would have to
+        // be sealed and its chunks are not. Saying so here rather than letting put_object
+        // reject the record is the difference between an explanation and an arithmetic
+        // complaint (ADR-0019 §1).
+        if to == crate::Visibility::Shared && object.sharing.is_none() {
+            return Err(StoreError::Object(
+                crate::object::ObjectError::SharedWithoutAnEnvelope,
+            ));
+        }
         object.visibility = to;
         self.put_object(&object)?;
         Ok(object)
@@ -350,7 +359,18 @@ impl Store {
             labels.push(self.get_object(id)?.visibility);
         }
         let visibility = crate::Visibility::most_restrictive(labels);
+        let refs = self.chunk_from_reader(reader)?;
+        let object = Object::new(&refs, visibility);
+        self.put_object(&object)?;
+        Ok(object)
+    }
 
+    /// Chunk a reader into the store, returning the chunk list and writing no record.
+    ///
+    /// Separate from [`put_reader`](Self::put_reader) because the `SHARED` path cannot
+    /// write its record until the envelope exists, and writing a record without one would
+    /// mean a valid-looking `Shared` object briefly existing that nobody could open.
+    fn chunk_from_reader<R: std::io::Read>(&self, reader: R) -> Result<Vec<ChunkRef>, StoreError> {
         self.ensure_layout()?;
         let mut failure = None;
         let refs = crate::chunk::stream(reader, |_, bytes| {
@@ -369,14 +389,126 @@ impl Store {
         if let Some(e) = failure {
             return Err(e);
         }
-        let refs = refs.map_err(|e| StoreError::Io {
+        refs.map_err(|e| StoreError::Io {
             path: self.chunks_dir(),
             reason: e.to_string(),
-        })?;
+        })
+    }
 
-        let object = Object::new(&refs, visibility);
-        self.put_object(&object)?;
-        Ok(object)
+    /// Store an object encrypted to a set of recipients (ADR-0019).
+    ///
+    /// The plaintext is sealed first and the *ciphertext* is chunked, so this object's
+    /// chunk digests and its [`ContentId`] are over bytes nobody without a key can
+    /// interpret. It therefore does not deduplicate against the same file stored any other
+    /// way, and sharing one file with two recipient sets produces two unrelated objects.
+    /// Both follow from the encryption meaning anything.
+    ///
+    /// The ciphertext goes through a temporary file rather than memory. Sealing produces a
+    /// `Write` and chunking consumes a `Read`, and the object may be larger than this
+    /// process — which is the whole reason `store.import` and ADR-0018 exist. One extra
+    /// pass over a disk the store is already on is the cheap way to bridge that; a lazy
+    /// sealing reader would mean a second copy of the frame logic, which is where this
+    /// kind of code goes wrong.
+    ///
+    /// An empty recipient list is refused. An object nobody can open is not a shared
+    /// object, and the person who asked for it would find out much later.
+    pub fn put_shared_reader<R: std::io::Read>(
+        &self,
+        reader: R,
+        recipients: &[Recipient],
+    ) -> Result<(Object, crate::shared::ContentKey), StoreError> {
+        if recipients.is_empty() {
+            return Err(StoreError::Object(crate::object::ObjectError::BadEnvelope(
+                "no recipients, so nobody could open it".to_string(),
+            )));
+        }
+        self.ensure_layout()?;
+        let key = crate::shared::ContentKey::generate();
+        let prefix = crate::shared::nonce_prefix();
+
+        let staging = self.chunks_dir().join(format!(
+            ".sealing-{}-{}.tmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let plaintext_size_bytes = {
+            let file = std::fs::File::create(&staging).map_err(|e| io(&staging, e))?;
+            let mut writer = std::io::BufWriter::new(file);
+            crate::shared::seal(&key, &prefix, reader, &mut writer).map_err(|e| StoreError::Io {
+                path: staging.clone(),
+                reason: e.to_string(),
+            })?
+        };
+
+        let sealed_keys = recipients
+            .iter()
+            .map(|r| otwono_identity::seal_to(&r.node_id, &r.sharing_public_key, key.as_bytes()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| StoreError::Object(crate::object::ObjectError::BadEnvelope(e.to_string())))?;
+
+        let result = (|| {
+            let file = std::fs::File::open(&staging).map_err(|e| io(&staging, e))?;
+            let refs = self.chunk_from_reader(std::io::BufReader::new(file))?;
+            let object = Object::new(&refs, crate::Visibility::Shared);
+            let object = object.with_sharing(crate::object::Sharing {
+                encryption: crate::shared::SHARED_ENCRYPTION.to_string(),
+                nonce_prefix: data_encoding::BASE64.encode(&prefix),
+                plaintext_size_bytes,
+                sealed_keys,
+            });
+            self.put_object(&object)?;
+            Ok(object)
+        })();
+
+        // The staging file is ciphertext, but it is a whole copy of the object and there is
+        // no reason for it to outlive this call — including when the call failed.
+        let _ = std::fs::remove_file(&staging);
+        result.map(|object| (object, key))
+    }
+
+    /// Reassemble a sealed object and open it, a frame at a time.
+    ///
+    /// Verifies each chunk against its digest on the way through, as every read does, and
+    /// then authenticates each frame. A truncated or reordered object fails rather than
+    /// yielding a shorter one.
+    pub fn open_shared<W: std::io::Write>(
+        &self,
+        object: &Object,
+        key: &crate::shared::ContentKey,
+        out: W,
+    ) -> Result<u64, StoreError> {
+        let sharing =
+            object
+                .sharing
+                .as_ref()
+                .ok_or(StoreError::Object(crate::object::ObjectError::BadEnvelope(
+                    "this object is not sealed".to_string(),
+                )))?;
+        sharing.validate().map_err(StoreError::Object)?;
+        let prefix = data_encoding::BASE64
+            .decode(sharing.nonce_prefix.as_bytes())
+            .ok()
+            .and_then(|b| crate::shared::decode_prefix(&b).ok())
+            .ok_or(StoreError::Object(crate::object::ObjectError::BadEnvelope(
+                "the nonce prefix is not usable".to_string(),
+            )))?;
+
+        let mut failure = None;
+        let reader = ChunkReader::new(self, object, &mut failure);
+        let written = crate::shared::open(key, &prefix, reader, out);
+        // A store failure surfaced through the reader arrives as an io::Error inside
+        // SharedError; carrying it out separately keeps "a chunk is missing" from being
+        // reported as "this did not decrypt", which are very different things to a user.
+        if let Some(e) = failure {
+            return Err(e);
+        }
+        written.map_err(|e| StoreError::Io {
+            path: self.chunks_dir(),
+            reason: e.to_string(),
+        })
     }
 
     /// Chunk and store bytes, returning the record.
@@ -391,6 +523,71 @@ impl Store {
         let object = Object::new(&refs, visibility);
         self.put_object(&object)?;
         Ok(object)
+    }
+}
+
+/// Who a `SHARED` object is sealed for.
+///
+/// The key is the caller's responsibility to have *verified* — it comes from a peer's
+/// signed `SharingBinding`, not from an unsigned field. Taking bytes here rather than a
+/// binding keeps the store out of the business of checking signatures, which belongs to the
+/// identity crate and to the daemon that fetched the binding.
+#[derive(Debug, Clone)]
+pub struct Recipient {
+    /// NodeID in text form, exactly as it will appear in the sealed key.
+    pub node_id: String,
+    pub sharing_public_key: [u8; 32],
+}
+
+/// Reads an object's chunks in order, as one stream.
+///
+/// Exists so a sealed object can be opened a frame at a time instead of being reassembled
+/// in memory first — the same reason `put_shared_reader` streams.
+struct ChunkReader<'a> {
+    store: &'a Store,
+    chunks: std::vec::IntoIter<ChunkRef>,
+    current: Vec<u8>,
+    offset: usize,
+    failure: &'a mut Option<StoreError>,
+}
+
+impl<'a> ChunkReader<'a> {
+    fn new(store: &'a Store, object: &Object, failure: &'a mut Option<StoreError>) -> ChunkReader<'a> {
+        ChunkReader {
+            store,
+            chunks: object.chunk_refs().into_iter(),
+            current: Vec::new(),
+            offset: 0,
+            failure,
+        }
+    }
+}
+
+impl std::io::Read for ChunkReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        while self.offset == self.current.len() {
+            let Some(next) = self.chunks.next() else {
+                return Ok(0);
+            };
+            match self.store.get_chunk(&next) {
+                Ok(bytes) => {
+                    self.current = bytes;
+                    self.offset = 0;
+                }
+                Err(e) => {
+                    // Reported as an io::Error so the caller's loop unwinds, and carried
+                    // out through `failure` so it can be told apart from a decryption
+                    // failure by whoever asked.
+                    let message = e.to_string();
+                    *self.failure = Some(e);
+                    return Err(std::io::Error::other(message));
+                }
+            }
+        }
+        let n = (self.current.len() - self.offset).min(buf.len());
+        buf[..n].copy_from_slice(&self.current[self.offset..self.offset + n]);
+        self.offset += n;
+        Ok(n)
     }
 }
 
@@ -509,14 +706,215 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// A recipient with a real sharing key, and the key itself so a test can open.
+    fn recipient(name: &str, seed: u8) -> (Recipient, otwono_identity::SharingKey) {
+        let key = otwono_identity::SharingKey::from_seed(&[seed; 32], 1_700_000_000_000);
+        (
+            Recipient {
+                node_id: name.to_string(),
+                sharing_public_key: key.public(),
+            },
+            key,
+        )
+    }
+
+    #[test]
+    fn a_shared_object_round_trips_through_a_recipients_key() {
+        // The whole path: seal, chunk the ciphertext, store, then unwrap one recipient's
+        // copy and open it back to the original bytes.
+        let d = tmp("shared-round");
+        let s = Store::new(&d);
+        let plaintext = data(300_000, 71);
+        let (alice, alice_key) = recipient("otw1alice", 1);
+
+        let (object, _) = s
+            .put_shared_reader(plaintext.as_slice(), &[alice])
+            .expect("put_shared_reader");
+        assert_eq!(object.visibility, Visibility::Shared);
+        let sharing = object.sharing.as_ref().expect("a shared object has an envelope");
+        assert_eq!(sharing.plaintext_size_bytes, plaintext.len() as u64);
+
+        let sealed_copy = sharing.copy_for("otw1alice").expect("alice has a copy");
+        let content_key = crate::shared::ContentKey::from_bytes(*alice_key.open(sealed_copy).unwrap());
+
+        let mut opened = Vec::new();
+        let written = s.open_shared(&object, &content_key, &mut opened).unwrap();
+        assert_eq!(written, plaintext.len() as u64);
+        assert_eq!(opened, plaintext);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn every_recipient_gets_their_own_copy_and_nobody_elses_opens() {
+        let d = tmp("shared-many");
+        let s = Store::new(&d);
+        let plaintext = data(80_000, 72);
+        let (alice, alice_key) = recipient("otw1alice", 2);
+        let (bob, bob_key) = recipient("otw1bob", 3);
+        let (_, stranger_key) = recipient("otw1stranger", 4);
+
+        let (object, _) = s.put_shared_reader(plaintext.as_slice(), &[alice, bob]).unwrap();
+        let sharing = object.sharing.as_ref().unwrap();
+        assert_eq!(sharing.authorized_nodes(), vec!["otw1alice", "otw1bob"]);
+        assert!(sharing.names("otw1bob"));
+        assert!(!sharing.names("otw1stranger"));
+
+        for key in [&alice_key, &bob_key] {
+            let copy = sharing.copy_for(&recipient_name(key, sharing)).unwrap();
+            let content_key = crate::shared::ContentKey::from_bytes(*key.open(copy).unwrap());
+            let mut opened = Vec::new();
+            s.open_shared(&object, &content_key, &mut opened).unwrap();
+            assert_eq!(opened, plaintext);
+        }
+
+        // A stranger holds no copy at all, and neither copy opens with their key.
+        assert!(sharing.copy_for("otw1stranger").is_none());
+        for copy in &sharing.sealed_keys {
+            assert!(stranger_key.open(copy).is_err(), "{copy:?}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Which of the envelope's copies belongs to this key, found by trying to open them.
+    fn recipient_name(key: &otwono_identity::SharingKey, sharing: &crate::object::Sharing) -> String {
+        sharing
+            .sealed_keys
+            .iter()
+            .find(|c| key.open(c).is_ok())
+            .expect("one of these must be theirs")
+            .recipient
+            .clone()
+    }
+
+    #[test]
+    fn the_stored_chunks_are_ciphertext() {
+        // If this ever fails, the encryption is decorative: the plaintext would be sitting
+        // in the chunk files under a digest anyone can compute from a guess.
+        let d = tmp("shared-cipher");
+        let s = Store::new(&d);
+        let plaintext = b"the quarterly figures".repeat(3000);
+        let (alice, _) = recipient("otw1alice", 5);
+        let (object, _) = s.put_shared_reader(plaintext.as_slice(), &[alice]).unwrap();
+
+        let reassembled = s.read_object(&object).unwrap();
+        assert!(!reassembled.windows(21).any(|w| w == b"the quarterly figures"));
+
+        // And the plaintext's own object id is nowhere near this one.
+        let plain = Store::new(tmp("shared-cipher-plain"));
+        let plain_object = plain.put_bytes(&plaintext, Visibility::Public).unwrap();
+        assert_ne!(plain_object.content_id, object.content_id);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn sharing_one_file_twice_produces_two_unrelated_objects() {
+        // The cost ADR-0019 names, demonstrated: no deduplication, and no way for a holder
+        // to tell that two shares are the same document.
+        let d = tmp("shared-nodedup");
+        let s = Store::new(&d);
+        let plaintext = data(60_000, 73);
+        let (alice, _) = recipient("otw1alice", 6);
+        let (bob, _) = recipient("otw1bob", 7);
+
+        let (first, _) = s.put_shared_reader(plaintext.as_slice(), &[alice]).unwrap();
+        let (second, _) = s.put_shared_reader(plaintext.as_slice(), &[bob]).unwrap();
+        assert_ne!(first.content_id, second.content_id);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_shared_object_with_no_recipients_is_refused_at_the_call() {
+        let d = tmp("shared-norecip");
+        let s = Store::new(&d);
+        let err = s
+            .put_shared_reader(b"anything".as_slice(), &[])
+            .expect_err("an object nobody can open is not a shared object");
+        assert!(err.to_string().contains("nobody"), "{err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn relabelling_cannot_turn_plaintext_into_a_shared_object() {
+        // Otherwise the label would claim a protection the bytes do not have.
+        let d = tmp("shared-relabel");
+        let s = Store::new(&d);
+        let o = s.put_bytes(&data(9_000, 74), Visibility::Replicated).unwrap();
+        let err = s
+            .demote(&o.content_id, Visibility::Shared)
+            .expect_err("plaintext must not become shared by relabelling");
+        assert!(err.to_string().contains("stored again sealed"), "{err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn demoting_a_shared_object_keeps_its_envelope() {
+        // Dropping the envelope on demotion would leave the owner unable to read their own
+        // object -- a data-loss bug wearing the costume of a privacy improvement.
+        let d = tmp("shared-demote");
+        let s = Store::new(&d);
+        let plaintext = data(40_000, 75);
+        let (alice, alice_key) = recipient("otw1alice", 8);
+        let (object, _) = s.put_shared_reader(plaintext.as_slice(), &[alice]).unwrap();
+
+        let after = s.demote(&object.content_id, Visibility::Private).unwrap();
+        assert_eq!(after.visibility, Visibility::Private);
+        let sharing = after.sharing.as_ref().expect("the bytes are still sealed");
+        let copy = sharing.copy_for("otw1alice").unwrap();
+        let content_key = crate::shared::ContentKey::from_bytes(*alice_key.open(copy).unwrap());
+        let mut opened = Vec::new();
+        s.open_shared(&after, &content_key, &mut opened).unwrap();
+        assert_eq!(opened, plaintext);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_missing_chunk_is_reported_as_missing_not_as_a_decryption_failure() {
+        // These are very different things to whoever is looking at the error: one is
+        // damage, the other is the wrong key.
+        let d = tmp("shared-gap");
+        let s = Store::new(&d);
+        let plaintext = data(400_000, 76);
+        let (alice, alice_key) = recipient("otw1alice", 9);
+        let (object, _) = s.put_shared_reader(plaintext.as_slice(), &[alice]).unwrap();
+        let copy = object.sharing.as_ref().unwrap().copy_for("otw1alice").unwrap();
+        let content_key = crate::shared::ContentKey::from_bytes(*alice_key.open(copy).unwrap());
+
+        let victim = object.chunk_refs()[0];
+        std::fs::remove_file(s.chunk_path(&victim.hex())).unwrap();
+
+        let mut opened = Vec::new();
+        let err = s.open_shared(&object, &content_key, &mut opened).unwrap_err();
+        assert!(matches!(err, StoreError::NotFound(_)), "{err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_wrong_content_key_does_not_open_a_shared_object() {
+        let d = tmp("shared-wrongkey");
+        let s = Store::new(&d);
+        let (alice, _) = recipient("otw1alice", 10);
+        let (object, _) = s
+            .put_shared_reader(data(50_000, 77).as_slice(), &[alice])
+            .unwrap();
+
+        let mut opened = Vec::new();
+        let err = s
+            .open_shared(&object, &crate::shared::ContentKey::generate(), &mut opened)
+            .expect_err("a key that was never sealed must not open it");
+        assert!(err.to_string().contains("did not authenticate"), "{err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn an_object_record_survives_a_round_trip_and_is_validated_on_the_way_out() {
         let d = tmp("record");
         let s = Store::new(&d);
-        let object = s.put_bytes(&data(300_000, 17), Visibility::Shared).expect("put");
+        let object = s
+            .put_bytes(&data(300_000, 17), Visibility::Replicated)
+            .expect("put");
         let back = s.get_object(&object.content_id).expect("get");
         assert_eq!(back, object);
-        assert_eq!(back.visibility, Visibility::Shared);
+        assert_eq!(back.visibility, Visibility::Replicated);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -806,7 +1204,7 @@ mod tests {
         let d = tmp("demote-id");
         let s = Store::new(&d);
         let o = s.put_bytes(&data(30_000, 59), Visibility::Replicated).unwrap();
-        let after = s.demote(&o.content_id, Visibility::Shared).expect("demote");
+        let after = s.demote(&o.content_id, Visibility::Private).expect("demote");
         assert_eq!(after.content_id, o.content_id);
         let _ = std::fs::remove_dir_all(&d);
     }

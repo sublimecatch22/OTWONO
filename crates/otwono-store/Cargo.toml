@@ -8,6 +8,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# For SealedKey and seal_to (ADR-0019). The store wraps a content key per recipient; the
+# sealing itself lives with the identity types because that is where the key formats are.
+# One direction only: otwono-identity knows nothing about storage.
+otwono-identity = { workspace = true }
 # statvfs, for the reserve floor that stops the cache filling the disk.
 rustix = { version = "0.38", features = ["fs", "process"] }
 serde = { workspace = true }
@@ -24,3 +28,6 @@ fastcdc = "5"
 chacha20poly1305 = { version = "0.10", features = ["stream"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 zeroize = "1"
+# Base64 for the nonce prefix in a sharing envelope, matching how every other key and
+# digest crosses a JSON boundary in this system.
+data-encoding = "2"

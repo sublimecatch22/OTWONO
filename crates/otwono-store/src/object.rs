@@ -105,6 +105,91 @@ impl From<&ChunkRef> for StoredChunk {
     }
 }
 
+/// How a `SHARED` object's bytes were sealed, and who can open them (ADR-0019).
+///
+/// Present on any object whose chunks are ciphertext, whatever its current label. It is
+/// **not** removed when an object is demoted: the bytes on disk are still sealed, and
+/// dropping the envelope would leave the owner unable to read their own object.
+///
+/// None of this is part of the [`ContentId`], because the id is over the chunk list and
+/// nothing else. A peer that substitutes a nonce prefix or a recipient's copy therefore
+/// produces an object that still verifies as the right bytes and then fails to open. That
+/// is a denial, not a disclosure: the ciphertext is covered by the id and each frame is
+/// authenticated, so no substitution yields *different* plaintext.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Sharing {
+    /// The scheme that produced the ciphertext. A value this build does not recognise must
+    /// be refused, never guessed at.
+    pub encryption: String,
+    /// Base64 nonce prefix, 19 bytes. Fresh per object.
+    pub nonce_prefix: String,
+    /// What the object was before it was sealed. Recorded because the chunk lengths measure
+    /// ciphertext, and a caller wants to know how much file to expect.
+    pub plaintext_size_bytes: u64,
+    /// The content key, sealed once per recipient. This list *is* the authorized set:
+    /// keeping a separate `authorized.nodes` alongside it would create two facts that can
+    /// disagree, and the disagreement would be a security bug in whichever direction it
+    /// went. That the list names who a node shares with is **OQ-28**, unsolved.
+    pub sealed_keys: Vec<otwono_identity::SealedKey>,
+}
+
+impl Sharing {
+    /// The NodeIDs that can open this object, in text form.
+    pub fn authorized_nodes(&self) -> Vec<&str> {
+        self.sealed_keys.iter().map(|k| k.recipient.as_str()).collect()
+    }
+
+    /// Whether this node may open the object — by name only. Holding the copy is what
+    /// decides in the end; this is the check a serving daemon can make before doing work.
+    pub fn names(&self, node_id: &str) -> bool {
+        self.sealed_keys.iter().any(|k| k.recipient == node_id)
+    }
+
+    /// This recipient's copy of the content key, if there is one.
+    pub fn copy_for(&self, node_id: &str) -> Option<&otwono_identity::SealedKey> {
+        self.sealed_keys.iter().find(|k| k.recipient == node_id)
+    }
+
+    /// Check the envelope is usable before anything relies on it.
+    ///
+    /// An envelope with no recipients is not a shared object, it is an object nobody can
+    /// open — including whoever sealed it. Refusing at the record is better than
+    /// discovering it when someone tries to read.
+    pub fn validate(&self) -> Result<(), ObjectError> {
+        if self.encryption != crate::shared::SHARED_ENCRYPTION {
+            return Err(ObjectError::BadEnvelope(format!(
+                "encrypted as {:?}, which this build does not implement",
+                self.encryption
+            )));
+        }
+        if self.sealed_keys.is_empty() {
+            return Err(ObjectError::BadEnvelope(
+                "no sealed keys, so nobody can open it".to_string(),
+            ));
+        }
+        let prefix = data_encoding::BASE64
+            .decode(self.nonce_prefix.as_bytes())
+            .map_err(|e| ObjectError::BadEnvelope(format!("the nonce prefix is not base64: {e}")))?;
+        crate::shared::decode_prefix(&prefix).map_err(|e| ObjectError::BadEnvelope(e.to_string()))?;
+
+        // Two copies for one recipient is either a duplicate or two different keys under
+        // one name, and there is no way to tell which. Refuse rather than pick.
+        let mut seen: Vec<&str> = self.sealed_keys.iter().map(|k| k.recipient.as_str()).collect();
+        seen.sort_unstable();
+        let before = seen.len();
+        seen.dedup();
+        if seen.len() != before {
+            return Err(ObjectError::BadEnvelope(
+                "the same recipient appears twice, and there is no way to tell which copy \
+                 is meant"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Everything the store knows about one object.
 ///
 /// The label lives here rather than in the identity, so relabelling an object does not
@@ -123,6 +208,9 @@ pub struct Object {
     /// Absent in a stored record means `Private`, like everything else about labels.
     #[serde(default)]
     pub visibility: Visibility,
+    /// Present when the chunks are ciphertext (ADR-0019). Absent on everything else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sharing: Option<Sharing>,
     /// Free-form, and never part of the identity. A media type, an original filename, a
     /// service's own key — all things that may differ between two nodes holding the same
     /// bytes.
@@ -144,6 +232,10 @@ pub enum ObjectError {
     },
     /// A chunk digest is not a digest.
     BadDigest(String),
+    /// Labelled `Shared` with no way for anybody to open it.
+    SharedWithoutAnEnvelope,
+    /// The envelope is malformed: no recipients, or a nonce prefix that is not one.
+    BadEnvelope(String),
     /// Chunked under rules this node does not use, so its chunks cannot be shared.
     ForeignChunking {
         theirs: String,
@@ -166,6 +258,14 @@ impl std::fmt::Display for ObjectError {
                 )
             }
             ObjectError::BadDigest(d) => write!(f, "{d:?} is not a BLAKE3 digest"),
+            ObjectError::SharedWithoutAnEnvelope => write!(
+                f,
+                "this object is labelled shared but its bytes are not sealed, so there is \
+                 no content key for anybody — including its owner — to be given. A shared \
+                 object is encrypted before it is chunked (ADR-0019); an existing object \
+                 becomes shared by being stored again sealed, not by being relabelled"
+            ),
+            ObjectError::BadEnvelope(m) => write!(f, "the sharing envelope is unusable: {m}"),
             ObjectError::ForeignChunking { theirs, ours } => write!(
                 f,
                 "chunked as {theirs}, but this node chunks as {ours}; its chunks cannot be shared"
@@ -187,8 +287,17 @@ impl Object {
             chunks: chunks.iter().map(StoredChunk::from).collect(),
             size_bytes: chunks.iter().map(|c| c.length as u64).sum(),
             visibility,
+            sharing: None,
             metadata: Default::default(),
         }
+    }
+
+    /// Attach a sharing envelope. Used by the `SHARED` put path, which is the only place
+    /// that has both the ciphertext's chunk list and the sealed keys.
+    #[must_use]
+    pub fn with_sharing(mut self, sharing: Sharing) -> Object {
+        self.sharing = Some(sharing);
+        self
     }
 
     /// Check a record against itself.
@@ -235,6 +344,15 @@ impl Object {
                 claimed: self.content_id.to_hex(),
                 actual: actual.to_hex(),
             });
+        }
+
+        // Shared implies an envelope, but not the converse: a demoted object keeps its
+        // envelope because its bytes are still sealed, and requiring the biconditional
+        // would make demotion destroy the owner's own access.
+        match (&self.sharing, self.visibility) {
+            (None, Visibility::Shared) => return Err(ObjectError::SharedWithoutAnEnvelope),
+            (Some(s), _) => s.validate()?,
+            (None, _) => {}
         }
         Ok(())
     }
@@ -346,7 +464,7 @@ mod tests {
 
     #[test]
     fn a_record_round_trips_through_json() {
-        let mut o = Object::new(&chunk::slice(&b"hello".repeat(10_000)), Visibility::Shared);
+        let mut o = Object::new(&chunk::slice(&b"hello".repeat(10_000)), Visibility::Public);
         o.metadata.insert("media_type".into(), "text/plain".into());
         let json = serde_json::to_string_pretty(&o).expect("serialize");
         let back: Object = serde_json::from_str(&json).expect("deserialize");

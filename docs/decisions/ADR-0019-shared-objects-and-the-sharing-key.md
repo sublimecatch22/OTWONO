@@ -8,9 +8,12 @@
   and by the open `id.sharing_binding` method.
   `id.unwrap_shared` exists behind its own capability, which no shipped policy grants
   because nothing calls it yet.
-- **SPECIFIED, no code:** §1 (encrypt then chunk), §4 (authorized serving and the
-  confirmation for `SHARED` egress), and §5 (adding and removing recipients). Until those
-  exist `SHARED` still fails closed everywhere, exactly as described under Context.
+  §1 is implemented in `otwono-store`: `put_shared_reader` seals then chunks, the object
+  record carries a `sharing` envelope, and the schema describes it.
+- **SPECIFIED, no code:** §4 (authorized serving and the confirmation for `SHARED` egress)
+  and §5 (adding and removing recipients). `otwono-stored` exposes no way to create a
+  `SHARED` object at all, so nothing can be served and `SHARED` still fails closed
+  everywhere, exactly as described under Context.
 
 ## Context
 

@@ -124,3 +124,89 @@ fn an_unrecognised_label_is_refused_by_the_schema_and_read_as_private_by_the_cod
     let parsed: Object = serde_json::from_value(odd).expect("the reader must not fail");
     assert_eq!(parsed.visibility, Visibility::Private);
 }
+
+#[test]
+fn a_shared_record_the_store_writes_validates() {
+    // The path that produces a sharing envelope, checked against the schema that describes
+    // one. Several sizes so a single-frame and a multi-frame object are both covered.
+    let dir = std::env::temp_dir().join(format!("otwono-schema-shared-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let s = Store::new(&dir);
+    let key = otwono_identity::SharingKey::from_seed(&[3u8; 32], 1_700_000_000_000);
+    let recipients = [otwono_store::cas::Recipient {
+        node_id: "otw1exampleneighbour".to_string(),
+        sharing_public_key: key.public(),
+    }];
+
+    for (len, seed) in [(0usize, 11u64), (100_000, 12), (2 << 20, 13)] {
+        let (o, _) = s
+            .put_shared_reader(data(len, seed).as_slice(), &recipients)
+            .expect("put_shared_reader");
+        assert_valid(&o);
+        let sharing = o.sharing.as_ref().expect("shared objects carry an envelope");
+        assert_eq!(sharing.plaintext_size_bytes, len as u64);
+        assert!(
+            o.size_bytes > sharing.plaintext_size_bytes,
+            "the ciphertext is longer by a tag per frame"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_schema_refuses_a_shared_envelope_with_no_recipients() {
+    // The invariant the code enforces, stated in the contract too: an object nobody can
+    // open is not a shared object.
+    let dir = std::env::temp_dir().join(format!("otwono-schema-empty-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let s = Store::new(&dir);
+    let key = otwono_identity::SharingKey::from_seed(&[4u8; 32], 1_700_000_000_000);
+    let (o, _) = s
+        .put_shared_reader(
+            data(50_000, 14).as_slice(),
+            &[otwono_store::cas::Recipient {
+                node_id: "otw1someone".to_string(),
+                sharing_public_key: key.public(),
+            }],
+        )
+        .expect("put");
+
+    let mut instance = serde_json::to_value(&o).expect("serialize");
+    instance["sharing"]["sealed_keys"] = serde_json::json!([]);
+    let v = validator();
+    assert!(
+        v.iter_errors(&instance).next().is_some(),
+        "an empty recipient list must not validate"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_schema_refuses_an_unrecognised_encryption_scheme() {
+    // The code refuses it rather than guessing; the schema must say the same, or a record
+    // written by a future build would look contractually fine to this one.
+    let dir = std::env::temp_dir().join(format!("otwono-schema-scheme-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let s = Store::new(&dir);
+    let key = otwono_identity::SharingKey::from_seed(&[5u8; 32], 1_700_000_000_000);
+    let (o, _) = s
+        .put_shared_reader(
+            data(20_000, 15).as_slice(),
+            &[otwono_store::cas::Recipient {
+                node_id: "otw1someone".to_string(),
+                sharing_public_key: key.public(),
+            }],
+        )
+        .expect("put");
+
+    let mut instance = serde_json::to_value(&o).expect("serialize");
+    instance["sharing"]["encryption"] = serde_json::json!("aes-gcm-siv-whatever");
+    let v = validator();
+    assert!(v.iter_errors(&instance).next().is_some());
+
+    // And the code agrees, rather than only the schema saying so.
+    let mut record = o.clone();
+    record.sharing.as_mut().unwrap().encryption = "aes-gcm-siv-whatever".to_string();
+    assert!(record.validate().is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}

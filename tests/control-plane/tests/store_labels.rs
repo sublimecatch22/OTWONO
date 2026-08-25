@@ -169,14 +169,26 @@ fn a_private_object_is_never_served_to_a_peer() {
 }
 
 #[test]
-fn a_shared_object_is_not_served_either_until_per_peer_authorization_exists() {
-    // Shared needs a per-peer decision this daemon cannot yet make. Answering "maybe" as
-    // "yes" is how data leaks, so it answers no.
+fn store_put_will_not_mint_a_shared_object_nobody_can_open() {
+    // Since ADR-0019 a shared object is encrypted before it is chunked and carries a
+    // content key sealed once per recipient. store.put takes bytes and a label and knows
+    // nothing about recipients, so the record it would write would be labelled shared with
+    // plaintext chunks and no key -- a label claiming a protection the bytes do not have.
+    //
+    // It refuses. Which means there is still no way to create a shared object through this
+    // daemon at all, and therefore still nothing for store.serve to be asked about.
     let h = Harness::start("shared");
-    let id = h.put(&payload(2), "shared");
-    assert!(h
-        .call("store.serve", json!({ "content_id": id }), "store.serve")
-        .is_err());
+    let err = h
+        .call(
+            "store.put",
+            json!({
+                "data": data_encoding::BASE64.encode(&payload(2)),
+                "visibility": "shared",
+            }),
+            "store.write",
+        )
+        .expect_err("store.put must refuse to label plaintext as shared");
+    assert!(err.message.contains("not sealed"), "{}", err.message);
 }
 
 #[test]

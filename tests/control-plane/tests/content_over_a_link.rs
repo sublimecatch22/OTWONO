@@ -321,12 +321,38 @@ fn a_private_object_never_crosses_a_link() {
 }
 
 #[test]
-fn a_shared_object_never_crosses_a_link() {
-    // SHARED needs a per-recipient key wrapping that does not exist yet. Until it does it
-    // must fail closed, which is the right way for a feature to be missing.
+fn a_shared_object_cannot_even_be_created_over_the_control_plane_yet() {
+    // Since ADR-0019 a SHARED object is encrypted before it is chunked and carries a
+    // content key sealed per recipient. store.put takes bytes and a label and knows nothing
+    // about recipients, so it cannot make one -- and refuses rather than writing a record
+    // labelled shared that nobody, including its owner, could open.
+    //
+    // There is deliberately no store.put_shared yet. So SHARED still never crosses a link,
+    // for a reason one step further along than "the feature is missing": it is now missing
+    // its door, not its lock.
     let h = Harness::start("shared");
-    let id = h.put(b"for one named peer only", "shared");
-    assert!(h.fetch(&id).is_err(), "shared must fail closed until it is built");
+    let token = h.token("store.write");
+    let err = Client::connect(&h.store_socket)
+        .unwrap()
+        .call_with_capability(
+            "store.put",
+            json!({
+                "data": data_encoding::BASE64.encode(b"for one named peer only"),
+                "visibility": "shared",
+            }),
+            &token,
+        )
+        .unwrap()
+        .expect_err("store.put must not mint an unopenable shared object");
+    assert!(
+        err.message.contains("not sealed"),
+        "the refusal should say why: {}",
+        err.message
+    );
+
+    // And nothing in the store carries the label, so there is nothing to ask a peer for.
+    let public = h.put(b"for one named peer only", "public");
+    assert!(h.fetch(&public).is_ok(), "the same bytes as public still move");
 }
 
 #[test]
