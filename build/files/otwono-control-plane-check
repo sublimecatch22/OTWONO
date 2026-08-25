@@ -113,7 +113,11 @@ if [ -f /etc/systemd/system/otwono-permd.service.d/90-confirmer.conf ]; then
     # them confirm, resume -- and it is worth walking on a machine because every step of it
     # crosses a process boundary that a host-side test replaces with a function call.
     wallet_created=failed
-    ask=$(otwono-walletctl create --passphrase "boot-check-passphrase" 2>&1 || true)
+    # Through stdin, not an argument. otwono-walletctl refuses --passphrase outright: an
+    # argument lands in shell history and in /proc/<pid>/cmdline, and this check should use
+    # the same door a person does.
+    pass_in() { printf '%s\n' "boot-check-passphrase"; }
+    ask=$(pass_in | otwono-walletctl create --passphrase-stdin 2>&1 || true)
     wcid=$(echo "$ask" | tr ' ' '\n' | grep -E '^[0-9a-f]{64}$' | head -1)
     [ -n "$wcid" ] || {
         echo "OTWONO-CONTROL-PLANE-FAIL creating a wallet did not ask for confirmation: $ask" >&2
@@ -125,7 +129,7 @@ if [ -f /etc/systemd/system/otwono-permd.service.d/90-confirmer.conf ]; then
 
     otwono-permctl approve "$wcid" >/dev/null 2>&1 \
         || { echo "OTWONO-CONTROL-PLANE-FAIL could not approve the wallet creation" >&2; exit 1; }
-    made=$(otwono-walletctl create --passphrase "boot-check-passphrase" --confirmation "$wcid" 2>&1) || {
+    made=$(pass_in | otwono-walletctl create --passphrase-stdin --confirmation "$wcid" 2>&1) || {
         echo "OTWONO-CONTROL-PLANE-FAIL creating the wallet after approval failed: $made" >&2
         exit 1
     }
@@ -141,7 +145,7 @@ if [ -f /etc/systemd/system/otwono-permd.service.d/90-confirmer.conf ]; then
         || { echo "OTWONO-CONTROL-PLANE-FAIL the wallet is not readable after creation" >&2; exit 1; }
 
     # Derive from it, which is the only way to know the vault actually opens.
-    keys=$(otwono-walletctl address --passphrase "boot-check-passphrase" --index 0 --index 1 2>&1) || {
+    keys=$(pass_in | otwono-walletctl address --passphrase-stdin --index 0 --index 1 2>&1) || {
         echo "OTWONO-CONTROL-PLANE-FAIL cannot derive from the new wallet: $keys" >&2
         exit 1
     }
@@ -154,7 +158,7 @@ if [ -f /etc/systemd/system/otwono-permd.service.d/90-confirmer.conf ]; then
         || { echo "OTWONO-CONTROL-PLANE-FAIL two indices produced the same key" >&2; exit 1; }
 
     # And the wrong passphrase opens nothing.
-    if otwono-walletctl address --passphrase "wrong" >/dev/null 2>&1; then
+    if printf 'wrong\n' | otwono-walletctl address --passphrase-stdin >/dev/null 2>&1; then
         echo "OTWONO-CONTROL-PLANE-FAIL the wrong passphrase derived a key" >&2
         exit 1
     fi

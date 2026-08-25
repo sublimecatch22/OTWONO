@@ -125,6 +125,24 @@ on a small board.
 A wrong passphrase and a damaged or altered file report **the same error**, because the AEAD
 tag covers both and the difference is genuinely not observable here.
 
+### The passphrase never reaches a command line
+
+`otwono-walletctl` refuses `--passphrase` outright and prompts without echo, or reads one
+line from stdin with `--passphrase-stdin` for scripts.
+
+The first version took it as an argument, which puts the key to a household's money into
+shell history and into `/proc/<pid>/cmdline`, where anything running as that user or as root
+can read it. For a design whose premise (`FINANCE.md` §3) is that *the disk alone must not be
+enough*, handing the passphrase to the process table is not a trade worth making for
+convenience.
+
+It is asked for **twice** when creating a wallet and once otherwise. A typo in a passphrase
+nobody has written down yet is a wallet lost before it is used; a typo when opening one just
+fails to open it.
+
+Only the line ending is stripped from stdin input. A passphrase is somebody's words, and
+trimming spaces would silently change the key.
+
 ## 4. Why there is no address yet
 
 ADR-0022 leaves **which chain** deliberately undecided, and an address string is

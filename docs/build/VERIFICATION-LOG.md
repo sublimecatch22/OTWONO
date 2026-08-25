@@ -4058,10 +4058,54 @@ failed".
   addresses because an address string would decide the chain in a render function.
 - **`export-seed` has never run.** It is granted no capability in any image, including the
   test one — deliberately, since it is the call that hands over everything at once.
-- **The passphrase is on a command line** in the boot check, which is fine for a check and
-  is not how a person should ever be asked for one. Nothing here designs that prompt.
+- ~~The passphrase is on a command line~~ — **fixed in the following commit**, which is why
+  it is struck through rather than removed: it was shipped that way first.
 - **A release image still creates nothing**, because it designates no confirmer. Verified by
   booting that path too.
 - **Expiry is still only tested against an injected clock**, and nothing notifies anybody a
   confirmation is waiting — a person must run `otwono-permctl list`.
+- amd64 only, TCG, single node.
+
+
+---
+
+## The passphrase stops going through argv
+
+**STATUS: VERIFIED on a booted node.** `confirmed=yes wallet_created=yes`, with the
+passphrase arriving on stdin rather than as an argument.
+
+A defect in the previous commit, found by reading back what had just been written rather than
+by any test. `otwono-walletctl` took `--passphrase`, which puts the key to a household's
+money into shell history and into `/proc/<pid>/cmdline`, readable by anything running as that
+user or as root. For a subsystem whose stated premise is that *the disk alone must not be
+enough* (`FINANCE.md` §3), handing the passphrase to the process table is not a trade worth
+making for convenience.
+
+Now: prompted without echo at a terminal (`rpassword`, integrated rather than written —
+reading a passphrase correctly means termios, and it is pure Rust so it cross-compiles), or
+one line from stdin with `--passphrase-stdin` for scripts. `--passphrase` is **refused with
+an explanation** rather than silently ignored, so somebody who had been scripting it finds
+out why instead of wondering where their passphrase went.
+
+Asked for twice when creating and once otherwise: a typo in a passphrase nobody has written
+down yet is a wallet lost before it is used, while a typo opening one merely fails to open it.
+
+### A test that was testing a copy
+
+The first version of the stdin tests reimplemented the line handling inside the test module.
+That is not a test — it checks that a copy behaves like itself, and the interesting behaviour
+here is exactly what a copy gets subtly wrong: **only the line ending is stripped, and
+nothing else.** A passphrase is somebody's words, so trimming spaces would silently change
+the key that opens their wallet.
+
+Split into `passphrase_from_line` and pointed the tests at the real function. Third instance
+in this session of a test that read as stronger than it was, and the only one caught by
+re-reading rather than by CI or by a deliberate mutation.
+
+### What is not tested
+
+- **The no-echo prompt itself never runs in any test or boot.** Every exercise here uses the
+  stdin path; the terminal path is `rpassword`'s code and is taken on trust.
+- Everything else unchanged from the previous entry: no signing, no chain, `export-seed`
+  still never run, nothing notifies anybody, expiry still only against an injected clock.
 - amd64 only, TCG, single node.

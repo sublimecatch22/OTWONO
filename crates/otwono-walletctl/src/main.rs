@@ -31,7 +31,11 @@ COMMANDS:
     export-seed               Reveal the seed. This is the whole wallet
 
 OPTIONS:
-    --passphrase <TEXT>       Required by address, create and export-seed
+    --passphrase-stdin        Read the passphrase from stdin instead of prompting. For
+                              scripts. There is deliberately no way to pass one as an
+                              argument: it would land in shell history and in
+                              /proc/<pid>/cmdline, where anything running as this user or as
+                              root can read it
     --coin <N>                BIP-44 coin type (default 60)
     --account <N>             BIP-44 account (default 0)
     --index <N>               Repeatable. Which addresses to derive (default 0)
@@ -40,6 +44,11 @@ OPTIONS:
     --perm-socket <PATH>      Permission broker (default $OTWONO_SOCKET_DIR/perm.sock)
     --json                    Print the daemon's reply verbatim
     -h, --help                Show this message
+
+ABOUT THE PASSPHRASE:
+    Prompted for, without echo, when this is run at a terminal. It is never accepted as a
+    command-line argument, and it is asked for twice when creating a wallet — a typo in a
+    passphrase nobody has written down yet is a wallet lost before it is used.
 
 ABOUT THE RECOVERY PHRASE:
     `create` prints 24 words once. Write them down, off this machine. They are the only way
@@ -91,7 +100,7 @@ enum Error {
 
 struct Options {
     command: String,
-    passphrase: Option<String>,
+    passphrase_stdin: bool,
     coin: u32,
     account: u32,
     indices: Vec<u32>,
@@ -103,7 +112,7 @@ struct Options {
 
 fn parse(args: &[String]) -> Result<Options, Error> {
     let mut command: Option<String> = None;
-    let mut passphrase = None;
+    let mut passphrase_stdin = false;
     let mut coin = 60u32;
     let mut account = 0u32;
     let mut indices: Vec<u32> = Vec::new();
@@ -126,7 +135,15 @@ fn parse(args: &[String]) -> Result<Options, Error> {
         match arg.as_str() {
             "-h" | "--help" => return Err(Error::Usage("help".into())),
             "--json" => json = true,
-            "--passphrase" => passphrase = Some(next("--passphrase")?),
+            "--passphrase-stdin" => passphrase_stdin = true,
+            "--passphrase" => {
+                return Err(Error::Usage(
+                    "--passphrase is not accepted: an argument lands in shell history and in \
+                     /proc/<pid>/cmdline. Run this at a terminal to be prompted, or use \
+                     --passphrase-stdin"
+                        .into(),
+                ))
+            }
             "--coin" => coin = num(&next("--coin")?, "--coin")?,
             "--account" => account = num(&next("--account")?, "--account")?,
             "--index" => indices.push(num(&next("--index")?, "--index")?),
@@ -143,7 +160,7 @@ fn parse(args: &[String]) -> Result<Options, Error> {
     }
     Ok(Options {
         command: command.ok_or_else(|| Error::Usage("no command given".into()))?,
-        passphrase,
+        passphrase_stdin,
         coin,
         account,
         indices,
@@ -171,11 +188,11 @@ fn run(args: &[String]) -> Result<String, Error> {
     let o = parse(args)?;
     let (action, confirms) = capability(&o.command)?;
 
-    let need_passphrase = |o: &Options| -> Result<String, Error> {
-        o.passphrase
-            .clone()
-            .ok_or_else(|| Error::Usage(format!("{} needs --passphrase", o.command)))
-    };
+    // Asked for twice when creating, once otherwise. A typo in a passphrase nobody has
+    // written down yet is a wallet lost before it is used; a typo when opening one just
+    // fails to open it, and asking twice there would be noise.
+    let need_passphrase =
+        |o: &Options| -> Result<String, Error> { read_passphrase(o.passphrase_stdin, o.command == "create") };
     let (method, params) = match o.command.as_str() {
         "status" => ("wallet.status", json!({})),
         "address" => (
@@ -259,6 +276,49 @@ fn obtain_token(o: &Options, action: &str, confirms: bool) -> Result<String, Err
     }
 }
 
+/// Obtain the passphrase, from stdin or from the terminal — never from an argument.
+///
+/// An argument would be visible in shell history and in `/proc/<pid>/cmdline` to anything
+/// running as this user or as root, which for the key that holds a household's money is not
+/// a trade worth making for convenience.
+fn read_passphrase(from_stdin: bool, twice: bool) -> Result<String, Error> {
+    if from_stdin {
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line)
+            .map_err(|e| Error::Runtime(format!("cannot read the passphrase: {e}")))?;
+        return passphrase_from_line(&line);
+    }
+    let first = rpassword::prompt_password("passphrase: ")
+        .map_err(|e| Error::Runtime(format!("cannot prompt for a passphrase: {e}")))?;
+    if first.is_empty() {
+        return Err(Error::Usage("an empty passphrase is not accepted".into()));
+    }
+    if twice {
+        let again = rpassword::prompt_password("passphrase again: ")
+            .map_err(|e| Error::Runtime(format!("cannot prompt for a passphrase: {e}")))?;
+        if again != first {
+            return Err(Error::Usage("those did not match. Nothing was created".into()));
+        }
+    }
+    Ok(first)
+}
+
+/// Turn one line of input into a passphrase.
+///
+/// Split out so the real thing is what the tests exercise: a test that reimplemented this
+/// would be checking a copy, and the interesting behaviour — that trailing newlines go and
+/// nothing else does — is exactly what a copy would get subtly wrong.
+///
+/// Only the line ending is removed. A passphrase is somebody's words, and trimming spaces
+/// would silently change the key that opens their wallet.
+fn passphrase_from_line(line: &str) -> Result<String, Error> {
+    let line = line.trim_end_matches(['\n', '\r']).to_string();
+    if line.is_empty() {
+        return Err(Error::Usage("the passphrase on stdin was empty".into()));
+    }
+    Ok(line)
+}
+
 fn render(command: &str, v: &Value) -> String {
     let s = |k: &str| v[k].as_str().unwrap_or("").to_string();
     match command {
@@ -332,13 +392,32 @@ mod tests {
     }
 
     #[test]
-    fn commands_that_touch_the_seed_need_a_passphrase() {
-        for c in ["address", "create", "export-seed"] {
-            match run(&opts(&[c])) {
-                Err(Error::Usage(m)) => assert!(m.contains("--passphrase"), "{c}: {m}"),
-                other => panic!("{c} should have demanded a passphrase, got {other:?}"),
+    fn a_passphrase_is_never_accepted_as_an_argument() {
+        // The whole point: an argument lands in shell history and in /proc/<pid>/cmdline.
+        // Refused with an explanation rather than silently ignored, so somebody who has been
+        // scripting it finds out why rather than wondering where their passphrase went.
+        match parse(&opts(&["create", "--passphrase", "hunter2"])) {
+            Err(Error::Usage(m)) => {
+                assert!(m.contains("shell history"), "{m}");
+                assert!(m.contains("--passphrase-stdin"), "{m}");
             }
+            Err(e) => panic!("--passphrase should be refused as a usage error, got {e:?}"),
+            Ok(_) => panic!("--passphrase was accepted"),
         }
+    }
+
+    #[test]
+    fn an_empty_passphrase_from_stdin_is_refused() {
+        // Reading an empty line and carrying on would encrypt a wallet under nothing.
+        assert!(matches!(passphrase_from_line(""), Err(Error::Usage(_))));
+        assert!(matches!(passphrase_from_line("\n"), Err(Error::Usage(_))));
+    }
+
+    #[test]
+    fn a_passphrase_from_stdin_keeps_its_spaces_and_loses_its_newline() {
+        // A passphrase is somebody's words. Trimming spaces would silently change the key.
+        assert_eq!(passphrase_from_line("  two words  \n").unwrap(), "  two words  ");
+        assert_eq!(passphrase_from_line("pass\r\n").unwrap(), "pass");
     }
 
     #[test]
