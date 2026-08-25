@@ -1,9 +1,14 @@
 # Wallet
 
-**Status:** `IMPLEMENTED`, not booted. `crates/otwono-wallet` (keys) and
-`crates/otwono-walletd` (the daemon) both exist and are tested — the daemon against a real
-`otwono-permd` over real sockets. There is no systemd unit, nothing in any image, and no run
-on a booted node. Signing is `SPECIFIED` only.
+**Status:** `VERIFIED` on a booted node, for what can run there. `crates/otwono-wallet`
+(keys) and `crates/otwono-walletd` (the daemon) exist, are tested against a real
+`otwono-permd` over real sockets, and the daemon ships in the image and starts on boot with
+its network isolation asserted as an observable fact
+(`out/amd64-qemu-ubuntu/boot.log`: `wallet_ns=isolated wallet_status=no-wallet`).
+
+What has **not** run on a node is everything that needs a person: no wallet has been
+created, signed with, or exported, and none can be until Phase 7. Signing is `SPECIFIED`
+only.
 
 Decided in **ADR-0022** (keys, curve, daemon, capabilities) and **ADR-0023** (how the
 passphrase reaches it, and what it holds). The finance surface it belongs to is
@@ -25,7 +30,7 @@ testable without a control plane and without root (CLAUDE.md §2.4).
 | Address *encoding* | **not built, deliberately** — see §4 |
 | `otwono-walletd`: `wallet.status`, `wallet.public_keys`, `wallet.create`, `wallet.export_seed` | IMPLEMENTED, 11 integration tests against a real broker |
 | The four capabilities in `otwono-permd`'s registry | IMPLEMENTED |
-| A systemd unit, and a place in any image | **not built** |
+| A systemd unit, and a place in the image | IMPLEMENTED, and booted |
 | Signing | SPECIFIED, and unreachable until Phase 7 **by construction** — see §5 |
 
 ### What the daemon can actually do today
@@ -152,8 +157,6 @@ most likely to soften:
 
 Not built:
 
-- A systemd unit for `otwono-walletd`, and any place for it in a built image. It has never
-  run on a booted node.
 - Signing, and therefore any transaction.
 - Address encoding (§4), balances, history, and anything that talks to a chain.
 - The encrypted identity backup ADR-0022's consequences say a wallet forces

@@ -3672,3 +3672,112 @@ exists to prevent.
 
 `remove_recipients` needs no key at all, so it is `store.write`. The asymmetry is the point,
 and a CLI test pins it so a later tidy-up cannot make the two symmetrical for neatness.
+
+---
+
+## The wallet: keys, a daemon that holds nothing, and a boot that proves it has no network
+
+**STATUS: VERIFIED on a booted node**, for the part that can run on one.
+`out/amd64-qemu-ubuntu/boot.log`:
+
+```
+
+```
+
+Four commits: the key material (ADR-0022), the capabilities and ADR-0023, the daemon, and
+the image integration.
+
+### Workspace
+
+```
+cargo test --workspace                                   949 passed, 0 failed
+cargo clippy --workspace --all-targets -- -D warnings     clean
+cargo fmt --all --check                                   clean
+shellcheck, CI's multi-file invocation                    clean
+cargo build --workspace --target aarch64-unknown-linux-gnu   ok, no C dependency
+```
+
+### What the boot proves that nothing else could
+
+`wallet_ns=isolated` is the whole reason this was booted. ADR-0022 §2 says the daemon
+holding the household's money key has no network, ever; `PrivateNetwork=yes` is a line in a
+unit file until something observes its effect. The check compares the daemon's network
+namespace against PID 1's, which differ only if the isolation took hold. Reading the setting
+back from systemd would confirm only what the file already says.
+
+It also proves the shipped policy is the right shape: `wallet.read` is granted and answers,
+and the three `always_confirm` actions are absent from the image's policy entirely.
+
+### Two measurements that changed decisions
+
+**Argon2id, and `p_cost` in particular.** Measured on this host rather than assumed:
+
+| m | t | p | time |
+|---|---|---|---|
+| 64 MiB | 3 | 4 | 2.24 s |
+| 64 MiB | 3 | 1 | 2.23 s |
+| **19 MiB** | **2** | **1** | **0.42 s** |
+
+The first two rows say `p_cost` buys nothing: the `argon2` crate computes lanes
+sequentially, so `p = 4` costs the same wall-clock and merely advertises a parallelism this
+build does not have. Settled on OWASP's second listed option verbatim, chosen on **memory**
+more than time — a T0 board may have 512 MiB with the system already in it, and a KDF
+allocating 64 MiB there may fail to unlock a wallet on the machine that created it. An
+earlier draft of that comment claimed 64/3/4 was an OWASP option; it is not one, and
+measuring is what surfaced that.
+
+**And the 0.42 s decided the daemon's shape.** ADR-0023 rejected an unlock session because
+an unlock cache exists to amortise a cost, and at 0.42 s on a key used a few times a day
+there is nothing worth amortising — while the window it opens is what an attacker wants.
+
+### A trap that cost a boot, now recorded where the next daemon will see it
+
+`ReadWritePaths` must name a directory that exists **at boot**. Stage 50 builds the data
+partition empty — `mkfs.ext4` on a blank file, nothing copied from the rootfs — so
+`/var/lib/otwono` is bare on first boot and every subdirectory under it is made at runtime
+by whichever daemon owns it.
+
+Naming `/var/lib/otwono/wallet` failed the unit during namespace setup, before `ExecStart`
+ran. The symptom is worth writing down because it is so unhelpful: the service logs
+`Starting...` and then nothing — no `Started`, no console error, because the failure goes
+only to the journal — and the whole boot then hangs, since the control-plane check requires
+the daemon. It is now in stage 30's shared hardening notes beside the two traps already
+there.
+
+A diagnostic note on the same incident: mid-investigation a directory listing piped through
+`head` cut off the very entry being looked for, which sent the diagnosis down a wrong path
+for a step. The rootfs directory existed all along; it was the *data partition* that did not
+have it.
+
+### Tests that were checking less than they read as
+
+Two, both found by breaking the code on purpose rather than by reading it.
+
+- **`a_recipient_added_later_can_open_the_same_object`** (ADR-0019 §5) asserted that the new
+  recipient's sealed key *unwrapped*. A grant sealing a freshly generated key passes that —
+  and `add_recipients` cannot detect it, because checking would mean decrypting. It now
+  compares against this node's own unwrapped copy. With `add_recipients` sealing a fresh
+  key the new assertion fails and the old one still passed.
+- **The wallet's confirmation test** asserted only that no token was issued. An unregistered
+  action or a policy typo would also produce "no token". It now asserts the refusal is for
+  want of a person. Clearing `always_confirm` on `wallet.create` fails both this and the
+  registry test, which is the defence in depth working.
+
+### What is not tested
+
+- **No wallet has been created on a node, and none can be until Phase 7.** `wallet.create`,
+  `wallet.sign` and `wallet.export_seed` are `always_confirm`; `policy.rs` turns `Allow`
+  into `Ask` and nothing answers. So `wallet_status=no-wallet` is the only value this check
+  can observe and the `present` branch is unexercised on a machine.
+- **No brokered wallet call happens on boot.** There is no wallet CLI to make one with, so
+  the socket's existence shows the daemon bound it and nothing more. The methods themselves
+  are covered host-side against a real broker.
+- **The boot-level mutation was inconclusive.** Rebuilding with `PrivateNetwork=no` produced
+  a boot that died early on an unrelated `otwono-fetchd` failure and was killed before the
+  check ran. The comparison logic was exercised directly on the host instead — refused for a
+  shared namespace, passing under `unshare -n` — which tests the branch but not the systemd
+  wiring around it.
+- **That `otwono-fetchd` failure has no diagnosis.** Seen once, in that run only, not in the
+  passing run. Recorded rather than called a flake.
+- **The T0 timing is extrapolated** from an amd64 host, not measured on a board.
+- **No signing, no address, no balance, no chain.** amd64 only, TCG, single node.
