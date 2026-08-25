@@ -30,6 +30,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod sharing;
+pub use sharing::{open_with, seal_to, SealedKey, SEAL_DOMAIN};
+
 pub mod keystore;
 pub mod node_id;
 pub mod signer;

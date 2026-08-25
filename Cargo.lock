@@ -1136,6 +1136,8 @@ dependencies = [
 name = "otwono-identity"
 version = "0.1.0"
 dependencies = [
+ "blake2",
+ "chacha20poly1305",
  "data-encoding",
  "ed25519-dalek",
  "getrandom 0.2.17",

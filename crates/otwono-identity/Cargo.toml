@@ -13,6 +13,10 @@ serde_json = { workspace = true }
 ed25519-dalek = { version = "2", features = ["zeroize"] }
 x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 sha2 = "0.10"
+# Sealing a content key to a recipient (ADR-0019). The same AEAD the store already uses
+# at rest, so a node carries one construction rather than two.
+chacha20poly1305 = "0.10"
+blake2 = "0.10"
 data-encoding = "2"
 getrandom = "0.2"
 zeroize = "1"
