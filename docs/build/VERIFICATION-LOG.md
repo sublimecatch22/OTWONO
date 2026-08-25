@@ -3084,3 +3084,85 @@ shellcheck -S warning ...  clean
 - **The cache still did nothing.** Budget non-zero, `cache.status` answers, nothing cached:
   `net.fetch` only caches when asked and the check does not ask.
 - **amd64 only, three nodes, one segment.** No partition, no healing, no arm64.
+
+---
+
+## Phase 5 item 5 — disjoint pieces, on real links
+
+**Date:** 2026-08-25 · **Where:** OTWONO Cloud dev environment (no `/dev/kvm`, TCG only)
+
+The previous entry spread a fetch across peers that all held the whole object. Any one of
+them could have served it alone, so what it demonstrated was that fan-out *happens*, not
+that it is *needed*. `NEIGHBOURHOOD-CACHE.md` §8 asks for the harder thing: three peers
+holding disjoint pieces.
+
+### The run
+
+```
+node n1: otw1:wqg2-chcn-91em-4ecx at 169.254.79.171/16, 2 peer(s)
+node n2: otw1:dh9h-cr55-srbk-9m53 at 169.254.56.133/16, 2 peer(s)
+node n3: otw1:b4k4-bdj0-pkky-qkkq at 169.254.188.162/16, 2 peer(s)
+
+OTWONO-MESH-CONTENT-OK node=1/3 ... large_served=2 ...
+OTWONO-MESH-CONTENT-OK node=2/3 ... large_served=2 ...
+OTWONO-MESH-CONTENT-OK node=3/3 ... large_served=2 ...
+fan-out: 3 of 3 node(s) drew the large object from several peers
+PASS: 3 nodes discovered and mutually authenticated
+```
+
+Every node deleted the chunk files where `index mod 3` equals its own ordinal, so **no node
+holds the whole object**. Every node then completed the fetch, and every one drew on two
+peers. That is not a race and not a likelihood: with disjoint shares a completed fetch has
+to have combined two peers, because no single one could supply it.
+
+### How a guest knows which of N it is
+
+Every node boots the same image, so a guest has no way to take a distinct share — or to
+know how many peers to wait for. The harness encodes both in the MAC: octet 5 is the node
+count, octet 6 the 1-based ordinal. Reading one's own MAC costs nothing and adds no
+interface to the image.
+
+The share split is `index mod N == ordinal - 1`, which is chosen so it works at all: node
+*i* is missing share *i*, and a fetcher's peers are every node but itself, so between them
+they are missing nothing — share *j* is held by *k* and share *k* is held by *j*. This is
+also why it needs three nodes. With two, the single peer is always missing its own share and
+the fetch cannot complete, so the split is disabled below `N = 3`.
+
+### The first run failed, and the assertion was right to fail it
+
+```
+OTWONO-MESH-CONTENT-FAIL a multi-chunk object would not cross the link:
+  net.fetch refused: the peer will not serve f8463333..., or does not have it
+```
+
+Two of three nodes. The cause was a race in the *test*, not the code: a peer being
+**connected** does not mean it has stored the object yet. Every node runs the check
+independently with no barrier between them, and with disjoint shares a peer that has stored
+nothing leaves its share uncovered — fatal, where with full copies it would merely have been
+slower.
+
+The large fetch is now retried the way the small one already was. Worth recording because
+the failure mode is the opposite of the ones this branch has been collecting: defects 38, 43
+and 44 were things passing when they should not have. This was a thing failing for a reason
+that was not a defect, and the fix is in the test rather than the product.
+
+### Workspace
+
+```
+cargo test --workspace     782 passed, 0 failed
+cargo clippy --workspace --all-targets -- -D warnings   clean
+cargo fmt --all --check    clean
+shellcheck -S warning ...  clean
+```
+
+### What this does not prove
+
+- **No speedup was measured**, still. Three peers under TCG on one host say nothing about
+  wall-clock time on a street.
+- **Nothing above the inline cap crossed a link.** 378 KB is under the 640 KiB
+  control-plane limit, so ADR-0018's file handoff between machines remains untested.
+- **The cache still did nothing.** Non-zero budget, `cache.status` answers, nothing cached:
+  `net.fetch` caches only when asked and the check does not ask.
+- **No partition and no healing.** Phase 6's exit criterion also wants a network that splits
+  and reconverges; this harness only ever brings nodes up.
+- **amd64 only**, three nodes, one segment, no real hardware.

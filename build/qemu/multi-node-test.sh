@@ -103,7 +103,11 @@ for i in $(seq 1 "$NODES"); do
     # given, and IPv4 link-local derives its address from the MAC -- so identical MACs put
     # every node on one address and nothing can reach anything. Locally-administered
     # unicast (the 0x02 bit in the first octet), distinct per node.
-    mac=$(printf '52:54:00:07:12:%02x' "$i")
+    # The MAC carries how many nodes there are and which one this is: octet 5 is N, octet 6
+    # is the 1-based ordinal. A guest has no other way to know -- every node boots the same
+    # image -- and it needs both to take a distinct share of an object's chunks and to know
+    # how many peers to wait for. Reading its own MAC costs nothing and adds no interface.
+    mac=$(printf '52:54:00:07:%02x:%02x' "$NODES" "$i")
     "$QEMU" "${MACHINE[@]}" \
         -m 2048 -smp 2 \
         -drive if=pflash,format=raw,unit=0,readonly=on,file="$OUT/code-$n.fd" \

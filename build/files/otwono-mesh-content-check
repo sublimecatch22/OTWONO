@@ -26,6 +26,25 @@ WORK=/var/lib/otwono/mesh-content-check
 
 fail() { echo "OTWONO-MESH-CONTENT-FAIL $*" >&2; exit 1; }
 
+# How many nodes are on this segment, and which one this is. The harness encodes both in the
+# MAC -- octet 5 is the count, octet 6 the 1-based ordinal -- because every node boots the
+# same image and has no other way to know. A node booted outside the multi-node harness sees
+# neither and falls back to "one of one", which disables the disjoint-share behaviour below.
+node_total=1
+node_ordinal=1
+for dev in /sys/class/net/*/address; do
+    a=$(cat "$dev" 2>/dev/null) || continue
+    case "$a" in
+        52:54:00:07:*)
+            node_total=$(( 0x$(echo "$a" | cut -d: -f5) ))
+            node_ordinal=$(( 0x$(echo "$a" | cut -d: -f6) ))
+            break
+            ;;
+    esac
+done
+[ "$node_total" -ge 1 ] || node_total=1
+[ "$node_ordinal" -ge 1 ] || node_ordinal=1
+
 rm -rf "$WORK"; mkdir -p "$WORK"; chmod 0700 "$WORK"
 printf '%s' "$PUBLIC_TEXT" > "$WORK/public.txt"
 printf '%s' "$PRIVATE_TEXT" > "$WORK/private.txt"
@@ -53,6 +72,39 @@ big_chunks=$(otwono-storectl stat "$big_id" | awk '{print $4}')
 [ -n "$big_chunks" ] || fail "store.stat did not report a chunk count"
 [ "$big_chunks" -gt 1 ] \
     || fail "the large fixture is $big_chunks chunk(s); it must span several to test ranging"
+
+# --- disjoint shares, on three nodes or more -------------------------------------------
+#
+# NEIGHBOURHOOD-CACHE.md section 8 asks for "a fetch with three peers holding disjoint
+# pieces". With every node holding the whole object, a fetch that spreads across peers is
+# nice but not necessary -- any one of them could have served it alone. This makes it
+# necessary: node i deletes the chunks where index mod N == i, so no single peer can serve
+# the object and any two together can.
+#
+# Node i is missing share i. A fetcher's peers are every node but itself, so between them
+# they are missing nothing: share j is held by k and share k is held by j. That is why the
+# fetcher's own copy being irrelevant -- net.fetch never consults the local store -- does
+# not break it, and why two nodes cannot do this: one peer is always missing its own share.
+if [ "$node_total" -ge 3 ]; then
+    # objects/<first two hex chars>/<hex>.json, per Store::object_path.
+    record="/var/lib/otwono/store/objects/$(echo "$big_id" | cut -c1-2)/$big_id.json"
+    [ -f "$record" ] || fail "cannot find the object record at $record"
+
+    idx=0
+    dropped=0
+    # In array order, which is the object's chunk order.
+    for digest in $(grep -o '"blake3": *"[0-9a-f]*"' "$record" | grep -o '[0-9a-f]\{64\}'); do
+        if [ $(( idx % node_total )) -eq $(( node_ordinal - 1 )) ]; then
+            aa=$(echo "$digest" | cut -c1-2)
+            bb=$(echo "$digest" | cut -c3-4)
+            rm -f "/var/lib/otwono/store/chunks/$aa/$bb/$digest" || true
+            dropped=$(( dropped + 1 ))
+        fi
+        idx=$(( idx + 1 ))
+    done
+    [ "$dropped" -gt 0 ] \
+        || fail "node $node_ordinal of $node_total dropped no chunks; the share split did nothing"
+fi
 prv_id=$(otwono-storectl put --file "$WORK/private.txt" --visibility private | awk '{print $1}') \
     || fail "could not store the private object"
 [ -n "$pub_id" ] && [ -n "$prv_id" ] || fail "a put returned no content id"
@@ -61,6 +113,18 @@ prv_id=$(otwono-storectl put --file "$WORK/private.txt" --visibility private | a
 # A PUBLIC object crosses the link and the peer names it back. Retried, because discovery
 # and the Noise handshake take a while under TCG and there is no point asking before there
 # is anybody to ask; "no connected peer" is the expected answer for the first minute or two.
+# Every peer, not merely one. With disjoint shares a fetch needs all of them, and starting
+# before the last neighbour arrives would fail for a reason that is not a defect.
+i=0
+while [ "$i" -lt 150 ]; do
+    seen=$(otwono-netd --status --socket /run/otwono/net.sock 2>/dev/null \
+        | awk '/^connected/ {print $2}')
+    case "$seen" in ''|*[!0-9]*) seen=0 ;; esac
+    [ "$seen" -ge $(( node_total - 1 )) ] && break
+    i=$((i + 1))
+    sleep 5
+done
+
 got=""
 i=0
 while [ "$i" -lt 120 ]; do
@@ -76,8 +140,24 @@ echo "$got" | grep -q "$pub_id" || fail "the peer served something else: $got"
 
 # The same, for an object that spans several chunks. This is what puts ADR-0017's manifest
 # pagination and ranged chunk fetch on a real wire rather than an in-memory link.
-big=$(otwono-netd --fetch "$big_id" --socket /run/otwono/net.sock 2>&1) \
-    || fail "a multi-chunk object would not cross the link: $big"
+# Retried, like the small fetch above, and for a reason the small one does not have.
+#
+# A peer being *connected* does not mean it has stored this object yet: every node runs this
+# script independently and there is no barrier between them. With disjoint shares that is
+# fatal rather than merely slow -- a peer that has stored nothing leaves its share uncovered,
+# and the fetch fails with "or does not have it". The first run of this test failed exactly
+# that way on two of three nodes, which is the assertion working.
+big=""
+i=0
+while [ "$i" -lt 60 ]; do
+    if big=$(otwono-netd --fetch "$big_id" --socket /run/otwono/net.sock 2>&1); then
+        break
+    fi
+    big=""
+    i=$((i + 1))
+    sleep 5
+done
+[ -n "$big" ] || fail "a multi-chunk object would not cross the link within 300s"
 echo "$big" | grep -q "$big_id" || fail "the peer served the wrong large object: $big"
 big_size=$(wc -c < "$WORK/large.bin")
 echo "$big" | grep -q " $big_size bytes " \
@@ -88,6 +168,14 @@ echo "$big" | grep -q " $big_size bytes " \
 # first is a race by design. The multi-node harness is what asserts a spread, across nodes.
 big_served=$(echo "$big" | grep -o "served=[0-9]*" | cut -d= -f2)
 case "$big_served" in ''|*[!0-9]*) big_served=0 ;; esac
+
+# With disjoint shares this is not a race and not a nicety: no single peer holds the whole
+# object, so a completed fetch *must* have drawn on at least two of them. Asserted here
+# rather than in the harness, because here it is forced rather than likely.
+if [ "$node_total" -ge 3 ]; then
+    [ "$big_served" -ge 2 ] || fail \
+        "the object completed from $big_served peer(s), but no peer holds all of it"
+fi
 
 # --- the negative case, which is the point ----------------------------------------------
 # A PRIVATE object must not cross. The peer holds it -- both nodes stored it -- and refuses.
@@ -118,4 +206,4 @@ if cache=$(otwono-storectl cache-status 2>&1); then
 fi
 
 rm -rf "$WORK"
-echo "OTWONO-MESH-CONTENT-OK public=$pub_id large=$big_id large_served=$big_served private_refused=$prv_id cache_budget=$cache_state"
+echo "OTWONO-MESH-CONTENT-OK node=$node_ordinal/$node_total public=$pub_id large=$big_id large_served=$big_served private_refused=$prv_id cache_budget=$cache_state"
