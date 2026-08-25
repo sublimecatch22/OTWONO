@@ -83,6 +83,12 @@ big_size=$(wc -c < "$WORK/large.bin")
 echo "$big" | grep -q " $big_size bytes " \
     || fail "the large object arrived at the wrong size (wanted $big_size): $big"
 
+# How many peers actually served chunks of it. Reported rather than asserted here, because
+# on a two-node segment there is only ever one peer and which peer answers a given chunk
+# first is a race by design. The multi-node harness is what asserts a spread, across nodes.
+big_served=$(echo "$big" | grep -o "served=[0-9]*" | cut -d= -f2)
+case "$big_served" in ''|*[!0-9]*) big_served=0 ;; esac
+
 # --- the negative case, which is the point ----------------------------------------------
 # A PRIVATE object must not cross. The peer holds it -- both nodes stored it -- and refuses.
 if otwono-netd --fetch "$prv_id" --socket /run/otwono/net.sock > "$WORK/leak" 2>&1; then
@@ -112,4 +118,4 @@ if cache=$(otwono-storectl cache-status 2>&1); then
 fi
 
 rm -rf "$WORK"
-echo "OTWONO-MESH-CONTENT-OK public=$pub_id large=$big_id private_refused=$prv_id cache_budget=$cache_state"
+echo "OTWONO-MESH-CONTENT-OK public=$pub_id large=$big_id large_served=$big_served private_refused=$prv_id cache_budget=$cache_state"

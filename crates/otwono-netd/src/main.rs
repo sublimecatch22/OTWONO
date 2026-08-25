@@ -291,55 +291,53 @@ fn fetch_from_a_peer(
         .map_err(|e| Error::Startup(format!("net.peers transport failure: {e}")))?
         .map_err(|e| Error::Startup(format!("net.peers refused: {}", e.message)))?;
 
-    let peer = peers
+    // Every connected peer, not the first one. ADR-0015's whole claim is that any holder of
+    // a chunk is as good as any other, so a fetch that used one peer when three were
+    // reachable would leave the point of the design on the floor -- and would make the
+    // fan-out path unreachable from a booted node.
+    let candidates: Vec<serde_json::Value> = peers
         .get("peers")
         .and_then(|p| p.as_array())
         .into_iter()
         .flatten()
-        .find(|p| {
-            p.get("state").and_then(|s| s.as_str()) == Some("connected")
-                && p.get("addresses")
-                    .and_then(|a| a.as_array())
-                    .is_some_and(|a| !a.is_empty())
+        .filter(|p| p.get("state").and_then(|s| s.as_str()) == Some("connected"))
+        .filter_map(|p| {
+            let node_id = p.get("node_id")?.as_str()?;
+            let address = p.get("addresses")?.as_array()?.first()?.as_str()?;
+            Some(serde_json::json!({ "node_id": node_id, "address": address }))
         })
-        .cloned()
-        .ok_or_else(|| Error::Startup("no connected peer to fetch from".into()))?;
-
-    let node_id = peer
-        .get("node_id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| Error::Startup("a peer record carries no node_id".into()))?;
-    let address = peer
-        .get("addresses")
-        .and_then(|a| a.as_array())
-        .and_then(|a| a.first())
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| Error::Startup("a connected peer has no address".into()))?;
+        .collect();
+    if candidates.is_empty() {
+        return Err(Error::Startup("no connected peer to fetch from".into()));
+    }
+    let asked = candidates.len();
 
     let content_token = broker_token(
         perm_socket,
         "net.content",
-        "otwono-netd --fetch: fetch an object from a peer",
+        "otwono-netd --fetch: fetch an object from this node's peers",
     )?;
     let value = client
         .call_with_capability(
             "net.fetch",
-            serde_json::json!({
-                "node_id": node_id,
-                "address": address,
-                "content_id": content_id,
-            }),
+            serde_json::json!({ "peers": candidates, "content_id": content_id }),
             &content_token,
         )
         .map_err(|e| Error::Startup(format!("net.fetch transport failure: {e}")))?
         .map_err(|e| Error::Startup(format!("net.fetch refused: {}", e.message)))?;
 
+    // `served` is what shows whether the work actually spread. A shell check on a booted
+    // node has no other way to see it, and "it completed" does not distinguish one peer
+    // doing everything from three sharing it.
     Ok(format!(
-        "{} {} bytes from {} visibility={}\n",
+        "{} {} bytes visibility={} asked={asked} served={}\n",
         value.get("content_id").and_then(|v| v.as_str()).unwrap_or("?"),
         value.get("size_bytes").and_then(|v| v.as_u64()).unwrap_or(0),
-        node_id,
         value.get("visibility").and_then(|v| v.as_str()).unwrap_or("?"),
+        value
+            .get("peers_that_served")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
     ))
 }
 

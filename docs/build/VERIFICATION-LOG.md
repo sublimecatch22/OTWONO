@@ -2991,3 +2991,96 @@ in the profile, and it gives the override mechanism its own first boot-time exer
 - **No real hardware, no radio.** `Trickle` links remain arithmetic (OQ-23, OQ-24).
 - **The cache never ran.** Both VMs probe as `storage=constrained`, so their budget is zero
   and neither opened a cache. Nothing cached anything for a neighbour.
+
+---
+
+## Phase 5 item 5, finished — three nodes, and fan-out on real links
+
+**Date:** 2026-08-25 · **Where:** OTWONO Cloud dev environment (no `/dev/kvm`, TCG only)
+
+ADR-0015's central claim is that a fetch draws chunks from *several* peers, so a dense
+neighbourhood transfers faster. Every previous slice recorded it as proven host-side only,
+over in-memory links. This is it on real ones.
+
+(Numbered against the roadmap this time. The entries titled "Phase 6 slice 1" through
+"slice 7" are this same subsystem — Phase 5 item 5 — and are left as they are, with a note
+in `ROADMAP.md` explaining the mislabel. A verification log is a record of what was done and
+when; renaming it after the fact would make it a worse record.)
+
+### The run
+
+```
+$ make -C build TARGET=amd64-qemu-ubuntu MESH_CONTENT_SMOKE=1 image
+$ MESH_CONTENT_SMOKE=1 build/qemu/multi-node-test.sh \
+      --image out/.../otwono-amd64-qemu-ubuntu.img --nodes 3 --arch amd64
+
+  segment    230.7.11.1:56687 (multicast)
+waiting for every node to see 2 peer(s) (TCG, up to 1200s)
+
+node n1: otw1:n6yr-sx1b-y96p-wf09 at 169.254.59.135/16, 2 peer(s)
+node n2: otw1:4f3e-7wtj-4aqz-kcfj at 169.254.10.208/16, 2 peer(s)
+node n3: otw1:k0xf-rr80-ecp0-r6k8 at 169.254.121.8/16, 2 peer(s)
+
+OTWONO-MESH-CONTENT-OK ... large_served=1 ...
+OTWONO-MESH-CONTENT-OK ... large_served=2 ...
+OTWONO-MESH-CONTENT-OK ... large_served=2 ...
+fan-out: 2 of 3 node(s) drew the large object from several peers
+PASS: 3 nodes discovered and mutually authenticated
+```
+
+Three VMs, three distinct first-boot identities, one L2 segment, no DHCP and no host
+bridge. Each node fetched a 378 890-byte multi-chunk object from its neighbours, and on two
+of the three the chunks came from **both** peers rather than one.
+
+### Why the segment is multicast
+
+`socket,listen=` / `socket,connect=`, which the two-node harness uses, is point to point and
+does not generalise to three guests. QEMU joins N guests to one link with
+`socket,mcast=GROUP:PORT` over loopback UDP. The two-node test keeps its point-to-point
+segment: it is the Phase 3 exit criterion, it passes, and a different network shape is worth
+keeping rather than folding away.
+
+### `--fetch` now uses every connected peer
+
+It used to take the first. That was wrong on its own terms — ADR-0015 says any holder of a
+chunk is as good as any other, so a node with three neighbours using one of them leaves the
+whole point of the design on the floor — and it also made the fan-out path unreachable from
+a booted node, which is why this could not have been tested before.
+
+The reply now carries `served=`, the number of peers that actually supplied chunks. "It
+completed" does not distinguish one peer doing everything from three sharing the work, and a
+shell check on a booted node has no other way to see the difference.
+
+### The assertion is deliberately weak, and says so
+
+The harness requires that **at least one** node drew the large object from several peers, not
+that all did. Which peer answers a given chunk first is a race by design: a node may
+legitimately get everything from one fast neighbour, and node n1 did exactly that
+(`large_served=1`). Requiring a spread on every node would be requiring the scheduler to
+cooperate, which is how defects 38, 43 and 44 happened — three things that were green
+because they were lucky.
+
+### Workspace
+
+```
+cargo test --workspace     782 passed, 0 failed
+cargo clippy --workspace --all-targets -- -D warnings   clean
+cargo fmt --all --check    clean
+shellcheck -S warning ...  clean
+```
+
+### What this does not prove
+
+- **Every node held the whole object.** Fan-out here spread work across peers that all had
+  everything. The harder case — peers holding *disjoint* pieces, where the fetch is
+  impossible without combining them — is still proven only host-side
+  (`three_peers_holding_disjoint_pieces_complete_a_fetch`). Giving booted nodes different
+  subsets needs a way for a guest to know which of N it is; the MAC address would do it, and
+  it is not built.
+- **No speedup was measured.** What is shown is that the work spread, not that it was
+  faster. Timing needs more than one host and a network that is not loopback under TCG.
+- **Nothing above the inline cap crossed a link.** 378 KB is under the 640 KiB
+  control-plane limit, so ADR-0018's file handoff between machines is still untested.
+- **The cache still did nothing.** Budget non-zero, `cache.status` answers, nothing cached:
+  `net.fetch` only caches when asked and the check does not ask.
+- **amd64 only, three nodes, one segment.** No partition, no healing, no arm64.
