@@ -8,6 +8,11 @@ Status legend: `SPECIFIED` (design only) · `IMPLEMENTED` (code + unit tests)
 
 ---
 
+**Direction not yet scheduled:** `docs/roadmap/CLUSTER-VISION.md` records the cluster,
+priority-tier, reach, knowledge-bundle and moderation direction, with the open questions
+and the two interactions (ranking against privacy, rewards against concentration) that
+need settling before any of it is built.
+
 ## Phase 0 — Foundation ✅ current
 
 **Goal:** a clean, extensible skeleton nobody has to undo later.
