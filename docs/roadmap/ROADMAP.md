@@ -201,9 +201,10 @@ GPU/NPU backends, and the tiered assistant shapes.
 4. Replication policy for `REPLICATED`. **decided and half built** — ADR-0026: replication
    is pulled by a holder, never pushed by an owner, so consent is inherent and the whole
    thing is best-effort by construction. The policy block is on the object record, and
-   `content.replicable` (§7) carries offers across a link, and a holder can take a copy and
-   hold it to a TTL (§8). What remains is the wiring: nothing yet *asks* a peer for offers on
-   its own, so no object has been replicated between two nodes.
+   `content.replicable` (§7) carries offers, a holder takes a copy and holds it to a TTL
+   (§8), and a pass runs on connection rather than on a timer (§9). An object has been
+   replicated between two nodes over a real channel. What remains is calling the pass from
+   the peer lifecycle, so it happens without a test driving it.
 5. ~~The **cluster cache** — a bounded, encrypted, tier-scaled contributed store
    (ADR-0015, `docs/services/CLUSTER-CACHE.md`).~~ **done**, including fan-out fetch
    and ADR-0018's file handoff for objects too large for the control plane. Chunking

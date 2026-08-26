@@ -146,6 +146,41 @@ remaining budget — so no caller can remember one and forget the other. Refusin
 `Ok(None)` rather than an error: on a small node "not this one" is the normal answer and
 not something to escalate.
 
+### 9. A node asks on connection, never on a timer, and takes at most one object
+
+**Amended 2026-08-26, on wiring the last piece.** §1 said a holder asks; this says when.
+
+**On connection.** When a node authenticates a peer and has replication enabled with budget
+to spare, it asks that peer once for offers. Not on a timer, and not in the background.
+
+Four reasons, and the first is the one that decides it:
+
+- **A timer that runs while offline is a timer that does nothing, badly.** Prime directive 2
+  says the system works with the cable out; asking on connection means an offline node does
+  no replication work at all, rather than waking up to discover it has no peers.
+- **The offer index is already per-session** (§7). Asking twice in one session returns the
+  same snapshot, so a timer would either re-ask pointlessly or force new handshakes to get
+  fresh answers — and a handshake per scan is exactly the price §7 chose.
+- **It needs no configuration.** No interval to tune, no jitter to get wrong, nothing for an
+  operator to set differently on two nodes and then wonder why they diverge.
+- **It is naturally rate-limited.** Replication work is bounded by how often this node meets
+  peers, which is the same bound ADR-0020 §4 relies on.
+
+**At most one object per connection.** A node that took everything on offer could have its
+whole replication budget filled by the first peer it meets, which is neither fair to other
+peers nor what "spread across the cluster" means. One per connection converges over time and
+degrades gracefully — it is slower to reach `target_replicas`, and §2 already said that
+number is a wish.
+
+**Nothing is asked when replication is off or the budget is full.** The capability engine's
+`content_replication` gate is the operator's consent and is checked before any request goes
+out, so a node that does not replicate makes no replication traffic at all rather than
+asking and discarding the answer.
+
+**Expiry is swept on the same trigger.** Releasing lapsed holds is cheap and needs no timer
+either; doing it when a connection happens keeps the whole subsystem free of background
+work, which on an SD-card-backed T0 board is worth more than promptness.
+
 ## Consequences
 
 **Good.** No consent mechanism to design, because nothing arrives unasked. No push

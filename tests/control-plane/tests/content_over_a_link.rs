@@ -1144,3 +1144,100 @@ fn an_offer_page_is_taken_once_per_session_like_the_sharing_index() {
     let mut fresh = otwono_netd::content::Session::default();
     assert_eq!(ask(&mut fresh), 1, "a new session sees it");
 }
+
+#[test]
+fn a_replica_crosses_a_link_and_is_held_to_its_ttl() {
+    // ADR-0026 end to end, between two stores: one node offers, the other asks, takes one
+    // object, and holds it. Until this ran, every piece of replication existed and nothing
+    // had ever copied anything.
+    let h = Harness::start("replicate");
+    let bytes = payload(40 * 1024, 91);
+    let id = h.put(&bytes, "replicated");
+    // Something it must *not* take, in the same store: an offer list that leaked a PUBLIC
+    // object would be caught by the responder, and a holder that took one anyway would be
+    // caught here.
+    let public = h.put(b"public, and never offered as a copy", "public");
+
+    // The holder's own cache, standing in for the second node's store.
+    let holder_dir = std::env::temp_dir().join(format!("otw-holder-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&holder_dir);
+    let holder = otwono_store::Cache::at(&holder_dir, otwono_store::StorageKey::generate(), 1 << 20)
+        .expect("holder cache");
+
+    let alice = NodeIdentity::generate().unwrap();
+    let bob = NodeIdentity::generate().unwrap();
+    let (client_link, server_link) = MemoryLink::pair();
+    let responder = h.responder();
+    let serving = std::thread::spawn(move || {
+        let mut channel = SecureChannel::accept(server_link, &bob).unwrap();
+        let _ = otwono_netd::serve_session(&mut channel, &responder);
+    });
+
+    let mut channel = SecureChannel::initiate(client_link, &alice).unwrap();
+    let now = 1_700_000_000_000u64;
+    let outcome =
+        otwono_netd::content::replication_pass(&mut channel, &LinkProperties::internet(), &holder, now)
+            .expect("a replication pass");
+
+    match &outcome {
+        otwono_netd::content::ReplicationPass::Took { content_id, .. } => {
+            assert_eq!(content_id, &id, "took something other than the offered object");
+            assert_ne!(content_id, &public, "a PUBLIC object was replicated");
+        }
+        other => panic!("expected to take the offered object, got {other:?}"),
+    }
+
+    // Held, not merely cached: budget pressure must not evict it.
+    assert_eq!(holder.replicas_held(now), 1);
+    let held = holder.entries();
+    let entry = held.iter().find(|e| e.content_id == id).expect("held");
+    assert!(!entry.is_evictable(now), "a live replica is evictable");
+    assert!(entry.replica_expires_ms.is_some(), "no hold was recorded");
+
+    // And the hold lapses on schedule rather than lasting forever.
+    let a_year = 365 * 24 * 60 * 60 * 1000u64;
+    assert_eq!(holder.expire_replicas(now + a_year).unwrap(), 1);
+    assert_eq!(holder.replicas_held(now + a_year), 0);
+
+    drop(channel);
+    let _ = serving.join();
+    let _ = std::fs::remove_dir_all(&holder_dir);
+}
+
+#[test]
+fn a_node_that_does_not_replicate_asks_for_nothing() {
+    // The capability engine's gate is the operator's consent, and it is checked before
+    // anything reaches the wire -- a node that does not replicate should make no
+    // replication traffic at all, rather than asking and discarding the answer.
+    let h = Harness::start("no-replicate");
+    h.put(b"on offer, and nobody is asking", "replicated");
+
+    let dir = std::env::temp_dir().join(format!("otw-noholder-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    // Budget zero is how the capability engine expresses "this machine contributes nothing".
+    let holder = otwono_store::Cache::at(&dir, otwono_store::StorageKey::generate(), 0).expect("cache");
+
+    let alice = NodeIdentity::generate().unwrap();
+    let bob = NodeIdentity::generate().unwrap();
+    let (client_link, server_link) = MemoryLink::pair();
+    let responder = h.responder();
+    let serving = std::thread::spawn(move || {
+        let mut channel = SecureChannel::accept(server_link, &bob).unwrap();
+        let _ = otwono_netd::serve_session(&mut channel, &responder);
+    });
+
+    let mut channel = SecureChannel::initiate(client_link, &alice).unwrap();
+    let outcome = otwono_netd::content::replication_pass(
+        &mut channel,
+        &LinkProperties::internet(),
+        &holder,
+        1_700_000_000_000,
+    )
+    .expect("a pass that does nothing is not an error");
+    assert_eq!(outcome, otwono_netd::content::ReplicationPass::NotReplicating);
+    assert!(holder.is_empty());
+
+    drop(channel);
+    let _ = serving.join();
+    let _ = std::fs::remove_dir_all(&dir);
+}

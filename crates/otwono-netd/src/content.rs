@@ -585,6 +585,152 @@ pub struct FetchedObject {
 /// An empty answer is not an error. It means either that nothing has been sealed to this
 /// node or that the peer will not say — deliberately indistinguishable, so that asking is
 /// not a way to learn whether a node shares with anyone (ADR-0020).
+/// Ask a peer what it is willing to have copied (ADR-0026 §7).
+///
+/// The mirror of [`fetch_shared_index`], with the same paging, the same round-trip budget,
+/// and the same refusal to let a peer that stops making progress page forever.
+pub fn fetch_replicable_index<L: LinkAdapter>(
+    channel: &mut SecureChannel<L>,
+    link: &LinkProperties,
+) -> Result<Vec<content::ReplicableEntry>, ProtocolError> {
+    let window = content::max_shared_entries_per_page(link);
+    let mut all: Vec<content::ReplicableEntry> = Vec::new();
+    let mut budget = MAX_ROUND_TRIPS;
+
+    loop {
+        let after = all.last().map(|e| e.content_id.clone());
+        let page = match round_trip(
+            channel,
+            &Request::Replicable {
+                after,
+                max_entries: window,
+            },
+            &mut budget,
+        )? {
+            Response::Replicable(p) => p,
+            Response::NotAvailable { .. } => return Ok(all),
+            Response::Manifest(_) | Response::Chunk(_) | Response::SharedWithYou(_) => {
+                return Err(ProtocolError::Mismatched(
+                    "the wrong kind of reply in place of an offer page".into(),
+                ))
+            }
+        };
+        if page.entries.is_empty() {
+            return Ok(all);
+        }
+        if page.entries.len() > window as usize {
+            return Err(ProtocolError::TooLarge {
+                field: "entries",
+                asked: page.entries.len() as u64,
+                ceiling: window as u64,
+            });
+        }
+        for entry in &page.entries {
+            if !content::is_hex_digest(&entry.content_id) {
+                return Err(ProtocolError::NotHex { field: "content_id" });
+            }
+        }
+        if let Some(last) = all.last() {
+            if page.entries[0].content_id <= last.content_id {
+                return Err(ProtocolError::NoProgress);
+            }
+        }
+        all.extend(page.entries.iter().cloned());
+        if all.len() > MAX_SHARED_INDEX_ENTRIES {
+            return Err(ProtocolError::TooLarge {
+                field: "entries",
+                asked: all.len() as u64,
+                ceiling: MAX_SHARED_INDEX_ENTRIES as u64,
+            });
+        }
+    }
+}
+
+/// What one replication pass did, so a caller can report it without guessing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplicationPass {
+    /// This node does not replicate, or has no budget. Nothing was asked.
+    NotReplicating,
+    /// The peer offered nothing, or nothing this node could take.
+    NothingTaken { offered: usize },
+    /// One object was copied and is now held to a TTL.
+    Took { content_id: String, size_bytes: u64 },
+}
+
+/// One replication pass against one peer (ADR-0026 §9).
+///
+/// Ask what is on offer, take **at most one** object, and hold it. One rather than all,
+/// because a node that took everything could have its whole replication budget filled by
+/// the first peer it meets — which is neither fair to other peers nor what "spread across
+/// the cluster" means. One per connection converges over time, and §2 already said
+/// `target_replicas` is a wish.
+///
+/// The choice among offers is deliberately **the smallest that fits**. Not random, which is
+/// untestable; not largest-first, which fills a budget with one object; and explicitly not
+/// by peer capability, which §6 refuses. Smallest-first also means a small node makes
+/// progress rather than repeatedly failing to fit anything.
+///
+/// Lapsed holds are swept first, on the same trigger, so the subsystem needs no timer.
+pub fn replication_pass<L: LinkAdapter>(
+    channel: &mut SecureChannel<L>,
+    link: &LinkProperties,
+    cache: &otwono_store::Cache,
+    now_ms: u64,
+) -> Result<ReplicationPass, ProtocolError> {
+    // Free what is no longer promised before deciding whether there is room. A failure here
+    // is not fatal to the pass: the worst case is that this node has less budget than it
+    // could have, which costs a replica rather than correctness.
+    let _ = cache.expire_replicas(now_ms);
+
+    // The operator's consent, checked before anything reaches the wire. A node that does
+    // not replicate makes no replication traffic at all rather than asking and discarding.
+    if !cache.enabled() || cache.used_bytes() >= cache.budget_bytes() {
+        return Ok(ReplicationPass::NotReplicating);
+    }
+
+    let mut offers = fetch_replicable_index(channel, link)?;
+    let offered = offers.len();
+    if offers.is_empty() {
+        return Ok(ReplicationPass::NothingTaken { offered });
+    }
+    let remaining = cache.budget_bytes().saturating_sub(cache.used_bytes());
+    offers.retain(|o| o.size_bytes <= o.max_size_bytes && o.size_bytes <= remaining);
+    offers.retain(|o| !cache.contains_hex(&o.content_id));
+    offers.sort_by_key(|o| (o.size_bytes, o.content_id.clone()));
+    let Some(pick) = offers.first().cloned() else {
+        return Ok(ReplicationPass::NothingTaken { offered });
+    };
+
+    let fetched = fetch_object(channel, &pick.content_id, link)?;
+    // The label the *peer* put on it, checked before this node keeps anything. An offer
+    // list saying "replicated" and a manifest saying otherwise is a peer contradicting
+    // itself, and the manifest is the one that carries the object.
+    if fetched.visibility != "replicated" {
+        return Err(ProtocolError::Mismatched(format!(
+            "offered for replication but served as {}",
+            fetched.visibility
+        )));
+    }
+    let policy = otwono_store::object::Replication {
+        target_replicas: 1,
+        ttl_days: pick.ttl_days,
+        max_size_bytes: pick.max_size_bytes,
+        allow_rereplication: pick.allow_rereplication,
+    };
+    match cache.take_replica(&fetched.bytes, &policy, now_ms) {
+        // Refused between the check and the take -- another thread filled the budget, or
+        // the object turned out larger than advertised. Not an error: "not this one".
+        Ok(None) => Ok(ReplicationPass::NothingTaken { offered }),
+        Ok(Some(object)) => Ok(ReplicationPass::Took {
+            content_id: object.content_id.to_hex(),
+            size_bytes: object.size_bytes,
+        }),
+        Err(e) => Err(ProtocolError::Mismatched(format!(
+            "could not hold the replica: {e}"
+        ))),
+    }
+}
+
 pub fn fetch_shared_index<L: LinkAdapter>(
     channel: &mut SecureChannel<L>,
     link: &LinkProperties,

@@ -253,6 +253,18 @@ impl Cache {
         self.store.root()
     }
 
+    /// Whether the cache already holds the object with this hex content id.
+    ///
+    /// Takes the text form because callers on the wire path have one and would otherwise
+    /// parse it back into a `ContentId` only to ask this question.
+    pub fn contains_hex(&self, hex: &str) -> bool {
+        self.index
+            .lock()
+            .expect("cache index poisoned")
+            .objects
+            .contains_key(hex)
+    }
+
     pub fn contains(&self, id: &ContentId) -> bool {
         self.index
             .lock()
