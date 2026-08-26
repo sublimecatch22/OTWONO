@@ -69,6 +69,28 @@ pub struct CacheEntry {
     /// available to the street even if nobody here has asked for it lately".
     #[serde(default)]
     pub pinned: bool,
+    /// When this node's promise to hold a replica runs out (ADR-0026).
+    ///
+    /// Deliberately separate from `pinned` rather than reusing it. Both mean "do not
+    /// evict", but an operator's pin is indefinite and a replica's hold expires — folding
+    /// them together would make a TTL sweep silently unpin something a person chose to
+    /// keep. Absent on everything that is not a replica.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replica_expires_ms: Option<u64>,
+}
+
+impl CacheEntry {
+    /// Whether this entry may be evicted to make room, at `now_ms`.
+    ///
+    /// Two independent reasons to keep it, and either is enough: an operator pinned it, or
+    /// this node promised to hold it as a replica and that promise has not run out.
+    pub fn is_evictable(&self, now_ms: u64) -> bool {
+        !self.pinned && !self.holds_a_live_replica(now_ms)
+    }
+
+    pub fn holds_a_live_replica(&self, now_ms: u64) -> bool {
+        self.replica_expires_ms.is_some_and(|at| now_ms < at)
+    }
 }
 
 /// What the cache holds, and how many objects reference each chunk.
@@ -290,6 +312,7 @@ impl Cache {
                     size_bytes: object.size_bytes,
                     last_access_ms: now_ms,
                     pinned: false,
+                    replica_expires_ms: None,
                 },
             );
         }
@@ -347,6 +370,81 @@ impl Cache {
         self.store.read_object(object).map_err(CacheError::Store)
     }
 
+    /// Take a copy of an offered object and promise to hold it (ADR-0026).
+    ///
+    /// The holder side of pull replication. Both rules are applied here so no caller can
+    /// remember one and forget the other: the **owner's** `max_size_bytes`, and this node's
+    /// **own** remaining budget. Refusing is the normal outcome on a small node and is not
+    /// an error worth escalating — `Ok(false)` means "not this one".
+    ///
+    /// A replica is a cache entry with an expiry rather than a separate store. It reuses the
+    /// budget, the encryption at rest, the refcounted chunks and the serving path that
+    /// already exist, and the only thing it adds is a reason not to evict it yet.
+    pub fn take_replica(
+        &self,
+        bytes: &[u8],
+        policy: &crate::object::Replication,
+        now_ms: u64,
+    ) -> Result<Option<Object>, CacheError> {
+        let size = bytes.len() as u64;
+        let remaining = self.budget_bytes.saturating_sub(self.used_bytes());
+        if !policy.a_holder_may_take(size, remaining) {
+            return Ok(None);
+        }
+        // REPLICATED and nothing else. insert() enforces this too; naming it here as well
+        // means a caller reading this function does not have to go and check.
+        let object = self.insert(bytes, Visibility::Replicated, now_ms)?;
+        let ttl_ms = (policy.ttl_days as u64).saturating_mul(24 * 60 * 60 * 1000);
+        let expires = now_ms.checked_add(ttl_ms);
+        {
+            let mut index = self.index.lock().expect("cache index poisoned");
+            if let Some(entry) = index.objects.get_mut(&object.content_id.to_hex()) {
+                // None from checked_add means an expiry beyond what a u64 can express,
+                // which is "effectively never" rather than "already expired" -- the same
+                // direction Replication::is_expired takes, for the same reason.
+                entry.replica_expires_ms = expires.or(Some(u64::MAX));
+            }
+            Self::persist(&index, &self.index_path)?;
+        }
+        Ok(Some(object))
+    }
+
+    /// Drop the hold on replicas whose promise has run out (ADR-0026).
+    ///
+    /// The objects are **not deleted** — they become ordinary cache entries, evictable when
+    /// the budget needs room. A node that fetched something recently should not lose it the
+    /// instant a TTL lapses, and letting the cache's own LRU decide is both cheaper and
+    /// kinder than a second deletion policy.
+    ///
+    /// Returns how many holds were released.
+    pub fn expire_replicas(&self, now_ms: u64) -> Result<usize, CacheError> {
+        let mut released = 0;
+        {
+            let mut index = self.index.lock().expect("cache index poisoned");
+            for entry in index.objects.values_mut() {
+                if entry.replica_expires_ms.is_some() && !entry.holds_a_live_replica(now_ms) {
+                    entry.replica_expires_ms = None;
+                    released += 1;
+                }
+            }
+            if released > 0 {
+                Self::persist(&index, &self.index_path)?;
+            }
+        }
+        Ok(released)
+    }
+
+    /// How many replicas this node is currently holding.
+    pub fn replicas_held(&self, now_ms: u64) -> usize {
+        self.index
+            .lock()
+            .expect("cache index poisoned")
+            .objects
+            .values()
+            .filter(|e| e.holds_a_live_replica(now_ms))
+            .count()
+    }
+
     /// Pin or unpin an object. A pinned object is never evicted.
     pub fn set_pinned(&self, id: &ContentId, pinned: bool) -> Result<bool, CacheError> {
         let mut index = self.index.lock().expect("cache index poisoned");
@@ -384,9 +482,9 @@ impl Cache {
 
     /// Evict least-recently-used objects until `need` more bytes fit inside the budget.
     ///
-    /// Pinned objects are skipped. If everything left is pinned and it still does not fit,
-    /// the insert is refused rather than the budget quietly exceeded.
-    pub fn evict_to_fit(&self, need: u64, _now_ms: u64) -> Result<u64, CacheError> {
+    /// Pinned objects and live replicas are skipped. If everything left is held and it
+    /// still does not fit, the insert is refused rather than the budget quietly exceeded.
+    pub fn evict_to_fit(&self, need: u64, now_ms: u64) -> Result<u64, CacheError> {
         let mut index = self.index.lock().expect("cache index poisoned");
         let mut freed = 0;
         loop {
@@ -399,7 +497,7 @@ impl Cache {
             let victim = index
                 .objects
                 .values()
-                .filter(|e| !e.pinned)
+                .filter(|e| e.is_evictable(now_ms))
                 .min_by(|a, b| {
                     a.last_access_ms
                         .cmp(&b.last_access_ms)
@@ -631,6 +729,123 @@ mod tests {
         assert!(c.contains(&a.content_id), "a was touched and must survive");
         assert!(!c.contains(&b.content_id), "b was oldest and must go");
         assert!(c.contains(&d.content_id));
+    }
+
+    // --- replicas (ADR-0026) --------------------------------------------------------------
+
+    fn policy(max_size: u64, ttl_days: u32) -> crate::object::Replication {
+        crate::object::Replication {
+            max_size_bytes: max_size,
+            ttl_days,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_replica_is_refused_by_the_owners_cap_or_by_this_nodes_budget() {
+        // Two rules from two parties. Applying one and forgetting the other is the mistake
+        // take_replica exists to prevent, so both refusals are pinned -- and a refusal is
+        // Ok(None), because "too big for me" is the normal answer on a small node and not
+        // an error worth escalating.
+        let c = cache("replica-limits", 1_000);
+        assert!(
+            c.take_replica(&[0u8; 500], &policy(100, 30), 0)
+                .unwrap()
+                .is_none(),
+            "over the owner's cap"
+        );
+        assert!(
+            c.take_replica(&[0u8; 5_000], &policy(u64::MAX, 30), 0)
+                .unwrap()
+                .is_none(),
+            "over this node's budget"
+        );
+        assert!(
+            c.take_replica(&[0u8; 500], &policy(1_000, 30), 0)
+                .unwrap()
+                .is_some(),
+            "within both"
+        );
+    }
+
+    #[test]
+    fn a_held_replica_is_not_evicted_to_make_room() {
+        // The point of holding one. If budget pressure could evict a replica, this node's
+        // promise would be worth nothing and durability would follow local demand.
+        let c = cache("replica-hold", 2_000);
+        let held = c
+            .take_replica(&[7u8; 900], &policy(u64::MAX, 30), 1_000)
+            .unwrap()
+            .expect("taken");
+        // Fill the rest and force pressure.
+        for i in 0..4u8 {
+            let _ = c.insert(&[i; 900], Visibility::Public, 2_000 + i as u64);
+        }
+        assert!(c.contains(&held.content_id), "a live replica was evicted");
+    }
+
+    #[test]
+    fn an_expired_replica_becomes_ordinary_rather_than_being_deleted() {
+        // ADR-0026: the hold lapses, the bytes stay. A node that fetched something recently
+        // should not lose it the instant a TTL passes -- the cache's own LRU is a kinder and
+        // cheaper decision than a second deletion policy.
+        let c = cache("replica-expire", 10_000);
+        let day = 24 * 60 * 60 * 1000u64;
+        let o = c
+            .take_replica(&[3u8; 100], &policy(u64::MAX, 1), 0)
+            .unwrap()
+            .expect("taken");
+        assert_eq!(c.replicas_held(0), 1);
+
+        assert_eq!(c.expire_replicas(day - 1).unwrap(), 0, "not yet");
+        assert_eq!(c.expire_replicas(day).unwrap(), 1, "the hold lapses");
+        assert!(c.contains(&o.content_id), "the object was deleted, not released");
+        assert_eq!(c.replicas_held(day), 0);
+        // And releasing twice is not counted twice.
+        assert_eq!(c.expire_replicas(day + 1).unwrap(), 0);
+    }
+
+    #[test]
+    fn an_expired_replica_can_then_be_evicted_like_anything_else() {
+        // The other half of the previous test: released really means evictable, otherwise
+        // "not deleted" would quietly mean "kept forever" and the budget would leak.
+        let c = cache("replica-evict", 2_000);
+        let day = 24 * 60 * 60 * 1000u64;
+        let o = c
+            .take_replica(&[9u8; 900], &policy(u64::MAX, 1), 0)
+            .unwrap()
+            .expect("taken");
+        c.expire_replicas(day).unwrap();
+        for i in 0..4u8 {
+            let _ = c.insert(&[i; 900], Visibility::Public, day + 1 + i as u64);
+        }
+        assert!(!c.contains(&o.content_id), "a released replica was never evicted");
+    }
+
+    #[test]
+    fn an_operators_pin_outlives_a_replica_ttl() {
+        // Why the two are separate fields. Folding them together would make a TTL sweep
+        // silently unpin something a person chose to keep.
+        let c = cache("replica-pin", 10_000);
+        let day = 24 * 60 * 60 * 1000u64;
+        let o = c
+            .take_replica(&[5u8; 100], &policy(u64::MAX, 1), 0)
+            .unwrap()
+            .expect("taken");
+        assert!(c.set_pinned(&o.content_id, true).unwrap());
+        c.expire_replicas(day).unwrap();
+
+        let entry = c
+            .entries()
+            .into_iter()
+            .find(|e| e.content_id == o.content_id.to_hex())
+            .expect("still there");
+        assert!(entry.pinned, "the operator's pin was cleared by a TTL sweep");
+        assert!(
+            entry.replica_expires_ms.is_none(),
+            "the replica hold should have lapsed"
+        );
+        assert!(!entry.is_evictable(day), "a pinned object is still not evictable");
     }
 
     #[test]

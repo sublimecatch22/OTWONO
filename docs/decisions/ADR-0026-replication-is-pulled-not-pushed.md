@@ -123,6 +123,29 @@ Each entry carries the content id, the size, and the parts of the policy a holde
 could not act on the number, and putting a figure on the wire that nobody can use is an
 invitation to build a UI on it.
 
+### 8. A replica is a cache entry with an expiry
+
+**Amended 2026-08-26, on building the holder side.**
+
+A replica lives in the cluster cache rather than in a store of its own. It reuses the
+budget, the encryption at rest, the refcounted chunks and the serving path that ADR-0015
+already built; the only thing replication adds is a reason not to evict it yet.
+
+**The hold is separate from an operator's pin**, and that separation is the part worth
+stating. Both mean "do not evict", but a pin is indefinite and a hold expires — folding them
+into one flag would make a TTL sweep silently unpin something a person chose to keep. Two
+fields, either sufficient to keep an object.
+
+**Expiry releases the hold; it does not delete the object.** The bytes become an ordinary
+cache entry, evictable when the budget needs room. A node that fetched something recently
+should not lose it the instant a TTL lapses, and letting the cache's own LRU decide is both
+cheaper and kinder than a second deletion policy.
+
+`take_replica` applies **both** rules — the owner's `max_size_bytes` and this node's own
+remaining budget — so no caller can remember one and forget the other. Refusing returns
+`Ok(None)` rather than an error: on a small node "not this one" is the normal answer and
+not something to escalate.
+
 ## Consequences
 
 **Good.** No consent mechanism to design, because nothing arrives unasked. No push
