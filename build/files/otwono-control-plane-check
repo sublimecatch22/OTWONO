@@ -152,10 +152,23 @@ if [ -f /etc/systemd/system/otwono-permd.service.d/90-confirmer.conf ]; then
     derived=$(echo "$keys" | grep -c "^m/44'")
     [ "$derived" -eq 2 ] \
         || { echo "OTWONO-CONTROL-PLANE-FAIL derived $derived keys, expected 2" >&2; exit 1; }
-    # Two indices, two different keys -- addresses are free, so reuse is never forced.
-    distinct=$(echo "$keys" | awk "/^m\/44'/ {print \$2}" | sort -u | wc -l)
-    [ "$distinct" -eq 2 ] \
-        || { echo "OTWONO-CONTROL-PLANE-FAIL two indices produced the same key" >&2; exit 1; }
+
+    # Every family renders, and every index differs in every family (ADR-0025). Two indices
+    # that produced the same address would make "a fresh address per purpose" a promise the
+    # UI cannot keep.
+    for fam in ethereum bitcoin cosmos; do
+        n=$(echo "$keys" | awk -v f="$fam" '$1 == f {print $2}' | sort -u | wc -l)
+        [ "$n" -eq 2 ] || {
+            echo "OTWONO-CONTROL-PLANE-FAIL $fam gave $n distinct addresses for 2 indices" >&2
+            exit 1
+        }
+    done
+    echo "$keys" | grep -q '^  ethereum  0x' \
+        || { echo "OTWONO-CONTROL-PLANE-FAIL no ethereum address rendered" >&2; exit 1; }
+    echo "$keys" | grep -q '^  bitcoin   bc1' \
+        || { echo "OTWONO-CONTROL-PLANE-FAIL no bitcoin address rendered" >&2; exit 1; }
+    echo "$keys" | grep -q '^  cosmos    otwono1' \
+        || { echo "OTWONO-CONTROL-PLANE-FAIL no cosmos address rendered" >&2; exit 1; }
 
     # And the wrong passphrase opens nothing.
     if printf 'wrong\n' | otwono-walletctl address --passphrase-stdin >/dev/null 2>&1; then

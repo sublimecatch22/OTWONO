@@ -20,4 +20,10 @@ argon2 = "0.5"
 chacha20poly1305 = "0.10"
 data-encoding = "2"
 rand_core = { version = "0.6", features = ["getrandom"] }
+# Address encoding (ADR-0025). Keccak for the Ethereum family, bech32 for the Bitcoin and
+# Cosmos families; ripemd and sha2 arrive with bip32 already.
+sha3 = "0.10"
+ripemd = "0.1"
+sha2 = "0.10"
+bech32 = "0.11"
 zeroize = { version = "1", features = ["derive"] }

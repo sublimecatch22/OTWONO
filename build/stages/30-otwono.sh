@@ -1004,7 +1004,14 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 IPAddressDeny=localhost link-local multicast
 # It writes only to the spool. The allow-list under /etc is read-only to it, so a
 # compromised fetcher cannot add a source for itself.
-ReadWritePaths=/run/otwono /var/lib/otwono/fetch
+# /var/lib/otwono, not /var/lib/otwono/fetch -- the trap in the note at the top of this
+# stage, and the cause of two intermittent boot failures before it was understood. The data
+# partition is created empty, so the subdirectory does not exist once that mount is up, and
+# systemd then fails the unit during namespace setup before ExecStart runs. It looked
+# intermittent because it is a race: mounted before this unit starts, it fails; not yet
+# mounted, the rootfs directory underneath is used and it works. otwono-fetchd creates its
+# own spool directory at startup (main.rs), so naming the parent here loses nothing.
+ReadWritePaths=/run/otwono /var/lib/otwono
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes

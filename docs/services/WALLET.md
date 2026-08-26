@@ -143,15 +143,22 @@ fails to open it.
 Only the line ending is stripped from stdin input. A passphrase is somebody's words, and
 trimming spaces would silently change the key.
 
-## 4. Why there is no address yet
+## 4. Addresses: every family, one key
 
-ADR-0022 leaves **which chain** deliberately undecided, and an address string is
-chain-specific: Ethereum hashes the public key with Keccak, Bitcoin hashes it differently and
-encodes with a network prefix. Committing to one encoder now would decide the chain by
-implementation, which is how a "not yet decided" quietly becomes decided.
+**Settled by ADR-0025.** ADR-0022 left the chain open and this crate used to stop at the
+public key. It now renders all three families — Ethereum `0x…`, Bitcoin `bc1q…`, Cosmos
+`otwono1…` — from the same compressed secp256k1 key.
 
-The crate goes as far as the compressed secp256k1 public key — which every chain in this
-family agrees on — and stops. Whatever encodes an address takes those 33 bytes.
+An address is a pure function of a public key, so rendering all three commits to nothing and
+defers the chain choice genuinely rather than by refusing to show anything. When the chain is
+chosen, the work is deleting two renderings.
+
+**The UI must say they are one wallet.** Three notations invite "three wallets, send
+anywhere". They are one set of funds, and money sent to the wrong chain is usually gone.
+
+**Rendering an address is not supporting a chain.** Nothing here knows about balances, fees,
+nonces, or broadcasting. A person seeing `bc1q…` may assume Bitcoin works; only the notation
+does.
 
 ## 5. Signing, and why it is not reachable
 

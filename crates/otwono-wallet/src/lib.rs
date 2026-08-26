@@ -25,9 +25,11 @@
 
 #![forbid(unsafe_code)]
 
+pub mod address;
 mod derive;
 mod vault;
 
+pub use address::{encode as encode_address, AddressError, Family};
 pub use derive::{Account, AccountPath, DeriveError};
 pub use vault::{Vault, VaultError, VaultFile, ARGON2_M_COST, ARGON2_P_COST, ARGON2_T_COST};
 

@@ -39,3 +39,4 @@ Rules:
 | 0022 | The wallet: a third key family, its own daemon, and what `PRIVATE` means when a transaction must be published | accepted |
 | 0023 | `otwono-walletd` holds nothing unlocked: the passphrase per call, no session, and no public key in the clear | accepted |
 | 0024 | The confirmation channel: asynchronous, bound to one request, and refused to the subject that asked | accepted |
+| 0025 | Render every address family, and decide the chain later | accepted |

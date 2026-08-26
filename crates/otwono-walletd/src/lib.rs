@@ -40,7 +40,7 @@
 use otwono_proto::{
     unknown_method, CallContext, Client, MethodDescription, RpcError, Service, ServiceDescription,
 };
-use otwono_wallet::{Account, AccountPath, Mnemonic, Vault};
+use otwono_wallet::{Account, AccountPath, Family, Mnemonic, Vault};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -78,6 +78,13 @@ struct PublicKeysParams {
     /// Which indices to derive. Explicit rather than a range so a caller can ask for the
     /// three it actually wants without deriving everything below them.
     indices: Vec<u32>,
+    /// Chain prefix for the bech32 rendering. Defaults to `otwono`.
+    #[serde(default = "default_hrp")]
+    hrp: String,
+}
+
+fn default_hrp() -> String {
+    "otwono".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -182,10 +189,22 @@ impl WalletService {
             let path = AccountPath::new(p.coin, p.account, p.change, *index)
                 .map_err(|e| RpcError::invalid_params(e.to_string()))?;
             let account = Account::derive(&seed, path).map_err(|e| RpcError::internal(e.to_string()))?;
+            // Every family, from the one key. ADR-0022 left the chain undecided and an
+            // address is a pure function of a public key, so rendering all three commits to
+            // nothing — and a caller that only wants one simply reads that field.
+            let pk = account.public_key();
             keys.push(json!({
                 "path": path.to_string(),
                 "index": index,
                 "public_key": account.public_key_hex(),
+                "addresses": {
+                    "ethereum": otwono_wallet::encode_address(pk, &Family::Ethereum)
+                        .map_err(|e| RpcError::internal(e.to_string()))?,
+                    "bitcoin": otwono_wallet::encode_address(pk, &Family::Bitcoin)
+                        .map_err(|e| RpcError::internal(e.to_string()))?,
+                    "cosmos": otwono_wallet::encode_address(pk, &Family::Cosmos(p.hrp.clone()))
+                        .map_err(|e| RpcError::invalid_params(e.to_string()))?,
+                },
             }));
         }
         Ok(json!({ "keys": keys }))

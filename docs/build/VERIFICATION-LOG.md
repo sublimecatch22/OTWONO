@@ -4158,3 +4158,87 @@ mistake in a script would have failed loudly.
 Nothing new is tested here. Every caveat from the entries above stands unchanged: no
 signing, no chain, `export-seed` never run, the no-echo prompt never exercised, expiry only
 against an injected clock, nothing notifying anybody, amd64 only, TCG, two nodes.
+
+
+---
+
+## Addresses in three families, and a latent boot defect that was never a flake
+
+**STATUS: VERIFIED on a booted node.**
+
+```
+OTWONO-CONTROL-PLANE-OK tier=T0_MICRO audit_records=12 wallet_ns=isolated wallet_status=present confirm_socket=present confirmed=yes wallet_created=yes
+```
+
+Decision 1-D from the project owner: render every address family rather than pick one.
+ADR-0025.
+
+### Workspace
+
+```
+cargo test --workspace                                   999 passed, 0 failed
+cargo clippy --workspace --all-targets -- -D warnings     clean
+cargo fmt --all --check                                   clean
+shellcheck, CI's multi-file invocation                    clean
+```
+
+The boot asserts all three families render and that two indices give six distinct addresses
+— if indices collided, "a fresh address per purpose" would be a promise the UI cannot keep.
+
+### The test that was wrong about working code
+
+The Ethereum encoder's first test carried a key/address vector **written from memory**. It
+was wrong, and it reported a correct implementation as broken.
+
+The fix was not to trust the code either. A from-scratch Keccak-256 and secp256k1 were
+written for the purpose, the Keccak checked against the published empty-string and `"abc"`
+digests *before* being used, and private key 1 confirmed against the widely published
+`0x7e5f…5bdf`. One trap worth naming: `hashlib.sha3_256` is NIST SHA-3, not Keccak-256 —
+the padding byte differs, so the obvious way to check this silently gives wrong answers.
+
+An encoder that is self-consistent and disagrees with the chain produces addresses nobody
+can spend from. Only a vector from outside the codebase catches that.
+
+### otwono-fetchd: twice is not a flake
+
+`otwono-fetchd` failed to start during a boot for the second time this session. The first
+occurrence was recorded as undiagnosed rather than called a flake, which was the right call
+— the second made it a defect to find.
+
+Its unit named `ReadWritePaths=/var/lib/otwono/fetch`: **a subdirectory of the data
+partition**, which stage 50 creates empty. That is precisely the trap documented for
+`otwono-walletd` several commits earlier, sitting in an older unit the whole time.
+
+The intermittency has a mechanism. It is a race between the mount and the unit: before
+`/var/lib/otwono` is mounted, the rootfs directory underneath exists and the namespace sets
+up fine; once mounted, the partition is empty and setup fails before `ExecStart`. Build
+timing decides which happens, which is why it looked random and why most boots passed.
+
+`otwono-fetchd` was the last unit naming a subdirectory there. Both boots since are clean
+with zero failed units.
+
+Two lessons, and the second is the one that generalises:
+
+- **A documented trap does not fix the instances that already exist.** Writing the note in
+  stage 30 stopped the next daemon repeating it and did nothing about the one that already
+  had. Auditing the other units for the same shape would have found this immediately.
+- **Intermittent is a symptom, not a diagnosis.** The word invites shrugging. Here it was
+  the signature of a race, and the race pointed straight at the cause.
+
+### A note on housekeeping
+
+The session filled its writable disk allowance mid-run (`out/` at 12 GB across repeated
+image builds, plus a 12 GB `target/`). CLAUDE.md §11 warns about exactly this. Cleared by
+deleting the two-node images, stage 60's verification scratch, and the aarch64 target tree —
+all reproducible.
+
+### What is not tested
+
+- **No chain is supported.** Nothing knows about balances, fees, nonces, or broadcasting.
+  Only the notation exists, and a person seeing `bc1q…` may reasonably assume otherwise.
+- **The Bitcoin and Cosmos encoders have no published vector**, only the property that they
+  agree with each other under the same prefix and differ per index. Ethereum is the one
+  checked against outside values.
+- **`export-seed` still never runs**, the no-echo prompt is still never exercised, expiry is
+  still only against an injected clock, and nothing notifies anybody a confirmation waits.
+- amd64 only, TCG, single node. The two-node run predates the fetchd fix.

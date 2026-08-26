@@ -39,6 +39,7 @@ OPTIONS:
     --coin <N>                BIP-44 coin type (default 60)
     --account <N>             BIP-44 account (default 0)
     --index <N>               Repeatable. Which addresses to derive (default 0)
+    --hrp <PREFIX>            Chain prefix for the bech32 address (default otwono)
     --confirmation <ID>       Resume a command after somebody approved it
     --socket <PATH>           Wallet socket (default $OTWONO_SOCKET_DIR/wallet.sock)
     --perm-socket <PATH>      Permission broker (default $OTWONO_SOCKET_DIR/perm.sock)
@@ -60,6 +61,10 @@ ABOUT ADDRESSES:
     household's whole history publicly linkable to anyone who ever sees one payment. Nothing
     here is shown without the passphrase, because this node stores no public key in the
     clear.
+
+    Three renderings of the same key are shown, because the chain is not decided. They are
+    the same funds under different notations, not three wallets -- and money sent to the
+    wrong chain's address is usually gone.
 
 EXIT CODES:
     0  done
@@ -104,6 +109,7 @@ struct Options {
     coin: u32,
     account: u32,
     indices: Vec<u32>,
+    hrp: String,
     confirmation: Option<String>,
     socket: PathBuf,
     perm_socket: PathBuf,
@@ -116,6 +122,7 @@ fn parse(args: &[String]) -> Result<Options, Error> {
     let mut coin = 60u32;
     let mut account = 0u32;
     let mut indices: Vec<u32> = Vec::new();
+    let mut hrp = "otwono".to_string();
     let mut confirmation = None;
     let mut socket: Option<PathBuf> = None;
     let mut perm_socket: Option<PathBuf> = None;
@@ -147,6 +154,7 @@ fn parse(args: &[String]) -> Result<Options, Error> {
             "--coin" => coin = num(&next("--coin")?, "--coin")?,
             "--account" => account = num(&next("--account")?, "--account")?,
             "--index" => indices.push(num(&next("--index")?, "--index")?),
+            "--hrp" => hrp = next("--hrp")?,
             "--confirmation" => confirmation = Some(next("--confirmation")?),
             "--socket" => socket = Some(next("--socket")?.into()),
             "--perm-socket" => perm_socket = Some(next("--perm-socket")?.into()),
@@ -164,6 +172,7 @@ fn parse(args: &[String]) -> Result<Options, Error> {
         coin,
         account,
         indices,
+        hrp,
         confirmation,
         socket: socket.unwrap_or_else(|| otwono_proto::socket_path("wallet")),
         perm_socket: perm_socket.unwrap_or_else(|| otwono_proto::socket_path("perm")),
@@ -202,6 +211,7 @@ fn run(args: &[String]) -> Result<String, Error> {
                 "coin": o.coin,
                 "account": o.account,
                 "indices": o.indices,
+                "hrp": o.hrp,
             }),
         ),
         "create" => ("wallet.create", json!({ "passphrase": need_passphrase(&o)? })),
@@ -348,15 +358,21 @@ fn render(command: &str, v: &Value) -> String {
         "address" => {
             let mut out = String::new();
             for k in v["keys"].as_array().cloned().unwrap_or_default() {
+                let a = &k["addresses"];
+                let at = |n: &str| a[n].as_str().unwrap_or("").to_string();
                 out.push_str(&format!(
-                    "{}  {}\n",
+                    "{}\n  ethereum  {}\n  bitcoin   {}\n  cosmos    {}\n  public key {}\n\n",
                     k["path"].as_str().unwrap_or(""),
-                    k["public_key"].as_str().unwrap_or("")
+                    at("ethereum"),
+                    at("bitcoin"),
+                    at("cosmos"),
+                    k["public_key"].as_str().unwrap_or(""),
                 ));
             }
             out.push_str(
-                "\nThese are public keys, not addresses: which chain is not decided, and an\n\
-                 address string is chain-specific.\n",
+                "The same key in three notations, because the chain is not decided. They are\n\
+                 one set of funds, not three wallets, and money sent to the wrong chain is\n\
+                 usually gone.\n",
             );
             out
         }
@@ -457,13 +473,19 @@ mod tests {
     }
 
     #[test]
-    fn addresses_are_labelled_as_public_keys_rather_than_addresses() {
-        // The chain is not decided, so calling these addresses would be deciding it in a
-        // help string.
+    fn every_family_is_shown_with_a_warning_that_they_are_one_wallet() {
+        // Three notations invite the reading "three wallets, send anywhere". The warning is
+        // load-bearing: money sent to the wrong chain's address is usually gone.
         let out = render(
             "address",
-            &json!({ "keys": [{ "path": "m/44'/60'/0'/0/0", "public_key": "02ab" }] }),
+            &json!({ "keys": [{
+                "path": "m/44'/60'/0'/0/0",
+                "public_key": "02ab",
+                "addresses": { "ethereum": "0xabc", "bitcoin": "bc1qxyz", "cosmos": "otwono1xyz" },
+            }] }),
         );
-        assert!(out.contains("public keys, not addresses"), "{out}");
+        for want in ["0xabc", "bc1qxyz", "otwono1xyz", "not three wallets"] {
+            assert!(out.contains(want), "missing {want}: {out}");
+        }
     }
 }
