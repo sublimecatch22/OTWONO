@@ -1,4 +1,4 @@
-//! The neighbourhood cache (ADR-0015).
+//! The cluster cache (ADR-0015).
 //!
 //! A bounded, encrypted, content-addressed slice of disk that a node contributes so its
 //! neighbours can serve each other instead of each fetching from origin. It is a cache and
@@ -23,7 +23,7 @@
 //!
 //! # The budget is not this module's decision
 //!
-//! It arrives as a number from `FeatureGates::neighbourhood_cache_bytes`, which the
+//! It arrives as a number from `FeatureGates::cluster_cache_bytes`, which the
 //! capability policy engine derives from the tier and the storage axis (CLAUDE.md §2.6).
 //! This module enforces it; it does not choose it.
 //!
@@ -48,7 +48,7 @@ pub const DEFAULT_CACHE_DIR: &str = "/var/lib/otwono/cache";
 /// Free space the cache will never consume, whatever its budget says.
 ///
 /// A cache that fills the disk is a fault, not a feature
-/// (`NEIGHBOURHOOD-CACHE.md` §3). The audit log and the fetch spool have to keep working
+/// (`CLUSTER-CACHE.md` §3). The audit log and the fetch spool have to keep working
 /// on a node whose cache is full, and on an SBC with an 8 GB eMMC the budget alone is not
 /// enough of a guarantee — the user's own data grows underneath it.
 pub const RESERVE_FLOOR_BYTES: u64 = 256 * 1024 * 1024;
@@ -152,7 +152,7 @@ impl std::fmt::Display for CacheError {
         match self {
             CacheError::NotCacheable(v) => write!(
                 f,
-                "{v} content is never placed in the neighbourhood cache; only public and \
+                "{v} content is never placed in the cluster cache; only public and \
                  replicated content may be"
             ),
             CacheError::LargerThanBudget { size, budget } => write!(
@@ -165,7 +165,7 @@ impl std::fmt::Display for CacheError {
             ),
             CacheError::Disabled => write!(
                 f,
-                "this machine contributes no neighbourhood cache; the capability policy set \
+                "this machine contributes no cluster cache; the capability policy set \
                  its budget to zero"
             ),
             CacheError::Store(e) => write!(f, "{e}"),
@@ -336,7 +336,7 @@ impl Cache {
     ///
     /// The trade-off is real and worth naming: a node's cache therefore keeps what its own
     /// household fetched in preference to what the street keeps asking for, which is
-    /// slightly backwards for a *neighbourhood* cache. Letting peers drive eviction is the
+    /// slightly backwards for a *cluster* cache. Letting peers drive eviction is the
     /// larger hazard, so this is where it sits until there is a reason to move it.
     pub fn chunk(&self, r: &ChunkRef) -> Result<Vec<u8>, CacheError> {
         self.store.get_chunk(r).map_err(CacheError::Store)
@@ -369,7 +369,7 @@ impl Cache {
     /// Empty the cache.
     ///
     /// "Serving is carrying": an operator stores bytes they did not choose one at a time,
-    /// so a purge must always be one action away (`NEIGHBOURHOOD-CACHE.md` §6). Pinned
+    /// so a purge must always be one action away (`CLUSTER-CACHE.md` §6). Pinned
     /// objects go too — a purge that left things behind would not be one.
     pub fn purge(&self) -> Result<u64, CacheError> {
         let mut index = self.index.lock().expect("cache index poisoned");
@@ -601,7 +601,7 @@ mod tests {
 
     #[test]
     fn the_budget_holds_under_sustained_pressure() {
-        // NEIGHBOURHOOD-CACHE.md §8: evict rather than fill the disk. Twenty inserts of
+        // CLUSTER-CACHE.md §8: evict rather than fill the disk. Twenty inserts of
         // 64 KiB into a 256 KiB budget.
         let budget = 256 * 1024;
         let c = cache("pressure", budget);

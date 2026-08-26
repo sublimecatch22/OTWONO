@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://otwono.org/schemas/capability-profile-1.1.0.json",
+  "$id": "https://otwono.org/schemas/capability-profile-2.0.0.json",
   "title": "OTWONO Capability Profile",
   "description": "The machine-readable statement of what an OTWONO node can do. Produced by otwono-hwd (and by `otwono-hwctl profile --json`) and consumed by every other subsystem. No subsystem may re-derive hardware capability for itself.",
   "type": "object",
@@ -53,7 +53,7 @@
         "local_llm", "max_model_parameters", "recommended_quantization", "local_rag",
         "speech_to_text", "text_to_speech", "image_generation", "max_concurrent_agents",
         "eligible_node_roles", "background_services", "desktop", "serve_ai_to_peers",
-        "content_replication", "neighbourhood_cache_bytes"
+        "content_replication", "cluster_cache_bytes"
       ],
       "additionalProperties": false,
       "properties": {
@@ -74,9 +74,9 @@
         "desktop": { "enum": ["headless", "light", "full"] },
         "serve_ai_to_peers": { "type": "boolean" },
         "content_replication": { "type": "boolean" },
-        "neighbourhood_cache_bytes": {
+        "cluster_cache_bytes": {
           "type": "integer",
-          "description": "Bytes this machine may contribute to the neighbourhood cache (ADR-0015). A default the operator may raise or lower; no subsystem infers its own. Zero means the machine caches nothing for peers, which is what a storage-constrained machine gets whatever its tier says.",
+          "description": "Bytes this machine may contribute to the cluster cache (ADR-0015). A default the operator may raise or lower; no subsystem infers its own. Zero means the machine caches nothing for peers, which is what a storage-constrained machine gets whatever its tier says.",
           "minimum": 0
         }
       }

@@ -1,6 +1,6 @@
 //! ADR-0015's central claim, tested: a fetch draws from every peer holding pieces.
 //!
-//! `NEIGHBOURHOOD-CACHE.md` §8 asks for "a fetch with three peers holding disjoint pieces
+//! `CLUSTER-CACHE.md` §8 asks for "a fetch with three peers holding disjoint pieces
 //! completes and is byte-identical to origin". That is what most of this file is.
 //!
 //! The peers are made genuinely partial rather than pretend-partial: each store gets the
@@ -175,7 +175,7 @@ fn source(name: &str, responder: ContentResponder) -> (PeerSource<MemoryLink>, s
 
 #[test]
 fn three_peers_holding_disjoint_pieces_complete_a_fetch() {
-    // NEIGHBOURHOOD-CACHE.md §8's criterion, and the reason this subsystem exists.
+    // CLUSTER-CACHE.md §8's criterion, and the reason this subsystem exists.
     let bytes = payload(400 * 1024, 1);
     let nodes = [Node::start("d0"), Node::start("d1"), Node::start("d2")];
 

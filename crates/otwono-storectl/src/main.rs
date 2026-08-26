@@ -55,8 +55,8 @@ COMMANDS:
     open <CONTENT_ID>         Open an object shared with this node, writing the plaintext
     grant <CONTENT_ID>        Add recipients to an object this node can open
     revoke <CONTENT_ID>       Delete recipients' copies of the key. Recalls nothing.
-    cache-status              The neighbourhood cache's budget, usage and contents
-    cache-purge               Empty the neighbourhood cache. The node's own store is untouched.
+    cache-status              The cluster cache's budget, usage and contents
+    cache-purge               Empty the cluster cache. The node's own store is untouched.
 
 OPTIONS:
     --socket <PATH>           Store daemon socket (default $OTWONO_SOCKET_DIR/store.sock)

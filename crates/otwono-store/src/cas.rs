@@ -5,7 +5,7 @@
 //! `get` re-hashes what it read and refuses to return bytes whose digest does not match the
 //! name they were asked for. That is not paranoia about our own writes — it is what makes a
 //! chunk from a peer, from a damaged disk, or from a half-finished write indistinguishable
-//! from absent rather than indistinguishable from correct. The neighbourhood cache
+//! from absent rather than indistinguishable from correct. The cluster cache
 //! (ADR-0015) rests on exactly this: a source does not have to be trusted, because the name
 //! is the hash.
 //!
@@ -885,7 +885,7 @@ mod tests {
 
     #[test]
     fn a_tampered_chunk_is_reported_rather_than_returned() {
-        // The property the neighbourhood cache depends on: a source does not have to be
+        // The property the cluster cache depends on: a source does not have to be
         // trusted, because the name is the hash.
         let d = tmp("tamper");
         let s = Store::new(&d);
@@ -1602,7 +1602,7 @@ mod tests {
     #[test]
     fn a_content_id_does_not_depend_on_the_storage_key() {
         // Two nodes with different keys must agree on what a file is called, or the
-        // neighbourhood cache cannot exist.
+        // cluster cache cannot exist.
         let d1 = tmp("enc-id1");
         let d2 = tmp("enc-id2");
         let payload = data(500_000, 43);

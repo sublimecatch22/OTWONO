@@ -31,7 +31,7 @@ Three properties it needs are OS properties here, not features to be re-implemen
   project's existing rule and it is the right one here.
 - **The heavy content is shared efficiently.** Curriculum, textbooks and media are `PUBLIC`
   or `REPLICATED`, so a school district or a street of families pulls them once between them
-  (`NEIGHBOURHOOD-CACHE.md`). Learner records are `PRIVATE` and never enter that path.
+  (`CLUSTER-CACHE.md`). Learner records are `PRIVATE` and never enter that path.
 
 ## 3. Data model, and the label on each part
 

@@ -61,7 +61,7 @@ pub const MAX_SHARED_ENTRIES: usize = 256;
 /// open every object shared with this node, which is precisely the split ADR-0019 §3 makes.
 /// A test asserts this string still matches the daemon that checks it.
 pub const CAPABILITY_UNWRAP: &str = "id.unwrap_shared";
-/// The neighbourhood cache's own pair, deliberately not `store.read`/`store.write`:
+/// The cluster cache's own pair, deliberately not `store.read`/`store.write`:
 /// `otwono-netd` must be able to add what it fetched to the shared cache without being able
 /// to write the user's own store (ADR-0015).
 pub const CAPABILITY_CACHE_READ: &str = "cache.read";
@@ -102,7 +102,7 @@ pub struct StoreService {
     /// (ADR-0018). `None` on a daemon started without one, and then `store.export` and
     /// `store.import` say so rather than silently capping at the inline size.
     handoff: Option<Handoff>,
-    /// The neighbourhood cache, when this machine contributes one. `None` on a machine
+    /// The cluster cache, when this machine contributes one. `None` on a machine
     /// whose capability profile set the budget to zero, or when no cache directory was
     /// configured — and then every cache method answers "not available" rather than
     /// pretending to have cached something.
@@ -166,7 +166,7 @@ struct ServeChunkParams {
     peer: Option<String>,
 }
 
-/// Put content fetched from a peer into the neighbourhood cache.
+/// Put content fetched from a peer into the cluster cache.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CachePutParams {
@@ -346,7 +346,7 @@ impl StoreService {
         })
     }
 
-    /// Give this daemon a neighbourhood cache to hold peers' content in.
+    /// Give this daemon a cluster cache to hold peers' content in.
     pub fn with_cache(mut self, cache: Cache) -> Self {
         self.cache = Some(cache);
         self
@@ -355,7 +355,7 @@ impl StoreService {
     fn cache(&self) -> Result<&Cache, RpcError> {
         self.cache.as_ref().ok_or_else(|| {
             RpcError::unavailable(
-                "this node contributes no neighbourhood cache; its capability profile set \
+                "this node contributes no cluster cache; its capability profile set \
                  the budget to zero, or none was configured",
             )
         })
@@ -1143,7 +1143,7 @@ impl StoreService {
     /// Empty the cache, pinned objects included.
     ///
     /// "Serving is carrying": an operator holds bytes they did not choose one at a time, so
-    /// a purge is always one action away (`NEIGHBOURHOOD-CACHE.md` §6). It touches only the
+    /// a purge is always one action away (`CLUSTER-CACHE.md` §6). It touches only the
     /// cache — the user's own store is a different directory and this has no path to it.
     fn handle_cache_purge(&self, _params: Value) -> Result<Value, RpcError> {
         let cache = self.cache()?;
@@ -1372,7 +1372,7 @@ impl Service for StoreService {
                 ),
                 MethodDescription::guarded(
                     "cache.put",
-                    "Put content fetched from a peer into the neighbourhood cache",
+                    "Put content fetched from a peer into the cluster cache",
                     CAPABILITY_CACHE_WRITE,
                 ),
                 MethodDescription::guarded(
@@ -1402,7 +1402,7 @@ impl Service for StoreService {
                 ),
                 MethodDescription::guarded(
                     "cache.purge",
-                    "Empty the neighbourhood cache; the node's own store is untouched",
+                    "Empty the cluster cache; the node's own store is untouched",
                     CAPABILITY_CACHE_WRITE,
                 ),
             ],

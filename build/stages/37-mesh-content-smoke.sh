@@ -61,7 +61,7 @@ POLICY
 chmod 0644 "$ROOTFS/etc/otwono/policy.d/91-mesh-content-smoke.toml"
 
 # The VMs have about 1.5 GiB of data partition, and classify_storage calls anything under
-# 16 GiB Constrained -- correctly, for a real board. A Constrained node's neighbourhood cache
+# 16 GiB Constrained -- correctly, for a real board. A Constrained node's cluster cache
 # budget is zero, so otwono-stored opens no cache and the cache has never run on a booted
 # node at all. Growing the image past 22 GiB to change that would make every build and boot
 # far slower for one axis.
@@ -75,7 +75,7 @@ cat > "$ROOTFS/etc/otwono/capability.override.toml" <<'OVERRIDE'
 # BUILT FOR TESTING. Installed only by build stage 37 (MESH_CONTENT_SMOKE=1).
 #
 # These VMs have a small data partition and are correctly classified as storage-constrained,
-# which sets the neighbourhood cache budget to zero. That is right for a real board and
+# which sets the cluster cache budget to zero. That is right for a real board and
 # leaves the cache untested on a booted node, so this claims more storage than there is.
 #
 # The detected value is kept in the capability profile alongside the forced one. If you are

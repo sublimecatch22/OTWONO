@@ -225,20 +225,20 @@ impl ActionRegistry {
                     BlastRadius::Egress,
                     false,
                 ),
-                // The neighbourhood cache is its own pair of capabilities, not store.read
+                // The cluster cache is its own pair of capabilities, not store.read
                 // and store.write, for the same reason store.serve is not store.read:
                 // otwono-netd must be able to add what it fetched to the shared cache
                 // without being able to write the user's own store. Reversible because
                 // everything in the cache is disposable and re-fetchable by definition.
                 ActionSpec::new(
                     "cache.read",
-                    "Read the neighbourhood cache's contents and accounting",
+                    "Read the cluster cache's contents and accounting",
                     BlastRadius::Read,
                     false,
                 ),
                 ActionSpec::new(
                     "cache.write",
-                    "Add to, pin in, or purge the neighbourhood cache",
+                    "Add to, pin in, or purge the cluster cache",
                     BlastRadius::Reversible,
                     false,
                 ),

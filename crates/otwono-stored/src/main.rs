@@ -24,13 +24,13 @@ OPTIONS:
     --id-socket <PATH>     Identity daemon socket (default $OTWONO_SOCKET_DIR/id.sock)
     --store-dir <PATH>     Where objects and chunks live (default /var/lib/otwono/store)
     --key <PATH>           Storage key, generated on first use (default /var/lib/otwono/storage.key)
-    --cache-dir <PATH>     Neighbourhood cache (default /var/lib/otwono/cache)
+    --cache-dir <PATH>     Cluster cache (default /var/lib/otwono/cache)
     --cache-bytes <N>      Override the cache budget the capability profile chose
-    --no-cache             Contribute no neighbourhood cache at all
+    --no-cache             Contribute no cluster cache at all
     --export-dir <PATH>    Where large objects are handed over (default /var/lib/otwono/export)
     -h, --help             Show this message
 
-THE NEIGHBOURHOOD CACHE:
+THE CLUSTER CACHE:
     A bounded, encrypted slice of disk holding PUBLIC and REPLICATED content fetched from
     peers, so neighbours can serve each other instead of each fetching from origin
     (ADR-0015). PRIVATE and SHARED never enter it, by any path.
@@ -192,7 +192,7 @@ fn run(args: &[String]) -> Result<String, Error> {
                 Ok(n) => Some(n),
                 Err(e) => {
                     eprintln!(
-                        "otwono-stored: no neighbourhood cache — cannot read this machine's \
+                        "otwono-stored: no cluster cache — cannot read this machine's \
                          capability profile ({e}). The node runs normally; it serves peers \
                          only its own PUBLIC and REPLICATED content."
                     );
@@ -202,13 +202,13 @@ fn run(args: &[String]) -> Result<String, Error> {
         };
         match budget {
             Some(0) => eprintln!(
-                "otwono-stored: no neighbourhood cache — this machine's capability profile \
+                "otwono-stored: no cluster cache — this machine's capability profile \
                  sets its budget to zero"
             ),
             Some(n) => match Cache::at(&cache_dir, cache_key(&key_path)?, n) {
                 Ok(cache) => {
                     eprintln!(
-                        "otwono-stored: neighbourhood cache at {} ({} bytes, {} used)",
+                        "otwono-stored: cluster cache at {} ({} bytes, {} used)",
                         cache_dir.display(),
                         n,
                         cache.used_bytes()
@@ -217,7 +217,7 @@ fn run(args: &[String]) -> Result<String, Error> {
                 }
                 Err(e) => {
                     return Err(Error::Startup(format!(
-                        "cannot open the neighbourhood cache at {}: {e}",
+                        "cannot open the cluster cache at {}: {e}",
                         cache_dir.display()
                     )))
                 }
@@ -225,7 +225,7 @@ fn run(args: &[String]) -> Result<String, Error> {
             None => {}
         }
     } else {
-        eprintln!("otwono-stored: no neighbourhood cache (--no-cache)");
+        eprintln!("otwono-stored: no cluster cache (--no-cache)");
     }
     let service = Arc::new(service);
     server
@@ -255,7 +255,7 @@ fn cache_budget_from_profile(perm_socket: &std::path::Path) -> Result<u64, Strin
             "perm.request",
             serde_json::json!({
                 "action": "hw.read",
-                "reason": "otwono-stored sizes the neighbourhood cache from the capability profile",
+                "reason": "otwono-stored sizes the cluster cache from the capability profile",
             }),
         )
         .map_err(|e| format!("perm.request: {e}"))?
@@ -275,9 +275,9 @@ fn cache_budget_from_profile(perm_socket: &std::path::Path) -> Result<u64, Strin
         .map_err(|e| format!("hw.profile refused: {}", e.message))?;
     profile
         .get("features")
-        .and_then(|f| f.get("neighbourhood_cache_bytes"))
+        .and_then(|f| f.get("cluster_cache_bytes"))
         .and_then(|v| v.as_u64())
-        .ok_or_else(|| "the capability profile carries no neighbourhood_cache_bytes".to_string())
+        .ok_or_else(|| "the capability profile carries no cluster_cache_bytes".to_string())
 }
 
 fn next_path<'a>(it: &mut impl Iterator<Item = &'a String>, flag: &str) -> Result<PathBuf, Error> {

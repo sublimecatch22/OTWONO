@@ -22,7 +22,7 @@ over `MAX_LINE_BYTES`, and `store.get`, `cache.get` and the inline `store.serve`
 object's size *before* reading it, so a caller gets a sentence naming `store.export` rather
 than a transport error after the daemon has already encoded eight megabytes.
 
-640 KiB is not a media ceiling. It is barely a photograph. `NEIGHBOURHOOD-CACHE.md` is
+640 KiB is not a media ceiling. It is barely a photograph. `CLUSTER-CACHE.md` is
 written about a household's media, `PORTABLE-APPS.md` about signed application bundles, and
 `AI-RUNTIME.md` about model weights measured in gigabytes. The subsystem that exists cannot
 carry any of them.
@@ -97,7 +97,7 @@ would have been the tempting wrong answer.
 - **Two code paths for the same operation.** Small objects go inline and large ones go
   through a file, so every consumer has to handle both, and the seam is a place bugs will
   live. Mitigated by making the boundary explicit and asserted rather than implicit.
-- **The export directory is a new thing to size.** It is not covered by the neighbourhood
+- **The export directory is a new thing to size.** It is not covered by the cluster
   cache's budget and nothing evicts from it under pressure; it is bounded by the reaper and
   by a free-space floor, which is weaker.
 
@@ -126,7 +126,7 @@ would have been the tempting wrong answer.
 ## References
 
 - ADR-0014 (`otwono-fetchd`'s spool — the pattern this generalises), ADR-0015 (the
-  neighbourhood cache, whose content this unblocks), ADR-0017 (the ONM content-fetch
+  cluster cache, whose content this unblocks), ADR-0017 (the ONM content-fetch
   protocol, which has its own separate framing and is unaffected).
 - **OQ-25** — streaming a fan-out fetch directly to a file, so a small board can fetch an
   object larger than its RAM.

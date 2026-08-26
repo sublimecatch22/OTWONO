@@ -264,7 +264,7 @@ from its id, and cannot confirm a guess about its contents.
 - **No forward secrecy.** A recipient's sharing key compromised tomorrow reads everything
   ever shared to it. Per-object ephemeral senders give sender-side unlinkability, not
   recipient-side forward secrecy, and getting that would need key rotation with re-wrapping.
-- **`SHARED` cannot use the neighbourhood cache**, by construction and by rule. It also
+- **`SHARED` cannot use the cluster cache**, by construction and by rule. It also
   cannot dedup. A household sharing a large video with three neighbours stores it four
   times.
 - **The authorized list is a privacy object in itself.** It names who a node shares with,

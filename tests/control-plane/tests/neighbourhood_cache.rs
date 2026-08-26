@@ -1,4 +1,4 @@
-//! The neighbourhood cache over the real control plane, and over a real link.
+//! The cluster cache over the real control plane, and over a real link.
 //!
 //! Three claims, each of which is only worth anything if it is checked at the boundary
 //! rather than in the function that implements it:
@@ -119,7 +119,7 @@ impl Harness {
         broker
             .call(
                 "perm.request",
-                json!({ "action": action, "reason": "neighbourhood cache test" }),
+                json!({ "action": action, "reason": "cluster cache test" }),
             )
             .unwrap()
             .unwrap_or_else(|e| panic!("{action} refused: {}", e.message))
@@ -480,7 +480,7 @@ fn a_node_with_no_cache_answers_plainly_rather_than_pretending() {
         .unwrap()
         .expect_err("a node with no cache must say so");
     assert_eq!(err.code, code::UNAVAILABLE);
-    assert!(err.message.contains("no neighbourhood cache"), "{}", err.message);
+    assert!(err.message.contains("no cluster cache"), "{}", err.message);
 
     shutdown.trigger();
     let _ = std::fs::remove_dir_all(&dir);

@@ -1,4 +1,4 @@
-# The Neighbourhood Cache
+# The Cluster Cache
 
 **Status:** `SPECIFIED`. No implementation. Nothing in this document has been built, run,
 or measured. Decided in **ADR-0015**; belongs to Phase 5 (the content store) and Phase 6
@@ -12,7 +12,7 @@ A node contributes a bounded slice of its disk. That slice holds content-address
 encrypted at rest, reachable only by `otwono-stored`. When the node wants something, it asks
 every peer it can reach for the chunks in parallel and verifies each one by its hash.
 
-The property this buys: **a dense neighbourhood is a fast neighbourhood.** Ten houses on a
+The property this buys: **a dense cluster is a fast cluster.** Ten houses on a
 street each fetching the same 4 GB model over their own uplinks is ten downloads. Ten houses
 with overlapping caches is one download and nine LAN copies. Nothing coordinates that — it
 falls out of naming chunks by their hash, which makes every holder interchangeable.
@@ -68,7 +68,7 @@ user's data.
 The default comes from the capability policy engine and nowhere else (CLAUDE.md §2.6). An
 operator may raise or lower it; no subsystem may infer it.
 
-**STATUS: IMPLEMENTED** — `FeatureGates::neighbourhood_cache_bytes`, in the capability
+**STATUS: IMPLEMENTED** — `FeatureGates::cluster_cache_bytes`, in the capability
 profile schema at `1.1.0`. A machine whose storage axis is `Constrained` gets zero whatever
 its tier says: a full disk is a broken node, so a machine with no room contributes nothing
 rather than contributing until it dies.
@@ -78,7 +78,7 @@ rather than contributing until it dies.
 | T0 | 512 MiB | An 8 GB eMMC has little to spare, and a full disk is a broken node |
 | T1 | 4 GiB | Enough for a model and a media manifest set |
 | T2 | 32 GiB | A working set for a household |
-| T3 | 128 GiB | A neighbourhood's shoulder |
+| T3 | 128 GiB | A cluster's shoulder |
 
 **A cache that fills the disk is a fault, not a feature.** The reserve floor that protects
 the audit log and the spool applies here too.

@@ -26,7 +26,7 @@ mainstream alternative is a service that reads your bank data on someone else's 
 **Everything here is `PRIVATE`.** Not `SHARED`, not `REPLICATED`, not cached, not indexed
 into anything a peer can query.
 
-- It never enters the neighbourhood cache. `NEIGHBOURHOOD-CACHE.md` §5 already forbids it;
+- It never enters the cluster cache. `CLUSTER-CACHE.md` §5 already forbids it;
   this is the case that rule exists for.
 - It is not backed up to peers. A backup is an explicit, user-driven, separately encrypted
   export.
@@ -154,7 +154,7 @@ A T0 node is a complete tracker. Only the explanation layer scales with the mach
 - A statement imports, reconciles, and the balance matches the bank's — with a fixture per
   supported format.
 - The vault cannot be read with the disk alone, proven by attempting exactly that.
-- No code path can place financial data in the neighbourhood cache, proven negatively.
+- No code path can place financial data in the cluster cache, proven negatively.
 - The agent cannot read the vault without a brokered capability, and every read appears in
   the audit log.
 - A wrong passphrase fails closed and does not corrupt the vault.

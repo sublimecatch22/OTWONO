@@ -92,7 +92,7 @@ big_chunks=$(otwono-storectl stat "$big_id" | awk '{print $4}')
 
 # --- disjoint shares, on three nodes or more -------------------------------------------
 #
-# NEIGHBOURHOOD-CACHE.md section 8 asks for "a fetch with three peers holding disjoint
+# CLUSTER-CACHE.md section 8 asks for "a fetch with three peers holding disjoint
 # pieces". With every node holding the whole object, a fetch that spreads across peers is
 # nice but not necessary -- any one of them could have served it alone. This makes it
 # necessary: node i deletes the chunks where index mod N == i, so no single peer can serve
@@ -231,10 +231,10 @@ if ! cmp -s "$WORK/leak.norm" "$WORK/absent.norm"; then
     fail "refused and absent differ, so a peer can tell what this node holds"
 fi
 
-# The neighbourhood cache, which on these nodes exists only because the test image overrides
+# The cluster cache, which on these nodes exists only because the test image overrides
 # the storage axis. Reported rather than asserted beyond being answerable: what matters here
 # is that a node with a real budget opens a real cache and can be asked about it.
-step "checking the neighbourhood cache"
+step "checking the cluster cache"
 cache_state=none
 cache_held=0
 if cache=$(otwono-storectl cache-status 2>&1); then

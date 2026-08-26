@@ -1,4 +1,4 @@
-# ADR-0015 — A content-addressed neighbourhood cache, not a ledger
+# ADR-0015 — A content-addressed cluster cache, not a ledger
 
 **Status:** accepted · **Date:** 2026-08-24
 
@@ -8,7 +8,7 @@ The requirement, in the words it arrived in: every node contributes a small slic
 locked and encrypted and reachable only by the node system; that slice is used to transfer,
 cache and store data; it works "almost like a blockchain but for verifying that the data is
 safe"; and when many nodes sit close together — a street where every house has one — a node
-pulls from several verified sources at once so transfers get *faster* as the neighbourhood
+pulls from several verified sources at once so transfers get *faster* as the cluster
 gets denser.
 
 The goal is right and the mechanism named for it is not. It is worth separating the two,
@@ -59,7 +59,7 @@ by trusting the peer.**
 **Good.** The mechanism is small enough to be right: a hash check on receipt, a set of
 chunks we hold, and a fan-out fetch. It reuses primitives that exist rather than adding a
 fourth (§1's own test). A malicious or merely broken peer can waste our bandwidth and
-cannot corrupt our data. The dense-neighbourhood speedup is real and needs no coordination
+cannot corrupt our data. The dense-cluster speedup is real and needs no coordination
 between neighbours — no registry, no accounting, nobody to run it. And it degrades
 correctly: with no peers, the cache is just a local cache.
 
@@ -104,7 +104,7 @@ which is what this ADR is about.
 
 ## References
 
-- `docs/services/NEIGHBOURHOOD-CACHE.md` — the specification this decides.
+- `docs/services/CLUSTER-CACHE.md` — the specification this decides.
 - ADR-0004 (capability tiers — where the cache size comes from), ADR-0007 (visibility
   labels — what may be cached at all).
 - **OQ-16** (chunking parameters), **OQ-17** (freeloading and fairness).

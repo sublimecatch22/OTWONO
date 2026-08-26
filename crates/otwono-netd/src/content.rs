@@ -409,7 +409,7 @@ impl ContentResponder {
         Some(token)
     }
 
-    /// Put content just fetched from a peer into the neighbourhood cache.
+    /// Put content just fetched from a peer into the cluster cache.
     ///
     /// Never automatic. "Serving is carrying" — caching a peer's content means storing bytes
     /// the operator did not choose one at a time — so `net.fetch` only does this when its
@@ -423,7 +423,7 @@ impl ContentResponder {
         let token = request_token(
             &self.perm_socket,
             otwono_stored::CAPABILITY_CACHE_WRITE,
-            "otwono-netd keeps content fetched from a peer for the neighbourhood",
+            "otwono-netd keeps content fetched from a peer for the cluster",
         )?;
         let mut client = Client::connect(&self.store_socket)
             .map_err(|e| format!("{}: {e}", self.store_socket.display()))?;
@@ -945,7 +945,7 @@ enum WorkerEnd {
 /// Who served what, after a fan-out fetch.
 ///
 /// Worth returning rather than logging: ADR-0015's central claim is that a dense
-/// neighbourhood transfers faster because every holder is as good as any other, and this is
+/// cluster transfers faster because every holder is as good as any other, and this is
 /// the only thing that shows whether that actually happened on a given fetch.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FanOutReport {

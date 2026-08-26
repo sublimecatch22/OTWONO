@@ -41,15 +41,15 @@ pub struct FeatureGates {
     pub serve_ai_to_peers: bool,
     /// Hold replicas of other nodes' `REPLICATED` content.
     pub content_replication: bool,
-    /// Bytes this machine may contribute to the neighbourhood cache (ADR-0015).
+    /// Bytes this machine may contribute to the cluster cache (ADR-0015).
     ///
     /// A default, not a setting: an operator raises or lowers it, and no subsystem may
     /// infer its own (CLAUDE.md §2.6). Zero means "do not cache for peers at all", which is
     /// what a machine with no room to spare gets whatever its tier says.
-    pub neighbourhood_cache_bytes: u64,
+    pub cluster_cache_bytes: u64,
 }
 
-/// The tier defaults from `NEIGHBOURHOOD-CACHE.md` §3.
+/// The tier defaults from `CLUSTER-CACHE.md` §3.
 ///
 /// T0 is deliberately non-zero. An 8 GB eMMC has little to spare, but a node that
 /// contributes nothing is a node its neighbours cannot help either — 512 MiB is the
@@ -77,7 +77,7 @@ impl FeatureGates {
                 desktop: DesktopProfile::Headless,
                 serve_ai_to_peers: false,
                 content_replication: false,
-                neighbourhood_cache_bytes: CACHE_BYTES_T0,
+                cluster_cache_bytes: CACHE_BYTES_T0,
             },
             Tier::T1Edge => FeatureGates {
                 local_llm: true,
@@ -98,7 +98,7 @@ impl FeatureGates {
                 desktop: DesktopProfile::Headless,
                 serve_ai_to_peers: false,
                 content_replication: false,
-                neighbourhood_cache_bytes: CACHE_BYTES_T1,
+                cluster_cache_bytes: CACHE_BYTES_T1,
             },
             Tier::T2Balanced => FeatureGates {
                 local_llm: true,
@@ -120,7 +120,7 @@ impl FeatureGates {
                 desktop: DesktopProfile::Light,
                 serve_ai_to_peers: false,
                 content_replication: true,
-                neighbourhood_cache_bytes: CACHE_BYTES_T2,
+                cluster_cache_bytes: CACHE_BYTES_T2,
             },
             Tier::T3Capable => FeatureGates {
                 local_llm: true,
@@ -147,7 +147,7 @@ impl FeatureGates {
                 desktop: DesktopProfile::Full,
                 serve_ai_to_peers: true,
                 content_replication: true,
-                neighbourhood_cache_bytes: CACHE_BYTES_T3,
+                cluster_cache_bytes: CACHE_BYTES_T3,
             },
             Tier::T4Workstation => FeatureGates {
                 local_llm: true,
@@ -175,7 +175,7 @@ impl FeatureGates {
                 desktop: DesktopProfile::Full,
                 serve_ai_to_peers: true,
                 content_replication: true,
-                neighbourhood_cache_bytes: CACHE_BYTES_T4,
+                cluster_cache_bytes: CACHE_BYTES_T4,
             },
         };
 
@@ -196,9 +196,9 @@ fn apply_axis_adjustments(g: &mut FeatureGates, axes: &CapabilityAxes) {
         g.content_replication = false;
         g.eligible_node_roles.retain(|r| r != "cache" && r != "archive");
         // And the cache goes with them. A full disk is a broken node
-        // (NEIGHBOURHOOD-CACHE.md §3), so a machine with no room contributes nothing rather
+        // (CLUSTER-CACHE.md §3), so a machine with no room contributes nothing rather
         // than contributing until it dies.
-        g.neighbourhood_cache_bytes = 0;
+        g.cluster_cache_bytes = 0;
     }
 
     // A gateway role requires the connectivity to be one.
@@ -253,12 +253,12 @@ mod tests {
         let a = roomy();
         let budgets: Vec<u64> = [Tier::T0Micro, Tier::T1Edge, Tier::T2Balanced, Tier::T3Capable]
             .iter()
-            .map(|t| FeatureGates::for_tier(*t, &a).neighbourhood_cache_bytes)
+            .map(|t| FeatureGates::for_tier(*t, &a).cluster_cache_bytes)
             .collect();
         assert_eq!(
             budgets,
             vec![CACHE_BYTES_T0, CACHE_BYTES_T1, CACHE_BYTES_T2, CACHE_BYTES_T3],
-            "the defaults must match NEIGHBOURHOOD-CACHE.md §3"
+            "the defaults must match CLUSTER-CACHE.md §3"
         );
         assert!(budgets.windows(2).all(|w| w[0] < w[1]));
     }
@@ -267,7 +267,7 @@ mod tests {
     fn even_the_smallest_tier_contributes_something() {
         // A node that contributes nothing is a node its neighbours cannot help either.
         let g = FeatureGates::for_tier(Tier::T0Micro, &roomy());
-        assert_eq!(g.neighbourhood_cache_bytes, 512 * 1024 * 1024);
+        assert_eq!(g.cluster_cache_bytes, 512 * 1024 * 1024);
     }
 
     #[test]
@@ -284,7 +284,7 @@ mod tests {
                     PowerClass::Unconstrained,
                 ),
             );
-            assert_eq!(g.neighbourhood_cache_bytes, 0, "{tier:?} on a constrained disk");
+            assert_eq!(g.cluster_cache_bytes, 0, "{tier:?} on a constrained disk");
             assert!(!g.content_replication);
         }
     }

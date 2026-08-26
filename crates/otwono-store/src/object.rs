@@ -6,7 +6,7 @@
 //! filename, its timestamps, or who stored it. Two people who store the same bytes get the
 //! same id even if one marks it `Public` and the other `Private`.
 //!
-//! That is deliberate and it is what makes the neighbourhood cache work: a peer holding a
+//! That is deliberate and it is what makes the cluster cache work: a peer holding a
 //! chunk is interchangeable with any other peer holding it, and a fetch can be verified
 //! against a name computed independently. Folding metadata into the identity would mean two
 //! nodes with the same file could not recognise it as the same file.
@@ -392,7 +392,7 @@ mod tests {
 
     #[test]
     fn the_same_bytes_get_the_same_name_on_any_node() {
-        // The property the neighbourhood cache depends on.
+        // The property the cluster cache depends on.
         let data = b"the same bytes, stored by two different people".repeat(1000);
         assert_eq!(
             ContentId::of(&chunk::slice(&data)),

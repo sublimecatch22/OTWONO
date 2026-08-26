@@ -673,7 +673,7 @@ impl Service for NetService {
                     .and_then(Value::as_str)
                     .ok_or_else(|| RpcError::invalid_params("net.fetch needs a content_id"))?;
                 // One peer or several. Several is the point of ADR-0015 — every holder of a
-                // chunk is as good as any other, so a dense neighbourhood transfers faster —
+                // chunk is as good as any other, so a dense cluster transfers faster —
                 // and one peer is just the degenerate case of it.
                 let candidates: Vec<Candidate> = match params.get("peers").and_then(Value::as_array) {
                     Some(list) => list.iter().map(Self::candidate).collect::<Result<_, _>>()?,
@@ -721,7 +721,7 @@ impl Service for NetService {
 
                 // Never by default. Caching a peer's content is storing bytes the operator
                 // did not choose one at a time, so it is asked for or it does not happen
-                // (NEIGHBOURHOOD-CACHE.md §5).
+                // (CLUSTER-CACHE.md §5).
                 let wanted_cache = params.get("cache").and_then(Value::as_bool).unwrap_or(false);
                 let cached = match (wanted_cache, self.state.responder.as_ref()) {
                     (false, _) => json!(false),

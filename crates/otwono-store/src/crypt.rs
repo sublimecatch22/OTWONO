@@ -16,7 +16,7 @@
 //!
 //! A chunk's name is the BLAKE3 of its *plaintext*, so two nodes with different storage keys
 //! still agree on what a chunk is called. Encryption is a property of this disk, not of the
-//! content — otherwise the neighbourhood cache could not exist.
+//! content — otherwise the cluster cache could not exist.
 //!
 //! # The nonce
 //!

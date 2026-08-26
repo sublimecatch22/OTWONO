@@ -186,7 +186,7 @@ testable on an actual link.
   because taking it means taking libp2p's transport and stream muxing, which would sit
   beside the Noise channel ADR-0006 already established rather than on top of it, and
   because Bitswap wants a want-list gossiped to many peers — a design for a public DHT,
-  not for a link that may be a duty-cycle-limited radio. Revisit if the neighbourhood cache
+  not for a link that may be a duty-cycle-limited radio. Revisit if the cluster cache
   grows past one-hop.
 - **Reusing the JSON-RPC control plane over the channel.** Tempting: the framing exists.
   Rejected because the control plane's contract is "a local caller with a capability

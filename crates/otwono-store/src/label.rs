@@ -67,7 +67,7 @@ impl Visibility {
         matches!(self, Visibility::Public | Visibility::Replicated)
     }
 
-    /// May an object with this label enter the shared neighbourhood cache?
+    /// May an object with this label enter the shared cluster cache?
     ///
     /// The rule from ADR-0015, in one place so no caller re-derives it.
     pub fn may_be_cached_for_peers(self) -> bool {
@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn the_cache_rule_matches_the_egress_rule() {
-        // ADR-0015 restricts the neighbourhood cache to exactly what may be served
+        // ADR-0015 restricts the cluster cache to exactly what may be served
         // unattended. If these ever diverge, one of them is a leak.
         for v in [
             Visibility::Private,

@@ -1906,7 +1906,7 @@ So everything is sealed with XChaCha20-Poly1305 under a node storage key, and th
 has been corrected. Consequences, each with a test:
 
 - **Digests are over plaintext**, so two nodes with different keys agree on what a chunk is
-  called — without which the neighbourhood cache could not exist. Asserted by storing the
+  called — without which the cluster cache could not exist. Asserted by storing the
   same bytes in two stores with different keys and comparing ids *and* chunk names.
 - **Dedup still works**, even though each sealing uses a fresh nonce and produces different
   ciphertext.
@@ -2123,7 +2123,7 @@ give it away, and `fetch_object` rejects it with `ObjectIdMismatch`.
 - **Roles are fixed per channel.** A node can only fetch over a channel it dialled. Nothing
   yet re-dials automatically.
 - **Nothing stores what it fetches.** `net.fetch` returns verified bytes to its caller; the
-  neighbourhood cache that would keep them does not exist.
+  cluster cache that would keep them does not exist.
 - **`SHARED` is still refused rather than authorized**, and per-recipient key wrapping still
   waits on the identity daemon's agreement keys.
 - **No LoRa hardware was involved.** The `Trickle` numbers above are frame sizes measured
@@ -2131,7 +2131,7 @@ give it away, and `fetch_object` rejects it with `ObjectIdMismatch`.
 
 ---
 
-## Phase 6 slice 1 — the neighbourhood cache, bounded and evicting
+## Phase 6 slice 1 — the cluster cache, bounded and evicting
 
 **Date:** 2026-08-24 · **Where:** OTWONO Cloud dev environment (no `/dev/kvm`)
 
@@ -2170,7 +2170,7 @@ the first, and reads the second back in full.
 
 ### The budget is decided in one place
 
-`FeatureGates::neighbourhood_cache_bytes`, from `NEIGHBOURHOOD-CACHE.md` §3's table:
+`FeatureGates::cluster_cache_bytes`, from `CLUSTER-CACHE.md` §3's table:
 512 MiB / 4 GiB / 32 GiB / 128 GiB. A machine whose storage axis is `Constrained` gets zero
 whatever its tier says, in the same `apply_axis_adjustments` that already strips the `cache`
 role from such a machine — one place, as CLAUDE.md §2.6 requires. The capability profile
@@ -2226,7 +2226,7 @@ by asking about it would hand the eviction policy to strangers.
   slice and it is what makes the cache do anything at all.
 - **Fan-out does not exist.** ADR-0015's central claim — that density makes transfers
   faster because a fetch draws from every peer holding pieces — is unimplemented. The fetch
-  is single-peer. `NEIGHBOURHOOD-CACHE.md` §8's three-peer criterion is untouched.
+  is single-peer. `CLUSTER-CACHE.md` §8's three-peer criterion is untouched.
 - **Nothing has booted**, and no `/var/lib/otwono/cache` is created by any build stage.
 - **The reserve floor is untested against a genuinely full disk.** `ensure_disk_room` calls
   `statvfs` and refuses below 256 MiB free; that path has been read, not exercised.
@@ -2278,7 +2278,7 @@ the bytes are verified and in the caller's hands either way.
 ### The budget is asked for, not guessed
 
 `otwono-stored` requests `hw.read` at startup and reads
-`features.neighbourhood_cache_bytes` out of `hw.profile`. If `otwono-hwd` cannot be reached
+`features.cluster_cache_bytes` out of `hw.profile`. If `otwono-hwd` cannot be reached
 it runs **without** a cache and says so, rather than picking a number — which is what
 CLAUDE.md §2.6 means by one place deciding. The unit gained `Wants=otwono-hwd.service`, not
 `Requires`: a node whose hardware daemon is down should still store and still mesh.
@@ -2317,7 +2317,7 @@ stranger get no benefit of the doubt.
 
 - **Fan-out still does not exist.** ADR-0015's central claim — density makes transfers
   faster because a fetch draws from every peer holding pieces — remains unimplemented. The
-  fetch is one peer, one chunk at a time. `NEIGHBOURHOOD-CACHE.md` §8's three-peer
+  fetch is one peer, one chunk at a time. `CLUSTER-CACHE.md` §8's three-peer
   criterion is untouched, and it is the most valuable thing left in this subsystem.
 - **`net.fetch --cache` has not been exercised end to end.** The `cache.put` call it makes
   is tested directly; the two-node path that ends in a cached object is not, because the
@@ -2329,7 +2329,7 @@ stranger get no benefit of the doubt.
   a log line. On a cold SBC first boot that may be the common case, and nothing retries.
 - **A peer's requests never refresh the cache**, so this node keeps what its own household
   fetched in preference to what the street keeps asking for. That is slightly backwards for
-  a neighbourhood cache and is the safe direction; it wants revisiting once fan-out exists.
+  a cluster cache and is the safe direction; it wants revisiting once fan-out exists.
 
 ---
 
@@ -2387,7 +2387,7 @@ A cap the transport makes unreachable is not a cap; it is a misleading comment.
 
 ### The three-peer criterion, met honestly
 
-`NEIGHBOURHOOD-CACHE.md` §8 asks for "a fetch with three peers holding disjoint pieces". The
+`CLUSTER-CACHE.md` §8 asks for "a fetch with three peers holding disjoint pieces". The
 peers here are genuinely partial: each store is given the whole object and then has two
 thirds of its chunk *files* deleted from disk, so `store.serve_chunk` really fails for what
 each is missing. The test asserts first that **no single peer can serve the object alone**,
@@ -2715,7 +2715,7 @@ Run on the booted node, through the real daemons, sockets, policy and units:
   `store.import`, then `store.export`ed and compared byte for byte against the original
   (ADR-0018's whole point, on a real filesystem with a real uid);
 - a `PRIVATE` object reported as private by `store.stat`;
-- the neighbourhood cache reporting its state, which also exercises the
+- the cluster cache reporting its state, which also exercises the
   `otwono-stored` → `otwono-hwd` capability-profile lookup at startup.
 
 ### Defect 39: two daemons had units and no binaries
@@ -2967,7 +2967,7 @@ ran on a wire. The check now also moves a multi-chunk object and **asserts** the
 is above one via `store.stat` first, so a shrinking fixture cannot quietly stop testing the
 thing it exists for.
 
-**The neighbourhood cache ran on a booted node for the first time**, reporting a 512 MiB
+**The cluster cache ran on a booted node for the first time**, reporting a 512 MiB
 budget. These VMs have ~1.5 GiB of data partition and `classify_storage` calls anything
 under 16 GiB `Constrained` — correctly, for a real board — which sets the cache budget to
 zero. Growing the image past 22 GiB to change that would make every build and boot far
@@ -2999,7 +2999,7 @@ in the profile, and it gives the override mechanism its own first boot-time exer
 **Date:** 2026-08-25 · **Where:** OTWONO Cloud dev environment (no `/dev/kvm`, TCG only)
 
 ADR-0015's central claim is that a fetch draws chunks from *several* peers, so a dense
-neighbourhood transfers faster. Every previous slice recorded it as proven host-side only,
+cluster transfers faster. Every previous slice recorded it as proven host-side only,
 over in-memory links. This is it on real ones.
 
 (Numbered against the roadmap this time. The entries titled "Phase 6 slice 1" through
@@ -3093,7 +3093,7 @@ shellcheck -S warning ...  clean
 
 The previous entry spread a fetch across peers that all held the whole object. Any one of
 them could have served it alone, so what it demonstrated was that fan-out *happens*, not
-that it is *needed*. `NEIGHBOURHOOD-CACHE.md` §8 asks for the harder thing: three peers
+that it is *needed*. `CLUSTER-CACHE.md` §8 asks for the harder thing: three peers
 holding disjoint pieces.
 
 ### The run
@@ -3214,7 +3214,7 @@ it, and `cache_held=1` on all three nodes.
 
 The flag is not a default and will not become one. "Serving is carrying": caching a peer's
 content means storing bytes the operator did not choose one at a time
-(`NEIGHBOURHOOD-CACHE.md` §6). The reply says `cached=` either way, so a caller that asked
+(`CLUSTER-CACHE.md` §6). The reply says `cached=` either way, so a caller that asked
 and did not get it knows, and one that did not ask can see nothing was kept.
 
 ### Workspace
@@ -3232,7 +3232,7 @@ shellcheck -S warning ...  clean
   wall-clock time on a street, and that is the claim ADR-0015 is actually about.
 - **The cache holds one small object.** Nothing has been evicted on a booted node, no
   budget has been reached, and nothing has been served *out of* a cache to a further peer —
-  which is the property that would make a dense neighbourhood compound.
+  which is the property that would make a dense cluster compound.
 - **No partition, no healing.** Phase 6's exit criterion wants a network that splits and
   reconverges; this harness only ever brings nodes up and never takes one away.
 - **`SHARED` has still never been served to anybody**, and the `REPLICATED` replication
@@ -4138,7 +4138,7 @@ Nothing regressed, and two things are stronger than any previous run:
   `granted`, so adding and removing recipients still works on a machine after four commits
   of unrelated change to the daemon that serves it.
 
-That the mesh, the content loop, the neighbourhood cache and the sharing index are all
+That the mesh, the content loop, the cluster cache and the sharing index are all
 untouched by a rewritten permission broker is the point of running this: the claim was
 plausible from reading the diff and is now observed.
 

@@ -83,7 +83,7 @@ can make that returns a `PRIVATE` object even if both checks failed at once.
   answer "which object referenced this chunk first?", and every answer to that is a bug. So
   the label governs who may read an object; it does not govern whether the bytes on disk are
   encrypted. Chunk digests are over **plaintext**, so two nodes with different storage keys
-  still agree on what a chunk is called — without that the neighbourhood cache could not
+  still agree on what a chunk is called — without that the cluster cache could not
   exist. TPM sealing where available remains unimplemented.
 - `SHARED`: a per-object content key, wrapped once per authorized recipient with an X25519
   key agreement. Adding a recipient re-wraps the key; **removing one does not un-share what

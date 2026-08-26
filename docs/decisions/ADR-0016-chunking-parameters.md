@@ -103,7 +103,7 @@ unit is still small enough to spread across peers and to retry cheaply.
 ## Consequences
 
 **Good.** One constant, decided once, with the arithmetic written down. A file edited
-anywhere still shares essentially all of its chunks, so incremental sync and neighbourhood
+anywhere still shares essentially all of its chunks, so incremental sync and cluster
 serving both work on changed data rather than only on identical copies. The index fits
 comfortably in the memory of the smallest supported node. `fastcdc` is a small, focused
 dependency with no runtime, matching the workspace's existing shape.
@@ -143,6 +143,6 @@ dependency with no runtime, matching the workspace's existing shape.
 
 ## References
 
-- ADR-0015 (the neighbourhood cache, which this makes possible), ADR-0007 (labels — what may
+- ADR-0015 (the cluster cache, which this makes possible), ADR-0007 (labels — what may
   be cached at all), ADR-0004 (tiers — where the index budget comes from).
-- `docs/services/NEIGHBOURHOOD-CACHE.md`, `docs/build/VERIFICATION-LOG.md`.
+- `docs/services/CLUSTER-CACHE.md`, `docs/build/VERIFICATION-LOG.md`.

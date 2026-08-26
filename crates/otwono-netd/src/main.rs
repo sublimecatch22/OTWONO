@@ -39,7 +39,7 @@ OPTIONS:
     --fetch <CONTENT_ID>   Fetch one object from every connected peer, then exit
     --to-file              Write the fetched object to a file instead of returning its
                            bytes. Required above the control-plane's inline cap (ADR-0018).
-    --cache                Keep what was fetched in the neighbourhood cache. Never the
+    --cache                Keep what was fetched in the cluster cache. Never the
                            default: caching a peer's content is storing bytes the operator
                            did not choose one at a time.
     -h, --help             Show this message

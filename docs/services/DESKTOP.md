@@ -40,8 +40,8 @@ The node's own settings surface, and the first place most people will meet the m
   helping a little."
 - **Sliders for what is contributed**: storage, RAM, CPU, and GPU. These are not decoration
   over a fixed policy; they set real limits, enforced by cgroups and by the capability
-  policy engine, and the neighbourhood cache's existing budget is the first of them
-  (`NEIGHBOURHOOD-CACHE.md`).
+  policy engine, and the cluster cache's existing budget is the first of them
+  (`CLUSTER-CACHE.md`).
 - **A plain reading of what the node has actually done** — bytes served, storage held,
   uptime — and where that record goes, which by default is nowhere. See §4.
 

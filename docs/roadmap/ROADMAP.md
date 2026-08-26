@@ -194,8 +194,8 @@ GPU/NPU backends, and the tiered assistant shapes.
    re-checks the label itself, with deliberately different code (`may_leave_a_node` is an
    allow-list of wire strings, not a call into `otwono-store`).
 4. Replication policy for `REPLICATED`. **not started.**
-5. ~~The **neighbourhood cache** — a bounded, encrypted, tier-scaled contributed store
-   (ADR-0015, `docs/services/NEIGHBOURHOOD-CACHE.md`).~~ **done**, including fan-out fetch
+5. ~~The **cluster cache** — a bounded, encrypted, tier-scaled contributed store
+   (ADR-0015, `docs/services/CLUSTER-CACHE.md`).~~ **done**, including fan-out fetch
    and ADR-0018's file handoff for objects too large for the control plane. Chunking
    parameters were OQ-16 and are settled by ADR-0016.
 
@@ -229,7 +229,7 @@ Profile site, wiki, and messaging, in that order — they exercise all three pri
 between them. `onm://` addressing, local resolver, browser integration, `Trickle`-safe modes.
 
 **Note on labelling.** Entries in `docs/build/VERIFICATION-LOG.md` titled "Phase 6 slice 1"
-through "slice 7" are the neighbourhood cache and the content path, which are Phase 5 item 5
+through "slice 7" are the cluster cache and the content path, which are Phase 5 item 5
 by this document. They are left under their original headings rather than renamed, because a
 verification log is a record of what was done and when, and quietly relabelling it would make
 it a worse record. Phase 6 as defined here has not started.

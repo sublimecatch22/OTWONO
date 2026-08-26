@@ -49,7 +49,7 @@ install -d -m 0700 "$ROOTFS/var/lib/otwono/fetch"
 # The content store. 0700 and encrypted at rest: it holds everything the user has, and the
 # storage key beside it is the only thing between a stolen disk and all of it.
 install -d -m 0700 "$ROOTFS/var/lib/otwono/store"
-# The neighbourhood cache. A separate directory from the store, not a subdirectory of it:
+# The cluster cache. A separate directory from the store, not a subdirectory of it:
 # everything here is disposable and evictable, everything there is the user's, and keeping
 # the two apart on disk means eviction has no path to their data (ADR-0015). 0700 for the
 # same reason as the spool -- these are a neighbour's bytes, encrypted with the node's
@@ -225,7 +225,7 @@ subjects = ["uid:0"]
 decision = "allow"
 ttl_seconds = 300
 
-# The neighbourhood cache's local accounting: what this node holds for its neighbours, how
+# The cluster cache's local accounting: what this node holds for its neighbours, how
 # much room is left, and the purge that empties it. Local operations on local state -- and
 # nothing can *enter* the cache without net.content, which is not granted, so a stock node's
 # cache stays empty however these are used.
@@ -806,7 +806,7 @@ UNIT
 
 log "installing the content self check"
 # Everything in Phase 5 and 6 -- the store, the labels, encryption at rest, the file handoff
-# and the neighbourhood cache -- has until now been proven only by tests on a build host.
+# and the cluster cache -- has until now been proven only by tests on a build host.
 # This runs the same paths on the booted node, through the real daemons and units.
 install -m 0755 "$BUILD_DIR/files/otwono-content-check" "$ROOTFS/usr/lib/otwono/content-check"
 cat > "$ROOTFS/etc/systemd/system/otwono-content-check.service" <<'UNIT'
@@ -915,7 +915,7 @@ log "installing the content store unit"
 # ledger. It faces no network at all -- otwono-netd will call store.serve over the control
 # plane, and that method refuses anything but PUBLIC and REPLICATED.
 #
-# It also owns the neighbourhood cache at /var/lib/otwono/cache: a separate directory, so
+# It also owns the cluster cache at /var/lib/otwono/cache: a separate directory, so
 # that eviction has no path to the user's own data and a cached object cannot be mistaken
 # for their copy (ADR-0015).
 cat > "$ROOTFS/etc/systemd/system/otwono-stored.service" <<'UNIT'
@@ -928,7 +928,7 @@ Requires=otwono-permd.service
 # identity daemon is down should still store and read its own objects, and say plainly that
 # it cannot open what was shared with it.
 Wants=otwono-idd.service
-# The neighbourhood cache's size comes from the capability profile and nowhere else
+# The cluster cache's size comes from the capability profile and nowhere else
 # (CLAUDE.md §2.6), so this daemon asks otwono-hwd for it at startup. Wants, not Requires:
 # a node whose hardware daemon is down runs without a cache rather than not running.
 Wants=otwono-hwd.service

@@ -61,11 +61,11 @@ them was covered before.
 | Role | Meaning | Why it matters |
 |---|---|---|
 | `Station` | The node joins an existing network | The ordinary home case: a router already exists |
-| `AccessPoint` | The node **is** the network — it runs `hostapd` and others associate to it | A node in a place with no infrastructure, a field deployment, or a neighbourhood where one house's node serves the street |
+| `AccessPoint` | The node **is** the network — it runs `hostapd` and others associate to it | A node in a place with no infrastructure, a field deployment, or a cluster where one house's node serves the street |
 | `Peer` | Symmetric, no infrastructure: Wi-Fi Direct, 802.11s mesh, LoRa | Nodes find each other with nothing in between |
 
 The `AccessPoint` role is what turns a household node into local infrastructure. Combined
-with the neighbourhood cache, it is the difference between "there is a fast copy nearby" and
+with the cluster cache, it is the difference between "there is a fast copy nearby" and
 "there is a fast copy nearby **and a way to reach it**" — a street where every house has a
 node does not need anyone's uplink to move data between houses.
 
