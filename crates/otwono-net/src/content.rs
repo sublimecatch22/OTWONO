@@ -99,6 +99,19 @@ pub enum Request {
         /// How many entries the requester can receive in one reply.
         max_entries: u32,
     },
+    /// What REPLICATED content do you hold that I could take a copy of? (ADR-0026 §7)
+    ///
+    /// Unlike `SharedWithMe` the answer is the same for every asker, because `REPLICATED`
+    /// means "explicitly permitted to be copied" and is not scoped to a recipient. There is
+    /// nothing to filter and so nothing for a filter to get wrong.
+    #[serde(rename = "content.replicable")]
+    Replicable {
+        /// Continue after this content id. Absent starts at the beginning.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+        /// How many entries the requester can receive in one reply.
+        max_entries: u32,
+    },
     /// One range of one chunk of one object.
     #[serde(rename = "content.chunk")]
     Chunk {
@@ -181,6 +194,25 @@ pub struct SharedIndexEntry {
     pub plaintext_size_bytes: u64,
 }
 
+/// One object a node is willing to have copied (ADR-0026 §7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicableEntry {
+    pub content_id: String,
+    pub size_bytes: u64,
+    /// How long a holder should keep it before dropping it unless re-offered.
+    pub ttl_days: u32,
+    /// The owner's size cap. A holder checks this *and* its own budget.
+    pub max_size_bytes: u64,
+    /// Whether a holder may offer it onward. A request rather than a control (ADR-0026 §5).
+    pub allow_rereplication: bool,
+}
+
+/// A page of what one node is willing to have copied (ADR-0026 §7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicablePage {
+    pub entries: Vec<ReplicableEntry>,
+}
+
 /// A page of what one node has sealed to the peer asking (ADR-0020).
 ///
 /// Ordered by content id, so paging is stable and needs no timestamp — sharing time is
@@ -258,6 +290,8 @@ pub enum Response {
     Chunk(ChunkPart),
     #[serde(rename = "shared_with_you")]
     SharedWithYou(SharedIndexPage),
+    #[serde(rename = "content.replicable")]
+    Replicable(ReplicablePage),
     /// Absent, refused, damaged, or not part of that object. One answer for all of them.
     #[serde(rename = "not_available")]
     NotAvailable { content_id: String },
@@ -360,7 +394,7 @@ impl Request {
     pub fn content_id(&self) -> Option<&str> {
         match self {
             Request::Manifest { content_id, .. } | Request::Chunk { content_id, .. } => Some(content_id),
-            Request::SharedWithMe { .. } => None,
+            Request::SharedWithMe { .. } | Request::Replicable { .. } => None,
         }
     }
 
@@ -401,7 +435,9 @@ impl Request {
                     });
                 }
             }
-            Request::SharedWithMe { after, max_entries } => {
+            // Same bounds for both index requests: they are the same shape of question and
+            // a divergence would be an accident rather than a decision.
+            Request::SharedWithMe { after, max_entries } | Request::Replicable { after, max_entries } => {
                 if let Some(after) = after {
                     if !is_hex_digest(after) {
                         return Err(ProtocolError::NotHex { field: "after" });

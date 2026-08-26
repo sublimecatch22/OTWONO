@@ -562,6 +562,61 @@ impl Store {
         Ok((object, removed))
     }
 
+    /// The objects this node is willing to have copied, by content id (ADR-0026 §7).
+    ///
+    /// Every `REPLICATED` object, with the policy a holder needs to decide. Unlike
+    /// [`Store::shared_with`] the answer does not depend on who is asking: `REPLICATED`
+    /// means copying is permitted, full stop, so there is nothing to scope and nothing for
+    /// a scoping bug to leak.
+    ///
+    /// **`target_replicas` is deliberately not returned.** A holder cannot count replicas
+    /// (ADR-0026 §3), so it could not act on the number, and sending a figure nobody can
+    /// use invites somebody to build a UI on it.
+    ///
+    /// Ordered by content id and paged like the sharing index, for the same reasons:
+    /// deterministic, stable across calls, and needing no state this store does not have.
+    ///
+    /// A damaged record is skipped rather than raised. One bad file must not stop a peer
+    /// learning what else is on offer.
+    pub fn replicable(
+        &self,
+        after: Option<&ContentId>,
+        limit: usize,
+    ) -> Result<Vec<(ContentId, crate::object::Replication, u64)>, StoreError> {
+        let mut found = Vec::new();
+        let shards = match std::fs::read_dir(self.objects_dir()) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(found),
+            Err(e) => return Err(io(&self.objects_dir(), e)),
+        };
+        for shard in shards.flatten() {
+            let entries = match std::fs::read_dir(shard.path()) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let Ok(text) = std::fs::read_to_string(entry.path()) else {
+                    continue;
+                };
+                let Ok(object) = serde_json::from_str::<Object>(&text) else {
+                    continue;
+                };
+                let Some(policy) = object.replication_policy() else {
+                    continue;
+                };
+                if let Some(after) = after {
+                    if object.content_id.to_hex() <= after.to_hex() {
+                        continue;
+                    }
+                }
+                found.push((object.content_id, policy, object.size_bytes));
+            }
+        }
+        found.sort_by_key(|(id, _, _)| id.to_hex());
+        found.truncate(limit);
+        Ok(found)
+    }
+
     /// The objects in this store sealed to `recipient`, by content id (ADR-0020).
     ///
     /// Answers the one question a recipient cannot answer for itself: a `SHARED` object's id
@@ -805,6 +860,101 @@ impl std::io::Read for ChunkReader<'_> {
 
 #[cfg(test)]
 mod tests {
+
+    // --- replicable offers (ADR-0026 §7) -------------------------------------------------
+
+    #[test]
+    fn only_replicated_content_is_offered_for_copying() {
+        // The whole filter. PUBLIC serves on request but is never offered as a copy, and
+        // PRIVATE must not appear in an answer that crosses a link at all.
+        let d = tmp("replicable");
+        let s = Store::new(&d);
+        let mut want = Vec::new();
+        for (i, v) in [
+            Visibility::Private,
+            Visibility::Public,
+            Visibility::Replicated,
+            Visibility::Replicated,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let o = s.put_bytes(&data(2_000 + i, 40 + i as u64), v).unwrap();
+            if v == Visibility::Replicated {
+                want.push(o.content_id.to_hex());
+            }
+        }
+        let got: Vec<String> = s
+            .replicable(None, 100)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _, _)| id.to_hex())
+            .collect();
+        want.sort();
+        assert_eq!(got, want);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_offer_carries_the_policy_and_the_size_a_holder_needs() {
+        let d = tmp("replicable-policy");
+        let s = Store::new(&d);
+        let bytes = data(5_000, 71);
+        let o = s.put_bytes(&bytes, Visibility::Replicated).unwrap();
+        let (id, policy, size) = s.replicable(None, 10).unwrap().into_iter().next().unwrap();
+        assert_eq!(id, o.content_id);
+        assert_eq!(size, bytes.len() as u64);
+        // No explicit policy was attached, so the default travels -- otherwise REPLICATED
+        // would silently mean "not replicable" whenever somebody omitted the block.
+        assert_eq!(policy, crate::object::Replication::default());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn offers_are_ordered_by_content_id_and_page_without_repeating() {
+        // Pagination has to be stable or a holder walking the list sees an object twice and
+        // misses another. Same requirement as ADR-0020's index, same reason.
+        let d = tmp("replicable-page");
+        let s = Store::new(&d);
+        for i in 0..7 {
+            s.put_bytes(&data(1_000 + i, 90 + i as u64), Visibility::Replicated)
+                .unwrap();
+        }
+        let all: Vec<String> = s
+            .replicable(None, 100)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _, _)| id.to_hex())
+            .collect();
+        assert_eq!(all.len(), 7);
+        let mut sorted = all.clone();
+        sorted.sort();
+        assert_eq!(all, sorted, "not ordered by content id");
+
+        let mut walked = Vec::new();
+        let mut cursor: Option<ContentId> = None;
+        loop {
+            let page = s.replicable(cursor.as_ref(), 3).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            cursor = Some(page.last().unwrap().0);
+            walked.extend(page.into_iter().map(|(id, _, _)| id.to_hex()));
+        }
+        assert_eq!(
+            walked, all,
+            "paging did not reproduce the whole list exactly once"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_empty_store_offers_nothing_rather_than_failing() {
+        let d = tmp("replicable-empty");
+        let s = Store::new(&d);
+        assert!(s.replicable(None, 10).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
     use super::*;
     use crate::Visibility;
 

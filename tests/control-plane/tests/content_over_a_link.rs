@@ -667,9 +667,13 @@ fn a_peer_that_serves_the_wrong_bytes_is_caught() {
             // Always answers, always about the wrong content, always claiming the id it was
             // asked for. Only the digests give it away.
             let response = match request {
-                // This liar shares nothing, so the honest answer is an empty page.
+                // This liar shares nothing and offers nothing, so the honest answer to
+                // either index question is an empty page of the matching kind.
                 Request::SharedWithMe { .. } => {
                     Response::SharedWithYou(otwono_net::content::SharedIndexPage { entries: Vec::new() })
+                }
+                Request::Replicable { .. } => {
+                    Response::Replicable(otwono_net::content::ReplicablePage { entries: Vec::new() })
                 }
                 Request::Manifest { content_id, .. } => {
                     Response::Manifest(otwono_net::content::ManifestPage {
@@ -1048,4 +1052,95 @@ fn a_chunk_of_a_shared_object_is_refused_without_the_manifest_that_carries_its_k
         matches!(served, Response::Chunk(_)),
         "the same request was refused after the manifest went out: {served:?}"
     );
+}
+
+#[test]
+fn a_peer_is_offered_replicated_content_and_nothing_else() {
+    // ADR-0026 §7 across the responder, with a real store behind it.
+    //
+    // The filter is the whole test. PUBLIC serves on request but is never *offered* as a
+    // copy, and PRIVATE must not appear in an answer that crosses a link at all -- an offer
+    // list is the one place a labelling mistake would hand a peer a shopping list of things
+    // it should never have heard of.
+    let h = Harness::start("replicable");
+    let mut ids = Vec::new();
+    for (label, v) in [
+        ("private", "private"),
+        ("public", "public"),
+        ("replicated", "replicated"),
+    ] {
+        ids.push((v.to_string(), h.put(label.as_bytes(), v)));
+    }
+
+    let responder = h.responder();
+    let peer = h.client.node_id();
+    let mut session = otwono_netd::content::Session::default();
+    let reply = responder.answer(
+        peer,
+        &Request::Replicable {
+            after: None,
+            max_entries: 64,
+        },
+        &mut session,
+    );
+    let page = match reply {
+        Response::Replicable(p) => p,
+        other => panic!("expected a replicable page, got {other:?}"),
+    };
+
+    let offered: Vec<&str> = page.entries.iter().map(|e| e.content_id.as_str()).collect();
+    for (v, id) in &ids {
+        let present = offered.contains(&id.as_str());
+        assert_eq!(
+            present,
+            v == "replicated",
+            "{v} content was {} in the offer list",
+            if present { "present" } else { "absent" }
+        );
+    }
+
+    // And the policy travels, so a holder can apply the owner's size cap and TTL without a
+    // second round trip.
+    let e = page
+        .entries
+        .iter()
+        .find(|e| e.content_id == ids[2].1)
+        .expect("the replicated object is offered");
+    assert_eq!(e.ttl_days, 365, "the default policy did not travel");
+    assert_eq!(e.max_size_bytes, 100 * 1024 * 1024);
+    assert!(e.allow_rereplication);
+    assert_eq!(e.size_bytes, "replicated".len() as u64);
+}
+
+#[test]
+fn an_offer_page_is_taken_once_per_session_like_the_sharing_index() {
+    // ADR-0026 §7 inherits ADR-0020 §4's discipline: producing the list scans every object
+    // record, so a peer that could force a fresh scan per request would have a cheap way to
+    // make an SD-card-backed node miserable. The cost is that an object marked REPLICATED
+    // *during* a session is not visible to it, which is asserted here rather than left as
+    // a claim in a document.
+    let h = Harness::start("replicable-session");
+    let responder = h.responder();
+    let peer = h.client.node_id();
+    let mut session = otwono_netd::content::Session::default();
+
+    let ask = |session: &mut otwono_netd::content::Session| match responder.answer(
+        peer,
+        &Request::Replicable {
+            after: None,
+            max_entries: 64,
+        },
+        session,
+    ) {
+        Response::Replicable(p) => p.entries.len(),
+        other => panic!("expected a replicable page, got {other:?}"),
+    };
+
+    assert_eq!(ask(&mut session), 0, "nothing is offered yet");
+
+    h.put(b"added later", "replicated");
+
+    assert_eq!(ask(&mut session), 0, "the snapshot must not change mid-session");
+    let mut fresh = otwono_netd::content::Session::default();
+    assert_eq!(ask(&mut fresh), 1, "a new session sees it");
 }

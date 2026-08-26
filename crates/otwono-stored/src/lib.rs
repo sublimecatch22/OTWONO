@@ -264,6 +264,19 @@ struct AcceptSharedParams {
 }
 
 /// What has this node sealed to one peer (ADR-0020)?
+/// What this node is willing to have copied (ADR-0026 §7).
+///
+/// No peer field, unlike `store.shared_with`: `REPLICATED` means copying is permitted, so
+/// the answer is the same for everybody and there is nothing to scope.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplicableParams {
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default)]
+    max_entries: Option<usize>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SharedWithParams {
@@ -1019,6 +1032,41 @@ impl StoreService {
         }))
     }
 
+    /// What this node is willing to have copied (ADR-0026 §7).
+    ///
+    /// `target_replicas` is deliberately absent from every entry: a holder cannot count
+    /// replicas, so it could not act on the number, and returning a figure nobody can use
+    /// invites a UI to be built on it.
+    fn handle_replicable(&self, params: Value) -> Result<Value, RpcError> {
+        let p: ReplicableParams = serde_json::from_value(params)
+            .map_err(|e| RpcError::invalid_params(format!("store.replicable: {e}")))?;
+        let after = match &p.after {
+            Some(raw) => Some(Self::parse_id(raw)?),
+            None => None,
+        };
+        let limit = p
+            .max_entries
+            .unwrap_or(MAX_SHARED_ENTRIES)
+            .min(MAX_SHARED_ENTRIES);
+        if limit == 0 {
+            return Err(RpcError::invalid_params("max_entries must be greater than zero"));
+        }
+        let entries = self.store.replicable(after.as_ref(), limit).map_err(rpc)?;
+        Ok(json!({
+            "schema_version": DESCRIBE_SCHEMA_VERSION,
+            "entries": entries
+                .iter()
+                .map(|(id, policy, size)| json!({
+                    "content_id": id.to_hex(),
+                    "size_bytes": size,
+                    "ttl_days": policy.ttl_days,
+                    "max_size_bytes": policy.max_size_bytes,
+                    "allow_rereplication": policy.allow_rereplication,
+                }))
+                .collect::<Vec<_>>(),
+        }))
+    }
+
     fn handle_serve(&self, params: Value) -> Result<Value, RpcError> {
         let p: ServeParams = serde_json::from_value(params)
             .map_err(|e| RpcError::invalid_params(format!("store.serve: {e}")))?;
@@ -1361,6 +1409,11 @@ impl Service for StoreService {
                     CAPABILITY_SERVE,
                 ),
                 MethodDescription::guarded(
+                    "store.replicable",
+                    "List what this node is willing to have copied (ADR-0026)",
+                    CAPABILITY_SERVE,
+                ),
+                MethodDescription::guarded(
                     "store.serve_manifest",
                     "One window of a servable object's chunk list, for a peer",
                     CAPABILITY_SERVE,
@@ -1434,6 +1487,13 @@ impl Service for StoreService {
             "store.shared_with" => {
                 self.authorize(ctx, CAPABILITY_SERVE)?;
                 self.handle_shared_with(params)
+            }
+            // Guarded by store.serve, like the sharing index and for the same reason: it is
+            // otwono-netd handing things to peers, and every id in the reply is one the
+            // asking peer could already fetch with this very capability.
+            "store.replicable" => {
+                self.authorize(ctx, CAPABILITY_SERVE)?;
+                self.handle_replicable(params)
             }
             "store.serve" => {
                 self.authorize(ctx, CAPABILITY_SERVE)?;

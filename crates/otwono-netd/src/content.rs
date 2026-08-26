@@ -119,6 +119,10 @@ impl std::fmt::Debug for ContentResponder {
 #[derive(Debug, Default)]
 pub struct Session {
     shared_released: std::collections::HashSet<String>,
+    /// What this node is willing to have copied, taken once and paged from thereafter
+    /// (ADR-0026 §7). Same once-per-session discipline as `shared_index`, for the same
+    /// reason: producing it scans every object record.
+    replicable_index: Option<Vec<otwono_net::content::ReplicableEntry>>,
     /// What this node has sealed to this peer, taken once and paged from thereafter
     /// (ADR-0020). `None` until the peer first asks.
     ///
@@ -164,15 +168,25 @@ impl ContentResponder {
         // refused with an empty page — the same answer a peer with nothing sealed to it
         // gets, so asking cannot tell "I will not tell you" from "there is nothing"
         // (ADR-0020).
-        let refuse = || match request.content_id() {
-            Some(id) => Response::not_available(id),
-            None => Response::SharedWithYou(SharedIndexPage { entries: Vec::new() }),
+        let refuse = || match request {
+            Request::Manifest { content_id, .. } | Request::Chunk { content_id, .. } => {
+                Response::not_available(content_id)
+            }
+            Request::SharedWithMe { .. } => Response::SharedWithYou(SharedIndexPage { entries: Vec::new() }),
+            // An empty page of the *matching* kind. Refusing a replication question with a
+            // sharing answer would be a protocol error dressed as a refusal.
+            Request::Replicable { .. } => {
+                Response::Replicable(otwono_net::content::ReplicablePage { entries: Vec::new() })
+            }
         };
         if request.validate().is_err() {
             return refuse();
         }
         if let Request::SharedWithMe { after, max_entries } = request {
             return self.shared_with(peer, after.as_deref(), *max_entries, session);
+        }
+        if let Request::Replicable { after, max_entries } = request {
+            return self.replicable(peer, after.as_deref(), *max_entries, session);
         }
         match self.ask_store(peer, request) {
             Some(reply) => self
@@ -221,6 +235,68 @@ impl ContentResponder {
     }
 
     /// Ask the store what it has sealed to this peer. `None` if it could not be asked.
+    /// Serve what this node is willing to have copied (ADR-0026 §7).
+    ///
+    /// Deliberately not scoped to the asking peer, unlike `shared_with`: `REPLICATED` means
+    /// copying is permitted, so every peer gets the same answer and there is no filter to
+    /// get wrong.
+    fn replicable(
+        &self,
+        _peer: &NodeId,
+        after: Option<&str>,
+        max_entries: u32,
+        session: &mut Session,
+    ) -> Response {
+        let empty = || Response::Replicable(otwono_net::content::ReplicablePage { entries: Vec::new() });
+        if session.replicable_index.is_none() {
+            let Some(entries) = self.ask_replicable_index() else {
+                return empty();
+            };
+            session.replicable_index = Some(entries);
+        }
+        let all = session.replicable_index.as_ref().expect("set just above");
+        let start = match after {
+            Some(after) => match all.iter().position(|e| e.content_id == after) {
+                Some(i) => i + 1,
+                None => return empty(),
+            },
+            None => 0,
+        };
+        let entries: Vec<_> = all
+            .iter()
+            .skip(start)
+            .take(max_entries as usize)
+            .cloned()
+            .collect();
+        Response::Replicable(otwono_net::content::ReplicablePage { entries })
+    }
+
+    fn ask_replicable_index(&self) -> Option<Vec<otwono_net::content::ReplicableEntry>> {
+        let reply = self.call_store(
+            "store.replicable",
+            json!({ "max_entries": content::MAX_SHARED_ENTRIES_PER_REQUEST }),
+        )?;
+        let entries = reply.get("entries")?.as_array()?;
+        entries
+            .iter()
+            .map(|e| {
+                let content_id = e.get("content_id")?.as_str()?.to_string();
+                // Checked here as well as at the store, for the same reason the sharing
+                // index checks it: this daemon puts it on a wire.
+                if !content::is_hex_digest(&content_id) {
+                    return None;
+                }
+                Some(otwono_net::content::ReplicableEntry {
+                    content_id,
+                    size_bytes: e.get("size_bytes")?.as_u64()?,
+                    ttl_days: u32::try_from(e.get("ttl_days")?.as_u64()?).ok()?,
+                    max_size_bytes: e.get("max_size_bytes")?.as_u64()?,
+                    allow_rereplication: e.get("allow_rereplication")?.as_bool()?,
+                })
+            })
+            .collect()
+    }
+
     fn ask_shared_index(&self, peer: &NodeId) -> Option<Vec<SharedIndexEntry>> {
         let reply = self.call_store(
             "store.shared_with",
@@ -278,7 +354,7 @@ impl ContentResponder {
             }
             Request::Chunk { .. } => may_leave_a_node(label),
             // Never reaches translate: answered from the session snapshot in `answer`.
-            Request::SharedWithMe { .. } => false,
+            Request::SharedWithMe { .. } | Request::Replicable { .. } => false,
         };
         if !allowed {
             // Reachable only if otwono-stored regressed: it has already applied its own
@@ -320,7 +396,7 @@ impl ContentResponder {
                     })
                     .collect::<Option<Vec<_>>>()?,
             })),
-            Request::SharedWithMe { .. } => None,
+            Request::SharedWithMe { .. } | Request::Replicable { .. } => None,
             Request::Chunk { digest, .. } => {
                 let served = reply.get("digest")?.as_str()?;
                 if served != digest {
@@ -369,7 +445,7 @@ impl ContentResponder {
             ),
             // Answered from a session snapshot, not per request (ADR-0020), so it never
             // reaches here.
-            Request::SharedWithMe { .. } => return None,
+            Request::SharedWithMe { .. } | Request::Replicable { .. } => return None,
         };
         self.call_store(method, params)
     }
@@ -529,9 +605,9 @@ pub fn fetch_shared_index<L: LinkAdapter>(
         )? {
             Response::SharedWithYou(p) => p,
             Response::NotAvailable { .. } => return Ok(all),
-            Response::Manifest(_) | Response::Chunk(_) => {
+            Response::Manifest(_) | Response::Chunk(_) | Response::Replicable(_) => {
                 return Err(ProtocolError::Mismatched(
-                    "content in place of an index page".into(),
+                    "the wrong kind of reply in place of a sharing index page".into(),
                 ))
             }
         };
@@ -703,7 +779,7 @@ fn fetch_manifest<L: LinkAdapter>(
             Response::Chunk(_) => {
                 return Err(ProtocolError::Mismatched("a chunk in place of a manifest".into()))
             }
-            Response::SharedWithYou(_) => {
+            Response::SharedWithYou(_) | Response::Replicable(_) => {
                 return Err(ProtocolError::Mismatched(
                     "an index page in place of a manifest".into(),
                 ))
@@ -826,7 +902,7 @@ fn fetch_chunk<L: LinkAdapter>(
             Response::Manifest(_) => {
                 return Err(ProtocolError::Mismatched("a manifest in place of a chunk".into()))
             }
-            Response::SharedWithYou(_) => {
+            Response::SharedWithYou(_) | Response::Replicable(_) => {
                 return Err(ProtocolError::Mismatched(
                     "an index page in place of a chunk".into(),
                 ))

@@ -200,9 +200,9 @@ GPU/NPU backends, and the tiered assistant shapes.
    allow-list of wire strings, not a call into `otwono-store`).
 4. Replication policy for `REPLICATED`. **decided and half built** — ADR-0026: replication
    is pulled by a holder, never pushed by an owner, so consent is inherent and the whole
-   thing is best-effort by construction. The policy block is on the object record and unit
-   tested; the wire protocol that lets a holder discover offers is the remaining half, and
-   nothing has been replicated anywhere yet.
+   thing is best-effort by construction. The policy block is on the object record, and
+   `content.replicable` (§7) carries offers across a link. What remains is the holder side:
+   nothing yet takes a copy, so no object has been replicated anywhere.
 5. ~~The **cluster cache** — a bounded, encrypted, tier-scaled contributed store
    (ADR-0015, `docs/services/CLUSTER-CACHE.md`).~~ **done**, including fan-out fetch
    and ADR-0018's file handoff for objects too large for the control plane. Chunking

@@ -98,6 +98,31 @@ peers would concentrate the network's durable copies on its largest nodes, which
 decentralised store quietly becomes three data centres with extra steps. If ranking arrives,
 it arrives with its own ADR and argues that case explicitly.
 
+### 7. How a holder discovers offers: one ONM request, in ADR-0017's shape
+
+**Amended 2026-08-26, on building it.** §1 needed a mechanism and left it to the next ADR;
+it turned out small enough to belong here.
+
+`content.replicable` asks a peer what it is willing to have copied. It mirrors ADR-0020's
+`content.shared_with_me` — paged by content id, bounded by the same `max_entries` ceiling,
+and **taken once per session**, because producing the list scans every object record and a
+peer that could force a fresh scan per request would have a cheap way to make an
+SD-card-backed node miserable. The same cost follows: an object marked `REPLICATED` during
+a session is not visible to that session.
+
+**The reply is the same for every asker**, which is the one place it differs from the
+sharing index. `REPLICATED` means copying is permitted, so there is nothing to scope — and
+therefore no filter that could be got wrong. ADR-0020 had to scope its computation to the
+asker precisely because a bug there would publish the store; here the question does not
+arise.
+
+Each entry carries the content id, the size, and the parts of the policy a holder acts on:
+`ttl_days`, `max_size_bytes`, `allow_rereplication`.
+
+**`target_replicas` is deliberately not sent.** A holder cannot count replicas (§3), so it
+could not act on the number, and putting a figure on the wire that nobody can use is an
+invitation to build a UI on it.
+
 ## Consequences
 
 **Good.** No consent mechanism to design, because nothing arrives unasked. No push

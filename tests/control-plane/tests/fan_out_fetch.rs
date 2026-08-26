@@ -354,9 +354,13 @@ fn a_substituted_manifest_is_caught_before_a_single_chunk_is_fetched() {
         while let Ok(frame) = channel.recv() {
             let request: Request = content::decode(&frame).unwrap();
             let response = match request {
-                // This stub never shares, so the honest answer is an empty page.
+                // This stub never shares and offers nothing for copying, so the honest
+                // answer to either index question is an empty page of the matching kind.
                 Request::SharedWithMe { .. } => {
                     Response::SharedWithYou(otwono_net::content::SharedIndexPage { entries: Vec::new() })
+                }
+                Request::Replicable { .. } => {
+                    Response::Replicable(otwono_net::content::ReplicablePage { entries: Vec::new() })
                 }
                 Request::Manifest { content_id, .. } => Response::Manifest(ManifestPage {
                     content_id,
@@ -429,9 +433,13 @@ fn a_peer_serving_rubbish_wastes_bandwidth_and_cannot_corrupt_the_result() {
                 return;
             };
             let response = match request {
-                // This stub never shares, so the honest answer is an empty page.
+                // This stub never shares and offers nothing for copying, so the honest
+                // answer to either index question is an empty page of the matching kind.
                 Request::SharedWithMe { .. } => {
                     Response::SharedWithYou(otwono_net::content::SharedIndexPage { entries: Vec::new() })
+                }
+                Request::Replicable { .. } => {
+                    Response::Replicable(otwono_net::content::ReplicablePage { entries: Vec::new() })
                 }
                 Request::Manifest { content_id, .. } => Response::Manifest(ManifestPage {
                     content_id,
