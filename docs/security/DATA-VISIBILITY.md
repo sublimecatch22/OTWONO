@@ -42,7 +42,7 @@ Every object in `otwono-stored` carries exactly one visibility label.
   "provenance": { "derived_from": ["blake3:…"], "tool": "libreoffice-writer" },
   "authorized": { "nodes": ["otw1:…"], "users": ["usr1:…"] },
   "replication": {
-    "target_replicas": 3, "max_hops": 4, "ttl_days": 365,
+    "target_replicas": 3, "ttl_days": 365,
     "max_size_bytes": 104857600, "allow_rereplication": true
   }
 }
@@ -50,6 +50,26 @@ Every object in `otwono-stored` carries exactly one visibility label.
 
 `replication` is meaningful only for `REPLICATED`. `authorized` is meaningful only for
 `SHARED`.
+
+**STATUS: IMPLEMENTED** — `otwono_store::object::Replication`, attached with
+`with_replication` and read with `replication_policy`. Unit tested; no wire protocol yet, so
+nothing has actually been replicated anywhere.
+
+**Settled by ADR-0026, and every field is advisory.** Replication is **pulled by a holder,
+never pushed by an owner**, which makes consent inherent — nothing arrives on a disk whose
+operator did not ask for it — and makes the whole thing best-effort:
+
+- `target_replicas` is **a wish, not a guarantee**. If nobody has budget to spare, an object
+  sits at zero copies, and its owner does not reliably learn that. Counting replicas would
+  mean asking peers who holds what, which builds exactly the map ADR-0015 and ADR-0020
+  avoid publishing.
+- `allow_rereplication` is **a request, not a control**. A holder that ignores it is running
+  modified software and already has the bytes. The label model has always been about what
+  *this* node does.
+- `max_hops` **is gone**. It counted distance from an origin, which is a push concept; under
+  pull there is no chain to count.
+- `REPLICATED` with no policy block gets the default rather than being treated as
+  un-replicable — the label is the statement of intent, and a missing block is an omission.
 
 ## 4. Enforcement points
 

@@ -211,11 +211,102 @@ pub struct Object {
     /// Present when the chunks are ciphertext (ADR-0019). Absent on everything else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sharing: Option<Sharing>,
+    /// How the owner would like this copied (ADR-0026). Meaningful only for `Replicated`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replication: Option<Replication>,
     /// Free-form, and never part of the identity. A media type, an original filename, a
     /// service's own key — all things that may differ between two nodes holding the same
     /// bytes.
     #[serde(default)]
     pub metadata: std::collections::BTreeMap<String, String>,
+}
+
+/// What an owner asks of whoever chooses to hold a copy (ADR-0026).
+///
+/// Every field here is **advisory**. Replication is pulled rather than pushed, so a holder
+/// decides what to take and an owner cannot compel, count, or recall. `DATA-VISIBILITY.md`
+/// §3 sketched this block with a `max_hops` field; ADR-0026 §4 drops it, because hops count
+/// distance from an origin and pull has no chain to count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Replication {
+    /// How many copies the owner hopes for. **A wish, not a guarantee** — if nobody has
+    /// budget to spare, an object sits at zero and its owner does not reliably learn that
+    /// (ADR-0026 §2, §3).
+    pub target_replicas: u32,
+    /// After this many days a holder should drop the copy unless it is offered again. The
+    /// only bound on unbounded growth, and the reason durability needs a live network
+    /// rather than one act of copying.
+    pub ttl_days: u32,
+    /// A holder refuses anything larger whatever its budget says. A cheap guard against one
+    /// object filling a small node.
+    pub max_size_bytes: u64,
+    /// Whether a replica may offer the object onward. This is how content outlives its
+    /// origin, and it is **a request rather than a control**: a holder that ignores it is
+    /// running modified software and already has the bytes (ADR-0026 §5).
+    pub allow_rereplication: bool,
+}
+
+impl Default for Replication {
+    /// Conservative on every axis a mistake could hurt.
+    ///
+    /// Three replicas is what `DATA-VISIBILITY.md` §3 sketched. A year is long enough to be
+    /// useful and short enough that abandoned content drains away. 100 MiB keeps a single
+    /// object from dominating a small holder's budget. Re-replication is **on**, because an
+    /// object that cannot be passed on dies with its origin, which is the one thing this
+    /// label exists to prevent.
+    fn default() -> Self {
+        Replication {
+            target_replicas: 3,
+            ttl_days: 365,
+            max_size_bytes: 100 * 1024 * 1024,
+            allow_rereplication: true,
+        }
+    }
+}
+
+impl Replication {
+    /// Whether a holder with `budget_bytes` to spare should consider an object of
+    /// `size_bytes`.
+    ///
+    /// The size rule is the owner's; the budget rule is the holder's. Both must pass, and
+    /// they are checked together here so no caller applies one and forgets the other.
+    pub fn a_holder_may_take(&self, size_bytes: u64, budget_bytes: u64) -> bool {
+        size_bytes <= self.max_size_bytes && size_bytes <= budget_bytes
+    }
+
+    /// Whether a copy taken at `taken_unix_ms` has outlived its welcome by `now_ms`.
+    pub fn is_expired(&self, taken_unix_ms: u64, now_ms: u64) -> bool {
+        let ttl_ms = (self.ttl_days as u64).saturating_mul(24 * 60 * 60 * 1000);
+        // checked_add, not saturating_add. Saturating means an expiry far enough in the
+        // future to overflow lands on u64::MAX and compares as *already expired* — an
+        // arithmetic edge that fails in the direction of deleting somebody's data. An
+        // overflow here means "effectively never", which is what was asked for.
+        match taken_unix_ms.checked_add(ttl_ms) {
+            Some(expires_at) => now_ms >= expires_at,
+            None => false,
+        }
+    }
+
+    /// Refuse a policy that cannot mean what it says.
+    pub fn validate(&self) -> Result<(), ObjectError> {
+        if self.target_replicas == 0 {
+            return Err(ObjectError::BadEnvelope(
+                "target_replicas of 0 asks for an object to be replicated nowhere; use a                  different label instead"
+                    .to_string(),
+            ));
+        }
+        if self.ttl_days == 0 {
+            return Err(ObjectError::BadEnvelope(
+                "a ttl of 0 days means every holder drops the copy immediately".to_string(),
+            ));
+        }
+        if self.max_size_bytes == 0 {
+            return Err(ObjectError::BadEnvelope(
+                "a max_size_bytes of 0 refuses every object, including this one".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,8 +379,41 @@ impl Object {
             size_bytes: chunks.iter().map(|c| c.length as u64).sum(),
             visibility,
             sharing: None,
+            // Absent rather than defaulted: a policy on an object nobody marked REPLICATED
+            // would be a setting with no effect, and later readers would have to work out
+            // whether it meant anything. `with_replication` puts one on deliberately.
+            replication: None,
             metadata: Default::default(),
         }
+    }
+
+    /// Attach a replication policy (ADR-0026).
+    ///
+    /// Refused on any label but `Replicated`. A policy on a `PRIVATE` object is either a
+    /// mistake or a misunderstanding of what the field does, and silently keeping it would
+    /// leave a record that reads as though the object were about to be copied.
+    pub fn with_replication(mut self, policy: Replication) -> Result<Object, ObjectError> {
+        if self.visibility != Visibility::Replicated {
+            return Err(ObjectError::BadEnvelope(format!(
+                "{:?} content carries no replication policy; only REPLICATED does",
+                self.visibility
+            )));
+        }
+        policy.validate()?;
+        self.replication = Some(policy);
+        Ok(self)
+    }
+
+    /// The policy a holder should apply, for an object that is replicated.
+    ///
+    /// `REPLICATED` with no explicit policy gets the default rather than being treated as
+    /// un-replicable: the label is the owner's statement of intent, and a missing policy
+    /// block is an omission rather than a refusal.
+    pub fn replication_policy(&self) -> Option<Replication> {
+        if self.visibility != Visibility::Replicated {
+            return None;
+        }
+        Some(self.replication.clone().unwrap_or_default())
     }
 
     /// Attach a sharing envelope. Used by the `SHARED` put path, which is the only place
@@ -383,6 +507,131 @@ pub(crate) fn digest_from_hex(s: &str) -> Option<[u8; 32]> {
 
 #[cfg(test)]
 mod tests {
+
+    // --- replication policy (ADR-0026) ---------------------------------------------------
+
+    fn replicated() -> Object {
+        Object::new(&[], Visibility::Replicated)
+    }
+
+    #[test]
+    fn only_replicated_content_carries_a_replication_policy() {
+        // A policy on a PRIVATE object is a mistake or a misunderstanding, and keeping it
+        // would leave a record reading as though the object were about to be copied.
+        for v in [Visibility::Private, Visibility::Shared, Visibility::Public] {
+            assert!(
+                Object::new(&[], v)
+                    .with_replication(Replication::default())
+                    .is_err(),
+                "{v:?} accepted a replication policy"
+            );
+            assert!(Object::new(&[], v).replication_policy().is_none());
+        }
+        assert!(replicated().with_replication(Replication::default()).is_ok());
+    }
+
+    #[test]
+    fn replicated_content_without_a_policy_gets_the_default_rather_than_none() {
+        // The label is the owner's statement of intent. A missing block is an omission, not
+        // a refusal to be copied -- treating it as "do not replicate" would make REPLICATED
+        // mean PUBLIC whenever somebody forgot a field.
+        let o = replicated();
+        assert!(o.replication.is_none(), "nothing was attached");
+        assert_eq!(o.replication_policy(), Some(Replication::default()));
+    }
+
+    #[test]
+    fn a_policy_that_cannot_mean_what_it_says_is_refused() {
+        for (p, why) in [
+            (
+                Replication {
+                    target_replicas: 0,
+                    ..Default::default()
+                },
+                "replicated nowhere",
+            ),
+            (
+                Replication {
+                    ttl_days: 0,
+                    ..Default::default()
+                },
+                "drops the copy immediately",
+            ),
+            (
+                Replication {
+                    max_size_bytes: 0,
+                    ..Default::default()
+                },
+                "refuses every object",
+            ),
+        ] {
+            let e = p.validate().expect_err(why);
+            assert!(matches!(e, ObjectError::BadEnvelope(_)), "{e:?}");
+        }
+        assert!(Replication::default().validate().is_ok());
+    }
+
+    #[test]
+    fn a_holder_needs_both_the_owners_size_rule_and_its_own_budget() {
+        // Two rules from two parties. Checking one and forgetting the other is the mistake
+        // this function exists to prevent, so both directions are pinned.
+        let p = Replication {
+            max_size_bytes: 1_000,
+            ..Default::default()
+        };
+        assert!(p.a_holder_may_take(500, 10_000), "within both");
+        assert!(!p.a_holder_may_take(2_000, 10_000), "over the owner's size cap");
+        assert!(!p.a_holder_may_take(500, 100), "over the holder's budget");
+        assert!(p.a_holder_may_take(1_000, 1_000), "exactly at both is allowed");
+    }
+
+    #[test]
+    fn a_copy_expires_after_its_ttl_and_not_before() {
+        let p = Replication {
+            ttl_days: 1,
+            ..Default::default()
+        };
+        let taken = 1_700_000_000_000u64;
+        let day = 24 * 60 * 60 * 1000;
+        assert!(!p.is_expired(taken, taken));
+        assert!(!p.is_expired(taken, taken + day - 1));
+        assert!(p.is_expired(taken, taken + day));
+    }
+
+    #[test]
+    fn a_long_ttl_does_not_overflow_into_immediate_expiry() {
+        // u32 days in milliseconds exceeds u32 and approaches u64 limits. Wrapping here
+        // would turn "keep this for a very long time" into "drop it now", which is the
+        // opposite of what was asked and would look like data loss.
+        let p = Replication {
+            ttl_days: u32::MAX,
+            ..Default::default()
+        };
+        assert!(!p.is_expired(u64::MAX - 1, u64::MAX));
+    }
+
+    #[test]
+    fn a_replication_policy_survives_a_round_trip_through_json() {
+        let o = replicated()
+            .with_replication(Replication {
+                target_replicas: 5,
+                ttl_days: 30,
+                max_size_bytes: 4096,
+                allow_rereplication: false,
+            })
+            .unwrap();
+        let back: Object = serde_json::from_str(&serde_json::to_string(&o).unwrap()).unwrap();
+        assert_eq!(back.replication, o.replication);
+        assert!(!back.replication.unwrap().allow_rereplication);
+    }
+
+    #[test]
+    fn an_object_with_no_policy_serialises_without_the_field() {
+        // skip_serializing_if, pinned: an absent policy must stay absent on disk rather
+        // than appearing as null, which a reader would have to interpret.
+        let json = serde_json::to_string(&Object::new(&[], Visibility::Public)).unwrap();
+        assert!(!json.contains("replication"), "{json}");
+    }
     use super::*;
     use crate::chunk;
 

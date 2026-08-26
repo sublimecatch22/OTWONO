@@ -40,3 +40,4 @@ Rules:
 | 0023 | `otwono-walletd` holds nothing unlocked: the passphrase per call, no session, and no public key in the clear | accepted |
 | 0024 | The confirmation channel: asynchronous, bound to one request, and refused to the subject that asked | accepted |
 | 0025 | Render every address family, and decide the chain later | accepted |
+| 0026 | Replication is pulled, never pushed, and it is best-effort by construction | accepted |

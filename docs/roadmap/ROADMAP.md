@@ -198,7 +198,11 @@ GPU/NPU backends, and the tiered assistant shapes.
    ADR-0017 gave the ONM content-fetch protocol; `otwono-netd` calls `store.serve` and
    re-checks the label itself, with deliberately different code (`may_leave_a_node` is an
    allow-list of wire strings, not a call into `otwono-store`).
-4. Replication policy for `REPLICATED`. **not started.**
+4. Replication policy for `REPLICATED`. **decided and half built** — ADR-0026: replication
+   is pulled by a holder, never pushed by an owner, so consent is inherent and the whole
+   thing is best-effort by construction. The policy block is on the object record and unit
+   tested; the wire protocol that lets a holder discover offers is the remaining half, and
+   nothing has been replicated anywhere yet.
 5. ~~The **cluster cache** — a bounded, encrypted, tier-scaled contributed store
    (ADR-0015, `docs/services/CLUSTER-CACHE.md`).~~ **done**, including fan-out fetch
    and ADR-0018's file handoff for objects too large for the control plane. Chunking
