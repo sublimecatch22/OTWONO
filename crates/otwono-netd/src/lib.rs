@@ -564,10 +564,18 @@ const DISCOVERY_SWEEP: Duration = Duration::from_secs(30);
 /// answers `NotReplicating` before the dial, so it makes no traffic at all. A node with room
 /// asks around until it has none. One peer per tick, rotating, so no single peer is asked
 /// repeatedly while another is never asked.
-fn replication_sweep(state: &Arc<NetState>, turn: &mut usize) {
+fn replication_sweep(state: &Arc<NetState>, turn: &mut usize, last: &mut std::time::Instant) {
     if state.holder.is_none() {
         return;
     }
+    // Elapsed time, not "the browse timed out". Tying this to the timeout branch would mean
+    // a segment whose peers re-announce briskly never sweeps at all: every iteration would
+    // take the `Some(candidate)` path and the sweep would starve exactly where there are
+    // most peers to ask.
+    if last.elapsed() < DISCOVERY_SWEEP {
+        return;
+    }
+    *last = std::time::Instant::now();
     let connected = state.peers.lock().unwrap().connected();
     if connected.is_empty() {
         return;
@@ -595,12 +603,16 @@ fn replication_sweep(state: &Arc<NetState>, turn: &mut usize) {
 pub fn run_discovery(state: Arc<NetState>, discovery: otwono_net::Discovery) {
     let local = *state.node_id();
     let mut turn = 0usize;
+    // Starts one interval in the past so the first sweep does not wait for one: a node that
+    // has just met its peers is a node with the most to ask them.
+    let mut last_sweep = std::time::Instant::now() - DISCOVERY_SWEEP;
     loop {
         let Some(candidate) = discovery.next_candidate(DISCOVERY_SWEEP) else {
             retry_known_peers(&state, &local);
-            replication_sweep(&state, &mut turn);
+            replication_sweep(&state, &mut turn, &mut last_sweep);
             continue;
         };
+        replication_sweep(&state, &mut turn, &mut last_sweep);
         if candidate.claimed_node_id == local {
             continue; // our own advertisement
         }
