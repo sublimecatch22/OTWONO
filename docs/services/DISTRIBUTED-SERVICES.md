@@ -24,8 +24,14 @@ control plane, so it survives a restart and there is one writer to it.
 2 over the link, then refused the peer's rolled-back sequence-1 record. The replayed record is
 the rightful owner's, genuinely signed and current for that owner; it is refused because the
 reader remembers a higher number. Same log entry, which also records that no *third party*
-replay has been shown on a wire and that the log's survival across a reboot is still only
-tested in-process.
+replay has been shown on a wire.
+
+**And it survives the machine going away**, verified 2026-08-27 by shutting both nodes down
+and booting them again from the same disks: each came back as itself and still refused its
+peer's rolled-back record, naming the sequence it had read off the disk. Nothing is
+republished on that boot, so the refusal can only come from the persisted log. The store's
+writes were made durable rather than merely atomic to make that claim honest (ADR-0027 §9);
+a *hard* power cut is still untested.
 
 ## 1. Three primitives, many services
 

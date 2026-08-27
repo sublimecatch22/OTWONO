@@ -4683,3 +4683,113 @@ belongs in the same pass.
 - **No tombstone crossed**, and no `MemoryUnavailable` refusal was exercised on a booted node:
   the test image grants `pointer.write`, so nothing there ever had to read a pointer without
   a memory.
+
+---
+
+## 2026-08-27 — the rollback defence survives the machine going away
+
+**STATUS: VERIFIED.** amd64, QEMU, TCG, no `/dev/kvm`. Two VMs, booted, shut down cleanly,
+and booted again from the same disks.
+
+ADR-0027 rests on one sentence: the reader remembers the highest sequence it has seen. A
+signature cannot tell a current record from an old one, so that memory is the only thing
+between a reader and a replay — and a memory that does not outlive a reboot is protection an
+attacker gets by waiting.
+
+That durability had been tested by opening a `PointerStore`, closing it, and opening it
+again. Same process, same kernel, same page cache.
+
+### The write was atomic and not durable
+
+Found on the way, and the reason the reboot test would have been dishonest without it.
+`write_atomically` wrote a temp file and renamed it, with no fsync anywhere. Rename means no
+reader sees half a record; it does not mean the record is on the disk. Both the bytes and the
+directory entry can still be in the page cache when the power goes, and the file comes back
+empty, stale, or absent.
+
+For most files that is an annoyance. For `sequences.json` it is the defence disappearing, in
+the direction that helps an attacker: a reader that comes back with no log accepts whatever
+it is offered as a first read, and cannot tell that it used to know better. Both fsyncs — the
+data before the rename, the **directory** after it — are now there (ADR-0027 §9).
+
+The temporary name also gained a counter. `otwono-stored` serves each connection on its own
+thread, so two writers for one pointer would otherwise share one temp path and interleave
+into a file that is neither record.
+
+### Nothing is republished on the second boot
+
+That is what makes the test sharp. The first boot ends with each node's own pointer regressed
+to sequence 1 and each node's memory of its peer at sequence 2, both on disk. So on the
+second boot each peer is **still serving** the record the other must **still** refuse, and
+nothing on that boot has read the pointer before. The only thing that can refuse it is what
+came back off the disk.
+
+`otwono-mesh-content-check` is conditioned off on the second boot and
+`otwono-pointer-reboot-check` on, by the presence of a stamp — `grep -c MESH-CONTENT-STEP`
+on the second boot's console returns `0`, so the first check really did not run. A second run
+of it would have republished a name the peer had already seen at sequence 2 with different
+bytes, which is equivocation and nothing to do with what either check is for.
+
+```
+content: each node took its peer's update, then refused the peer's rolled-back record
+shutting both nodes down and booting them again from the same disks
+  both nodes powered off cleanly
+  OTWONO-POINTER-REBOOT-OK fingerprint=otw1:0zm3-5vfc-2ps7-m8jr remembered=2
+  OTWONO-POINTER-REBOOT-OK fingerprint=otw1:x438-909q-g84m-a9b7 remembered=2
+reboot: each node came back as itself and still refused its peer's rolled-back pointer
+PASS: two nodes discovered and mutually authenticated
+```
+
+Second-boot timings, from each node's kernel clock:
+
+| | mesh back | same identity | refused from disk |
+|---|---|---|---|
+| node A | 71.3s → 78.2s | 78.2s | 81.7s |
+| node B | 73.0s → 74.6s | 74.6s | 79.4s |
+
+The second boot reaches a mesh in about 75s against the first boot's ~230s, because the
+identity already exists and nothing has to be generated.
+
+**Asserted on the number, not on the refusal.** The check reads the sequence out of the
+refusal text — "sequence 1 is not newer than **2** already seen" — and fails if it is below
+2. A log that came back empty would not refuse at all; it would accept the record as a first
+read. A log that came back wrong would refuse while naming something else.
+
+The disk afterwards, read by mounting node A's data partition:
+
+```
+$ cat /mnt/otwdata/pointers/sequences.json
+{"highest":[[{"node_id":"otw128gej1m4g4vr42a54nkyvgjkqxrw2xtsepr4vtd985rfddnkem3xs2g",
+"service":"wiki","name":"Getting-Started"},{"sequence":2,"signature":"0drZH9iu…"}]]}
+
+$ cat /mnt/otwdata/pointers/mine/*.json
+{… "sequence":1,"content_id":"616ad6686fe37ca6…" …}
+```
+
+The peer at sequence 2, this node's own record regressed to 1, and no leftover `.tmp.N` files
+from the new write path.
+
+### A claim this harness had been making since Phase 3
+
+Its header said "an identity generated on first boot survives a reboot of the VM that owns
+it". Nothing in it rebooted anything — every node booted once, with `-no-reboot`. What stood
+in for the claim was `otwono-mesh-check` asserting the key files exist on disk, which is a
+proxy for the property and not the property.
+
+It is now true. Both nodes assert their fingerprint against a stamp written on the first
+boot, and the harness cross-checks it against what the *first boot's console* said, which the
+second boot cannot have written.
+
+### What this does not show
+
+- **The power was not cut.** Shutdown is a clean ACPI powerdown over QMP. Cutting it would
+  also be testing every daemon's write durability, which is a different question — so what is
+  verified here is that the log survives a boot boundary, not that it survives the moment the
+  fsyncs exist for. The fsyncs are reasoned, not demonstrated.
+- **The other atomic-write sites are unaudited.** `otwono-store`'s CAS and cache,
+  `otwono-fetch`'s spool, and `otwono-ai`'s installer all have the same
+  rename-without-fsync shape. Named in ADR-0027 §9 as deliberately untouched, not fixed.
+- **One reboot, not many.** No repeated cycling, and no reboot in the middle of a write.
+- **amd64 only, two nodes.** No arm64. No three-node or partition test.
+- **Still no third-party replay on a wire**, and no equivocation across a link. Both remain
+  integration tests only.
