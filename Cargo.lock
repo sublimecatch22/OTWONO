@@ -1450,6 +1450,8 @@ name = "otwono-storectl"
 version = "0.1.0"
 dependencies = [
  "data-encoding",
+ "otwono-identity",
+ "otwono-pointer",
  "otwono-proto",
  "otwono-stored",
  "serde_json",

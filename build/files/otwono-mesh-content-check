@@ -258,6 +258,62 @@ if cache=$(otwono-storectl cache-status 2>&1); then
         || fail "the cache holds $cache_held object(s) after a caching fetch"
 fi
 
+# --- A pointer crosses a link and resolves to a name (ADR-0027) -------------------------
+# Phase 6's second primitive on a booted node. Each node publishes a pointer under the same
+# name, and each then asks its peer what *that peer's* copy of the name points at.
+#
+# The same name on both is the point: a pointer is fetched only from its owner, so two nodes
+# publishing `wiki/Getting-Started` are two different pointers, and the record each receives
+# must carry the *peer's* NodeID and the peer's content id. A node that got its own back
+# would mean the request was being answered locally somewhere, which is the failure this
+# arrangement is shaped to catch.
+#
+# The content differs per node -- ordinal and nanoseconds -- so the ids are certainly
+# different and neither node can derive the other's.
+step "publishing a pointer and resolving the peer's"
+pointer_published=none
+pointer_resolved=none
+printf 'otwono pointer check node %s %s\n' "$node_ordinal" "$(date -u +%s%N)" \
+    > "$WORK/for-pointer.txt"
+if pt=$(otwono-storectl put --file "$WORK/for-pointer.txt" --visibility public 2>&1); then
+    pointer_target=$(echo "$pt" | awk 'NR==1 {print $1}')
+    [ -n "$pointer_target" ] || fail "storing the pointer's target returned no content id"
+
+    otwono-storectl pointer-publish --service wiki --name Getting-Started \
+        "$pointer_target" >/dev/null 2>&1 \
+        || fail "pointer-publish failed"
+    pointer_published=$pointer_target
+
+    # Retried: the peer may not have published yet, and unlike the offer index there is no
+    # per-session snapshot here -- each ask is a fresh channel and a fresh answer.
+    i=0
+    while [ "$i" -lt 60 ]; do
+        line=$(otwono-netd --pointer wiki/Getting-Started --socket /run/otwono/net.sock 2>/dev/null \
+            | awk '$3 ~ /^[0-9]+$/ { print $4; exit }')
+        case "$line" in
+            [0-9a-f]*) pointer_resolved=$line; break ;;
+        esac
+        i=$((i + 1))
+        sleep 5
+    done
+
+    if [ "$pointer_resolved" != none ]; then
+        # It must be the peer's object, not this node's own. Getting our own back would mean
+        # the name resolved locally rather than over the link.
+        [ "$pointer_resolved" != "$pointer_published" ] \
+            || fail "the pointer resolved to this node's own object"
+        # And the object it names must be fetchable, which is what makes a pointer useful
+        # rather than merely verifiable.
+        got=$(otwono-netd --fetch "$pointer_resolved" --socket /run/otwono/net.sock 2>&1) \
+            || fail "the object a resolved pointer names could not be fetched: $got"
+        step "resolved the peer's pointer and fetched what it names"
+    else
+        # Not a failure on its own: a peer that has not published yet has nothing to resolve,
+        # and one node cannot tell that from a broken path. The harness asserts across both.
+        step "no peer pointer resolved within the retry window"
+    fi
+fi
+
 # --- REPLICATED replicates itself, with nothing driving it (ADR-0026) -------------------
 # The claim this step exists for: a node that meets a peer takes a copy of what that peer
 # offers, without anyone asking it to. Every other replication test drives the pass by
@@ -474,4 +530,4 @@ if [ "$discovered" != none ]; then
 fi
 
 rm -rf "$WORK"
-echo "OTWONO-MESH-CONTENT-OK node=$node_ordinal/$node_total public=$pub_id large=$big_id large_served=$big_served private_refused=$prv_id cache_budget=$cache_state cache_held=$cache_held shared_to_peer=$shared_to_peer granted=$granted discovered=$discovered replicated=$replicated_id replica_taken=$replica_taken"
+echo "OTWONO-MESH-CONTENT-OK node=$node_ordinal/$node_total public=$pub_id large=$big_id large_served=$big_served private_refused=$prv_id cache_budget=$cache_state cache_held=$cache_held shared_to_peer=$shared_to_peer granted=$granted discovered=$discovered replicated=$replicated_id replica_taken=$replica_taken pointer_published=$pointer_published pointer_resolved=$pointer_resolved"

@@ -55,6 +55,9 @@ COMMANDS:
     open <CONTENT_ID>         Open an object shared with this node, writing the plaintext
     grant <CONTENT_ID>        Add recipients to an object this node can open
     revoke <CONTENT_ID>       Delete recipients' copies of the key. Recalls nothing.
+    pointer-publish           Publish a signed pointer under this node's name (ADR-0027).
+                              Needs --service and --name; a CONTENT_ID names what it points
+                              at, and omitting one publishes a tombstone.
     cache-status              The cluster cache's budget, usage and contents
     cache-purge               Empty the cluster cache. The node's own store is untouched.
 
@@ -64,6 +67,8 @@ OPTIONS:
     --file <PATH>             Input file, for put and import
     --out <PATH>              Where get writes its bytes; stdout is never used for binary
     --visibility <LABEL>      private (default), shared, public or replicated
+    --service <NAME>          Pointer namespace: wiki, profile, forum
+    --name <PATH>             Pointer path within that namespace
     --derived-from <ID>       An object this content was derived from. Repeatable.
     --recipient <SELF|PATH>   Who may open a shared object. `self` asks this node's identity
                               daemon for its own binding; a path reads one from a file.
@@ -130,6 +135,9 @@ struct Options {
     recipients: Vec<String>,
     nodes: Vec<String>,
     id_socket: Option<PathBuf>,
+    /// Pointer namespace and path, for `pointer-publish` (ADR-0027).
+    service: Option<String>,
+    name: Option<String>,
     json: bool,
 }
 
@@ -146,6 +154,14 @@ fn run(args: &[String]) -> Result<String, Error> {
         .perm_socket
         .clone()
         .unwrap_or_else(|| otwono_proto::socket_path("perm"));
+
+    // Publishing is three calls, not one: ask the store what sequence comes next, have
+    // otwono-idd sign the record, then hand it back. It cannot go through the single-call
+    // dispatch below, and splitting it into three shell invocations would put an unsigned
+    // record on a command line between them.
+    if opts.command == "pointer-publish" {
+        return publish_pointer(&opts, &store_socket, &perm_socket);
+    }
 
     let recipients = resolve_recipients(&opts)?;
     let (method, params, action) = build_call(&opts, &recipients)?;
@@ -231,6 +247,119 @@ fn resolve_recipients(opts: &Options) -> Result<Vec<Value>, Error> {
 ///
 /// Separated from the socket work so every command's request shape is unit-testable without
 /// a daemon anywhere.
+/// Publish one of this node's own signed pointers (ADR-0027).
+///
+/// Three capabilities, and each is doing different work: `pointer.read` to learn the next
+/// sequence, `id.sign` to sign the record with the node key that never leaves `otwono-idd`,
+/// and `pointer.publish` to store it. A node that could do the first two but not the third
+/// could compose a record and not publish it, which is exactly the separation the
+/// capabilities are for.
+///
+/// The sequence comes from the store rather than from a flag. A caller choosing its own
+/// could regress, and a pointer that goes backwards is refused as a rollback by every peer
+/// that saw the higher number — permanently.
+fn publish_pointer(opts: &Options, store_socket: &Path, perm_socket: &Path) -> Result<String, Error> {
+    let service = opts
+        .service
+        .clone()
+        .ok_or_else(|| Error::Usage("pointer-publish needs --service".into()))?;
+    let name = opts
+        .name
+        .clone()
+        .ok_or_else(|| Error::Usage("pointer-publish needs --name".into()))?;
+
+    let next = call(
+        store_socket,
+        perm_socket,
+        "pointer.next_sequence",
+        json!({ "service": service, "name": name }),
+        Some("pointer.read"),
+    )?
+    .get("next_sequence")
+    .and_then(Value::as_u64)
+    .ok_or_else(|| Error::Runtime("the store returned no next_sequence".into()))?;
+
+    // `--content-id` absent is a tombstone, not an error: "this no longer exists" is a
+    // publish like any other, signed and sequenced (ADR-0027 §4).
+    let node_id = node_id_of_this_node(opts, perm_socket)?;
+    let mut pointer = otwono_pointer::Pointer::new(
+        &node_id,
+        service.clone(),
+        name.clone(),
+        next,
+        opts.target.clone(),
+        otwono_identity::now_unix_ms(),
+    );
+
+    let payload = pointer
+        .payload_for_id_sign()
+        .map_err(|e| Error::Runtime(e.to_string()))?;
+    let id_socket = opts
+        .id_socket
+        .clone()
+        .unwrap_or_else(|| otwono_proto::socket_path("id"));
+    let signed = call(
+        &id_socket,
+        perm_socket,
+        "id.sign",
+        json!({ "payload": data_encoding::BASE64.encode(&payload) }),
+        Some("id.sign"),
+    )?;
+    pointer.signature = signed
+        .get("signature")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Runtime("otwono-idd returned no signature".into()))?
+        .to_string();
+
+    let out = call(
+        store_socket,
+        perm_socket,
+        "pointer.publish",
+        json!({ "record": pointer }),
+        Some("pointer.publish"),
+    )?;
+    Ok(format!(
+        "{} {}/{} sequence {}{}\n",
+        node_id.to_text(),
+        out.get("service").and_then(Value::as_str).unwrap_or(&service),
+        out.get("name").and_then(Value::as_str).unwrap_or(&name),
+        out.get("sequence").and_then(Value::as_u64).unwrap_or(next),
+        if pointer.is_tombstone() {
+            " (tombstone)"
+        } else {
+            ""
+        }
+    ))
+}
+
+/// Which node this is, from `otwono-idd`.
+///
+/// Asked rather than assumed: the record names an owner, and one naming the wrong owner
+/// would not verify anywhere.
+///
+/// `id.fingerprint`, not `id.node`. Both return the full NodeID, but `id.node` is the
+/// *publishable* identity and refuses until an agreement key has been bound — which only
+/// `otwono-netd` does, at startup. A pointer is signed with the signing key and has nothing
+/// to do with agreement, so requiring one would mean a node that never joins a mesh could
+/// not publish to its own store.
+fn node_id_of_this_node(opts: &Options, _perm_socket: &Path) -> Result<otwono_identity::NodeId, Error> {
+    let id_socket = opts
+        .id_socket
+        .clone()
+        .unwrap_or_else(|| otwono_proto::socket_path("id"));
+    let mut client = Client::connect(&id_socket)
+        .map_err(|e| Error::Runtime(format!("cannot reach {}: {e}", id_socket.display())))?;
+    let value = client
+        .call("id.fingerprint", json!({}))
+        .map_err(|e| Error::Runtime(format!("id.fingerprint: {e}")))?
+        .map_err(|e| Error::Runtime(format!("id.fingerprint refused: {}", e.message)))?;
+    let text = value
+        .get("node_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Runtime("id.fingerprint returned no node_id".into()))?;
+    otwono_identity::NodeId::parse(text).map_err(|e| Error::Runtime(e.to_string()))
+}
+
 fn build_call(opts: &Options, recipients: &[Value]) -> Result<(String, Value, Option<&'static str>), Error> {
     let need_target = |what: &str| -> Result<String, Error> {
         opts.target
@@ -570,6 +699,8 @@ fn parse_args(args: &[String]) -> Result<Options, Error> {
             "--file" => opts.file = Some(next(&mut it, "--file")?.into()),
             "--out" => opts.out = Some(next(&mut it, "--out")?.into()),
             "--visibility" => opts.visibility = Some(next(&mut it, "--visibility")?),
+            "--service" => opts.service = Some(next(&mut it, "--service")?),
+            "--name" => opts.name = Some(next(&mut it, "--name")?),
             "--derived-from" => opts.derived_from.push(next(&mut it, "--derived-from")?),
             "--recipient" => opts.recipients.push(next(&mut it, "--recipient")?),
             "--node" => opts.nodes.push(next(&mut it, "--node")?),

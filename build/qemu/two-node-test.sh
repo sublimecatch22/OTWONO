@@ -304,6 +304,25 @@ if [ "${MESH_CONTENT_SMOKE:-0}" != 0 ]; then
         fi
     done
     echo "content: each node took a replica of the other's REPLICATED object, unprompted"
+
+    # Each node must have resolved the *other's* pointer. Asserted across both for the same
+    # reason replication is: one node cannot tell "my peer had not published yet" from "the
+    # path is broken", and both having published makes the distinction unnecessary.
+    for node in a b; do
+        line=$(grep -hoa "OTWONO-MESH-CONTENT-OK.*" "$OUT/node-$node.log" | tail -1 | tr -d '\r')
+        resolved=$(echo "$line" | grep -o 'pointer_resolved=[^ ]*' | cut -d= -f2)
+        published=$(echo "$line" | grep -o 'pointer_published=[^ ]*' | cut -d= -f2)
+        if [ -z "$resolved" ] || [ "$resolved" = none ]; then
+            echo "FAIL: node $node resolved no pointer (pointer_resolved=${resolved:-absent})" >&2
+            echo "  $line" >&2
+            exit 1
+        fi
+        if [ "$resolved" = "$published" ]; then
+            echo "FAIL: node $node resolved its own pointer, not its peer's" >&2
+            exit 1
+        fi
+    done
+    echo "content: each node resolved the other's pointer and fetched what it names"
 fi
 
 echo "PASS: two nodes discovered and mutually authenticated"

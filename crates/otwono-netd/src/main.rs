@@ -35,7 +35,8 @@ OPTIONS:
     --peer-binding <PATH>  Write the first connected peer's sharing binding to PATH, so
                            something can seal to it (ADR-0019). Exits non-zero if no
                            connected peer has published one.
-    --shared-with-me       Ask every connected peer what it has sealed to this node, print
+    --shared-with-me       Ask every connected peer what it has sealed to this node
+    --pointer <SVC/NAME>   Ask every connected peer what that name points at, print
                            one content id and plaintext size per line, then exit (ADR-0020)
     --fetch <CONTENT_ID>   Fetch one object from every connected peer, then exit
     --to-file              Write the fetched object to a file instead of returning its
@@ -98,6 +99,7 @@ fn run(args: &[String]) -> Result<String, Error> {
     let mut status_only = false;
     let mut peers_only = false;
     let mut shared_with_me = false;
+    let mut pointer: Option<String> = None;
     let mut peer_binding: Option<PathBuf> = None;
     let mut fetch_id: Option<String> = None;
     let mut fetch_to_file = false;
@@ -119,6 +121,7 @@ fn run(args: &[String]) -> Result<String, Error> {
             "--status" => status_only = true,
             "--peers" => peers_only = true,
             "--shared-with-me" => shared_with_me = true,
+            "--pointer" => pointer = Some(next(&mut it, "--pointer")?),
             "--peer-binding" => peer_binding = Some(next(&mut it, "--peer-binding")?.into()),
             "--fetch" => fetch_id = Some(next(&mut it, "--fetch")?),
             "--to-file" => fetch_to_file = true,
@@ -179,6 +182,12 @@ fn run(args: &[String]) -> Result<String, Error> {
         let socket = socket.unwrap_or_else(|| otwono_proto::socket_path("net"));
         let perm_socket = perm_socket.unwrap_or_else(|| otwono_proto::socket_path("perm"));
         return shared_index_report(&socket, &perm_socket);
+    }
+
+    if let Some(spec) = pointer {
+        let socket = socket.unwrap_or_else(|| otwono_proto::socket_path("net"));
+        let perm_socket = perm_socket.unwrap_or_else(|| otwono_proto::socket_path("perm"));
+        return pointer_report(&socket, &perm_socket, &spec);
     }
 
     if let Some(path) = peer_binding {
@@ -418,6 +427,86 @@ fn fetch_from_a_peer(
 /// A peer that answers nothing contributes nothing and is not an error: "nothing for you"
 /// and "nothing for anybody" are the same answer by design, so there is no failure here to
 /// report.
+/// Ask every connected peer what one of *its* names points at (ADR-0027).
+///
+/// Every peer is asked for its own record under that name, not for one owner's record from
+/// whoever has it: a pointer is only ever fetched from the node that signed it, so "the same
+/// name on three peers" is three different pointers, and the output names each owner.
+///
+/// A peer that does not publish the name is skipped rather than reported. It is
+/// indistinguishable from one that will not say, and printing "absent" for both would put a
+/// claim in front of an operator that this node cannot support.
+fn pointer_report(
+    socket: &std::path::Path,
+    perm_socket: &std::path::Path,
+    spec: &str,
+) -> Result<String, Error> {
+    let (service, name) = spec
+        .split_once('/')
+        .ok_or_else(|| Error::Usage(format!("--pointer wants <service>/<name>, got {spec:?}")))?;
+    if service.is_empty() || name.is_empty() {
+        return Err(Error::Usage("--pointer wants <service>/<name>".into()));
+    }
+
+    let peers = peer_table(socket, perm_socket, "otwono-netd --pointer")?;
+    let connected: Vec<&serde_json::Value> = peers
+        .iter()
+        .filter(|p| p.get("state").and_then(|s| s.as_str()) == Some("connected"))
+        .collect();
+    if connected.is_empty() {
+        return Ok("no connected peers\n".to_string());
+    }
+
+    let token = request_token(perm_socket, "net.content", "otwono-netd --pointer")?;
+    let mut client = otwono_proto::Client::connect_waiting(socket, std::time::Duration::from_secs(5))
+        .map_err(|e| Error::Startup(format!("cannot reach otwono-netd at {}: {e}", socket.display())))?;
+
+    let mut out = String::new();
+    for peer in connected {
+        let Some(node_id) = peer.get("node_id").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        let Some(address) = peer
+            .get("addresses")
+            .and_then(|a| a.as_array())
+            .and_then(|a| a.first())
+            .and_then(|a| a.as_str())
+        else {
+            continue;
+        };
+        let reply = client
+            .call_with_capability(
+                "net.pointer",
+                serde_json::json!({
+                    "node_id": node_id, "address": address,
+                    "service": service, "name": name,
+                }),
+                &token,
+            )
+            .map_err(|e| Error::Startup(format!("net.pointer transport failure: {e}")))?;
+        // One unreachable peer must not lose the answers from the others.
+        let Ok(reply) = reply else { continue };
+        let Some(record) = reply.get("record").filter(|r| !r.is_null()) else {
+            continue;
+        };
+        out.push_str(&format!(
+            "{} {}/{} sequence {} {}\n",
+            node_id,
+            service,
+            name,
+            record.get("sequence").and_then(|s| s.as_u64()).unwrap_or(0),
+            record
+                .get("content_id")
+                .and_then(|c| c.as_str())
+                .unwrap_or("(tombstone)")
+        ));
+    }
+    if out.is_empty() {
+        out.push_str("no connected peer publishes that name\n");
+    }
+    Ok(out)
+}
+
 fn shared_index_report(socket: &std::path::Path, perm_socket: &std::path::Path) -> Result<String, Error> {
     let peers = peer_table(socket, perm_socket, "otwono-netd --shared-with-me")?;
     let connected: Vec<&serde_json::Value> = peers

@@ -781,6 +781,11 @@ impl Service for NetService {
                     CAPABILITY_CONTENT,
                 ),
                 MethodDescription::guarded(
+                    "net.pointer",
+                    "Ask one peer what one of its names points at (ADR-0027)",
+                    CAPABILITY_CONTENT,
+                ),
+                MethodDescription::guarded(
                     "net.fetch",
                     "Fetch one content-addressed object from a peer, verified on arrival",
                     CAPABILITY_CONTENT,
@@ -819,6 +824,34 @@ impl Service for NetService {
             }
             // net.content, the same capability a fetch needs: every id in the reply is one
             // this node could then fetch, so being allowed to ask is being allowed to fetch.
+            // net.content, like the fetch it usually precedes: a pointer's answer is a
+            // content id this node could then ask for, so being allowed to resolve a name is
+            // being allowed to reach what it names.
+            "net.pointer" => {
+                self.authorize(ctx, CAPABILITY_CONTENT)?;
+                let candidate = Self::candidate(&params)?;
+                let service = params
+                    .get("service")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| RpcError::invalid_params("net.pointer needs a service"))?;
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| RpcError::invalid_params("net.pointer needs a name"))?;
+                let found = self
+                    .state
+                    .pointer_from(&candidate, service, name)
+                    .map_err(RpcError::internal)?;
+                Ok(json!({
+                    "schema_version": DESCRIBE_SCHEMA_VERSION,
+                    "node_id": candidate.claimed_node_id.to_text(),
+                    "service": service,
+                    "name": name,
+                    // null for a name the peer does not publish or will not discuss. One
+                    // answer for both, so asking cannot enumerate a node's names.
+                    "record": found.map(|p| serde_json::to_value(p).unwrap_or(Value::Null)),
+                }))
+            }
             "net.shared_with_me" => {
                 self.authorize(ctx, CAPABILITY_CONTENT)?;
                 let candidate = Self::candidate(&params)?;

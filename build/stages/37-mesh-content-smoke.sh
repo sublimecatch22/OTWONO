@@ -67,6 +67,32 @@ action = "cache.replicate"
 subjects = ["uid:0"]
 decision = "allow"
 ttl_seconds = 300
+
+# Publishing a pointer needs three things this image grants together and a release image
+# grants none of: pointer.read to learn the next sequence, id.sign to sign the record with
+# the node key, and pointer.publish to store it (ADR-0027).
+#
+# id.sign is the one worth pausing on. It is a general signing oracle for the application
+# domain -- a caller who holds it can have the node sign anything that is not a protocol
+# message -- which is why 10-default.toml grants id.sign_session and id.unwrap_shared and
+# deliberately not this. An image that hands it to uid:0 is a test image.
+[[rule]]
+action = "pointer.read"
+subjects = ["uid:0"]
+decision = "allow"
+ttl_seconds = 300
+
+[[rule]]
+action = "pointer.publish"
+subjects = ["uid:0"]
+decision = "allow"
+ttl_seconds = 300
+
+[[rule]]
+action = "id.sign"
+subjects = ["uid:0"]
+decision = "allow"
+ttl_seconds = 300
 POLICY
 chmod 0644 "$ROOTFS/etc/otwono/policy.d/91-mesh-content-smoke.toml"
 
@@ -130,7 +156,7 @@ UNIT
 chroot "$ROOTFS" systemctl enable otwono-mesh-content-check.service 2>/dev/null \
     || warn "could not enable otwono-mesh-content-check.service"
 
-log "NOTE: this image grants store.serve, net.content and cache.replicate. It is a test image."
+log "NOTE: this image grants store.serve, net.content, cache.replicate and id.sign. It is a test image."
 manifest_add "mesh-content-smoke" "policy drop-in and boot check installed"
 stage_mark_complete 37-mesh-content-smoke
 stage_done

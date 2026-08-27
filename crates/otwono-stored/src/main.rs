@@ -25,6 +25,7 @@ OPTIONS:
     --store-dir <PATH>     Where objects and chunks live (default /var/lib/otwono/store)
     --key <PATH>           Storage key, generated on first use (default /var/lib/otwono/storage.key)
     --cache-dir <PATH>     Cluster cache (default /var/lib/otwono/cache)
+    --pointer-dir <PATH>   Signed pointers (default /var/lib/otwono/pointers)
     --cache-bytes <N>      Override the cache budget the capability profile chose
     --no-cache             Contribute no cluster cache at all
     --export-dir <PATH>    Where large objects are handed over (default /var/lib/otwono/export)
@@ -92,6 +93,7 @@ fn run(args: &[String]) -> Result<String, Error> {
     let mut cache_bytes: Option<u64> = None;
     let mut want_cache = true;
     let mut export_dir = PathBuf::from(DEFAULT_EXPORT_DIR);
+    let mut pointer_dir = PathBuf::from(otwono_store::DEFAULT_POINTER_DIR);
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -102,6 +104,7 @@ fn run(args: &[String]) -> Result<String, Error> {
             "--store-dir" => store_dir = next_path(&mut it, "--store-dir")?,
             "--key" => key_path = next_path(&mut it, "--key")?,
             "--cache-dir" => cache_dir = next_path(&mut it, "--cache-dir")?,
+            "--pointer-dir" => pointer_dir = next_path(&mut it, "--pointer-dir")?,
             "--cache-bytes" => {
                 let raw = it
                     .next()
@@ -178,6 +181,22 @@ fn run(args: &[String]) -> Result<String, Error> {
     let mut service = StoreService::new(store, perm_socket.clone())
         .with_handoff(handoff)
         .with_identity(id_socket);
+
+    // Always opened, unlike the cache: a pointer store costs a directory and holds nothing
+    // until something publishes, where the cache costs whatever budget the capability engine
+    // allots. A node that cannot open it runs without one and says which pointer calls will
+    // therefore refuse, rather than failing to start over a service nobody may use.
+    match otwono_store::PointerStore::at(&pointer_dir) {
+        Ok(pointers) => {
+            eprintln!("otwono-stored: pointers at {}", pointer_dir.display());
+            service = service.with_pointers(pointers);
+        }
+        Err(e) => eprintln!(
+            "otwono-stored: no pointer store at {} ({e}); \
+             pointer.publish and pointer.mine will say so",
+            pointer_dir.display()
+        ),
+    }
     if want_cache {
         // The budget is the capability policy engine's decision and nobody else's
         // (CLAUDE.md §2.6). An override is an operator saying so on purpose; absent one,
