@@ -166,17 +166,28 @@ echo "$got" | grep -q "$pub_id" || fail "the peer served something else: $got"
 # fatal rather than merely slow -- a peer that has stored nothing leaves its share uncovered,
 # and the fetch fails with "or does not have it". The first run of this test failed exactly
 # that way on two of three nodes, which is the assertion working.
+#
+# The last failure is kept, not discarded. Throwing it away is how the first three-node run
+# reported only "a multi-chunk object would not cross the link" -- true, and silent about
+# which peer would not serve it, which cost a disk-mounting session to answer. The pointer
+# step above already learned this; this one had not.
 big=""
+last_error=""
 i=0
 while [ "$i" -lt 60 ]; do
     if big=$(otwono-netd --fetch "$big_id" --to-file --socket /run/otwono/net.sock 2>&1); then
         break
     fi
+    last_error=$big
     big=""
     i=$((i + 1))
     sleep 5
 done
-[ -n "$big" ] || fail "a multi-chunk object would not cross the link within 300s"
+# No number in the message. It used to say "within 300s" while the loop actually spends 60
+# attempts *plus* their fetch time -- 510s on the run that hit it -- and a message that
+# states a wrong duration sends the reader looking in the wrong place.
+[ -n "$big" ] \
+    || fail "a multi-chunk object would not cross the link after $i attempts: $last_error"
 echo "$big" | grep -q "$big_id" || fail "the peer served the wrong large object: $big"
 step "large object fetched"
 big_size=$(wc -c < "$WORK/large.bin")

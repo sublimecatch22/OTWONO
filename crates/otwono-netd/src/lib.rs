@@ -368,6 +368,27 @@ impl NetState {
     /// A candidate that cannot be dialled or cannot be authenticated is dropped here rather
     /// than carried into the transfer: a peer this node cannot prove the identity of is not
     /// a peer, whatever it is serving.
+    /// Say what a partly-reachable set of peers cost, when it costs something.
+    ///
+    /// A fetch that reaches *some* peers proceeds, which is right — ADR-0015's whole claim
+    /// is that any holder will do. But with disjoint shares "some" is not enough, and the
+    /// failure then reads "the peer will not serve it, or does not have it": true of the
+    /// peers that answered, and silent about the one that never did.
+    ///
+    /// That silence cost a three-node run and a disk-mounting session to resolve. So an
+    /// unreachable candidate is folded into the error when the fetch fails, and never
+    /// mentioned when it succeeds — a peer that was not needed is not a fault.
+    fn with_unreachable(e: String, unreachable: &[String]) -> String {
+        if unreachable.is_empty() {
+            return e;
+        }
+        format!(
+            "{e} (and {} peer(s) could not be reached at all: {})",
+            unreachable.len(),
+            unreachable.join("; ")
+        )
+    }
+
     pub fn fetch_from_peers(
         &self,
         candidates: &[Candidate],
@@ -387,7 +408,8 @@ impl NetState {
                 unreachable.join("; ")
             ));
         }
-        content::fetch_object_from_peers(sources, content_id).map_err(|e| e.to_string())
+        content::fetch_object_from_peers(sources, content_id)
+            .map_err(|e| Self::with_unreachable(e.to_string(), &unreachable))
     }
 
     /// Fetch one object from several peers straight into a file owned by `uid`.
@@ -433,7 +455,10 @@ impl NetState {
                         outcome = Some(v);
                         Ok(())
                     }
-                    Err(e) => Err(std::io::Error::other(e.to_string())),
+                    Err(e) => Err(std::io::Error::other(Self::with_unreachable(
+                        e.to_string(),
+                        &unreachable,
+                    ))),
                 }
             })
             .map_err(|e| e.to_string())?;
@@ -442,8 +467,13 @@ impl NetState {
     }
 
     fn open_content_channel(&self, candidate: &Candidate) -> Result<content::PeerSource<TcpLink>, String> {
+        // The address, not just the error. "connect: Connection refused" says a peer is
+        // unreachable and nothing about *where* this node tried, which on a mesh where the
+        // address came from an advertisement is the only fact that matters -- a stale entry,
+        // the wrong address family, and a peer that is genuinely down all read identically
+        // without it. Diagnosing a three-node run without this meant mounting a VM disk.
         let link = TcpLink::connect(candidate.address, content::FETCH_TIMEOUT)
-            .map_err(|e| format!("connect: {e}"))?;
+            .map_err(|e| format!("connect to {}: {e}", candidate.address))?;
         link.set_timeout(Some(content::FETCH_TIMEOUT))
             .map_err(|e| e.to_string())?;
         let properties = link.properties();
@@ -979,5 +1009,44 @@ impl Service for NetService {
             }
             other => Err(unknown_method(other)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A peer that was never reached is named when the fetch fails, and not otherwise.
+    ///
+    /// The silent version of this cost a three-node run: with disjoint shares a fetch needs
+    /// every peer, and "the peer will not serve it, or does not have it" was true of the
+    /// peers that answered while saying nothing about the one that never did.
+    #[test]
+    fn a_failed_fetch_names_the_peers_it_could_not_reach() {
+        let unreachable = vec![
+            "169.254.251.233:8443: connect to 169.254.251.233:8443: link I/O failed: Connection refused"
+                .to_string(),
+        ];
+        let reported = NetState::with_unreachable("the peer will not serve it".into(), &unreachable);
+        assert!(reported.starts_with("the peer will not serve it"), "{reported}");
+        assert!(
+            reported.contains("169.254.251.233:8443"),
+            "the address is the fact a reader needs: {reported}"
+        );
+        assert!(reported.contains("1 peer(s) could not be reached"), "{reported}");
+    }
+
+    /// A fetch that succeeded says nothing about peers it did not need.
+    ///
+    /// ADR-0015's claim is that any holder will do, so an unreachable peer is only a fault
+    /// when the object could not be assembled without it. Mentioning it on success would
+    /// teach an operator to ignore the line.
+    #[test]
+    fn an_unreachable_peer_is_not_mentioned_when_nothing_went_wrong() {
+        assert_eq!(
+            NetState::with_unreachable("some other failure".into(), &[]),
+            "some other failure",
+            "an empty unreachable list must not decorate the error"
+        );
     }
 }
