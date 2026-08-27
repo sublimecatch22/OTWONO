@@ -82,6 +82,21 @@ case "$ARCH" in
 esac
 [ -n "$FW_CODE" ] || { echo "no UEFI firmware for $ARCH" >&2; exit 1; }
 
+# How many vCPUs each guest gets, sized to the host rather than assumed.
+#
+# Every guest here is TCG -- there is no /dev/kvm in this environment -- so a vCPU is a host
+# thread spinning at emulation speed, and oversubscribing them does not merely slow the run
+# down. Two of three guests at `-smp 2` on a four-core host produced a guest that stopped
+# executing about one second into its kernel and never resumed: no panic, no QEMU error, a
+# complete last line, and an empty journal because it never reached userspace.
+#
+# TCG barely parallelises a single guest anyway, so dividing the host's cores among the
+# guests costs almost nothing and keeps a core for the host. At least one, always.
+HOST_CORES=$(nproc 2>/dev/null || echo 2)
+SMP="${OTWONO_MULTI_NODE_SMP:-$(( HOST_CORES / NODES ))}"
+[ "$SMP" -ge 1 ] || SMP=1
+echo "  vcpus      $SMP per guest ($NODES guests on $HOST_CORES host cores)"
+
 PIDS=()
 cleanup() {
     for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
@@ -113,7 +128,7 @@ for i in $(seq 1 "$NODES"); do
     # how many peers to wait for. Reading its own MAC costs nothing and adds no interface.
     mac=$(segment_mac "$NODES" "$i")
     "$QEMU" "${MACHINE[@]}" \
-        -m 2048 -smp 2 \
+        -m 2048 -smp "$SMP" \
         -drive if=pflash,format=raw,unit=0,readonly=on,file="$OUT/code-$n.fd" \
         -drive if=pflash,format=raw,unit=1,file="$OUT/vars-$n.fd" \
         -drive if=virtio,format=raw,file="$OUT/node-$n.img" \
