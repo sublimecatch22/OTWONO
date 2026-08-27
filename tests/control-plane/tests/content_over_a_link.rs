@@ -1690,3 +1690,47 @@ fn a_peer_cannot_serve_a_pointer_it_does_not_own() {
     drop(channel);
     let _ = serving.join();
 }
+
+/// A pointer served *after* the responder has already served something else.
+///
+/// This is the case a booted node is always in and the earlier tests never were. `store.serve`
+/// is `BlastRadius::Egress`, so its tokens are one-shot by default: the first content request
+/// spends one and caches it, and every later request has to notice and ask for another. The
+/// responder has `call_store` for exactly that.
+///
+/// The first version of the pointer responder did not use it — it read the cached token and
+/// refused if the call failed. With a fresh responder that is invisible, because the cache is
+/// empty and a fresh token is requested; on a node that has served anything at all, every
+/// pointer request is answered "I do not publish that name" by a node that does. Which is
+/// what two twenty-minute VM runs reported before this test existed.
+#[test]
+fn a_pointer_is_served_after_the_responder_has_spent_a_token() {
+    let h = Harness::start("pointer-after-serving");
+    let object = h.put(b"something served before the pointer is asked for", "public");
+    let target = h.put(b"what the name points at", "public");
+    h.publish("wiki", "Home", Some(&target));
+
+    // Spend a token on the ordinary content path first. This is the step that makes the
+    // responder's cached token stale, and without it the test proves nothing.
+    let fetched = h
+        .client
+        .fetch_from(&h.candidate(), &object)
+        .expect("an ordinary fetch");
+    assert_eq!(fetched.content_id, object);
+
+    // Now the pointer, through the same long-lived responder.
+    let found = h
+        .client
+        .pointer_from(&h.candidate(), "wiki", "Home")
+        .expect("a pointer fetch after a content fetch")
+        .expect("the peer publishes that name");
+    assert_eq!(found.content_id.as_deref(), Some(target.as_str()));
+
+    // And again, so a second stale-token round is covered too.
+    let again = h
+        .client
+        .pointer_from(&h.candidate(), "wiki", "Home")
+        .expect("a second pointer fetch")
+        .expect("still published");
+    assert_eq!(again.sequence, found.sequence);
+}

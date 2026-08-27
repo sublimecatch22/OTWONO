@@ -261,17 +261,13 @@ impl ContentResponder {
     /// names exist by the shape of the refusal.
     fn pointer(&self, service: &str, name: &str) -> Response {
         let refused = || Response::not_available("");
-        let Some(token) = self.token() else {
-            return refused();
-        };
-        let Ok(mut client) = Client::connect(&self.store_socket) else {
-            return refused();
-        };
-        let Ok(Ok(reply)) = client.call_with_capability(
-            "pointer.mine",
-            json!({ "service": service, "name": name }),
-            &token,
-        ) else {
+        // `call_store`, not a hand-rolled call. store.serve is BlastRadius::Egress and its
+        // tokens are therefore one-shot by default, so a cached one is usually already
+        // spent — which is exactly what `call_store`'s retry exists for, and exactly what
+        // the first version of this function got wrong. It asked once with the cached token
+        // and refused on failure, so every pointer request over a link was answered "I do
+        // not publish that name" by a node that did.
+        let Some(reply) = self.call_store("pointer.mine", json!({ "service": service, "name": name })) else {
             return refused();
         };
         match reply.get("record") {
