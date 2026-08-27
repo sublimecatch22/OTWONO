@@ -1374,3 +1374,93 @@ fn a_node_whose_broker_refuses_replication_asks_nobody() {
         otwono_netd::content::ReplicationPass::NotReplicating
     );
 }
+
+/// A peer that offers pages forever cannot hold the discovery thread open (ADR-0026 §10).
+///
+/// The pass runs inline on the thread that finds peers, so "how long can one peer make this
+/// take" is a question about the whole node's ability to mesh, not about one caller's
+/// request. An entry ceiling does not answer it: sixteen thousand entries at a trickle
+/// link's one-per-page is sixteen thousand round trips, each able to sit on a socket
+/// timeout. The bound is therefore on pages.
+///
+/// Here the peer is deliberately hostile-but-conformant: every page is full, every page
+/// advances the content id as the protocol requires, and it never stops. A pass that reads
+/// until the peer stops reading would never return.
+#[test]
+fn a_peer_offering_endless_pages_is_cut_off_after_a_bounded_number() {
+    use otwono_net::content::{ReplicableEntry, ReplicablePage};
+
+    let alice = NodeIdentity::generate().unwrap();
+    let bob = NodeIdentity::generate().unwrap();
+    let (client_link, server_link) = MemoryLink::pair();
+
+    let pages_served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&pages_served);
+    let serving = std::thread::spawn(move || {
+        let mut channel = SecureChannel::accept(server_link, &bob).unwrap();
+        // Ids ascend forever, so the pass's no-progress check never fires and the only thing
+        // that can stop this is the page bound under test.
+        let mut next: u64 = 0;
+        while let Ok(raw) = channel.recv() {
+            let request: Request = match serde_json::from_slice(&raw) {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            let Request::Replicable { max_entries, .. } = request else {
+                break;
+            };
+            let entries: Vec<ReplicableEntry> = (0..max_entries)
+                .map(|_| {
+                    next += 1;
+                    ReplicableEntry {
+                        content_id: format!("{next:064x}"),
+                        // Larger than any budget this test gives, so nothing is ever
+                        // fetched and the test measures paging and nothing else.
+                        size_bytes: 1 << 30,
+                        ttl_days: 365,
+                        max_size_bytes: 1 << 30,
+                        allow_rereplication: true,
+                    }
+                })
+                .collect();
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let reply = serde_json::to_vec(&Response::Replicable(ReplicablePage { entries })).unwrap();
+            if channel.send(&reply).is_err() {
+                break;
+            }
+        }
+    });
+
+    let dir = std::env::temp_dir().join(format!("otw-endless-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let holder = otwono_store::Cache::at(&dir, otwono_store::StorageKey::generate(), 8 << 20).expect("cache");
+
+    let mut channel = SecureChannel::initiate(client_link, &alice).unwrap();
+    let outcome = otwono_netd::content::replication_pass(
+        &mut channel,
+        &LinkProperties::internet(),
+        &holder,
+        1_700_000_000_000,
+    )
+    .expect("the pass must return rather than page forever");
+
+    // Nothing on offer fits, so nothing is taken — but it got there by stopping, not by
+    // exhausting a peer that never stops.
+    assert!(
+        matches!(
+            outcome,
+            otwono_netd::content::ReplicationPass::NothingTaken { .. }
+        ),
+        "{outcome:?}"
+    );
+    let served = pages_served.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        served,
+        otwono_netd::content::MAX_OFFER_PAGES_PER_PASS,
+        "the pass read {served} pages from a peer that offers them endlessly"
+    );
+
+    drop(channel);
+    let _ = serving.join();
+    let _ = std::fs::remove_dir_all(&dir);
+}

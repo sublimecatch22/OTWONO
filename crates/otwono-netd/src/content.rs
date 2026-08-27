@@ -720,7 +720,7 @@ pub fn fetch_replicable_index<L: LinkAdapter>(
     let mut all: Vec<content::ReplicableEntry> = Vec::new();
     let mut budget = MAX_ROUND_TRIPS;
 
-    loop {
+    for _ in 0..MAX_OFFER_PAGES_PER_PASS {
         let after = all.last().map(|e| e.content_id.clone());
         let page = match round_trip(
             channel,
@@ -767,6 +767,10 @@ pub fn fetch_replicable_index<L: LinkAdapter>(
             });
         }
     }
+    // Running out of pages is not an error. A peer with more to offer than four pages hold
+    // is one this node will meet again, and stopping here is the difference between a
+    // bounded pass and a peer that can hold the discovery thread open at will.
+    Ok(all)
 }
 
 /// What one replication pass did, so a caller can report it without guessing.
@@ -932,6 +936,19 @@ pub fn fetch_shared_index<L: LinkAdapter>(
 /// objects sealed to one node is far past any household, and a recipient that genuinely has
 /// more can page again after fetching what it has.
 pub const MAX_SHARED_INDEX_ENTRIES: usize = 16_384;
+
+/// How many offer pages one replication pass will read before choosing.
+///
+/// The pass takes at most one object, so it does not need a peer's whole catalogue — a
+/// bounded sample is enough, and a peer with more to offer will be met again.
+///
+/// Bounded in **pages rather than entries**, because the pass runs on the discovery thread
+/// (ADR-0026 §10) and an entry ceiling does not bound time: `MAX_SHARED_INDEX_ENTRIES` with
+/// a trickle link's one-entry window is sixteen thousand round trips, each of which can sit
+/// on a fifteen-second socket timeout. That would let one slow or hostile peer stall this
+/// node's peer discovery entirely. Four pages costs four round trips whatever the link, and
+/// yields up to 1024 offers on a fast one.
+pub const MAX_OFFER_PAGES_PER_PASS: usize = 4;
 
 /// Fetch one object from a peer over an established channel.
 ///
