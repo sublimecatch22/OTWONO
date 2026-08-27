@@ -176,6 +176,18 @@ distinct=$(echo "$ids" | sort -u | grep -c . || true)
 # The content markers have to be *waited* for: the check polls for peers and only then
 # fetches, so it finishes seconds after the mesh forms -- and this harness tears the VMs
 # down the moment it does. Asserting at that instant is a race (defect 44).
+#
+# Which image this is comes from the image's own manifest, as in two-node-test.sh: the
+# variable had to be set once for the build and again for the run, and forgetting the second
+# made the harness print PASS having tested nothing. The variable is still honoured as an
+# override; it is just no longer how the answer is normally reached.
+MANIFEST="$(dirname "$IMAGE")/manifest.tsv"
+if [ "${MESH_CONTENT_SMOKE:-0}" = 0 ] && [ -f "$MANIFEST" ] \
+    && awk -F'\t' '$2 == "mesh-content-smoke" && $3 != "none" { found = 1 } END { exit !found }' "$MANIFEST"; then
+    echo "image manifest says it carries the content check; asserting it"
+    MESH_CONTENT_SMOKE=1
+fi
+
 if [ "${MESH_CONTENT_SMOKE:-0}" != 0 ]; then
     echo "waiting for every node to exchange content (up to ${CONTENT_TIMEOUT}s)"
     deadline=$(( $(date +%s) + CONTENT_TIMEOUT ))

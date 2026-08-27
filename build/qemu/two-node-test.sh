@@ -255,6 +255,19 @@ fi
 # fetches, so it finishes seconds after the mesh forms -- and this harness tears the VMs
 # down the moment it does. Asserting at that instant passed once by timing luck and failed
 # the next run with the check still mid-retry, having printed nothing at all.
+#
+# Which image this is comes from the image's own manifest, not from the environment. It used
+# to come only from MESH_CONTENT_SMOKE, which had to be set twice -- once for the build and
+# again for the run -- and forgetting the second made this harness print PASS having tested
+# nothing at all. A green result that checked nothing is worse than a red one. The variable
+# is still honoured as an override, but it is no longer how the answer is normally reached.
+MANIFEST="$(dirname "$IMAGE")/manifest.tsv"
+if [ "${MESH_CONTENT_SMOKE:-0}" = 0 ] && [ -f "$MANIFEST" ] \
+    && awk -F'\t' '$2 == "mesh-content-smoke" && $3 != "none" { found = 1 } END { exit !found }' "$MANIFEST"; then
+    echo "image manifest says it carries the content check; asserting it"
+    MESH_CONTENT_SMOKE=1
+fi
+
 if [ "${MESH_CONTENT_SMOKE:-0}" != 0 ]; then
     echo "waiting for both nodes to exchange content (up to ${CONTENT_TIMEOUT}s)"
     deadline=$(( $(date +%s) + CONTENT_TIMEOUT ))
