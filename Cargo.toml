@@ -24,6 +24,7 @@ members = [
     "crates/otwono-walletd",
     "crates/otwono-walletctl",
     "crates/otwono-aid",
+    "crates/otwono-agent",
     "tests/schema",
     "tests/control-plane",
 ]

@@ -333,6 +333,30 @@ decision and not the image builder's.
 Degradation must be **honest**: a T0 node says "I cannot do that locally; I can queue it
 for your workstation when it is reachable" rather than producing a bad answer.
 
+**STATUS: IMPLEMENTED** for T0 — `otwono-capability::AssistantShape` (derived from the tier,
+per CLAUDE.md §2.6) and the `otwono-agent` crate. Unit and cross-process tested; not yet
+exercised on a booted node, because nothing calls it yet: there is no `otwono-agentd` and no
+`otwono do` binary. The grammar is a library, and deliberately so.
+
+Three properties are worth stating because they are what make a T0 assistant safe rather
+than merely small:
+
+- **It executes nothing.** A parse produces an inert `Intent` naming a control-plane method
+  and the capability the *caller* must hold. It carries no token and confers nothing; an
+  assistant that could act because it parsed something would have ambient privilege, which
+  §2.5 forbids. A test asserts a serialized intent contains nothing bearer-shaped.
+- **It invents no operations.** Every verb names a method that already exists and is already
+  gated by `otwono-permd`, checked against the daemons' own `describe` output rather than
+  against a copy of it — so adding a verb is a vocabulary decision, never a security one.
+- **It does not guess.** The only concession to fuzziness is a "did you mean" over the
+  closed verb set, which produces a better error and never an `Intent`. A deterministic
+  grammar that guesses is a language model with none of the benefits.
+
+What T0 does *not* have yet is delegation: `Elsewhere::Peer` and `ConfiguredProvider` are
+modelled and rendered into the refusal, but nothing queues work for a peer or forwards it to
+a provider. The refusal tells the truth about where a request could go; making it go there
+is the next slice.
+
 ## 7. Remote inference over ONM
 
 A `T3`/`T4` node may offer `ai-provider` to authorized peers, with per-peer quotas

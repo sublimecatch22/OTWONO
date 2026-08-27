@@ -18,8 +18,60 @@ pub enum DesktopProfile {
     Full,
 }
 
+/// What shape the assistant takes on this machine (`AI-RUNTIME.md` §6).
+///
+/// Derived from the tier here and nowhere else, per CLAUDE.md §2.6. The assistant is the
+/// most tempting subsystem in which to re-derive "is this machine big enough" — every layer
+/// of it has an opinion about how much thinking it can afford — and one place to look is
+/// worth more than each layer being clever.
+///
+/// Ordered least to most capable, and deliberately *not* `Option<...>`: T0 is a shape the
+/// assistant takes, not the absence of one. A node that says "no assistant" invites a UI
+/// that hides the feature; a node that says "command grammar" invites one that shows what
+/// the grammar can do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistantShape {
+    /// No LLM at all. A deterministic verb grammar over actions that already exist, and an
+    /// honest refusal for anything outside it. Delegation to a peer or a cloud provider is
+    /// possible but never automatic — the user configures it or it does not happen.
+    CommandGrammar,
+    /// A 1-3B model, one tool call per turn, no retrieval, short context.
+    SingleStepToolCalling,
+    /// A 7-8B model with embeddings and retrieval over the user's own content, planning
+    /// across several steps.
+    PlanningWithRetrieval,
+    /// Planning plus sub-agents running concurrently.
+    ParallelAgents,
+}
+
+impl AssistantShape {
+    /// Whether this shape thinks with a language model.
+    ///
+    /// Exists so callers ask the shape rather than re-checking `local_llm`, which is a
+    /// different question: a node can have `local_llm` true and no model installed.
+    pub fn uses_a_model(&self) -> bool {
+        !matches!(self, AssistantShape::CommandGrammar)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AssistantShape::CommandGrammar => "command_grammar",
+            AssistantShape::SingleStepToolCalling => "single_step_tool_calling",
+            AssistantShape::PlanningWithRetrieval => "planning_with_retrieval",
+            AssistantShape::ParallelAgents => "parallel_agents",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeatureGates {
+    /// How the assistant behaves here (`AI-RUNTIME.md` §6).
+    ///
+    /// Separate from `local_llm`, which answers "may a model run at all". This answers
+    /// "what does the user get", and at T0 the answer is a real assistant with no model in
+    /// it rather than nothing.
+    pub assistant_shape: AssistantShape,
     /// May a local language model run at all?
     pub local_llm: bool,
     /// Largest model, in parameters, this machine should be offered. `None` at T0.
@@ -64,6 +116,7 @@ impl FeatureGates {
     pub fn for_tier(tier: Tier, axes: &CapabilityAxes) -> Self {
         let mut g = match tier {
             Tier::T0Micro => FeatureGates {
+                assistant_shape: AssistantShape::CommandGrammar,
                 local_llm: false,
                 max_model_parameters: None,
                 recommended_quantization: None,
@@ -80,6 +133,7 @@ impl FeatureGates {
                 cluster_cache_bytes: CACHE_BYTES_T0,
             },
             Tier::T1Edge => FeatureGates {
+                assistant_shape: AssistantShape::SingleStepToolCalling,
                 local_llm: true,
                 max_model_parameters: Some(3_000_000_000),
                 recommended_quantization: Some("Q4_K_M".into()),
@@ -101,6 +155,7 @@ impl FeatureGates {
                 cluster_cache_bytes: CACHE_BYTES_T1,
             },
             Tier::T2Balanced => FeatureGates {
+                assistant_shape: AssistantShape::PlanningWithRetrieval,
                 local_llm: true,
                 max_model_parameters: Some(8_000_000_000),
                 recommended_quantization: Some("Q4_K_M".into()),
@@ -123,6 +178,7 @@ impl FeatureGates {
                 cluster_cache_bytes: CACHE_BYTES_T2,
             },
             Tier::T3Capable => FeatureGates {
+                assistant_shape: AssistantShape::ParallelAgents,
                 local_llm: true,
                 max_model_parameters: Some(32_000_000_000),
                 recommended_quantization: Some("Q4_K_M".into()),
@@ -150,6 +206,7 @@ impl FeatureGates {
                 cluster_cache_bytes: CACHE_BYTES_T3,
             },
             Tier::T4Workstation => FeatureGates {
+                assistant_shape: AssistantShape::ParallelAgents,
                 local_llm: true,
                 max_model_parameters: Some(70_000_000_000),
                 recommended_quantization: Some("Q4_K_M".into()),

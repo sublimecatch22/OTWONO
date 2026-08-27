@@ -131,7 +131,23 @@ path, not yet kernel-enforced.
    toolchains and a redistribution decision. See `docs/ai/AI-RUNTIME.md` §3.2, which also
    names the untested gap: a discovered backend can still fail at exec on a machine whose
    driver is missing.
-5. Tiered assistant shapes T0–T2.
+5. Tiered assistant shapes T0–T2. **T0 built; T1 and T2 blocked on OQ-6, not on code.**
+
+   `AssistantShape` is now a field on `FeatureGates`, derived from the tier in the one place
+   CLAUDE.md §2.6 allows — so no subsystem re-decides how much thinking this machine can
+   afford. `otwono-agent` implements the T0 shape: a deterministic verb grammar over methods
+   that already exist and are already brokered, and `AI-RUNTIME.md` §6's honest refusal for
+   everything else.
+
+   The grammar **executes nothing**. It parses words into an inert `Intent` naming a
+   control-plane method and the capability the *caller* must hold; dispatch and
+   authorization are unchanged. That is what makes giving a T0 node an assistant safe: its
+   reach is exactly what the user could already do with a `*ctl` command, and parsing is not
+   permission (CLAUDE.md §2.5).
+
+   T1 and T2 need models in an image, which is **OQ-6** — a licensing and redistribution
+   question, not an engineering one. The shapes are defined and the tier derives them; what
+   is missing is the decision about which models may ship.
 
 **Exit criterion:** the same `ai.infer` request served on an amd64 VM and an arm64 VM with
 tier-appropriate models, plus a test proving admission control refuses an oversized model

@@ -23,6 +23,7 @@ otwono-stored = { path = "../../crates/otwono-stored" }
 otwono-ai = { path = "../../crates/otwono-ai", features = ["testing"] }
 otwono-hal = { path = "../../crates/otwono-hal" }
 otwono-capability = { path = "../../crates/otwono-capability", features = ["testing"] }
+otwono-agent = { path = "../../crates/otwono-agent" }
 serde_json = "1"
 blake3 = "1"
 data-encoding = "2"
