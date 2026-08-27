@@ -52,8 +52,15 @@ Every object in `otwono-stored` carries exactly one visibility label.
 `SHARED`.
 
 **STATUS: IMPLEMENTED** — `otwono_store::object::Replication`, attached with
-`with_replication` and read with `replication_policy`. Unit tested; no wire protocol yet, so
-nothing has actually been replicated anywhere.
+`with_replication` and read with `replication_policy`; offered over the wire as
+`content.replicable`, taken by a holder through `cache.take_replica`, and held to its TTL as
+a cluster-cache entry that eviction will not touch. A node runs a pass against each peer it
+dials, so an object replicates without a test driving it.
+
+Unit, integration and cross-process tested — including an object crossing a real TCP link
+and landing in a *different* process's cache. **Not** yet exercised between two booted
+machines: `REPLICATED` has no entry in `docs/build/VERIFICATION-LOG.md` of the kind `SHARED`
+has, so nothing here is `VERIFIED`.
 
 **Settled by ADR-0026, and every field is advisory.** Replication is **pulled by a holder,
 never pushed by an owner**, which makes consent inherent — nothing arrives on a disk whose

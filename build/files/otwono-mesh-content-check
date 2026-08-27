@@ -258,6 +258,58 @@ if cache=$(otwono-storectl cache-status 2>&1); then
         || fail "the cache holds $cache_held object(s) after a caching fetch"
 fi
 
+# --- REPLICATED replicates itself, with nothing driving it (ADR-0026) -------------------
+# The claim this step exists for: a node that meets a peer takes a copy of what that peer
+# offers, without anyone asking it to. Every other replication test drives the pass by
+# calling it; here nothing does. Both nodes publish one REPLICATED object, both nodes dial,
+# and if the wiring is right each ends up holding the other's.
+#
+# Nothing passes an id between the VMs, and this node cannot derive the peer's: the object
+# carries a per-node timestamp so the two are certainly different bytes. So a replica showing
+# up here is one the peer offered and this node chose to take.
+#
+# Retried for the same reason the sharing index is: the offer list is taken once per session,
+# so an object marked REPLICATED after this node's last connection is only visible on a
+# later one (ADR-0026 §7). That is the design's stated cost, and here it is as a retry.
+step "publishing a REPLICATED object and waiting for the peer's"
+replicated_id=none
+replica_taken=none
+printf 'otwono replication check node %s %s\n' "$node_ordinal" "$(date -u +%s%N)" \
+    > "$WORK/for-replication.txt"
+if mine=$(otwono-storectl put --file "$WORK/for-replication.txt" --visibility replicated 2>&1); then
+    replicated_id=$(echo "$mine" | awk 'NR==1 {print $1}')
+    [ -n "$replicated_id" ] || fail "putting a REPLICATED object returned no content id"
+
+    i=0
+    while [ "$i" -lt 60 ]; do
+        # Any held replica that is not this node's own object came from the peer. The status
+        # marks a hold separately from a pin, so this cannot be satisfied by a pinned entry.
+        replica_taken=$(otwono-storectl cache-status 2>/dev/null \
+            | awk -v mine="$replicated_id" '$3 == "bytes" && /replica/ && $1 != mine { print $1; exit }')
+        [ -n "$replica_taken" ] && break
+        replica_taken=none
+        i=$((i + 1))
+        sleep 5
+    done
+
+    if [ "$replica_taken" != none ]; then
+        # It must be the peer's object and not this node's own, or "replication happened"
+        # would be satisfied by a node talking to itself.
+        [ "$replica_taken" != "$replicated_id" ] \
+            || fail "the only replica held is this node's own object"
+        held=$(otwono-storectl cache-status | awk '/^budget/ {print $8}')
+        case "$held" in ''|*[!0-9]*) held=0 ;; esac
+        [ "$held" -ge 1 ] \
+            || fail "a replica is marked held but the count says $held"
+        step "holding a replica taken from the peer with nothing driving it"
+    else
+        # Not a failure: a node whose peer never got as far as publishing has nothing to
+        # take, and this check has no way to tell that from a broken pass. The summary line
+        # records which happened, and the harness asserts across both nodes.
+        step "no replica taken from the peer within the retry window"
+    fi
+fi
+
 # --- A peer learned over the mesh can be sealed to (ADR-0019) ---------------------------
 # Until now a node could only be shared with by somebody who already held its binding out of
 # band. The binding now travels in the hello after every Noise handshake, so this asserts
@@ -422,4 +474,4 @@ if [ "$discovered" != none ]; then
 fi
 
 rm -rf "$WORK"
-echo "OTWONO-MESH-CONTENT-OK node=$node_ordinal/$node_total public=$pub_id large=$big_id large_served=$big_served private_refused=$prv_id cache_budget=$cache_state cache_held=$cache_held shared_to_peer=$shared_to_peer granted=$granted discovered=$discovered"
+echo "OTWONO-MESH-CONTENT-OK node=$node_ordinal/$node_total public=$pub_id large=$big_id large_served=$big_served private_refused=$prv_id cache_budget=$cache_state cache_held=$cache_held shared_to_peer=$shared_to_peer granted=$granted discovered=$discovered replicated=$replicated_id replica_taken=$replica_taken"

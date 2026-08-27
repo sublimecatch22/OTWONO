@@ -33,6 +33,11 @@ decision = "allow"
 ttl_seconds = 300
 
 [[rule]]
+action = "cache.replicate"
+decision = "allow"
+ttl_seconds = 300
+
+[[rule]]
 action = "store.serve"
 decision = "allow"
 ttl_seconds = 300
@@ -154,6 +159,33 @@ impl Harness {
 
     fn status(&self) -> Value {
         self.call("cache.status", json!({}), "cache.read").unwrap()
+    }
+
+    fn replica_room(&self, candidates: &[&str]) -> Value {
+        self.call(
+            "cache.replica_room",
+            json!({ "candidates": candidates }),
+            "cache.replicate",
+        )
+        .unwrap()
+    }
+
+    fn take_replica(
+        &self,
+        bytes: &[u8],
+        ttl_days: u32,
+        max_size_bytes: u64,
+    ) -> Result<Value, otwono_proto::RpcError> {
+        self.call(
+            "cache.take_replica",
+            json!({
+                "data": data_encoding::BASE64.encode(bytes),
+                "ttl_days": ttl_days,
+                "max_size_bytes": max_size_bytes,
+                "allow_rereplication": true,
+            }),
+            "cache.replicate",
+        )
     }
 }
 
@@ -299,18 +331,53 @@ fn the_cache_daemon_cannot_write_the_users_own_store() {
 
 #[test]
 fn every_cache_method_is_guarded() {
+    // The list comes from `describe`, not from this test. It used to be written out here,
+    // and a hand-maintained list is one somebody forgets to extend — the failure mode being
+    // an unguarded method that this test reports as fine because it never asked about it.
+    //
+    // Empty params are enough: every arm authorizes before it parses, so a method that got
+    // as far as complaining about its parameters has already failed the thing under test.
     let h = Harness::start("guards", POLICY, 4 * 1024 * 1024);
-    for (method, params) in [
-        ("cache.put", json!({ "data": "", "visibility": "public" })),
-        ("cache.get", json!({ "content_id": "0".repeat(64) })),
-        ("cache.status", json!({})),
-        (
-            "cache.pin",
-            json!({ "content_id": "0".repeat(64), "pinned": true }),
-        ),
-        ("cache.purge", json!({})),
-    ] {
-        let err = h.call_unauthorized(method, params);
+    let described = {
+        let mut client = Client::connect(&h.store_socket).unwrap();
+        client
+            .describe()
+            .unwrap()
+            .expect("describe must not need a token")
+    };
+    let cache_methods: Vec<_> = described
+        .methods
+        .iter()
+        .filter(|m| m.name.starts_with("cache."))
+        .collect();
+    let methods: Vec<String> = cache_methods.iter().map(|m| m.name.clone()).collect();
+
+    // Declared and enforced are two different claims, and both are worth checking: a method
+    // described as open would be a documented hole, and one described as guarded but
+    // dispatched without the check would be an undocumented one.
+    for m in &cache_methods {
+        assert!(
+            m.capability.is_some(),
+            "{} is described as needing no capability",
+            m.name
+        );
+    }
+
+    // A guard test that found nothing to guard would pass silently.
+    assert!(
+        methods.len() >= 7,
+        "describe named only {} cache methods: {methods:?}",
+        methods.len()
+    );
+    for known in ["cache.put", "cache.replica_room", "cache.take_replica"] {
+        assert!(
+            methods.iter().any(|m| m == known),
+            "{known} is missing from describe: {methods:?}"
+        );
+    }
+
+    for method in &methods {
+        let err = h.call_unauthorized(method, json!({}));
         assert_eq!(err.code, code::UNAUTHORIZED, "{method} was not guarded");
     }
 }
@@ -480,6 +547,220 @@ fn a_node_with_no_cache_answers_plainly_rather_than_pretending() {
         .unwrap()
         .expect_err("a node with no cache must say so");
     assert_eq!(err.code, code::UNAVAILABLE);
+    assert!(err.message.contains("no cluster cache"), "{}", err.message);
+
+    shutdown.trigger();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `cache.replicate` is its own capability, and `cache.write` is not a substitute (ADR-0026 §10).
+///
+/// The distinction is the whole reason the capability exists: "keep what I fetched" and
+/// "keep what a stranger offered" are different decisions, and an operator who grants the
+/// first has not granted the second. A guard that accepted either would make the separation
+/// documentation rather than enforcement.
+#[test]
+fn holding_a_replica_needs_more_than_permission_to_cache() {
+    let h = Harness::start("repl-guard", POLICY, 8 << 20);
+    let bytes = payload(4096, 21);
+
+    // The right capability works.
+    let ok = h
+        .take_replica(&bytes, 30, 1 << 20)
+        .expect("cache.replicate is allowed here");
+    assert_eq!(ok["taken"], json!(true));
+
+    // A cache.write token does not.
+    let token = h.token("cache.write");
+    let mut client = Client::connect(&h.store_socket).unwrap();
+    let err = client
+        .call_with_capability(
+            "cache.take_replica",
+            json!({
+                "data": data_encoding::BASE64.encode(&payload(4096, 22)),
+                "ttl_days": 30,
+                "max_size_bytes": 1 << 20,
+                "allow_rereplication": true,
+            }),
+            &token,
+        )
+        .unwrap()
+        .expect_err("a cache.write token must not buy a replica");
+    assert_eq!(err.code, code::UNAUTHORIZED, "{}", err.message);
+
+    // And no token at all does not either.
+    let err = h.call_unauthorized("cache.replica_room", json!({ "candidates": [] }));
+    assert_eq!(err.code, code::UNAUTHORIZED, "{}", err.message);
+}
+
+/// A holder answers about what it was asked about, and takes what it agreed to hold.
+#[test]
+fn a_holder_answers_about_the_offer_and_then_holds_it() {
+    let h = Harness::start("repl-room", POLICY, 8 << 20);
+    let bytes = payload(4096, 31);
+    let absent = "11".repeat(32);
+
+    let before = h.replica_room(&[&absent]);
+    assert_eq!(before["replicating"], json!(true));
+    assert!(before["room_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(
+        before["already_held"],
+        json!([]),
+        "claimed to hold something it has never seen"
+    );
+
+    let taken = h.take_replica(&bytes, 30, 1 << 20).expect("take");
+    assert_eq!(taken["taken"], json!(true));
+    let id = taken["content_id"].as_str().unwrap().to_string();
+    assert_eq!(taken["size_bytes"], json!(bytes.len() as u64));
+
+    let after = h.replica_room(&[&id, &absent]);
+    assert_eq!(
+        after["already_held"],
+        json!([id]),
+        "an object just taken was not reported as held"
+    );
+    // The reply is bounded by the question: asking about two ids answers about those two,
+    // and never turns into a listing of the cache. That listing is `cache.status`, and it
+    // needs `cache.read`, which a replicating peer has no reason to hold.
+    assert!(after.get("entries").is_none());
+
+    // And an operator can see the hold. A subsystem that stores a promise the operator
+    // cannot see is one they cannot reason about, which is the objection ADR-0015 raised
+    // about eviction and applies here for the same reason.
+    let status = h.status();
+    assert_eq!(status["replicas_held"], json!(1));
+    let entry = status["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["content_id"] == json!(id))
+        .expect("the replica is in the cache");
+    assert_eq!(entry["size_bytes"], json!(bytes.len() as u64));
+    assert_eq!(entry["holds_a_replica"], json!(true));
+    assert!(
+        entry["replica_expires_ms"].as_u64().is_some(),
+        "a held replica with no expiry is a promise with no end"
+    );
+    // A hold is not a pin: they are separate commitments and the status must not conflate
+    // them, or a TTL sweep would look like it had unpinned something a person chose to keep.
+    assert_eq!(entry["pinned"], json!(false));
+}
+
+/// A refusal is `taken: false`, not an error — and the caller must be able to tell the two
+/// apart, because one means "try another object" and the other means "something is broken".
+#[test]
+fn an_object_that_will_not_fit_is_refused_rather_than_failed() {
+    let h = Harness::start("repl-full", POLICY, 4096);
+    // Larger than the whole budget.
+    let outcome = h
+        .take_replica(&payload(64 * 1024, 41), 30, 1 << 20)
+        .expect("a refusal is not an error");
+    assert_eq!(outcome["taken"], json!(false));
+    assert_eq!(outcome["cache_used_bytes"], json!(0));
+    assert!(outcome.get("content_id").is_none());
+
+    // The owner's own size cap refuses independently of this node's budget: an object that
+    // fits here but that its owner said not to replicate above a smaller size is still
+    // refused, because the policy is the owner's to set.
+    let small = payload(2048, 42);
+    let outcome = h
+        .take_replica(&small, 30, 1024)
+        .expect("a refusal is not an error");
+    assert_eq!(
+        outcome["taken"],
+        json!(false),
+        "took an object over the owner's own max_size_bytes"
+    );
+}
+
+/// A policy with a zero in it is refused rather than normalised.
+///
+/// A zero TTL is a promise that has already expired and a zero size cap permits nothing;
+/// either is a peer offering something no holder can honour, and silently substituting a
+/// default would mean inventing terms on the owner's behalf.
+#[test]
+fn a_policy_that_promises_nothing_is_refused() {
+    let h = Harness::start("repl-zero", POLICY, 8 << 20);
+    let bytes = payload(2048, 51);
+
+    let err = h
+        .take_replica(&bytes, 0, 1 << 20)
+        .expect_err("a zero TTL must be refused");
+    assert_eq!(err.code, code::INVALID_PARAMS, "{}", err.message);
+
+    let err = h
+        .take_replica(&bytes, 30, 0)
+        .expect_err("a zero size cap must be refused");
+    assert_eq!(err.code, code::INVALID_PARAMS, "{}", err.message);
+}
+
+/// A node with no cache says "I do not replicate", rather than failing.
+///
+/// The distinction matters to the pass: a refusal that reads as an error would invite a
+/// retry, and there is nothing to retry — this node is not going to hold anything. It is
+/// also why `cache.replica_room` answers here while `cache.take_replica` does not: the first
+/// is a question this node can answer truthfully, and the second is an action it cannot take.
+#[test]
+fn a_node_with_no_cache_answers_that_it_does_not_replicate() {
+    let dir = std::env::temp_dir().join(format!("otw-nc-nocache-repl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("policy.d")).unwrap();
+    std::fs::write(dir.join("policy.d/10-test.toml"), POLICY_WITH_WRITE).unwrap();
+    let perm_socket = dir.join("perm.sock");
+    let store_socket = dir.join("store.sock");
+    let shutdown = Shutdown::new();
+
+    let policy = Policy::load_dir(&dir.join("policy.d")).unwrap();
+    let broker = Arc::new(Broker::new(
+        policy,
+        AuditLog::open(dir.join("audit.jsonl")).unwrap(),
+    ));
+    let s = shutdown.clone();
+    let server = Server::bind(&perm_socket).unwrap();
+    std::thread::spawn(move || server.serve(broker, s));
+
+    let (key, _) = StorageKey::load_or_generate(&dir.join("storage.key")).unwrap();
+    let store = Store::encrypted(dir.join("store"), key);
+    store.ensure_layout().unwrap();
+    // No `.with_cache(..)`: this node contributes nothing.
+    let service = Arc::new(StoreService::new(store, perm_socket.clone()));
+    let s = shutdown.clone();
+    let server = Server::bind(&store_socket).unwrap();
+    std::thread::spawn(move || server.serve(service, s));
+    for sock in [&perm_socket, &store_socket] {
+        Client::connect_waiting(sock, Duration::from_secs(5)).unwrap();
+    }
+
+    let token = {
+        let mut broker = Client::connect(&perm_socket).unwrap();
+        broker
+            .call(
+                "perm.request",
+                json!({ "action": "cache.replicate", "reason": "test" }),
+            )
+            .unwrap()
+            .unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let mut client = Client::connect(&store_socket).unwrap();
+    let room = client
+        .call_with_capability("cache.replica_room", json!({ "candidates": [] }), &token)
+        .unwrap()
+        .expect("asking is not an error on a node with no cache");
+    assert_eq!(room["replicating"], json!(false));
+    assert_eq!(room["room_bytes"], json!(0));
+
+    let err = client
+        .call_with_capability(
+            "cache.take_replica",
+            json!({ "data": "", "ttl_days": 30, "max_size_bytes": 1024 }),
+            &token,
+        )
+        .unwrap()
+        .expect_err("there is nowhere to put it");
     assert!(err.message.contains("no cluster cache"), "{}", err.message);
 
     shutdown.trigger();

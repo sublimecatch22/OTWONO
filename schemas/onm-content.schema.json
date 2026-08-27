@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://otwono.org/schemas/onm-content-1.2.0.json",
+  "$id": "https://otwono.org/schemas/onm-content-1.3.0.json",
   "title": "OTWONO ONM Content-Fetch Protocol",
   "description": "The messages two nodes exchange to move content over an authenticated ONM channel (ADR-0017). Every message travels inside one Noise transport frame after the Hello exchange, so every one is bounded: a requester asks for a range, a responder may answer with less, and the requester loops. There is exactly one error shape \u2014 absent, private, shared, damaged, and not-part-of-that-object all produce not_available, because any finer answer tells a stranger what this node holds. A chunk request names the object the chunk belongs to; a bare digest would be a probe against a content-addressed store.",
   "oneOf": [
@@ -31,6 +31,9 @@
         },
         {
           "$ref": "#/$defs/shared_index_request"
+        },
+        {
+          "$ref": "#/$defs/replicable_request"
         }
       ]
     },
@@ -117,6 +120,9 @@
         },
         {
           "$ref": "#/$defs/shared_index_response"
+        },
+        {
+          "$ref": "#/$defs/replicable_response"
         }
       ]
     },
@@ -301,6 +307,86 @@
               "description": "Base64 ciphertext of the 32-byte content key."
             }
           }
+        }
+      }
+    },
+    "replicable_request": {
+      "type": "object",
+      "description": "What are you offering for replication? (ADR-0026). Like shared_index_request there is NO FIELD NAMING THE ASKER, but for the opposite reason: this answer is not scoped to anyone. Every REPLICATED object is offered to every peer that asks, because the label already says public copying is permitted, and scoping it would imply a per-peer decision this design does not make.",
+      "required": [
+        "method",
+        "max_entries"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "method": {
+          "const": "content.replicable"
+        },
+        "after": {
+          "$ref": "#/$defs/digest",
+          "description": "Continue strictly after this content id. Absent starts at the beginning. Ordered by content id for the same reason the sharing index is: it is deterministic and needs no timestamp."
+        },
+        "max_entries": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256
+        }
+      }
+    },
+    "replicable_response": {
+      "type": "object",
+      "description": "A page of what this node offers for replication. A node that replicates nothing and a node that refuses to say both return an empty page, so asking cannot distinguish them. Nothing here obliges the asker: the holder decides what, if anything, to take (ADR-0026 \u00a71).",
+      "required": [
+        "reply",
+        "entries"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "reply": {
+          "const": "replicable"
+        },
+        "entries": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/replicable_entry"
+          }
+        }
+      }
+    },
+    "replicable_entry": {
+      "type": "object",
+      "description": "One offer: an object, its size, and the terms its owner asks of whoever holds a copy. target_replicas is deliberately NOT here \u2014 a holder holds one copy and cannot count the others, so a number it could not act on would only invite it to try (ADR-0026 \u00a72, \u00a73).",
+      "required": [
+        "content_id",
+        "size_bytes",
+        "ttl_days",
+        "max_size_bytes",
+        "allow_rereplication"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "content_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "So a holder can decide whether it fits before fetching anything."
+        },
+        "ttl_days": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "How long the owner asks a holder to keep it. At least one: a zero-day promise has already expired, and a holder cannot honour it."
+        },
+        "max_size_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The owner's own ceiling on what it asks anyone to hold. A holder applies this and its own budget, and the smaller wins."
+        },
+        "allow_rereplication": {
+          "type": "boolean",
+          "description": "A request, not a control (ADR-0026 \u00a75). A holder that ignores it is running modified software and already has the bytes."
         }
       }
     },

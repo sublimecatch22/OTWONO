@@ -123,6 +123,13 @@ Each entry carries the content id, the size, and the parts of the policy a holde
 could not act on the number, and putting a figure on the wire that nobody can use is an
 invitation to build a UI on it.
 
+**The request is `content.replicable`; the reply is tagged `replicable`.** The method name
+belongs on the question, and every other reply in ADR-0017's protocol is a bare noun
+(`manifest`, `chunk`, `shared_with_you`, `not_available`). The first version of this code
+tagged the reply with the method name too, and that was found by writing the JSON Schema
+rather than by any test — which is the argument for CLAUDE.md §4.2 in one line: a contract
+written down is read by something other than the code that produced it.
+
 ### 8. A replica is a cache entry with an expiry
 
 **Amended 2026-08-26, on building the holder side.**
@@ -180,6 +187,57 @@ asking and discarding the answer.
 **Expiry is swept on the same trigger.** Releasing lapsed holds is cheap and needs no timer
 either; doing it when a connection happens keeps the whole subsystem free of background
 work, which on an SD-card-backed T0 board is worth more than promptness.
+
+### §10 The pass runs in the network daemon, and the cache stays in one process
+
+**Amended 2026-08-27, on wiring the trigger.** §9 said "on connection" without saying which
+process. It matters, because the two halves of a replication pass live in different daemons.
+
+The link is `otwono-netd`'s: it is the only process that speaks Noise to a peer, and by the
+security model it is the one deliberately *not* given the storage key. The cluster cache is
+`otwono-stored`'s: that daemon opens it at startup, holds its index in memory, and persists
+on every change.
+
+So `otwono-netd` **must not open the cache itself**. Two processes each holding their own
+in-memory copy of one on-disk index lose each other's updates and double-count the same
+budget — a corruption bug that would show up as a cache that overruns its limit and then
+forgets objects it is still serving. CLAUDE.md §2.4 says the same thing in the general case:
+cross-subsystem calls go through the Local Control Plane, never through shared mutable state.
+A file on disk that two daemons both write *is* shared mutable state, whatever it looks like
+in the type system.
+
+**The pass is therefore generic over where the replica goes.** `ReplicaHolder` (in
+`otwono-store`) is the two questions and one action a pass needs: how much room is there,
+which of these do you already have, and will you take this. `Cache` implements it directly —
+which is what the tests drive, in-process, with no daemon. `otwono-netd`'s `BrokeredCache`
+implements it over the control plane against `otwono-stored`. Neither implementation knows
+about the other, and the pass logic — the ordering, the smallest-that-fits choice, the
+label re-check — exists once.
+
+**Two new control-plane methods**, mirroring `cache.put`'s existing shape and its inline size
+cap:
+
+- `cache.replica_room` — sweeps lapsed holds, then answers with the room remaining and which
+  of the offered ids this node already has. Called *before* anything reaches the wire, so §9's
+  "a node that does not replicate makes no replication traffic at all" survives the split.
+  Bounded: it answers about the ids it was asked about, and does not return the cache listing.
+- `cache.take_replica` — `cache.put` plus the hold, applying the owner's policy inside the one
+  process that can see the budget.
+
+**A new capability, `cache.replicate`, not `cache.write`.** These are different authorities
+and an operator must be able to hold one without the other. `cache.write` is *keep what I
+fetched* — the bytes are already on the machine because someone asked for them. `cache.replicate`
+is *keep what a stranger offered* — bytes that arrive because a peer had them, on a node that
+may be unattended. "Cache what I fetch, but do not host for strangers" is a sentence a person
+will want to say, and only a separate capability lets them say it.
+
+It is `Reversible` and not `always_confirm`, for the reason §9 gives: a replica is disposable
+by construction, and a node that had to prompt before holding one could not replicate while
+unattended, which is the only condition under which replication is worth anything.
+
+**What this does not change.** The choice of *what* to take is still the holder's and still
+smallest-that-fits (§9); the owner still cannot count replicas (§3); nothing new is pushed.
+The split is about which process holds the bytes, not about who decides.
 
 ## Consequences
 

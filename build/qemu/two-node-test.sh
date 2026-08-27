@@ -276,6 +276,21 @@ if [ "${MESH_CONTENT_SMOKE:-0}" != 0 ]; then
     fi
     echo "content: both nodes served a public object and refused a private one"
     grep -hoa "OTWONO-MESH-CONTENT-OK.*" "$OUT/node-a.log" | tail -1 | tr -d '\r'
+
+    # Replication is asserted here rather than inside the check, because neither node can
+    # tell "the pass is broken" from "my peer had not published yet" on its own (ADR-0026).
+    # Across both, it is unambiguous: each published a REPLICATED object, so each had
+    # something to take, and a node reporting none took none.
+    for node in a b; do
+        line=$(grep -hoa "OTWONO-MESH-CONTENT-OK.*" "$OUT/node-$node.log" | tail -1 | tr -d '\r')
+        taken=$(echo "$line" | grep -o 'replica_taken=[^ ]*' | cut -d= -f2)
+        if [ -z "$taken" ] || [ "$taken" = none ]; then
+            echo "FAIL: node $node held no replica from its peer (replica_taken=${taken:-absent})" >&2
+            echo "  $line" >&2
+            exit 1
+        fi
+    done
+    echo "content: each node took a replica of the other's REPLICATED object, unprompted"
 fi
 
 echo "PASS: two nodes discovered and mutually authenticated"

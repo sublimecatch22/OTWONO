@@ -242,6 +242,19 @@ impl ActionRegistry {
                     BlastRadius::Reversible,
                     false,
                 ),
+                // Separate from cache.write, and the distinction is the operator's to make:
+                // cache.write is "keep what I fetched", where the bytes are already here
+                // because someone asked for them; this is "keep what a stranger offered"
+                // (ADR-0026 §10). Reversible for the same reason cache.write is -- a replica
+                // is disposable by construction. Not always_confirm, because a node that had
+                // to prompt before holding one could not replicate while unattended, which
+                // is the only condition under which replication is worth anything.
+                ActionSpec::new(
+                    "cache.replicate",
+                    "Hold content offered by a peer as a replica for the cluster",
+                    BlastRadius::Reversible,
+                    false,
+                ),
                 ActionSpec::new(
                     "net.fetch",
                     "Fetch an object from a source on the egress allow-list",

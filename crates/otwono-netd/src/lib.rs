@@ -81,6 +81,13 @@ pub struct NetState {
     /// on a node built without one: such a node meshes and authenticates, and refuses every
     /// content request by never listening for one.
     pub responder: Option<Arc<ContentResponder>>,
+    /// Where a replica goes, when this node holds any (ADR-0026 §10). `None` on a node that
+    /// does not replicate, and then no replication request ever reaches the wire — which is
+    /// §9's rule, kept structural rather than left to a check somebody could forget.
+    ///
+    /// Not a `Cache`: the cache belongs to `otwono-stored`, and this daemon reaches it over
+    /// the control plane precisely so there is only ever one writer to its index.
+    pub holder: Option<Arc<dyn otwono_store::ReplicaHolder + Send + Sync>>,
     /// Whatever can sign for this node. In the daemon it is a [`BrokeredSigner`]; in a
     /// test it is usually a whole `NodeIdentity`, which signs locally.
     pub signer: Arc<dyn SessionSigner>,
@@ -95,6 +102,7 @@ impl NetState {
         NetState {
             handoff: None,
             responder: None,
+            holder: None,
             signer,
             node_id,
             peers: Mutex::new(PeerTable::new()),
@@ -111,6 +119,16 @@ impl NetState {
     /// Give this node a store to serve peers from.
     pub fn with_responder(mut self, responder: ContentResponder) -> Self {
         self.responder = Some(Arc::new(responder));
+        self
+    }
+
+    /// Give this node somewhere to put replicas it takes from peers.
+    ///
+    /// Takes the trait rather than a concrete cache so a test can drive a real
+    /// `otwono_store::Cache` in-process, while the daemon passes a [`content::BrokeredCache`]
+    /// that goes over the control plane. The pass cannot tell them apart, which is the point.
+    pub fn with_holder(mut self, holder: Arc<dyn otwono_store::ReplicaHolder + Send + Sync>) -> Self {
+        self.holder = Some(holder);
         self
     }
 
@@ -268,6 +286,36 @@ impl NetState {
         }
         self.exchange_hello(&mut channel, true)?;
         content::fetch_shared_index(&mut channel, &properties).map_err(|e| e.to_string())
+    }
+
+    /// Ask one peer what it is offering for replication, and take at most one (ADR-0026 §9).
+    ///
+    /// A fresh channel, for the same reason [`Self::fetch_from`] opens one: roles are fixed
+    /// for a channel's life, and this node has to be the one that dialled in order to ask.
+    ///
+    /// A node with no holder does nothing and says so, without dialling. That is §9's
+    /// "a node that does not replicate makes no replication traffic at all" enforced before
+    /// the TCP connect rather than after it — a node that connected and then discovered it
+    /// had nowhere to put anything would still have told the peer it was interested.
+    pub fn replicate_from(&self, candidate: &Candidate) -> Result<content::ReplicationPass, String> {
+        let Some(holder) = self.holder.clone() else {
+            return Ok(content::ReplicationPass::NotReplicating);
+        };
+        // Asked before the connect, not after. A holder that will take nothing -- no cache,
+        // no budget left, or `cache.replicate` refused -- must not cause a connection at
+        // all: a node that dialled and then discovered it had nowhere to put anything would
+        // still have told the peer it was interested, which is exactly what §9 rules out.
+        // The pass asks again once the channel is up; it is a local socket call, and it
+        // keeps the pass correct on its own for the tests that drive it directly.
+        match holder.replica_room(&[], self.now()) {
+            Some(room) if room.room_bytes > 0 => {}
+            _ => return Ok(content::ReplicationPass::NotReplicating),
+        }
+        let source = self.open_content_channel(candidate)?;
+        let content::PeerSource {
+            mut channel, link, ..
+        } = source;
+        content::replication_pass(&mut channel, &link, holder.as_ref(), self.now()).map_err(|e| e.to_string())
     }
 
     /// Fetch one object from several peers at once (ADR-0015).
@@ -453,6 +501,47 @@ pub fn run_listener(state: Arc<NetState>, listener: TcpListener) {
     }
 }
 
+/// Take at most one replica from a peer that just authenticated (ADR-0026 §9).
+///
+/// Inline, on the discovery thread, and that is a deliberate cost rather than an oversight.
+/// §9 chose "on connection" over a timer, and a timer is what a background worker would
+/// become — it would need a queue, a bound on how many passes run at once, and a policy for
+/// what to do with a peer that disconnected while queued. Running here means the pass is
+/// naturally serialised, naturally rate-limited by how often this node meets peers, and has
+/// no state of its own.
+///
+/// What it costs: on a node that has enabled replication, discovering the next peer waits
+/// for this pass. The pass is bounded — one object, at most [`content::MAX_FETCH_BYTES`] —
+/// but on a slow link that is still a real delay, and it is worth naming. On a stock node no
+/// holder is configured and this returns without opening anything.
+///
+/// A failure is logged and swallowed: the peer is authenticated and connected either way,
+/// and a replication pass that did not work out is not a reason to forget a peer.
+fn replication_pass_after_dial(state: &Arc<NetState>, candidate: &Candidate) {
+    if state.holder.is_none() {
+        return;
+    }
+    match state.replicate_from(candidate) {
+        Ok(content::ReplicationPass::Took {
+            content_id,
+            size_bytes,
+        }) => eprintln!(
+            "otwono-netd: holding a replica of {} ({size_bytes} bytes) from {}",
+            &content_id[..content_id.len().min(16)],
+            candidate.claimed_node_id.fingerprint()
+        ),
+        Ok(content::ReplicationPass::NothingTaken { offered }) => eprintln!(
+            "otwono-netd: {} offered {offered} object(s) for replication, took none",
+            candidate.claimed_node_id.fingerprint()
+        ),
+        Ok(content::ReplicationPass::NotReplicating) => {}
+        Err(e) => eprintln!(
+            "otwono-netd: replication pass with {} failed: {e}",
+            candidate.claimed_node_id.fingerprint()
+        ),
+    }
+}
+
 /// How long the discovery loop waits for a new advertisement before retrying known peers.
 const DISCOVERY_SWEEP: Duration = Duration::from_secs(30);
 
@@ -496,7 +585,10 @@ pub fn run_discovery(state: Arc<NetState>, discovery: otwono_net::Discovery) {
         }
 
         match state.dial(&candidate) {
-            Ok(id) => eprintln!("otwono-netd: outbound peer authenticated: {}", id.fingerprint()),
+            Ok(id) => {
+                eprintln!("otwono-netd: outbound peer authenticated: {}", id.fingerprint());
+                replication_pass_after_dial(&state, &candidate);
+            }
             Err(e) => eprintln!("otwono-netd: dial failed: {e}"),
         }
     }
@@ -519,7 +611,10 @@ fn retry_known_peers(state: &Arc<NetState>, local: &otwono_identity::NodeId) {
             address,
         };
         match state.dial(&candidate) {
-            Ok(id) => eprintln!("otwono-netd: peer authenticated on retry: {}", id.fingerprint()),
+            Ok(id) => {
+                eprintln!("otwono-netd: peer authenticated on retry: {}", id.fingerprint());
+                replication_pass_after_dial(state, &candidate);
+            }
             // Expected while the other side is still coming up. The reason is kept on the
             // peer record either way, so `otwono-netd --peers` can explain a mesh that
             // will not form.

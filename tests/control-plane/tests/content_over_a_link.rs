@@ -63,6 +63,11 @@ decision = "allow"
 ttl_seconds = 300
 
 [[rule]]
+action = "cache.replicate"
+decision = "allow"
+ttl_seconds = 300
+
+[[rule]]
 action = "store.read"
 decision = "deny"
 "#;
@@ -127,8 +132,15 @@ impl Harness {
         // otwono-stored, encrypted at rest as a node's store always is.
         let store = Store::encrypted(dir.join("store"), StorageKey::generate());
         store.ensure_layout().unwrap();
-        let service =
-            Arc::new(StoreService::new(store, perm_socket.clone()).with_identity(id_socket.clone()));
+        // A cluster cache too, because that is where a replica goes. Separate directory from
+        // the store, as on a real node: what the user put there and what the node picked up
+        // on its neighbours' behalf never share a path (ADR-0015).
+        let cache = otwono_store::Cache::at(dir.join("cache"), StorageKey::generate(), 8 << 20).unwrap();
+        let service = Arc::new(
+            StoreService::new(store, perm_socket.clone())
+                .with_identity(id_socket.clone())
+                .with_cache(cache),
+        );
         let s = shutdown.clone();
         let server = Server::bind(&store_socket).unwrap();
         std::thread::spawn(move || server.serve(service, s));
@@ -154,7 +166,14 @@ impl Harness {
         );
         std::thread::spawn(move || otwono_netd::run_listener(serving, listener));
 
-        let client = Arc::new(NetState::new(Arc::new(signer(dir.join("agreement-client")))));
+        // The asking node replicates through the control plane, exactly as the daemon does:
+        // it never opens the cache directory itself, because the store daemon owns that
+        // index and two writers would lose each other's updates (ADR-0026 §10).
+        let client = Arc::new(
+            NetState::new(Arc::new(signer(dir.join("agreement-client")))).with_holder(Arc::new(
+                otwono_netd::content::BrokeredCache::new(&store_socket, &perm_socket),
+            )),
+        );
 
         // The asking node's control plane, so net.fetch is exercised through a socket and a
         // capability check rather than as a function call.
@@ -1240,4 +1259,118 @@ fn a_node_that_does_not_replicate_asks_for_nothing() {
     drop(channel);
     let _ = serving.join();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The whole wire, both halves: a real TCP link and a real control plane (ADR-0026 §10).
+///
+/// Every other replication test drives the pass against an in-process `Cache`, which proves
+/// the protocol and says nothing about the split. This one goes through
+/// `NetState::replicate_from`, so the offer crosses a socket to a peer, the bytes come back
+/// over that socket, and the decision to keep them is made in the *other* process — the one
+/// that owns the cache index. If the daemon were opening the cache directly, this test
+/// would still pass and the node would still be wrong; what it checks is that the path that
+/// does not do that works.
+#[test]
+fn a_replica_crosses_a_link_and_the_control_plane_together() {
+    let h = Harness::start("brokered-replica");
+    let bytes = payload(6 * 1024, 91);
+    let id = h.put(&bytes, "replicated");
+    // Something the holder must not take, on the same node, so "took the right one" is a
+    // claim about choosing rather than about there being only one thing to choose.
+    let public = h.put(&payload(1024, 92), "public");
+
+    let outcome = h
+        .client
+        .replicate_from(&h.candidate())
+        .expect("a replication pass over a real link");
+
+    match &outcome {
+        otwono_netd::content::ReplicationPass::Took {
+            content_id,
+            size_bytes,
+        } => {
+            assert_eq!(content_id, &id, "took something other than the offered object");
+            assert_ne!(content_id, &public, "a PUBLIC object was replicated");
+            assert_eq!(*size_bytes, bytes.len() as u64);
+        }
+        other => panic!("expected to take the offered object, got {other:?}"),
+    }
+
+    // And it is really in the other process's cache, asked for over the control plane rather
+    // than read off a struct this test happens to be holding.
+    let token = h.token("cache.replicate");
+    let mut client = Client::connect(&h.store_socket).unwrap();
+    let room = client
+        .call_with_capability(
+            "cache.replica_room",
+            json!({ "candidates": [id, public] }),
+            &token,
+        )
+        .unwrap()
+        .expect("asking about room");
+    assert_eq!(
+        room["already_held"],
+        json!([id]),
+        "the store daemon does not have the replica the pass said it took"
+    );
+
+    // Asking again takes nothing: the object is already held, so the second pass finds the
+    // only offer filtered out. Without this, "took one" and "takes one every time" would be
+    // indistinguishable, and a node that meets a peer often would fill its budget with
+    // copies of the same object.
+    let again = h
+        .client
+        .replicate_from(&h.candidate())
+        .expect("a second pass is not an error");
+    assert_eq!(
+        again,
+        otwono_netd::content::ReplicationPass::NothingTaken { offered: 1 },
+        "took the same object twice"
+    );
+}
+
+/// A node whose broker refuses `cache.replicate` never opens a connection at all.
+///
+/// ADR-0026 §9 says a node that does not replicate makes no replication traffic. Checked
+/// here by pointing the holder at a broker that denies it and asserting the pass reports
+/// `NotReplicating` — the one outcome that is reached before the dial.
+#[test]
+fn a_node_whose_broker_refuses_replication_asks_nobody() {
+    let h = Harness::start("brokered-refused");
+    let _id = h.put(&payload(4096, 93), "replicated");
+
+    // A second broker, denying the one capability, on its own socket. Everything else about
+    // the node is unchanged, so a refusal here is about the capability and nothing else.
+    let deny_dir = h.dir.join("deny");
+    std::fs::create_dir_all(deny_dir.join("policy.d")).unwrap();
+    std::fs::write(
+        deny_dir.join("policy.d/10-deny.toml"),
+        "[[rule]]\naction = \"cache.replicate\"\ndecision = \"deny\"\n",
+    )
+    .unwrap();
+    let deny_socket = deny_dir.join("perm.sock");
+    let policy = Policy::load_dir(&deny_dir.join("policy.d")).unwrap();
+    policy.validate(&ActionRegistry::builtin()).unwrap();
+    let broker = Arc::new(Broker::new(
+        policy,
+        AuditLog::open(deny_dir.join("audit.jsonl")).unwrap(),
+    ));
+    let s = h.shutdown.clone();
+    let server = Server::bind(&deny_socket).unwrap();
+    std::thread::spawn(move || server.serve(broker, s));
+    Client::connect_waiting(&deny_socket, Duration::from_secs(5)).unwrap();
+
+    // Its own identity, signed through the *allowing* broker: only the holder is pointed at
+    // the denying one, so a refusal here cannot be a handshake that failed for another reason.
+    let (agreement, _) = AgreementKeystore::new(h.dir.join("agreement-refused"))
+        .load_or_generate()
+        .unwrap();
+    let signer = BrokeredSigner::bind(agreement, &h.id_socket, &h.perm_socket).expect("bind");
+    let refused = Arc::new(NetState::new(Arc::new(signer)).with_holder(Arc::new(
+        otwono_netd::content::BrokeredCache::new(&h.store_socket, &deny_socket),
+    )));
+    assert_eq!(
+        refused.replicate_from(&h.candidate()).expect("not an error"),
+        otwono_netd::content::ReplicationPass::NotReplicating
+    );
 }

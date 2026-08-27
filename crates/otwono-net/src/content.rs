@@ -290,7 +290,10 @@ pub enum Response {
     Chunk(ChunkPart),
     #[serde(rename = "shared_with_you")]
     SharedWithYou(SharedIndexPage),
-    #[serde(rename = "content.replicable")]
+    /// `replicable`, not `content.replicable`: that is the *request*'s method name, and a
+    /// reply tagged with a method name reads as one. Every other variant here is a bare
+    /// noun, and the schema is where the inconsistency showed up.
+    #[serde(rename = "replicable")]
     Replicable(ReplicablePage),
     /// Absent, refused, damaged, or not part of that object. One answer for all of them.
     #[serde(rename = "not_available")]

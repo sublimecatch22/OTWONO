@@ -24,6 +24,7 @@ OPTIONS:
     --id-socket <PATH>     Identity daemon socket (default $OTWONO_SOCKET_DIR/id.sock)
     --store-socket <PATH>  Content store socket (default $OTWONO_SOCKET_DIR/store.sock)
     --no-serve-content     Do not answer peers' content requests at all
+    --no-replicate         Never hold a replica for the cluster, whatever policy allows
     --export-dir <PATH>    Where objects fetched with to_file are written
                            (default /var/lib/otwono/net-export)
     --identity-dir <PATH>  Keystore directory (default /var/lib/otwono/identity)
@@ -89,6 +90,7 @@ fn run(args: &[String]) -> Result<String, Error> {
     let mut id_socket: Option<PathBuf> = None;
     let mut store_socket: Option<PathBuf> = None;
     let mut serve_content = true;
+    let mut replicate = true;
     let mut export_dir = PathBuf::from("/var/lib/otwono/net-export");
     let mut identity_dir = PathBuf::from(DEFAULT_IDENTITY_DIR);
     let mut listen = format!("0.0.0.0:{DEFAULT_PORT}");
@@ -109,6 +111,7 @@ fn run(args: &[String]) -> Result<String, Error> {
             "--id-socket" => id_socket = Some(next(&mut it, "--id-socket")?.into()),
             "--store-socket" => store_socket = Some(next(&mut it, "--store-socket")?.into()),
             "--no-serve-content" => serve_content = false,
+            "--no-replicate" => replicate = false,
             "--export-dir" => export_dir = next(&mut it, "--export-dir")?.into(),
             "--identity-dir" => identity_dir = next(&mut it, "--identity-dir")?.into(),
             "--listen" => listen = next(&mut it, "--listen")?,
@@ -242,7 +245,21 @@ fn run(args: &[String]) -> Result<String, Error> {
             store_socket.display()
         );
         state = state.with_responder(ContentResponder::new(&store_socket, &perm_socket));
+        // Replication needs the same store socket, and giving it one is not the decision to
+        // replicate: the broker's `cache.replicate` is, and a stock image does not grant it
+        // (ADR-0026 §10). Configuring it here and gating it there keeps the operator's
+        // consent in one place instead of two that can disagree.
+        if replicate {
+            state = state.with_holder(Arc::new(otwono_netd::content::BrokeredCache::new(
+                &store_socket,
+                &perm_socket,
+            )));
+        } else {
+            eprintln!("otwono-netd: holding no replicas for the cluster (--no-replicate)");
+        }
     } else {
+        // A node that will not serve does not replicate either. Holding a replica it would
+        // never hand to anyone is storage spent on nothing.
         eprintln!("otwono-netd: not serving content to peers (--no-serve-content)");
     }
     let state = Arc::new(state);

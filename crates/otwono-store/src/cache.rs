@@ -1006,6 +1006,72 @@ mod tests {
     }
 
     #[test]
+    fn a_node_with_no_budget_is_not_a_replica_holder_at_all() {
+        // Not "a holder with zero room": the pass has to be able to tell "I do not do this"
+        // from "I do this and am full", because only the first means make no traffic.
+        let c = cache("holder-off", 0);
+        assert!(ReplicaHolder::replica_room(&c, &[], 1_000).is_none());
+    }
+
+    #[test]
+    fn a_holder_reports_its_room_and_what_it_already_has() {
+        let c = cache("holder-room", 1 << 20);
+        let bytes = data(4096, 77);
+        let held = c
+            .insert(&bytes, Visibility::Replicated, 1_000)
+            .expect("insert")
+            .content_id
+            .to_hex();
+        let absent = "00".repeat(32);
+
+        let room = ReplicaHolder::replica_room(&c, &[held.clone(), absent.clone()], 1_000)
+            .expect("this node replicates");
+        assert_eq!(room.room_bytes, (1 << 20) - c.used_bytes());
+        assert_eq!(
+            room.already_held,
+            vec![held],
+            "the answer must name only what was asked about, and only what is there"
+        );
+        assert!(!room.already_held.contains(&absent));
+        let _ = std::fs::remove_dir_all(c.root());
+    }
+
+    #[test]
+    fn asking_for_room_releases_a_hold_that_has_run_out() {
+        // The sweep rides this call rather than a timer (ADR-0026 §9). If it did not, a node
+        // whose holds had all lapsed would report no room and quietly stop replicating.
+        let c = cache("holder-sweep", 1 << 20);
+        let policy = crate::object::Replication {
+            ttl_days: 1,
+            ..Default::default()
+        };
+        let taken = ReplicaHolder::take_replica(&c, &data(2048, 3), &policy, 1_000)
+            .expect("take")
+            .expect("taken");
+        assert_eq!(c.replicas_held(1_000), 1);
+
+        let a_day = 24 * 60 * 60 * 1000u64;
+        let room = ReplicaHolder::replica_room(&c, std::slice::from_ref(&taken.content_id), 1_000 + a_day)
+            .expect("still replicating");
+        assert_eq!(c.replicas_held(1_000 + a_day), 0, "the hold did not lapse");
+        // Lapsed is not deleted: the bytes stay as an ordinary evictable cache entry, so the
+        // holder still reports having them and a peer need not re-offer.
+        assert_eq!(room.already_held, vec![taken.content_id]);
+        let _ = std::fs::remove_dir_all(c.root());
+    }
+
+    #[test]
+    fn a_holder_refuses_what_will_not_fit_without_calling_it_an_error() {
+        let c = cache("holder-full", 4096);
+        let policy = crate::object::Replication::default();
+        let outcome = ReplicaHolder::take_replica(&c, &data(64 * 1024, 9), &policy, 1_000)
+            .expect("a refusal is not an error");
+        assert!(outcome.is_none(), "took an object larger than the budget");
+        assert!(c.is_empty());
+        let _ = std::fs::remove_dir_all(c.root());
+    }
+
+    #[test]
     fn a_chunk_that_fails_its_digest_is_recognisable_as_wrong() {
         let bytes = data(1024, 11);
         let honest = ChunkRef::of(&bytes).hex();
@@ -1013,5 +1079,98 @@ mod tests {
         let mut tampered = bytes.clone();
         tampered[0] ^= 1;
         assert!(!Cache::verify_chunk(&tampered, &honest));
+    }
+}
+
+/// Somewhere a replica can be put (ADR-0026 §10).
+///
+/// A replication pass has two halves in two processes: the link belongs to `otwono-netd`,
+/// and the cache belongs to `otwono-stored`. `otwono-netd` must not open the cache itself —
+/// two processes each holding their own in-memory copy of one on-disk index lose each
+/// other's updates and double-count the same budget, which is CLAUDE.md §2.4's "never
+/// through shared mutable state" with a file standing in for the shared global.
+///
+/// So the pass is written against this trait instead of against [`Cache`]. [`Cache`]
+/// implements it directly, which is what the tests drive with no daemon running;
+/// `otwono-netd` implements it over the control plane. The pass logic — what to take, in
+/// what order, and which checks to run before keeping anything — exists once, above both.
+///
+/// The three methods are exactly the three moments a pass has, and no more: it asks before
+/// it puts anything on the wire, it filters the offer page in one call rather than one call
+/// per offer, and it takes at most one object.
+pub trait ReplicaHolder {
+    /// How many more bytes this node will promise to hold, and which of `candidates` it
+    /// already has.
+    ///
+    /// `None` means this node does not replicate — a budget of zero, no cache at all, or an
+    /// operator who said no. The pass makes no replication traffic in that case rather than
+    /// asking and discarding the answer (ADR-0026 §9).
+    ///
+    /// Implementations sweep lapsed holds first, because the answer is about room and a hold
+    /// that has run out is not occupying any.
+    fn replica_room(&self, candidates: &[String], now_ms: u64) -> Option<ReplicaRoom>;
+
+    /// Take the bytes and promise to hold them for the policy's term.
+    ///
+    /// `Ok(None)` is "not this one" and not an error: the budget may have filled between the
+    /// question and the answer, or the object may be larger than it was advertised as.
+    fn take_replica(
+        &self,
+        bytes: &[u8],
+        policy: &crate::object::Replication,
+        now_ms: u64,
+    ) -> Result<Option<TakenReplica>, String>;
+}
+
+/// What a holder has room for, and what it need not be offered again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicaRoom {
+    /// Bytes still available under this node's budget. May be zero, which is a node that
+    /// replicates in principle and has no room today — distinct from `None`, which is a node
+    /// that does not replicate at all.
+    pub room_bytes: u64,
+    /// Which of the offered content ids this node already holds, in lowercase hex.
+    pub already_held: Vec<String>,
+}
+
+/// One object a holder agreed to keep.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TakenReplica {
+    pub content_id: String,
+    pub size_bytes: u64,
+}
+
+impl ReplicaHolder for Cache {
+    fn replica_room(&self, candidates: &[String], now_ms: u64) -> Option<ReplicaRoom> {
+        // Best-effort: failing to release lapsed holds costs this node room it could have
+        // had, which loses a replica rather than correctness.
+        let _ = self.expire_replicas(now_ms);
+        if !self.enabled() {
+            return None;
+        }
+        Some(ReplicaRoom {
+            room_bytes: self.budget_bytes().saturating_sub(self.used_bytes()),
+            already_held: candidates
+                .iter()
+                .filter(|hex| self.contains_hex(hex))
+                .cloned()
+                .collect(),
+        })
+    }
+
+    fn take_replica(
+        &self,
+        bytes: &[u8],
+        policy: &crate::object::Replication,
+        now_ms: u64,
+    ) -> Result<Option<TakenReplica>, String> {
+        match Cache::take_replica(self, bytes, policy, now_ms) {
+            Ok(Some(object)) => Ok(Some(TakenReplica {
+                content_id: object.content_id.to_hex(),
+                size_bytes: object.size_bytes,
+            })),
+            Ok(None) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
     }
 }

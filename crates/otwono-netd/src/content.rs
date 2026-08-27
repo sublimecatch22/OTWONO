@@ -517,6 +517,119 @@ impl ContentResponder {
     }
 }
 
+/// This daemon's view of the cluster cache, over the control plane (ADR-0026 §10).
+///
+/// The cache belongs to `otwono-stored` — that daemon opens it, holds its index in memory,
+/// and persists on every change. This daemon must not open the same directory: two
+/// processes each with their own copy of one index lose each other's updates and
+/// double-count the same budget. So every question goes over the socket, to the one process
+/// that can answer it correctly.
+///
+/// A token per call rather than a cached one, unlike [`ContentResponder`]'s `store.serve`:
+/// a pass happens when this node meets a peer, which is rare enough that the extra round
+/// trip costs nothing, and it means an operator who revokes `cache.replicate` stops
+/// replication at the next peer rather than whenever a cached token happens to expire.
+pub struct BrokeredCache {
+    store_socket: PathBuf,
+    perm_socket: PathBuf,
+}
+
+impl std::fmt::Debug for BrokeredCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrokeredCache")
+            .field("store", &self.store_socket)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BrokeredCache {
+    pub fn new(store_socket: impl AsRef<Path>, perm_socket: impl AsRef<Path>) -> Self {
+        BrokeredCache {
+            store_socket: store_socket.as_ref().to_path_buf(),
+            perm_socket: perm_socket.as_ref().to_path_buf(),
+        }
+    }
+
+    fn call(&self, method: &str, params: Value, reason: &str) -> Result<Value, String> {
+        let token = request_token(&self.perm_socket, otwono_stored::CAPABILITY_REPLICATE, reason)?;
+        let mut client = Client::connect(&self.store_socket)
+            .map_err(|e| format!("{}: {e}", self.store_socket.display()))?;
+        client
+            .call_with_capability(method, params, &token)
+            .map_err(|e| format!("{method}: {e}"))?
+            .map_err(|e| e.message)
+    }
+}
+
+impl otwono_store::ReplicaHolder for BrokeredCache {
+    /// A refusal reads as "this node does not replicate", and that is deliberate.
+    ///
+    /// The broker denying `cache.replicate`, the store being down, and a node configured
+    /// with no cache all mean the same thing to a pass: nothing will be held, so ask nobody.
+    /// Distinguishing them here would only give the pass more ways to be wrong; the operator
+    /// learns which it was from the log line, not from the network.
+    fn replica_room(&self, candidates: &[String], _now_ms: u64) -> Option<otwono_store::ReplicaRoom> {
+        let reply = match self.call(
+            "cache.replica_room",
+            json!({ "candidates": candidates }),
+            "otwono-netd is deciding whether to hold a replica for the cluster",
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("otwono-netd: not replicating: {e}");
+                return None;
+            }
+        };
+        if !reply.get("replicating").and_then(Value::as_bool).unwrap_or(false) {
+            return None;
+        }
+        Some(otwono_store::ReplicaRoom {
+            room_bytes: reply.get("room_bytes").and_then(Value::as_u64).unwrap_or(0),
+            already_held: reply
+                .get("already_held")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                .unwrap_or_default(),
+        })
+    }
+
+    fn take_replica(
+        &self,
+        bytes: &[u8],
+        policy: &otwono_store::object::Replication,
+        _now_ms: u64,
+    ) -> Result<Option<otwono_store::TakenReplica>, String> {
+        let reply = self.call(
+            "cache.take_replica",
+            json!({
+                "data": data_encoding::BASE64.encode(bytes),
+                "ttl_days": policy.ttl_days,
+                "max_size_bytes": policy.max_size_bytes,
+                "allow_rereplication": policy.allow_rereplication,
+            }),
+            "otwono-netd is holding a replica offered by a peer",
+        )?;
+        if !reply.get("taken").and_then(Value::as_bool).unwrap_or(false) {
+            return Ok(None);
+        }
+        // `taken: true` with no id would mean the store and this daemon disagree about what
+        // just happened, which is worth an error rather than a silent `None`.
+        let content_id = reply
+            .get("content_id")
+            .and_then(Value::as_str)
+            .ok_or("cache.take_replica said taken but named no object")?
+            .to_string();
+        let size_bytes = reply
+            .get("size_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(bytes.len() as u64);
+        Ok(Some(otwono_store::TakenReplica {
+            content_id,
+            size_bytes,
+        }))
+    }
+}
+
 fn request_token(perm_socket: &Path, action: &str, reason: &str) -> Result<String, String> {
     let mut broker = Client::connect(perm_socket).map_err(|e| format!("{}: {e}", perm_socket.display()))?;
     let value = broker
@@ -671,20 +784,20 @@ pub enum ReplicationPass {
 /// progress rather than repeatedly failing to fit anything.
 ///
 /// Lapsed holds are swept first, on the same trigger, so the subsystem needs no timer.
-pub fn replication_pass<L: LinkAdapter>(
+pub fn replication_pass<L: LinkAdapter, H: otwono_store::ReplicaHolder + ?Sized>(
     channel: &mut SecureChannel<L>,
     link: &LinkProperties,
-    cache: &otwono_store::Cache,
+    holder: &H,
     now_ms: u64,
 ) -> Result<ReplicationPass, ProtocolError> {
-    // Free what is no longer promised before deciding whether there is room. A failure here
-    // is not fatal to the pass: the worst case is that this node has less budget than it
-    // could have, which costs a replica rather than correctness.
-    let _ = cache.expire_replicas(now_ms);
-
     // The operator's consent, checked before anything reaches the wire. A node that does
     // not replicate makes no replication traffic at all rather than asking and discarding.
-    if !cache.enabled() || cache.used_bytes() >= cache.budget_bytes() {
+    // Lapsed holds are swept inside this call, on the same trigger, so the subsystem needs
+    // no timer (ADR-0026 §9).
+    let Some(room) = holder.replica_room(&[], now_ms) else {
+        return Ok(ReplicationPass::NotReplicating);
+    };
+    if room.room_bytes == 0 {
         return Ok(ReplicationPass::NotReplicating);
     }
 
@@ -693,9 +806,20 @@ pub fn replication_pass<L: LinkAdapter>(
     if offers.is_empty() {
         return Ok(ReplicationPass::NothingTaken { offered });
     }
-    let remaining = cache.budget_bytes().saturating_sub(cache.used_bytes());
-    offers.retain(|o| o.size_bytes <= o.max_size_bytes && o.size_bytes <= remaining);
-    offers.retain(|o| !cache.contains_hex(&o.content_id));
+    offers.retain(|o| o.size_bytes <= o.max_size_bytes && o.size_bytes <= room.room_bytes);
+
+    // One call for the whole page rather than one per offer: the holder may be another
+    // process, and a round trip per offer would make a large page cost more than the
+    // transfer it is trying to avoid.
+    let ids: Vec<String> = offers.iter().map(|o| o.content_id.clone()).collect();
+    let held = match holder.replica_room(&ids, now_ms) {
+        Some(r) => r.already_held,
+        // Between the two questions this node stopped replicating. Nothing has been taken
+        // and nothing needs undoing.
+        None => return Ok(ReplicationPass::NotReplicating),
+    };
+    offers.retain(|o| !held.contains(&o.content_id));
+
     offers.sort_by_key(|o| (o.size_bytes, o.content_id.clone()));
     let Some(pick) = offers.first().cloned() else {
         return Ok(ReplicationPass::NothingTaken { offered });
@@ -717,13 +841,13 @@ pub fn replication_pass<L: LinkAdapter>(
         max_size_bytes: pick.max_size_bytes,
         allow_rereplication: pick.allow_rereplication,
     };
-    match cache.take_replica(&fetched.bytes, &policy, now_ms) {
+    match holder.take_replica(&fetched.bytes, &policy, now_ms) {
         // Refused between the check and the take -- another thread filled the budget, or
         // the object turned out larger than advertised. Not an error: "not this one".
         Ok(None) => Ok(ReplicationPass::NothingTaken { offered }),
-        Ok(Some(object)) => Ok(ReplicationPass::Took {
-            content_id: object.content_id.to_hex(),
-            size_bytes: object.size_bytes,
+        Ok(Some(taken)) => Ok(ReplicationPass::Took {
+            content_id: taken.content_id,
+            size_bytes: taken.size_bytes,
         }),
         Err(e) => Err(ProtocolError::Mismatched(format!(
             "could not hold the replica: {e}"

@@ -337,3 +337,97 @@ fn the_schema_bounds_an_index_request_the_way_the_code_does() {
         .is_err());
     }
 }
+
+fn offer(byte: u8) -> otwono_net::content::ReplicableEntry {
+    otwono_net::content::ReplicableEntry {
+        content_id: id(byte),
+        size_bytes: 65_536,
+        ttl_days: 365,
+        max_size_bytes: 100 * 1024 * 1024,
+        allow_rereplication: true,
+    }
+}
+
+#[test]
+fn the_replicable_request_and_reply_validate() {
+    assert_valid(&encoded(&Request::Replicable {
+        after: None,
+        max_entries: 64,
+    }));
+    assert_valid(&encoded(&Request::Replicable {
+        after: Some(id(4)),
+        max_entries: 1,
+    }));
+    assert_valid(&encoded(&Response::Replicable(
+        otwono_net::content::ReplicablePage {
+            entries: vec![offer(5)],
+        },
+    )));
+    // An empty page answers "I offer nothing", "I do not replicate" and "I will not say"
+    // alike, so it has to be a legal reply rather than an omission.
+    assert_valid(&encoded(&Response::Replicable(
+        otwono_net::content::ReplicablePage { entries: vec![] },
+    )));
+}
+
+#[test]
+fn the_schema_refuses_an_offer_that_names_a_replica_count() {
+    // ADR-0026 §2 and §3: target_replicas is the owner's wish about the cluster, and a
+    // holder holds exactly one copy and cannot count the others. Putting it on the wire
+    // would hand a holder a number it cannot act on, and invite a second implementation to
+    // try — which is how the who-holds-what map gets built by accident.
+    let mut page = encoded(&Response::Replicable(otwono_net::content::ReplicablePage {
+        entries: vec![offer(6)],
+    }));
+    page["entries"][0]["target_replicas"] = serde_json::json!(3);
+    assert_invalid(&page, "an offer carrying a replica count");
+}
+
+#[test]
+fn the_schema_refuses_an_offer_request_that_names_who_is_asking() {
+    // The sharing index refuses this because the answer is scoped to the asker. This one
+    // refuses it for the opposite reason: the answer is scoped to nobody, every REPLICATED
+    // object is offered to every peer, and a field for the asker would imply a per-peer
+    // decision that is not made anywhere.
+    for field in ["peer", "node_id", "recipient", "for"] {
+        let mut request = encoded(&Request::Replicable {
+            after: None,
+            max_entries: 8,
+        });
+        request[field] = serde_json::json!("otw1somebody");
+        assert_invalid(&request, &format!("an offer request naming {field}"));
+        assert!(content::decode::<Request>(request.to_string().as_bytes()).is_err());
+    }
+}
+
+#[test]
+fn the_schema_refuses_terms_no_holder_could_honour() {
+    // A zero TTL has already expired and a zero size cap permits nothing. Both are refused
+    // rather than normalised: substituting a default would mean inventing terms on the
+    // owner's behalf, and the owner is the only one who gets to set them.
+    for (field, value) in [("ttl_days", 0), ("max_size_bytes", 0)] {
+        let mut page = encoded(&Response::Replicable(otwono_net::content::ReplicablePage {
+            entries: vec![offer(7)],
+        }));
+        page["entries"][0][field] = serde_json::json!(value);
+        assert_invalid(&page, &format!("an offer with {field} = {value}"));
+    }
+}
+
+#[test]
+fn the_schema_bounds_an_offer_request_the_way_the_code_does() {
+    for entries in [0u32, 257] {
+        let mut request = encoded(&Request::Replicable {
+            after: None,
+            max_entries: 8,
+        });
+        request["max_entries"] = serde_json::json!(entries);
+        assert_invalid(&request, &format!("max_entries {entries}"));
+        assert!(Request::Replicable {
+            after: None,
+            max_entries: entries
+        }
+        .validate()
+        .is_err());
+    }
+}

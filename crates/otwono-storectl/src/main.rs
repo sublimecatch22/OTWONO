@@ -522,21 +522,28 @@ fn render(command: &str, v: &Value) -> String {
         ),
         "cache-status" => {
             let mut out = format!(
-                "budget {} bytes, used {}, {} object(s)\n",
+                "budget {} bytes, used {}, {} object(s), {} replica(s) held\n",
                 n("budget_bytes"),
                 n("used_bytes"),
-                n("objects")
+                n("objects"),
+                n("replicas_held")
             );
             for e in v.get("entries").and_then(Value::as_array).into_iter().flatten() {
+                // Two independent flags, shown as two words. A pinned entry the operator
+                // chose to keep and a replica this node promised a peer are different
+                // commitments with different ends, and an entry can be both.
+                let mut flags = String::new();
+                if e.get("pinned").and_then(Value::as_bool).unwrap_or(false) {
+                    flags.push_str(" pinned");
+                }
+                if e.get("holds_a_replica").and_then(Value::as_bool).unwrap_or(false) {
+                    flags.push_str(" replica");
+                }
                 out.push_str(&format!(
                     "  {} {} bytes{}\n",
                     e.get("content_id").and_then(Value::as_str).unwrap_or("?"),
                     e.get("size_bytes").and_then(Value::as_u64).unwrap_or(0),
-                    if e.get("pinned").and_then(Value::as_bool).unwrap_or(false) {
-                        " pinned"
-                    } else {
-                        ""
-                    }
+                    flags
                 ));
             }
             out.push_str(&format!("note: {}\n", s("note")));

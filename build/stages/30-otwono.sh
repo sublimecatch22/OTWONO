@@ -295,13 +295,21 @@ subjects = ["uid:0"]
 decision = "allow"
 ttl_seconds = 300
 
-# store.serve and net.content are deliberately NOT granted, and they are the two that
-# matter. store.serve is the network boundary: it is what otwono-netd calls to hand an
-# object to a peer, and granting it is the decision to let this node serve the street.
-# net.content is the other direction, fetching from peers -- and holding is publishing, so a
-# node that fetches and caches tells its neighbours what it holds, and what a household
-# reads is partly inferable from what its node serves (ADR-0015). Both are costs an operator
-# agrees to, not defaults.
+# store.serve, net.content and cache.replicate are deliberately NOT granted, and they are
+# the three that matter. store.serve is the network boundary: it is what otwono-netd calls
+# to hand an object to a peer, and granting it is the decision to let this node serve the
+# street. net.content is the other direction, fetching from peers -- and holding is
+# publishing, so a node that fetches and caches tells its neighbours what it holds, and what
+# a household reads is partly inferable from what its node serves (ADR-0015).
+#
+# cache.replicate is narrower than either and absent for its own reason: it is what lets
+# this node hold content a *peer* offered, rather than content someone here asked for
+# (ADR-0026 §10). A stock node therefore replicates nothing at all -- it does not ask for
+# offers, so it makes no replication traffic -- until its operator says otherwise. That is
+# the shape ADR-0026 §1 chose: the holder consents, and a default grant would be consenting
+# on their behalf.
+#
+# All three are costs an operator agrees to, not defaults.
 POLICY
 
 log "installing the model publisher trust store"

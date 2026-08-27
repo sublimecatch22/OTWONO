@@ -198,13 +198,22 @@ GPU/NPU backends, and the tiered assistant shapes.
    ADR-0017 gave the ONM content-fetch protocol; `otwono-netd` calls `store.serve` and
    re-checks the label itself, with deliberately different code (`may_leave_a_node` is an
    allow-list of wire strings, not a call into `otwono-store`).
-4. Replication policy for `REPLICATED`. **decided and half built** — ADR-0026: replication
-   is pulled by a holder, never pushed by an owner, so consent is inherent and the whole
-   thing is best-effort by construction. The policy block is on the object record, and
-   `content.replicable` (§7) carries offers, a holder takes a copy and holds it to a TTL
-   (§8), and a pass runs on connection rather than on a timer (§9). An object has been
-   replicated between two nodes over a real channel. What remains is calling the pass from
-   the peer lifecycle, so it happens without a test driving it.
+4. ~~Replication policy for `REPLICATED`.~~ **built** — ADR-0026: replication is pulled by
+   a holder, never pushed by an owner, so consent is inherent and the whole thing is
+   best-effort by construction. The policy block is on the object record;
+   `content.replicable` (§7) carries offers; a holder takes a copy and holds it to a TTL
+   (§8); a pass runs on connection rather than on a timer (§9); and `otwono-netd` runs one
+   against each peer it dials, so it happens without a test driving it. The pass talks to
+   the cache over the control plane rather than opening it — the cache belongs to
+   `otwono-stored`, and two writers to one index lose each other's updates (§10).
+
+   Off by default and deliberately so: holding a replica needs `cache.replicate`, which a
+   stock image does not grant, and a node without it makes no replication traffic at all.
+
+   **Not yet verified between booted machines.** Everything above is unit, integration and
+   cross-process tested; `REPLICATED` still has no two-VM entry in
+   `docs/build/VERIFICATION-LOG.md` of the kind `SHARED` earned. Until it does, this is
+   `IMPLEMENTED` and not `VERIFIED`.
 5. ~~The **cluster cache** — a bounded, encrypted, tier-scaled contributed store
    (ADR-0015, `docs/services/CLUSTER-CACHE.md`).~~ **done**, including fan-out fetch
    and ADR-0018's file handoff for objects too large for the control plane. Chunking
@@ -219,9 +228,10 @@ link**: two booted VMs on a segment with no DHCP, mutually authenticated over No
 refusing the other a `PRIVATE` object it demonstrably holds, with the refusal byte-identical
 to the one an absent object gets. See `docs/build/VERIFICATION-LOG.md`.
 
-**Still outstanding here**, and named rather than folded into a later phase: the
-`REPLICATED` replication policy (item 4), which does not exist and fails closed. That is the
-right way for a feature to be missing but is not the same as being done.
+**Still outstanding here**, and named rather than folded into a later phase: `REPLICATED`
+(item 4) is implemented but has not been exercised between two booted machines the way
+`SHARED` has. The code path exists and is tested across processes; what is missing is the
+boot log, and an untested-on-real-hardware subsystem is not a finished one.
 
 `SHARED` is no longer on that list. It has now passed between two booted nodes end to end:
 each seals an object to the other, each asks what it has been sent, and each fetches and

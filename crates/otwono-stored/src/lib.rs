@@ -66,6 +66,13 @@ pub const CAPABILITY_UNWRAP: &str = "id.unwrap_shared";
 /// to write the user's own store (ADR-0015).
 pub const CAPABILITY_CACHE_READ: &str = "cache.read";
 pub const CAPABILITY_CACHE_WRITE: &str = "cache.write";
+/// Holding a replica for the cluster, deliberately not `cache.write` (ADR-0026 §10).
+///
+/// `cache.write` is *keep what I fetched* — the bytes are already on this machine because
+/// someone here asked for them. This is *keep what a stranger offered*, on a node that may
+/// be unattended. "Cache what I fetch, but do not host for strangers" is a sentence an
+/// operator will want to say, and only a separate capability lets them say it.
+pub const CAPABILITY_REPLICATE: &str = "cache.replicate";
 
 /// A cap on one inline object, in **raw** bytes before base64.
 ///
@@ -176,6 +183,32 @@ struct CachePutParams {
     /// and an unrecognised label parses as `private` and is therefore refused.
     #[serde(default)]
     visibility: Visibility,
+}
+
+/// How much room this node has to promise, and what it need not be offered again.
+///
+/// `candidates` is bounded by the offer page the caller is filtering, and the reply names
+/// only ids from it: this answers about what it was asked about, and never returns the
+/// cache listing — that is `cache.status`, and it needs `cache.read` (ADR-0026 §10).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplicaRoomParams {
+    #[serde(default)]
+    candidates: Vec<String>,
+}
+
+/// Take one object as a replica and hold it for the owner's term.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TakeReplicaParams {
+    /// Base64, subject to [`MAX_INLINE_BYTES`] like `store.put`.
+    data: String,
+    /// The owner's policy, as it was offered. Validated here rather than trusted: a peer
+    /// that offers a zero TTL or a zero size cap is offering something no holder can honour.
+    ttl_days: u32,
+    max_size_bytes: u64,
+    #[serde(default)]
+    allow_rereplication: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1144,8 +1177,107 @@ impl StoreService {
     }
 
     /// What the cache holds, and how much room is left.
+    /// How much this node will still promise, and which offered ids it already has.
+    ///
+    /// Lapsed holds are swept before the arithmetic, because the question is about room and
+    /// a hold that has run out is not occupying any (ADR-0026 §9). A node with no cache
+    /// answers `replicating: false` rather than erroring: "this node does not replicate" is
+    /// a true and useful answer to the question, not a fault.
+    fn handle_replica_room(&self, params: Value) -> Result<Value, RpcError> {
+        let p: ReplicaRoomParams = serde_json::from_value(params)
+            .map_err(|e| RpcError::invalid_params(format!("cache.replica_room: {e}")))?;
+        let Some(cache) = self.cache.as_ref() else {
+            return Ok(json!({
+                "schema_version": DESCRIBE_SCHEMA_VERSION,
+                "replicating": false,
+                "room_bytes": 0,
+                "already_held": Vec::<String>::new(),
+            }));
+        };
+        match otwono_store::ReplicaHolder::replica_room(
+            cache,
+            &p.candidates,
+            otwono_store::cache::now_unix_ms(),
+        ) {
+            Some(room) => Ok(json!({
+                "schema_version": DESCRIBE_SCHEMA_VERSION,
+                "replicating": true,
+                "room_bytes": room.room_bytes,
+                "already_held": room.already_held,
+            })),
+            None => Ok(json!({
+                "schema_version": DESCRIBE_SCHEMA_VERSION,
+                "replicating": false,
+                "room_bytes": 0,
+                "already_held": Vec::<String>::new(),
+            })),
+        }
+    }
+
+    /// Hold one object as a replica for the cluster (ADR-0026).
+    ///
+    /// `cache.put` with a promise attached, and the same inline cap. The budget check is
+    /// here rather than at the caller for the reason the whole method is here: this is the
+    /// only process that can see the budget, and a caller's arithmetic about somebody
+    /// else's index is a guess.
+    ///
+    /// `taken: false` is a refusal, not an error. The budget may have filled since the
+    /// caller asked, or the object may be larger than it was advertised as — both are "not
+    /// this one", and a caller that treated them as failures would retry a decision this
+    /// node already made.
+    fn handle_take_replica(&self, params: Value) -> Result<Value, RpcError> {
+        let p: TakeReplicaParams = serde_json::from_value(params)
+            .map_err(|e| RpcError::invalid_params(format!("cache.take_replica: {e}")))?;
+        let bytes = data_encoding::BASE64
+            .decode(p.data.as_bytes())
+            .map_err(|e| RpcError::invalid_params(format!("data must be base64: {e}")))?;
+        if bytes.len() > MAX_INLINE_BYTES {
+            return Err(RpcError::invalid_params(format!(
+                "{} bytes is over the {MAX_INLINE_BYTES}-byte inline cap",
+                bytes.len()
+            )));
+        }
+        let policy = otwono_store::object::Replication {
+            // Not the owner's number. A holder holds one copy; `target_replicas` is a wish
+            // about the cluster that no single holder can act on (ADR-0026 §2, §3), and
+            // carrying it here would invite somebody to try.
+            target_replicas: 1,
+            ttl_days: p.ttl_days,
+            max_size_bytes: p.max_size_bytes,
+            allow_rereplication: p.allow_rereplication,
+        };
+        policy
+            .validate()
+            .map_err(|e| RpcError::invalid_params(format!("cache.take_replica: {e}")))?;
+        let cache = self.cache()?;
+        let taken = otwono_store::ReplicaHolder::take_replica(
+            cache,
+            &bytes,
+            &policy,
+            otwono_store::cache::now_unix_ms(),
+        )
+        .map_err(RpcError::internal)?;
+        Ok(match taken {
+            Some(t) => json!({
+                "schema_version": DESCRIBE_SCHEMA_VERSION,
+                "taken": true,
+                "content_id": t.content_id,
+                "size_bytes": t.size_bytes,
+                "cache_used_bytes": cache.used_bytes(),
+                "cache_budget_bytes": cache.budget_bytes(),
+            }),
+            None => json!({
+                "schema_version": DESCRIBE_SCHEMA_VERSION,
+                "taken": false,
+                "cache_used_bytes": cache.used_bytes(),
+                "cache_budget_bytes": cache.budget_bytes(),
+            }),
+        })
+    }
+
     fn handle_cache_status(&self, _params: Value) -> Result<Value, RpcError> {
         let cache = self.cache()?;
+        let now = otwono_store::cache::now_unix_ms();
         let entries: Vec<Value> = cache
             .entries()
             .iter()
@@ -1155,6 +1287,12 @@ impl StoreService {
                     "size_bytes": e.size_bytes,
                     "last_access_ms": e.last_access_ms,
                     "pinned": e.pinned,
+                    // Reported separately from `pinned` because they are separate decisions:
+                    // a pin is a person keeping something, a hold is a promise to a peer
+                    // that runs out (ADR-0026). Folding them together would let a TTL sweep
+                    // look like it had unpinned something.
+                    "holds_a_replica": e.holds_a_live_replica(now),
+                    "replica_expires_ms": e.replica_expires_ms,
                 })
             })
             .collect();
@@ -1163,6 +1301,7 @@ impl StoreService {
             "budget_bytes": cache.budget_bytes(),
             "used_bytes": cache.used_bytes(),
             "objects": entries.len(),
+            "replicas_held": cache.replicas_held(now),
             "entries": entries,
             // Stated on every call, because an operator has to be told and a UI that has to
             // remember to say it is a UI that will forget.
@@ -1429,6 +1568,16 @@ impl Service for StoreService {
                     CAPABILITY_CACHE_WRITE,
                 ),
                 MethodDescription::guarded(
+                    "cache.replica_room",
+                    "How much this node will still promise, and which offered ids it holds",
+                    CAPABILITY_REPLICATE,
+                ),
+                MethodDescription::guarded(
+                    "cache.take_replica",
+                    "Hold an object offered by a peer as a replica for the cluster",
+                    CAPABILITY_REPLICATE,
+                ),
+                MethodDescription::guarded(
                     "cache.get",
                     "Read a cached object, counting it as a local use",
                     CAPABILITY_CACHE_READ,
@@ -1510,6 +1659,14 @@ impl Service for StoreService {
             "cache.put" => {
                 self.authorize(ctx, CAPABILITY_CACHE_WRITE)?;
                 self.handle_cache_put(params)
+            }
+            "cache.replica_room" => {
+                self.authorize(ctx, CAPABILITY_REPLICATE)?;
+                self.handle_replica_room(params)
+            }
+            "cache.take_replica" => {
+                self.authorize(ctx, CAPABILITY_REPLICATE)?;
+                self.handle_take_replica(params)
             }
             "cache.get" => {
                 self.authorize(ctx, CAPABILITY_CACHE_READ)?;

@@ -57,6 +57,16 @@ action = "net.content"
 subjects = ["uid:0"]
 decision = "allow"
 ttl_seconds = 300
+
+# The third boundary capability, and the one that acts on its own: with this granted, a node
+# takes a copy of what a peer offers when it dials, without anything asking it to (ADR-0026).
+# That is precisely what the check below is for, and precisely why a release image does not
+# grant it -- holding a stranger's bytes is a cost an operator agrees to, not a default.
+[[rule]]
+action = "cache.replicate"
+subjects = ["uid:0"]
+decision = "allow"
+ttl_seconds = 300
 POLICY
 chmod 0644 "$ROOTFS/etc/otwono/policy.d/91-mesh-content-smoke.toml"
 
@@ -120,7 +130,7 @@ UNIT
 chroot "$ROOTFS" systemctl enable otwono-mesh-content-check.service 2>/dev/null \
     || warn "could not enable otwono-mesh-content-check.service"
 
-log "NOTE: this image grants store.serve and net.content. It is a test image."
+log "NOTE: this image grants store.serve, net.content and cache.replicate. It is a test image."
 manifest_add "mesh-content-smoke" "policy drop-in and boot check installed"
 stage_mark_complete 37-mesh-content-smoke
 stage_done
