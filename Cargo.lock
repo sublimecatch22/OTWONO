@@ -1247,6 +1247,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "otwono-envelope"
+version = "0.1.0"
+dependencies = [
+ "otwono-identity",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "otwono-fetch"
 version = "0.1.0"
 dependencies = [

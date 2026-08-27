@@ -1,0 +1,15 @@
+[package]
+name = "otwono-envelope"
+description = "Addressed messages: the relay-visible descriptor of a sealed envelope, and the custody rules a carrier follows."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+otwono-identity = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -42,3 +42,4 @@ Rules:
 | 0025 | Render every address family, and decide the chain later | accepted |
 | 0026 | Replication is pulled, never pushed, and it is best-effort by construction | accepted |
 | 0027 | Signed mutable pointers: sequence numbers, not timestamps, and rollback is the threat | accepted |
+| 0028 | Addressed messages: the envelope already exists, so store-and-forward is about custody, and it is pulled | accepted |

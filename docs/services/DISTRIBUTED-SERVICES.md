@@ -1,13 +1,14 @@
 # Distributed Services
 
-**Status:** `SPECIFIED`, with the second primitive built.
+**Status:** `SPECIFIED`, with the first two primitives built and the third's rules written.
 
 Primitive 1 (content-addressed blocks) is `VERIFIED` — `otwono-store`, ADR-0016, exercised
 between booted nodes. Primitive 2 (signed mutable pointers) is `IMPLEMENTED` per ADR-0027:
 the record and its rollback rules in `otwono-pointer`, durable storage in
 `otwono-store::PointerStore`, and `content.pointer` on the wire — a pointer crosses a real
 channel and is verified against the key the Noise handshake proved. Primitive 3 (addressed
-messages) does not exist, and no service in §2 is built.
+messages) is `SPECIFIED` per ADR-0028 with its custody rules `IMPLEMENTED` in
+`otwono-envelope`; nothing of it has crossed a link. No service in §2 is built.
 
 **Verified between booted nodes** on 2026-08-27: two VMs each published `wiki/Getting-Started`
 and each resolved the other's, then fetched the object it named. See
@@ -44,7 +45,13 @@ We are not building eight independent systems. Every service is composed from:
    out of date, so a reader that trusted the signature alone could be rolled back to any
    historical version. The defence is state the reader keeps, and a first read has none.
 3. **Addressed messages** — end-to-end encrypted envelopes to a NodeID or UserID, with
-   store-and-forward for offline recipients.
+   store-and-forward for offline recipients. The envelope half is **already built**: ADR-0019
+   seals a payload to a recipient's sharing key and ADR-0020 lets that recipient discover it
+   over the mesh, both verified between booted nodes. What was missing is the clause after
+   the comma — that discovery is a question asked of *the sender*, so delivery needed both
+   parties online at once. ADR-0028 settles the rest: store-and-forward is about **custody**,
+   and a carrier **pulls** rather than being pushed to, so consent stays inherent as it is
+   for replication (ADR-0026 §1).
 
 If a proposed service cannot be expressed in these three, that is a signal to re-examine
 the design before adding a fourth primitive.

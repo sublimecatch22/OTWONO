@@ -291,7 +291,13 @@ it a worse record.
 booted nodes, and the rollback rule that makes a mutable name safe on an untrusted network
 is on the fetch path rather than beside it (ADR-0027 §7) — two VMs took each other's update
 and then refused each other's rolled-back record. Primitive 3 — addressed messages — has not
-started, and none of the three services has.
+started as anything that crosses a link — but most of it turned out to exist already.
+ADR-0019's sealing and ADR-0020's discovery are an encrypted envelope addressed to a NodeID,
+verified between booted nodes; what was missing is that the discovery is a question asked of
+the *sender*, so delivery needed both parties online. ADR-0028 settles the remainder as a
+custody question and keeps it **pulled** rather than pushed, so a relay's consent is inherent
+the way a replica holder's is. Its rules are implemented and unit-tested in
+`otwono-envelope`. None of the three services is built.
 
 **Exit criterion:** a three-node QEMU network where node A's wiki page is readable on node
 B, an offline message to node C is delivered when C returns, and a network partition heals
