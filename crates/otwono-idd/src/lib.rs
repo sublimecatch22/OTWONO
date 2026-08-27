@@ -40,13 +40,9 @@ pub const CAPABILITY_BIND: &str = "id.bind_agreement";
 pub const CAPABILITY_ROTATE: &str = "id.rotate";
 pub const CAPABILITY_UNWRAP: &str = "id.unwrap_shared";
 
-/// Domain prefix for anything signed on a caller's behalf.
-///
-/// Without this, `id.sign` would be a signing oracle: a caller could ask for a signature
-/// over bytes that happen to be a valid agreement binding or succession record and use the
-/// result to impersonate the node's own protocol messages. Every internal message type has
-/// its own distinct prefix, so a signature made here can never be replayed as one of them.
-pub const APPLICATION_DOMAIN: &[u8] = b"otwono-application-v1:";
+/// Re-exported: the constant lives in `otwono-identity` so that libraries which verify
+/// these signatures do not have to depend on this daemon to learn the prefix.
+pub use otwono_identity::APPLICATION_DOMAIN;
 
 pub struct IdentityService {
     keystore: SigningKeystore,
@@ -281,12 +277,7 @@ impl IdentityService {
     }
 }
 
-/// Prefix a caller's payload so its signature cannot be reused as a protocol message.
-pub fn domain_separated(payload: &[u8]) -> Vec<u8> {
-    let mut m = APPLICATION_DOMAIN.to_vec();
-    m.extend_from_slice(payload);
-    m
-}
+pub use otwono_identity::domain_separated;
 
 impl Service for IdentityService {
     fn describe(&self) -> ServiceDescription {

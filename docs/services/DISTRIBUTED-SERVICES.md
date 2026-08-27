@@ -1,6 +1,12 @@
 # Distributed Services
 
-**Status:** `SPECIFIED`. No implementation yet.
+**Status:** `SPECIFIED`, with the second primitive built.
+
+Primitive 1 (content-addressed blocks) is `VERIFIED` — `otwono-store`, ADR-0016, exercised
+between booted nodes. Primitive 2 (signed mutable pointers) is `IMPLEMENTED` in
+`otwono-pointer` per ADR-0027: the record, its canonical encoding, and the rollback rules,
+unit tested with no network. Nothing yet fetches a pointer from a peer, and primitive 3
+(addressed messages) does not exist. No service in §2 is built.
 
 ## 1. Three primitives, many services
 
@@ -8,7 +14,10 @@ We are not building eight independent systems. Every service is composed from:
 
 1. **Content-addressed blocks** — immutable, BLAKE3-addressed, chunked, deduplicated.
 2. **Signed mutable pointers** — a NodeID-owned, monotonically-sequenced record naming a
-   current CID. This is how anything changes over time.
+   current CID. This is how anything changes over time. Built (ADR-0027). The sequence is
+   not decoration: an old pointer is genuinely signed by its rightful owner and is simply
+   out of date, so a reader that trusted the signature alone could be rolled back to any
+   historical version. The defence is state the reader keeps, and a first read has none.
 3. **Addressed messages** — end-to-end encrypted envelopes to a NodeID or UserID, with
    store-and-forward for offline recipients.
 

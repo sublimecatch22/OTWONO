@@ -15,6 +15,7 @@ otwono-ai = { path = "../../crates/otwono-ai" }
 otwono-fetch = { path = "../../crates/otwono-fetch" }
 otwono-store = { path = "../../crates/otwono-store" }
 otwono-identity = { path = "../../crates/otwono-identity" }
+otwono-pointer = { path = "../../crates/otwono-pointer" }
 otwono-net = { path = "../../crates/otwono-net" }
 data-encoding = "2"
 serde = "1"

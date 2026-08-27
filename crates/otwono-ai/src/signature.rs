@@ -188,7 +188,7 @@ impl ModelManifest {
             obj.remove("signature");
         }
         let mut message = MANIFEST_DOMAIN.to_vec();
-        write_canonical(&value, &mut message);
+        message.extend_from_slice(&otwono_identity::canonical_json(&value));
         Ok(message)
     }
 
@@ -237,49 +237,6 @@ fn decode_key(base64: &str) -> Result<[u8; 32], String> {
 }
 
 /// Serialize `value` deterministically: object keys sorted, no insignificant whitespace.
-fn write_canonical(value: &serde_json::Value, out: &mut Vec<u8>) {
-    match value {
-        serde_json::Value::Object(map) => {
-            // Sorted explicitly. See the module docs: relying on serde_json's map type
-            // would tie the meaning of every signature to a feature flag.
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            out.push(b'{');
-            for (i, key) in keys.iter().enumerate() {
-                if i > 0 {
-                    out.push(b',');
-                }
-                write_json_string(key, out);
-                out.push(b':');
-                write_canonical(&map[*key], out);
-            }
-            out.push(b'}');
-        }
-        serde_json::Value::Array(items) => {
-            out.push(b'[');
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push(b',');
-                }
-                write_canonical(item, out);
-            }
-            out.push(b']');
-        }
-        serde_json::Value::String(s) => write_json_string(s, out),
-        // Numbers here are integers by construction (the manifest has no float fields),
-        // so their textual form is unambiguous.
-        other => out.extend_from_slice(other.to_string().as_bytes()),
-    }
-}
-
-fn write_json_string(s: &str, out: &mut Vec<u8>) {
-    out.extend_from_slice(
-        serde_json::to_string(s)
-            .expect("a string always serializes")
-            .as_bytes(),
-    );
-}
-
 /// Signing helpers for tests in this crate and in others.
 ///
 /// Public behind a feature rather than `#[cfg(test)]` because integration tests in other
@@ -447,11 +404,12 @@ mod tests {
 
     #[test]
     fn canonical_output_is_sorted_and_compact() {
+        // The canonicalizer itself now lives in otwono-identity, so that the manifest and
+        // the pointer record cannot drift into two encodings whose signatures disagree
+        // (ADR-0027 §5). This asserts the manifest still gets those bytes.
         let value = serde_json::json!({ "z": 1, "a": { "y": [3, 2], "b": "x" } });
-        let mut out = Vec::new();
-        write_canonical(&value, &mut out);
         assert_eq!(
-            String::from_utf8(out).unwrap(),
+            String::from_utf8(otwono_identity::canonical_json(&value)).unwrap(),
             r#"{"a":{"b":"x","y":[3,2]},"z":1}"#,
             "keys sorted, array order preserved, no whitespace"
         );

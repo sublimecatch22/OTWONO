@@ -1388,6 +1388,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "otwono-pointer"
+version = "0.1.0"
+dependencies = [
+ "data-encoding",
+ "otwono-identity",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "otwono-proto"
 version = "0.1.0"
 dependencies = [
@@ -1409,6 +1419,7 @@ dependencies = [
  "otwono-identity",
  "otwono-llama",
  "otwono-net",
+ "otwono-pointer",
  "otwono-store",
  "serde",
  "serde_json",

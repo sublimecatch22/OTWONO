@@ -45,7 +45,10 @@ pub use keystore::{
     SHARING_KEY_FILE, SIGNING_KEY_FILE,
 };
 pub use node_id::{NodeId, NodeIdError};
-pub use signer::{session_proof_message, SessionSigner, SignerError, HANDSHAKE_HASH_LEN, SESSION_DOMAIN};
+pub use signer::{
+    domain_separated, session_proof_message, SessionSigner, SignerError, APPLICATION_DOMAIN,
+    HANDSHAKE_HASH_LEN, SESSION_DOMAIN,
+};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -701,6 +704,106 @@ mod tests {
         assert_eq!(
             verify_signature(&id.public_key_bytes(), b"x", &[0u8; 10]),
             Err(IdentityError::MalformedSignature)
+        );
+    }
+}
+
+/// Canonical JSON encoding, for anything whose meaning is fixed by a signature.
+///
+/// # Why this exists here rather than beside its first caller
+///
+/// Two canonicalizers is one more than the system can have. If the model manifest and the
+/// pointer record each had their own, a divergence between them would not be a compile
+/// error or a test failure — it would be signatures that verify in one crate and not the
+/// other, discovered by a user whose data would not load. So there is one, in the crate that
+/// owns signing, and everything that signs structured data uses it.
+///
+/// # Why it is written out rather than delegated
+///
+/// `serde_json`'s object type preserves insertion order or sorts, depending on the
+/// `preserve_order` feature — which any transitive dependency can turn on. Delegating would
+/// tie the meaning of every signature in OTWONO to a Cargo feature nobody is watching
+/// (ADR-0011, and now ADR-0027 §5).
+///
+/// Keys are sorted, arrays keep their order (their order is data), and there is no
+/// insignificant whitespace.
+pub fn canonical_json(value: &serde_json::Value) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_canonical(value, &mut out);
+    out
+}
+
+fn write_canonical(value: &serde_json::Value, out: &mut Vec<u8>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            out.push(b'{');
+            for (i, key) in keys.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                write_json_string(key, out);
+                out.push(b':');
+                write_canonical(&map[*key], out);
+            }
+            out.push(b'}');
+        }
+        serde_json::Value::Array(items) => {
+            out.push(b'[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                write_canonical(item, out);
+            }
+            out.push(b']');
+        }
+        serde_json::Value::String(s) => write_json_string(s, out),
+        // Every signed record in OTWONO has integer fields only, so the textual form of a
+        // number is unambiguous. A float would not be, and adding one to a signed record
+        // needs this function revisited rather than trusted.
+        other => out.extend_from_slice(other.to_string().as_bytes()),
+    }
+}
+
+fn write_json_string(s: &str, out: &mut Vec<u8>) {
+    out.extend_from_slice(
+        serde_json::to_string(s)
+            .expect("a string always serializes")
+            .as_bytes(),
+    );
+}
+
+#[cfg(test)]
+mod canonical_tests {
+    use super::canonical_json;
+
+    #[test]
+    fn keys_are_sorted_and_arrays_are_not() {
+        let value = serde_json::json!({ "z": 1, "a": { "y": [3, 2], "b": "x" } });
+        assert_eq!(
+            String::from_utf8(canonical_json(&value)).unwrap(),
+            r#"{"a":{"b":"x","y":[3,2]},"z":1}"#,
+            "keys sorted, array order preserved, no whitespace"
+        );
+    }
+
+    #[test]
+    fn the_same_content_in_a_different_order_canonicalizes_the_same() {
+        // The failure this prevents: a record re-serialized by another tool, with the same
+        // content in a different order, failing to verify.
+        let a = serde_json::json!({ "one": 1, "two": 2, "three": 3 });
+        let b: serde_json::Value = serde_json::from_str(r#"{"three":3,"one":1,"two":2}"#).unwrap();
+        assert_eq!(canonical_json(&a), canonical_json(&b));
+    }
+
+    #[test]
+    fn strings_that_need_escaping_are_escaped_once() {
+        let value = serde_json::json!({ "k": "a\"b\\c\nd" });
+        assert_eq!(
+            String::from_utf8(canonical_json(&value)).unwrap(),
+            r#"{"k":"a\"b\\c\nd"}"#
         );
     }
 }

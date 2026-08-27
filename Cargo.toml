@@ -26,6 +26,7 @@ members = [
     "crates/otwono-aid",
     "crates/otwono-agent",
     "crates/otwono-agentctl",
+    "crates/otwono-pointer",
     "tests/schema",
     "tests/control-plane",
 ]
@@ -46,6 +47,7 @@ otwono-hal = { path = "crates/otwono-hal" }
 otwono-capability = { path = "crates/otwono-capability" }
 otwono-ai = { path = "crates/otwono-ai" }
 otwono-agent = { path = "crates/otwono-agent" }
+otwono-pointer = { path = "crates/otwono-pointer" }
 otwono-llama = { path = "crates/otwono-llama" }
 otwono-identity = { path = "crates/otwono-identity" }
 otwono-net = { path = "crates/otwono-net" }

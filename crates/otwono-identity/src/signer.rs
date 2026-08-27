@@ -22,6 +22,27 @@ use zeroize::Zeroizing;
 /// Domain tag for the per-session signature, distinct from every other signing context.
 pub const SESSION_DOMAIN: &[u8] = b"otwono-session-v1:";
 
+/// Prefix for signatures made on an application's behalf through `id.sign`.
+///
+/// Here rather than in `otwono-idd` because it is a *contract*, not a daemon detail: the
+/// daemon produces these signatures and libraries all over the system verify them, and a
+/// verifier that had to depend on a daemon crate to learn the prefix would either grow that
+/// dependency or copy the constant. The second is how two definitions drift apart and
+/// signatures stop verifying for reasons nobody can see.
+///
+/// Without it `id.sign` would be a signing oracle: a caller could ask for a signature over
+/// bytes that happen to be a valid agreement binding or succession record and replay the
+/// result as the node's own protocol message. Every internal message type has its own
+/// distinct prefix, so a signature made through `id.sign` can never be one of them.
+pub const APPLICATION_DOMAIN: &[u8] = b"otwono-application-v1:";
+
+/// Prefix a caller's payload so its signature cannot be reused as a protocol message.
+pub fn domain_separated(payload: &[u8]) -> Vec<u8> {
+    let mut m = APPLICATION_DOMAIN.to_vec();
+    m.extend_from_slice(payload);
+    m
+}
+
 /// Length of the Noise handshake hash a session proof signs.
 ///
 /// `Noise_..._BLAKE2s` produces 32 bytes. The length is checked rather than assumed

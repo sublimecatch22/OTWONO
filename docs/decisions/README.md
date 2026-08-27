@@ -41,3 +41,4 @@ Rules:
 | 0024 | The confirmation channel: asynchronous, bound to one request, and refused to the subject that asked | accepted |
 | 0025 | Render every address family, and decide the chain later | accepted |
 | 0026 | Replication is pulled, never pushed, and it is best-effort by construction | accepted |
+| 0027 | Signed mutable pointers: sequence numbers, not timestamps, and rollback is the threat | accepted |

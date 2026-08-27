@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://otwono.org/schemas/pointer-1.0.0.json",
+  "title": "OTWONO Signed Mutable Pointer",
+  "description": "A signed, monotonically sequenced binding from (node_id, service, name) to a content id (ADR-0027). This is the second of the three primitives every OTWONO service is composed from: content addressing gives immutability, and this is how anything changes over time. The threat it defends against is rollback, not forgery -- an old record is genuinely signed by the rightful owner and is simply out of date, so the defence is the sequence number plus state the reader keeps, never the signature alone.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "node_id",
+    "service",
+    "name",
+    "sequence",
+    "published_at_ms",
+    "signature"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$"
+    },
+    "node_id": {
+      "type": "string",
+      "description": "The owner, as NodeId::to_text produces it: the prefix otw1 followed by 55 characters of lowercase Crockford base32 over a 34-byte multihash. This is the FULL form, deliberately not the otw1:xxxx-xxxx-xxxx-xxxx fingerprint -- that one is truncated for people to read aloud and is documented as never being what a trust decision is made against. A record identified by a truncated id would be a weaker claim than the signature it carries. Exactly one node may write a given pointer, which is why there is no concurrent-write conflict to resolve and no merge rule (ADR-0027 §3).",
+      "pattern": "^otw1[0-9abcdefghjkmnpqrstvwxyz]{55}$"
+    },
+    "service": {
+      "type": "string",
+      "description": "Which service's namespace this name lives in: wiki, profile, forum. Part of the signed record and not derived from where the record was found -- otherwise a valid pointer could be lifted from one namespace and served under another, with the signature still verifying (ADR-0027 §6).",
+      "pattern": "^[a-z][a-z0-9-]{0,31}$"
+    },
+    "name": {
+      "type": "string",
+      "description": "The path within that service, e.g. a wiki page title. Signed for the same reason `service` is.",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "sequence": {
+      "type": "integer",
+      "description": "Strictly increasing, chosen by the owner. This is the whole rollback defence: a reader remembers the highest it has seen and REJECTS anything lower. Not a timestamp -- clocks disagree, and ordering by wall clock orders by whose clock is furthest ahead (ADR-0027 §2).",
+      "minimum": 1,
+      "maximum": 18446744073709551615
+    },
+    "content_id": {
+      "$ref": "#/$defs/digest",
+      "description": "What the name currently points at. ABSENT is a tombstone: the owner saying this no longer exists, signed and sequenced like any other update. Absent rather than a deleted record, because a reader that saw version 5 and now sees nothing cannot tell 'deleted' from 'never existed' from 'the peer is withholding it' (ADR-0027 §4)."
+    },
+    "published_at_ms": {
+      "type": "integer",
+      "description": "When the owner says it published this. Signed, and shown to people, because 'when did this change' is a real question. NEVER used for ordering -- see `sequence`. A record with a future timestamp and a lower sequence still loses.",
+      "minimum": 0
+    },
+    "signature": {
+      "type": "string",
+      "description": "Base64 Ed25519 signature over the canonical encoding of this object with `signature` removed, prefixed with `otwono-pointer-v1:`, then signed through id.sign which adds its own `otwono-application-v1:` domain. Both prefixes are needed: the outer stops replay as a session signature, the inner stops replay as a different application record.",
+      "pattern": "^[A-Za-z0-9+/]{86}==$"
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "description": "A BLAKE3 digest as 64 lowercase hex characters. Lowercase is required rather than normalised: these are compared byte for byte everywhere else, and two spellings would be two objects.",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}
