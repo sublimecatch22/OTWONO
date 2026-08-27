@@ -130,6 +130,84 @@ discards by id, and one that serves a three-day-old envelope has done its job. S
 sequence, no reader-held state, and none of ADR-0027's machinery here. Staleness is bounded
 by §3's expiry and nothing else needs bounding.
 
+### 7. A carrier may re-relay, and it could not have been otherwise
+
+**Settled 2026-08-27.** The question as posed — *may a relay offer onward what it is
+carrying?* — presupposes that a carrier can tell an offer from the sender apart from an offer
+from another carrier. **It cannot.** §1 removed the sender field and there is no hop count,
+so the two cases are indistinguishable in the record. Re-relay is not a permission that could
+be granted or withheld; it is what the descriptor's shape already implies.
+
+Which leaves the real question: should a distinguisher be added so the choice becomes
+available? No, and the reason is §4.
+
+A hop count is the obvious candidate, and it leaks. An envelope arriving with its counter at
+the maximum has travelled nowhere, so the carrier receiving it is almost certainly talking to
+the sender. That hands every relay a decent guess at exactly the thing §4 works to keep away
+from it. A field whose purpose is to bound amplification would end up de-anonymising the
+sender, which is a bad trade for a bound that only honest carriers respect anyway.
+
+So amplification is bounded by three things instead, and only one of them asks a carrier to
+be honest:
+
+- **Absolute expiry** (§3). A hard stop that no carrier can extend.
+- **Each carrier's own budget and size cap.** The bound that matters, and the one nobody
+  else can forge: a carrier holds what it agreed to hold and no more. No node can be harmed
+  past the limit its own operator set, which is ADR-0026's consent argument unchanged.
+- **Drop on delivery.** A carrier that has handed an envelope to its recipient drops it.
+
+That last one is free, and it is worth being precise about why, because §5 refuses an
+acknowledgement on privacy grounds and this looks like one. It is not. A carrier that hands
+an envelope over has just spoken to the recipient — it already knows the recipient is
+reachable, and dropping the envelope tells it nothing further. **Local delivery knowledge is
+free; end-to-end delivery knowledge is not.** §5's refusal is about telling the *sender*,
+who learned nothing by being there.
+
+The cost of allowing re-relay, stated plainly: **every hop is another party that learns the
+recipient, the size, and the timing.** That is inherent to carrying mail through strangers
+and cannot be designed away while multi-hop delivery is wanted — and it is wanted, because a
+single-hop rule would mean delivery only ever happens when one carrier meets both parties,
+which on a sparse or mobile mesh is most of the time never.
+
+Note what makes this different from ADR-0026 §5, where `allow_rereplication: false` exists as
+a request. A replica's audience is everyone, so an owner may reasonably want holders to be
+leaves. An envelope's audience is exactly one node. There is nothing to scope, and no
+sensible thing for a sender to ask for.
+
+### 8. Carrying mail is a separate budget and a separate capability from the cluster cache
+
+**Settled 2026-08-27.** Two budgets, not one, and `envelope.carry` in the broker rather than
+riding on `cache.replicate`. Four reasons, and the first is on its own sufficient.
+
+**Consent.** `cache.replicate` means "hold some of the neighbourhood's content" — content
+that is `PUBLIC` or `REPLICATED`, that the operator can inspect, and that they can purge on
+sight. An envelope is opaque ciphertext addressed to a stranger. Those are different things
+to agree to, and one budget would mean that granting the first silently enrols an operator in
+the second. That is the failure mode ADR-0026 §10 built a separate capability to avoid, and
+the reasoning carries here without modification.
+
+**Eviction means different things.** A cache entry is a convenience copy: evicting it costs
+somebody a round trip to fetch the object from its origin, which still exists. Evicting an
+envelope may mean a message is never delivered, and **nobody finds out** — not the sender
+(§5), not the recipient, not the operator. Under one eviction policy those compete, and the
+cache wins by construction: it is refreshed by traffic and the envelope is not.
+
+**The lifetime rules are opposites.** A replica's TTL restarts when the object is re-offered,
+because replication is about durability (ADR-0026 §5). An envelope's expiry is absolute and
+can only be brought closer (§3). One store enforcing two contradictory lifetime rules is
+exactly the sort of thing that gets confused a year later by somebody adding a sweep.
+
+**They exhaust differently.** Cache objects are content-addressed and shared: a hundred nodes
+wanting one object cost one copy. Envelopes are sealed per recipient under a fresh key, so
+the same message to two people is two ciphertexts with two ids and no deduplication at all.
+Sizing one number for both behaviours would mean sizing it wrong for at least one.
+
+The number itself comes from **one place**, as CLAUDE.md §2.6 requires: a new
+`envelope_carry_bytes` on `FeatureGates`, derived per tier alongside `cluster_cache_bytes`
+and zeroed on a storage-constrained machine by the same rule. The gate and the capability
+answer different questions and both must pass — the gate says what this machine can afford,
+the broker says what its operator permits.
+
 ## Consequences
 
 **Good.** No new cryptography and no second envelope format — this composes ADR-0019's
@@ -145,6 +223,8 @@ for a `Trickle` link, which §4.2 requires of messaging natively.
 - **A relay spends its disk on strangers' traffic.** Bounded by its own budget and by
   expiry, and entered into deliberately, but it is a cost with no direct return — the same
   bargain as the cluster cache, and it needs saying in the UI before anyone enables it.
+- **Every hop is another party that learns the recipient, size, and timing** (§7). The price
+  of multi-hop delivery, and it cannot be designed away while multi-hop delivery is wanted.
 - **No ordering.** Two envelopes may arrive in either order, and nothing here fixes that. A
   service that needs ordering must carry its own sequence inside the ciphertext.
 - **NodeID only.** `DISTRIBUTED-SERVICES.md` §1 says "NodeID or UserID". A person with a
@@ -165,18 +245,28 @@ for a `Trickle` link, which §4.2 requires of messaging natively.
   infrastructure this OS exists not to require. Any peer may relay, or none.
 - **TTL that restarts on re-offer**, as replication has. §3. Turns a message network into an
   archive nobody asked for.
+- **A hop count to bound amplification.** §7. An envelope whose counter is untouched has
+  travelled nowhere, so the field would tell every carrier it is probably talking to the
+  sender — de-anonymising the one party §4 protects, to buy a bound that only honest
+  carriers respect. The budget bounds it already and nobody can forge somebody else's
+  budget.
+- **Single-hop carriage** — a carrier takes only from the sender. §7. Delivery would then
+  need one carrier that meets both parties, which on a sparse or mobile mesh is usually
+  never, and it is unenforceable anyway since the record cannot distinguish the cases.
+- **One budget shared with the cluster cache.** §8. Granting `cache.replicate` would
+  silently enrol an operator in carrying strangers' opaque mail, and one eviction policy
+  cannot serve a convenience copy and an undeliverable message at once.
 
 ## What is deliberately not decided
 
-- **Whether a relay may re-relay.** ADR-0026 §5 makes onward replication a request rather
-  than a control; whether the same applies to envelopes needs its own thinking, because
-  "content outlives its origin" is a virtue for a replica and a hazard for a message.
+- ~~**Whether a relay may re-relay.**~~ **Settled 2026-08-27**, §7. Yes, and the record's
+  shape already decided it.
+- ~~**How a relay's budget for envelopes relates to the cluster cache's.**~~ **Settled
+  2026-08-27**, §8. Two budgets, and its own capability.
 - **Forward secrecy.** The sharing key is long-lived, so compromising it opens every
   envelope ever sealed to it. A ratchet is the answer and it needs a design of its own.
 - **UserID addressing**, per the consequence above.
 - **Ordering and grouping**, per the consequence above.
-- **How a relay's budget for envelopes relates to the cluster cache's.** One budget or two
-  is a capability-policy question and belongs with whoever builds the pass.
 
 ## References
 

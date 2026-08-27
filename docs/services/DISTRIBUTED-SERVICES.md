@@ -90,6 +90,49 @@ Optional human-readable names come from **local petname assignment**, not a glob
 namespace. There is no registry to squat, no auction, and no authority. Users may import
 name suggestions from trusted peers; suggestions are never automatic.
 
+## 3a. Carrying mail for other people
+
+**STATUS: SPECIFIED** (ADR-0028) — the custody rules are `IMPLEMENTED` and unit-tested in
+`otwono-envelope`; nothing has crossed a link.
+
+A node that agrees to carry envelopes holds opaque ciphertext addressed to people it may
+never meet, until either it hands the envelope over or the envelope expires. Two things
+govern whether it does so at all, and **both must pass**:
+
+- `envelope.carry` in the permission broker — what the operator permits. Deliberately not
+  `cache.replicate`: holding neighbourhood content you can inspect and purge is a different
+  thing to agree to than carrying a stranger's sealed mail (ADR-0028 §8).
+- `FeatureGates::envelope_carry_bytes` — what the machine can afford. From the capability
+  policy engine and nowhere else (CLAUDE.md §2.6).
+
+| Tier | Default carriage | Cluster cache, for comparison |
+|---|---|---|
+| T0 | 64 MiB | 512 MiB |
+| T1 | 256 MiB | 4 GiB |
+| T2 | 1 GiB | 32 GiB |
+| T3 | 4 GiB | 128 GiB |
+| T4 | 4 GiB | 128 GiB |
+
+The curve is much flatter than the cache's on purpose. Mail is small and transient, and
+carriage is about **reach** rather than capacity — a workstation does not make delivery more
+likely than a Raspberry Pi does; meeting more peers does. A budget that tracked the cache's
+curve would pile the network's undelivered mail onto its largest nodes for no gain in
+delivery, which is the shape of mistake ADR-0026 §6 refuses for replicas.
+
+A storage-constrained machine carries nothing, whatever its tier, and for a sharper reason
+than the cache's: a carrier that runs out of room drops envelopes, a dropped envelope is a
+message that may never arrive with nobody told, and carrying mail you cannot promise to hold
+is worse than not carrying it.
+
+**A carrier may pass an envelope on**, and the record's shape settled that rather than a
+policy: the descriptor names no sender and counts no hops, so a carrier cannot tell an offer
+from the sender apart from an offer from another carrier (ADR-0028 §7). What bounds the
+spread is the absolute expiry, each carrier's own budget, and dropping an envelope once it
+has been handed to its recipient. The price is that **every hop is another party that learns
+the recipient, the size, and the timing** — unavoidable if multi-hop delivery is wanted, and
+it is, because a single-hop rule would mean delivery only ever happens when one carrier meets
+both parties.
+
 ## 4. Universal requirements
 
 Every service must:

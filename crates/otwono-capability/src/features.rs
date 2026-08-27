@@ -99,6 +99,19 @@ pub struct FeatureGates {
     /// infer its own (CLAUDE.md §2.6). Zero means "do not cache for peers at all", which is
     /// what a machine with no room to spare gets whatever its tier says.
     pub cluster_cache_bytes: u64,
+    /// Bytes this machine may spend carrying other people's envelopes (ADR-0028 §8).
+    ///
+    /// Separate from `cluster_cache_bytes` on purpose, and not because two numbers are
+    /// tidier. Cache entries are convenience copies of content the operator can inspect and
+    /// purge; an envelope is opaque ciphertext for a stranger, evicting it may mean a
+    /// message is never delivered and nobody finds out, and its lifetime rule is the
+    /// opposite of a replica's. Under one budget those compete and the cache wins by
+    /// construction, because traffic keeps refreshing it and the envelope has nothing
+    /// refreshing it.
+    ///
+    /// A default, not a setting, and not permission: the broker's `envelope.carry` says
+    /// what the operator allows and this says what the machine can afford. Both must pass.
+    pub envelope_carry_bytes: u64,
 }
 
 /// The tier defaults from `CLUSTER-CACHE.md` §3.
@@ -111,6 +124,25 @@ pub const CACHE_BYTES_T1: u64 = 4 * 1024 * 1024 * 1024;
 pub const CACHE_BYTES_T2: u64 = 32 * 1024 * 1024 * 1024;
 pub const CACHE_BYTES_T3: u64 = 128 * 1024 * 1024 * 1024;
 pub const CACHE_BYTES_T4: u64 = 128 * 1024 * 1024 * 1024;
+
+/// Envelope carriage budgets, and the curve is deliberately much flatter than the cache's.
+///
+/// Two reasons. Mail is small and transient — this is sized for many little envelopes over a
+/// short window, not for bulk — so the numbers are small in absolute terms. And carriage is
+/// about *reach*, not capacity: a workstation does not make delivery more likely than a
+/// Raspberry Pi does, meeting more peers does. A budget that scaled like the cache's would
+/// concentrate the network's undelivered mail on its largest nodes for no gain in delivery,
+/// which is the same shape of mistake ADR-0026 §6 refuses for replicas.
+///
+/// T0 is non-zero and matters most: `eligible_node_roles` already gives a T0 node the
+/// "relay" role, and `DISTRIBUTED-SERVICES.md` §4.4 asks it to relay messages. A small
+/// always-on box that carries mail is the most useful thing a T0 node does for its
+/// neighbours.
+pub const CARRY_BYTES_T0: u64 = 64 * 1024 * 1024;
+pub const CARRY_BYTES_T1: u64 = 256 * 1024 * 1024;
+pub const CARRY_BYTES_T2: u64 = 1024 * 1024 * 1024;
+pub const CARRY_BYTES_T3: u64 = 4 * 1024 * 1024 * 1024;
+pub const CARRY_BYTES_T4: u64 = 4 * 1024 * 1024 * 1024;
 
 impl FeatureGates {
     pub fn for_tier(tier: Tier, axes: &CapabilityAxes) -> Self {
@@ -131,6 +163,7 @@ impl FeatureGates {
                 serve_ai_to_peers: false,
                 content_replication: false,
                 cluster_cache_bytes: CACHE_BYTES_T0,
+                envelope_carry_bytes: CARRY_BYTES_T0,
             },
             Tier::T1Edge => FeatureGates {
                 assistant_shape: AssistantShape::SingleStepToolCalling,
@@ -153,6 +186,7 @@ impl FeatureGates {
                 serve_ai_to_peers: false,
                 content_replication: false,
                 cluster_cache_bytes: CACHE_BYTES_T1,
+                envelope_carry_bytes: CARRY_BYTES_T1,
             },
             Tier::T2Balanced => FeatureGates {
                 assistant_shape: AssistantShape::PlanningWithRetrieval,
@@ -176,6 +210,7 @@ impl FeatureGates {
                 serve_ai_to_peers: false,
                 content_replication: true,
                 cluster_cache_bytes: CACHE_BYTES_T2,
+                envelope_carry_bytes: CARRY_BYTES_T2,
             },
             Tier::T3Capable => FeatureGates {
                 assistant_shape: AssistantShape::ParallelAgents,
@@ -204,6 +239,7 @@ impl FeatureGates {
                 serve_ai_to_peers: true,
                 content_replication: true,
                 cluster_cache_bytes: CACHE_BYTES_T3,
+                envelope_carry_bytes: CARRY_BYTES_T3,
             },
             Tier::T4Workstation => FeatureGates {
                 assistant_shape: AssistantShape::ParallelAgents,
@@ -233,6 +269,7 @@ impl FeatureGates {
                 serve_ai_to_peers: true,
                 content_replication: true,
                 cluster_cache_bytes: CACHE_BYTES_T4,
+                envelope_carry_bytes: CARRY_BYTES_T4,
             },
         };
 
@@ -256,6 +293,12 @@ fn apply_axis_adjustments(g: &mut FeatureGates, axes: &CapabilityAxes) {
         // (CLUSTER-CACHE.md §3), so a machine with no room contributes nothing rather
         // than contributing until it dies.
         g.cluster_cache_bytes = 0;
+        // Mail goes with it, and for a sharper reason than the cache's. A carrier that runs
+        // out of room drops envelopes, and a dropped envelope is a message that may never
+        // arrive with nobody told (ADR-0028 §5). Carrying mail on a machine that cannot
+        // promise to hold it is worse than not carrying it: the sender believes it is on
+        // its way and the recipient never sees it.
+        g.envelope_carry_bytes = 0;
     }
 
     // A gateway role requires the connectivity to be one.
@@ -320,6 +363,67 @@ mod tests {
         assert!(budgets.windows(2).all(|w| w[0] < w[1]));
     }
 
+    /// Mail carriage is its own budget, and it is not the cache's (ADR-0028 §8).
+    ///
+    /// Asserted as a *relationship* rather than as five numbers, because the numbers will be
+    /// tuned and the relationship is the decision: carriage is always smaller than the
+    /// cache, because mail is small and transient, and it flattens out rather than tracking
+    /// the cache's curve, because delivery comes from meeting peers and not from having a
+    /// big disk. A budget that scaled like the cache's would pile the network's undelivered
+    /// mail onto its largest nodes for no gain in delivery.
+    #[test]
+    fn carrying_mail_is_a_smaller_and_flatter_budget_than_the_cache() {
+        let a = roomy();
+        let tiers = [
+            Tier::T0Micro,
+            Tier::T1Edge,
+            Tier::T2Balanced,
+            Tier::T3Capable,
+            Tier::T4Workstation,
+        ];
+        let gates: Vec<FeatureGates> = tiers.iter().map(|t| FeatureGates::for_tier(*t, &a)).collect();
+
+        for (tier, g) in tiers.iter().zip(&gates) {
+            assert!(
+                g.envelope_carry_bytes < g.cluster_cache_bytes,
+                "{tier:?} would spend more on strangers' mail than on the cluster cache"
+            );
+            assert!(
+                g.envelope_carry_bytes > 0,
+                "{tier:?} carries no mail at all on a roomy disk"
+            );
+        }
+
+        // Flatter than the cache: T3's cache is 256x T0's, and carriage must not be.
+        let cache_spread = gates[3].cluster_cache_bytes / gates[0].cluster_cache_bytes;
+        let carry_spread = gates[3].envelope_carry_bytes / gates[0].envelope_carry_bytes;
+        assert!(
+            carry_spread < cache_spread,
+            "carriage tracks the cache's curve ({carry_spread}x against {cache_spread}x); \
+             a bigger machine does not make delivery more likely"
+        );
+        // Monotonic all the same -- a larger machine may carry more, just not proportionally.
+        assert!(gates
+            .windows(2)
+            .all(|w| w[0].envelope_carry_bytes <= w[1].envelope_carry_bytes));
+    }
+
+    /// A T0 node is the one that most needs to carry, and already has the role for it.
+    #[test]
+    fn the_smallest_tier_still_carries_mail() {
+        let g = FeatureGates::for_tier(Tier::T0Micro, &roomy());
+        assert!(
+            g.eligible_node_roles.iter().any(|r| r == "relay"),
+            "T0 lost the relay role DISTRIBUTED-SERVICES.md §4.4 gives it"
+        );
+        assert_eq!(g.envelope_carry_bytes, CARRY_BYTES_T0);
+        assert!(
+            g.envelope_carry_bytes > 0,
+            "a small always-on box carrying mail is the most useful thing it does for its \
+             neighbours; a zero budget here makes the relay role decorative"
+        );
+    }
+
     #[test]
     fn even_the_smallest_tier_contributes_something() {
         // A node that contributes nothing is a node its neighbours cannot help either.
@@ -342,6 +446,10 @@ mod tests {
                 ),
             );
             assert_eq!(g.cluster_cache_bytes, 0, "{tier:?} on a constrained disk");
+            assert_eq!(
+                g.envelope_carry_bytes, 0,
+                "{tier:?} on a constrained disk still offered to carry mail"
+            );
             assert!(!g.content_replication);
         }
     }

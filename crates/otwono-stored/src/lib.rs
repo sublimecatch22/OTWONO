@@ -73,6 +73,13 @@ pub const CAPABILITY_CACHE_WRITE: &str = "cache.write";
 /// be unattended. "Cache what I fetch, but do not host for strangers" is a sentence an
 /// operator will want to say, and only a separate capability lets them say it.
 pub const CAPABILITY_REPLICATE: &str = "cache.replicate";
+/// Holding somebody else's addressed envelope until its recipient turns up (ADR-0028 §8).
+///
+/// Deliberately not `cache.replicate`. A node that caches for its neighbourhood has agreed
+/// to hold `PUBLIC` and `REPLICATED` content it can inspect and purge on sight; it has not
+/// thereby agreed to carry opaque ciphertext addressed to a stranger. One capability for
+/// both would make the second a silent consequence of the first.
+pub const CAPABILITY_CARRY: &str = "envelope.carry";
 /// Publishing one of this node's own pointers (ADR-0027).
 ///
 /// Its own capability rather than `store.write`: publishing changes what a *name* means to

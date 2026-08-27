@@ -25,7 +25,7 @@ use otwono_hal::HardwareReport;
 use serde::{Deserialize, Serialize};
 
 /// Schema version of [`CapabilityProfile`]. Bump on any breaking change.
-pub const CAPABILITY_PROFILE_SCHEMA_VERSION: &str = "2.1.0";
+pub const CAPABILITY_PROFILE_SCHEMA_VERSION: &str = "2.2.0";
 
 /// Overall hardware capability tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

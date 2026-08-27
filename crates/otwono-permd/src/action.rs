@@ -282,6 +282,17 @@ impl ActionRegistry {
                     BlastRadius::Reversible,
                     false,
                 ),
+                // Separate from cache.replicate, which is the whole point (ADR-0028 §8).
+                // Holding neighbourhood content the operator can inspect and purge is a
+                // different thing to agree to than carrying a stranger's opaque mail, and
+                // one capability for both would mean granting the first silently enrols
+                // them in the second.
+                ActionSpec::new(
+                    "envelope.carry",
+                    "Hold an addressed envelope for a recipient this node may meet later",
+                    BlastRadius::Reversible,
+                    false,
+                ),
                 ActionSpec::new(
                     "net.fetch",
                     "Fetch an object from a source on the egress allow-list",
