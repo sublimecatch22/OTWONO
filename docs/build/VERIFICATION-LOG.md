@@ -4465,3 +4465,86 @@ It also changed the method, for the better: this boots the image directly with
 `build/qemu/run-amd64.sh` rather than through `make boot-test`. Stage 60's artifact
 re-verification is a separate claim with its own green result; running it again to observe a
 boot marker cost 4.2 GB for nothing. Booting a copy also leaves the artifact pristine.
+
+## 2026-08-27 — a signed pointer resolves between two booted nodes
+
+**STATUS: VERIFIED.** amd64, QEMU, TCG. Two VMs on a segment with no DHCP, link-local
+addressing, mDNS discovery, Noise XX mutual authentication.
+
+Each node publishes `wiki/Getting-Started` and then asks its peer what *that peer's* copy of
+the name points at. The same name on both is the point: a pointer is fetched only from its
+owner, so these are two different pointers, and a node getting its own record back would
+mean the request was answered locally.
+
+```
+content: both nodes served a public object and refused a private one
+content: each node took a replica of the other's REPLICATED object, unprompted
+content: each node resolved the other's pointer and fetched what it names
+PASS: two nodes discovered and mutually authenticated
+```
+
+| | published | resolved |
+|---|---|---|
+| node A | `e82e47122ff66158…` | `6f6e3174f2e3403f…` |
+| node B | `6f6e3174f2e3403f…` | `e82e47122ff66158…` |
+
+Each holds exactly what the other published. The object each pointer names was then fetched
+over the same mesh, which is what makes a pointer useful rather than merely verifiable.
+
+Resolution took **3 seconds** (259.7s → 262.7s), against the replication pass's 17–22s. A
+pointer is one small record fetched on demand, where replication waits for the discovery
+sweep to come round.
+
+### It took three runs, and the first two were my fault
+
+Worth recording in full, because the pattern repeated and the lesson is not about pointers.
+
+**Run 1** failed with `pointer_resolved=none` on both nodes and no other information. The
+check's `awk` tested `$3` for a number, but `$3` in `otwono-netd --pointer` output is the
+literal word `sequence` — the condition could never be true, so the check could not have
+passed. The `shared-with-me` step three sections above already matched on the **shape** of a
+value across fields rather than a field index; departing from that was the whole mistake.
+
+The same run also failed the sharing step on one node. That was older and only exposed here:
+the step took the *first* discovered id and failed if it would not fetch, but the peer seals
+two things per run and one is revoked moments after granting. It was asserting that anything
+in an index snapshot stays fetchable — a guarantee `ADR-0019` §5 explicitly declines to make.
+Inserting the pointer step moved the nodes ~5 seconds out of step, which was enough.
+
+**Run 2** failed the same way, and told me why only because the retry loop had stopped
+discarding stderr: *"no connected peer publishes that name"* — from a node that was
+publishing it. That one line is the difference between a diagnosis and a third guess.
+
+The fault was in `otwono-netd`'s responder. `store.serve` is `BlastRadius::Egress`, so its
+tokens are one-shot; the responder has `call_store`, whose own comment reads "with the token
+retry every path here needs", and the pointer path did not use it. It read the cached token,
+asked once, and refused on failure — so a node that had served anything at all refused every
+pointer request while holding the record.
+
+**The integration tests passed throughout, and would have kept passing.** The old code read
+the token cache but never wrote it, so with a fresh responder it always requested a fresh
+token and worked. Both pointer tests used a fresh harness that had served nothing else. A
+booted node is never in that state. There is now a test that fetches an ordinary object
+through the same responder first; reverting the fix makes it fail with the VM's exact
+symptom while the other two still pass.
+
+Run 2's diagnosis was done locally, not on VMs: calling `pointer.mine` over a raw socket
+returned the full record, which located the fault in `otwono-netd` rather than in the store
+and saved a twenty-minute cycle.
+
+Three times in this work I wrote a new path where an established one existed — shape
+matching, `call_store`, and keeping stderr — and each failed in exactly the way the
+established one exists to prevent.
+
+### What this does not show
+
+- **amd64 only, two nodes.** No arm64 run.
+- **No rollback was attempted on a wire.** The `SequenceLog` refusal is unit-tested and has
+  never refused a replayed record between machines. Nothing here proves the defence works
+  where it matters most.
+- **No tombstone crossed.** Both nodes published live records; the deletion path crossed a
+  link only in an integration test.
+- **Nothing survived a restart.** The sequence log's durability is tested in-process; no VM
+  was rebooted to confirm the protection persists.
+- **One name each.** No node published two, and no pointer was republished on a booted node,
+  so a sequence advancing over a real link is untested.

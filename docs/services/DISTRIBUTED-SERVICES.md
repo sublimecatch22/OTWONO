@@ -9,7 +9,10 @@ the record and its rollback rules in `otwono-pointer`, durable storage in
 channel and is verified against the key the Noise handshake proved. Primitive 3 (addressed
 messages) does not exist, and no service in §2 is built.
 
-**Not yet exercised between booted nodes**, so nothing here is `VERIFIED`.
+**Verified between booted nodes** on 2026-08-27: two VMs each published `wiki/Getting-Started`
+and each resolved the other's, then fetched the object it named. See
+`docs/build/VERIFICATION-LOG.md`, which also records what that run did *not* show — no
+rollback attempted on a wire, no tombstone, no restart, and one name per node.
 
 ## 1. Three primitives, many services
 
