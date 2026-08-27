@@ -4,6 +4,7 @@
 #   make TARGET=amd64-qemu rootfs       stages 10..35
 #   make TARGET=amd64-qemu image        stages 10..50
 #   make TARGET=amd64-qemu AI_ENGINE=llama.cpp image     ... with local inference
+#   make TARGET=amd64-qemu AI_ENGINE=llama.cpp AI_ENGINE_VARIANTS="cpu vulkan" image
 #   make TARGET=amd64-qemu engine-repro-check            engine builds twice, identically?
 #   make TARGET=amd64-qemu AI_ENGINE=llama.cpp AI_SMOKE_MODEL=1 verify
 #                                                        ... and run a prompt at boot
@@ -37,12 +38,23 @@ SOURCE_DATE_EPOCH ?= 1767225600
 # it should not pay for it. Set AI_ENGINE=llama.cpp, or put it in the recipe's [ai] section.
 AI_ENGINE ?=
 
+# Which builds of that engine to install, space separated. Default `cpu`, which is what
+# every recipe got before variants existed. `vulkan` installs a GPU build *alongside* the
+# CPU one -- both are discovered, and the machine's capability profile decides which a given
+# model uses, so adding one cannot change what a GPU-less node runs.
+#
+# Building `vulkan` needs the Vulkan SDK headers and glslc on the *build host*; stage 35
+# checks for them and fails immediately rather than ten minutes into a compile. No GPU build
+# has been executed on real hardware -- see docs/ai/AI-RUNTIME.md §3.2.
+AI_ENGINE_VARIANTS ?=
+
 # Bundle a synthetic model and a boot-time inference check. Off by default and must stay
 # that way: it puts a test model *and* a policy granting ai.admin into the image. Needs
 # AI_ENGINE=llama.cpp, since an inference check with no engine can only fail.
 AI_SMOKE_MODEL ?=
 
 export SOURCE_DATE_EPOCH OUT TARGET RECIPE REPO_ROOT BUILD_DIR TARGET_OUT AI_ENGINE AI_SMOKE_MODEL
+export AI_ENGINE_VARIANTS
 export MESH_CONTENT_SMOKE
 
 .PHONY: help probe list-targets check-recipe rootfs image boot-test verify clean distclean \

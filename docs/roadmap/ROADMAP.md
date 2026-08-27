@@ -119,7 +119,18 @@ path, not yet kernel-enforced.
    (including `ai.models.pull` over `otwono-fetchd`, per ADR-0014)
 3. ~~Admission control with a real refusal path — `ModelTooLargeForTier` must be observed.~~
    **done**
-4. GPU/NPU backends behind capability detection.
+4. GPU/NPU backends behind capability detection. **Partly built, and the remainder is
+   hardware-blocked rather than unwritten.** Selection and on-disk discovery have handled
+   `vulkan`/`cuda`/`rocm` since slice 1; stage 35 now builds and installs variants
+   (`AI_ENGINE_VARIANTS`, default `cpu`, so every existing recipe is unchanged). A test
+   joins the two halves for the first time and asserts the property that makes shipping a
+   GPU build safe: installing one does not change what a machine with no GPU selects.
+
+   **No GPU has run any of this**, and the Vulkan variant has never been built — this
+   environment has neither a GPU nor the Vulkan SDK. `cuda` and `rocm` need vendor
+   toolchains and a redistribution decision. See `docs/ai/AI-RUNTIME.md` §3.2, which also
+   names the untested gap: a discovered backend can still fail at exec on a machine whose
+   driver is missing.
 5. Tiered assistant shapes T0–T2.
 
 **Exit criterion:** the same `ai.infer` request served on an amd64 VM and an arm64 VM with

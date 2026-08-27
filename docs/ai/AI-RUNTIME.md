@@ -120,8 +120,26 @@ about this node's reserve. That is asserted directly: a test reads the engine's
   ggml's CPU detection needs them.
 - **Any backend other than llama.cpp.** whisper.cpp, Piper, ONNX Runtime and vLLM each need
   their own adapter. The protocol is deliberately engine-neutral so that is additive work.
-- **GPU variants.** The discovery layout has directories for `vulkan`, `cuda` and `rocm`,
-  and selection already prefers them correctly, but no build stage produces them.
+- **GPU variants: the build exists, the execution has never happened.** Stage 35 takes
+  `AI_ENGINE_VARIANTS` (default `cpu`) and can install a `vulkan` build alongside the CPU
+  one, discovered and selected the same way. Two things are worth stating plainly rather
+  than leaving to be discovered:
+
+  **No GPU has ever run this.** The Vulkan variant has not been built, let alone executed,
+  because the development environment has neither the Vulkan SDK nor a GPU. `STATUS:
+  IMPLEMENTED` for the build path and the selection logic; nothing about GPU inference is
+  `VERIFIED`.
+
+  **A backend can be discovered and still fail to start.** Discovery is a path probe, so an
+  image carrying a Vulkan engine reports `llama-cpp-vulkan` as installed even where no
+  driver exists. Selection will not choose it on a machine whose profile reports no
+  accelerator — but a machine that *has* a GPU and lacks a working driver would get past
+  selection and fail at exec. That gap is real and untested; it is why the variant is
+  opt-in and why `cuda` and `rocm` are still unbuildable by the stage.
+
+- **`cuda` and `rocm` builds.** Discovery and selection handle them; the stage does not
+  build them. Each needs a vendor toolchain on the build host and a licence decision about
+  redistribution.
 
 Rules:
 

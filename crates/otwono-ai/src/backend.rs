@@ -291,6 +291,134 @@ mod tests {
         assert!(select_backend(&m, &pi5(), &[BackendId::Vllm]).is_err());
     }
 
+    /// Installing a GPU build must not change what a GPU-less machine runs.
+    ///
+    /// This is the one property that makes shipping a Vulkan variant safe, and until now it
+    /// was only *implied*: `discovery` was tested for what it finds and `select_backend` for
+    /// what it picks from a hand-written list, and nothing joined the two. So "adding a
+    /// variant to an image cannot disturb the CPU path" was an argument about two modules
+    /// rather than a fact about their composition.
+    ///
+    /// Here the available set comes from a filesystem, as it does in the daemon.
+    #[test]
+    fn adding_a_gpu_variant_to_the_image_does_not_change_a_gpu_less_machine() {
+        let tree = temptree("variant-safety");
+        adapter(&tree);
+        engine(&tree, "cpu");
+
+        let mut m = tiny();
+        // The publisher prefers the GPU. That is the interesting case: if preference alone
+        // decided, this machine would pick a backend it cannot run.
+        m.backends = vec![BackendId::LlamaCppVulkan, BackendId::LlamaCppCpu];
+
+        let cpu_only = crate::installed_backends_in(&tree);
+        assert_eq!(cpu_only, vec![BackendId::LlamaCppCpu]);
+        let before = select_backend(&m, &pi5(), &cpu_only).expect("cpu-only image runs it");
+        assert_eq!(before.backend, BackendId::LlamaCppCpu);
+
+        // Now ship the Vulkan build alongside, exactly as stage 35 does with
+        // AI_ENGINE_VARIANTS="cpu vulkan". Nothing else about the machine changes.
+        engine(&tree, "vulkan");
+        let both = crate::installed_backends_in(&tree);
+        assert_eq!(
+            both,
+            vec![BackendId::LlamaCppCpu, BackendId::LlamaCppVulkan],
+            "the variant must be discovered, or this test proves nothing"
+        );
+
+        let after = select_backend(&m, &pi5(), &both).expect("still runnable");
+        assert_eq!(
+            after.backend, before.backend,
+            "installing a GPU engine changed what a machine with no GPU runs"
+        );
+        assert!(!after.offloads_to_accelerator);
+        assert!(
+            after
+                .rejected
+                .iter()
+                .any(|(b, why)| *b == BackendId::LlamaCppVulkan && why.contains("no GPU")),
+            "Vulkan must be rejected for the machine's sake, not silently skipped: {:?}",
+            after.rejected
+        );
+        let _ = std::fs::remove_dir_all(&tree);
+    }
+
+    /// ...and the same image *does* use the GPU where there is one.
+    ///
+    /// The other half of the pair. Without it, "adding a variant is safe" would also be
+    /// satisfied by a variant that is never selected anywhere, which is not a feature.
+    #[test]
+    fn the_same_image_reaches_for_the_gpu_on_a_machine_that_has_one() {
+        let tree = temptree("variant-useful");
+        adapter(&tree);
+        engine(&tree, "cpu");
+        engine(&tree, "vulkan");
+
+        let mut m = medium();
+        m.backends = vec![BackendId::LlamaCppVulkan, BackendId::LlamaCppCpu];
+
+        let choice = select_backend(&m, &workstation(), &crate::installed_backends_in(&tree))
+            .expect("a workstation runs it");
+        assert_eq!(choice.backend, BackendId::LlamaCppVulkan);
+        assert!(
+            choice.offloads_to_accelerator,
+            "admission control charges the wrong pool if this is wrong"
+        );
+        let _ = std::fs::remove_dir_all(&tree);
+    }
+
+    /// A variant on disk that the running machine cannot use is still *reported* as
+    /// installed, and that is deliberate.
+    ///
+    /// `installed_backends` answers "what is on this disk", not "what will run here" — the
+    /// second question needs a model, because it is the manifest that says which backends
+    /// are even candidates. Collapsing the two would make `ai.capabilities` unable to
+    /// distinguish "this image has no Vulkan build" from "this machine has no GPU", which
+    /// are different problems with different fixes.
+    #[test]
+    fn discovery_reports_what_is_installed_not_what_is_usable_here() {
+        let tree = temptree("variant-honest");
+        adapter(&tree);
+        engine(&tree, "cpu");
+        engine(&tree, "vulkan");
+        assert!(crate::installed_backends_in(&tree).contains(&BackendId::LlamaCppVulkan));
+        let _ = std::fs::remove_dir_all(&tree);
+    }
+
+    fn temptree(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("otwono-variant-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    fn adapter(root: &std::path::Path) {
+        write_executable(
+            &root
+                .join(crate::discovery::ADAPTER_DIR)
+                .join(crate::discovery::LLAMA_ADAPTER),
+        );
+    }
+
+    fn engine(root: &std::path::Path, variant: &str) {
+        write_executable(
+            &root
+                .join(crate::discovery::ENGINE_DIR)
+                .join("llama.cpp")
+                .join(variant)
+                .join("bin")
+                .join("llama-server"),
+        );
+    }
+
+    fn write_executable(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
     #[test]
     fn backend_ids_round_trip_through_their_wire_names() {
         for b in [
