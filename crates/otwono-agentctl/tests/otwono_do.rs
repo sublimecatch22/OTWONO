@@ -50,6 +50,18 @@ struct Node {
 
 impl Node {
     fn start(tag: &str, policy: &str) -> Node {
+        Node::start_as(tag, policy, otwono_capability::Tier::T0Micro)
+    }
+
+    /// Stand up a node that reports `tier`, whatever machine this actually is.
+    ///
+    /// Pinned rather than probed, and that is the whole point. An earlier version let the
+    /// hardware daemon classify the host, so the assistant's shape — and therefore every
+    /// message it produced — depended on what the tests happened to run on. They passed on a
+    /// T0_MICRO development box and failed on a larger CI runner, which is the failure mode
+    /// CLAUDE.md §6 exists to prevent: a test that reads the machine under it is testing the
+    /// machine.
+    fn start_as(tag: &str, policy: &str, tier: otwono_capability::Tier) -> Node {
         let dir = std::env::temp_dir().join(format!("otw-do-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("policy.d")).unwrap();
@@ -77,12 +89,21 @@ impl Node {
         let srv = Server::bind(dir.join("store.sock")).unwrap();
         std::thread::spawn(move || srv.serve(service, s));
 
-        // Probes `/` — the tier it reports is this machine's, which is all the binary needs
-        // in order to ask for a shape at all.
+        // A captured fixture tree, never `/`, following the pattern authorization.rs already
+        // sets: nothing about these tests may read the machine they run on. The tier is then
+        // pinned on top, because the shape under test is derived from the tier and the
+        // fixtures do not include a T0-class machine. The override is a shipped mechanism
+        // for exactly "I know better than the probe", so this uses it rather than inventing
+        // a test-only path into the daemon.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../otwono-hal/tests/fixtures/x86_64-cloud-vm");
         let hw = Arc::new(otwono_hwd::HwService::new(
-            PathBuf::from("/"),
+            fixture,
             perm_socket.clone(),
-            Default::default(),
+            otwono_capability::CapabilityOverrides {
+                tier: Some(tier),
+                ..Default::default()
+            },
         ));
         let s = shutdown.clone();
         let srv = Server::bind(dir.join("hw.sock")).unwrap();
@@ -302,4 +323,56 @@ fn the_assistant_cannot_reach_past_what_the_policy_granted() {
             stdout(&out)
         );
     }
+}
+
+/// The same binary on a bigger machine behaves differently, and says so.
+///
+/// This is the assertion whose absence let the suite depend on its host. Every other test
+/// here pins T0 and checks the command-grammar behaviour; without a second tier, "the shape
+/// comes from the capability engine" was an untested claim, and the whole suite passed on a
+/// T0 development box while failing on a larger CI runner for a reason none of it named.
+///
+/// The refusal is the visible difference: at T0 an unrecognised request is a limit of the
+/// machine and says "command-grammar". At T2 the request would go to a model — there is no
+/// model installed here, so it still refuses, but it must not claim to be a command grammar.
+#[test]
+fn a_larger_machine_is_not_described_as_a_command_grammar() {
+    let node = Node::start_as("t2", POLICY, otwono_capability::Tier::T2Balanced);
+
+    let out = node.otwono(&["do", "tier"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("T2_BALANCED"), "{}", stdout(&out));
+
+    // Help must not tell a T2 user their machine answers a fixed set of commands.
+    let out = node.otwono(&["do", "help", "--json"]);
+    let value: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(
+        value["assistant_shape"], "planning_with_retrieval",
+        "the binary did not take its shape from the capability engine: {value}"
+    );
+
+    let out = node.otwono(&["do", "summarise", "my", "week"]);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert!(
+        !stderr(&out).contains("command-grammar"),
+        "a T2 machine described itself as a command grammar: {}",
+        stderr(&out)
+    );
+}
+
+/// A verb still works on a bigger machine.
+///
+/// The grammar is not a T0 fallback that a larger node discards — "save this file" is a
+/// deterministic request at every tier, and routing it through a model would be slower,
+/// less reliable, and no more useful.
+#[test]
+fn the_verbs_still_work_on_a_machine_with_a_bigger_shape() {
+    let node = Node::start_as("t2verbs", POLICY, otwono_capability::Tier::T2Balanced);
+    let file = node.dir.join("t2.txt");
+    std::fs::write(&file, "verbs are not a T0 fallback").unwrap();
+    let out = node.otwono(&["do", "save", file.to_str().unwrap(), "--json"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(value["did"], "store.put");
+    assert_eq!(value["result"]["visibility"], "private");
 }
