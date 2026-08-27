@@ -26,6 +26,10 @@ BUILD_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 REPO_ROOT := $(patsubst %/,%,$(dir $(BUILD_DIR)))
 OUT       ?= $(REPO_ROOT)/out
 TARGET    ?= amd64-qemu
+# How many VMs `multi-node-test` boots. Three is the smallest number that can answer
+# ADR-0015's fan-out question, and the smallest that can hold a message for an absent
+# sender (ADR-0028). Each guest is 2 vCPUs of TCG, so raising this costs real time.
+NODES     ?= 3
 RECIPE    := $(BUILD_DIR)/recipes/$(TARGET).toml
 STAGES    := $(BUILD_DIR)/stages
 TARGET_OUT := $(OUT)/$(TARGET)
@@ -110,6 +114,17 @@ two-node-test: check-recipe
 	  --image "$(TARGET_OUT)/otwono-$(TARGET).img" \
 	  --arch "$$(sed -n 's/^arch = "\(.*\)"/\1/p' $(RECIPE) | head -1)" \
 	  --out "$(TARGET_OUT)/two-node"
+
+# The questions two nodes structurally cannot answer: ADR-0015's fan-out, and a mesh forming
+# when more than one neighbour is announcing. Also the shape store-and-forward needs
+# (ADR-0028), since a message held for an absent sender needs three parties to be a test.
+.PHONY: multi-node-test
+multi-node-test: check-recipe
+	@$(BUILD_DIR)/qemu/multi-node-test.sh \
+	  --image "$(TARGET_OUT)/otwono-$(TARGET).img" \
+	  --nodes "$(NODES)" \
+	  --arch "$$(sed -n 's/^arch = "\(.*\)"/\1/p' $(RECIPE) | head -1)" \
+	  --out "$(TARGET_OUT)/multi-node"
 
 clean:
 	rm -rf "$(TARGET_OUT)"

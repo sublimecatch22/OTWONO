@@ -95,14 +95,7 @@ echo "  source image carries no identity, as it should"
 # broken". Two seconds of blkid says it instead.
 for n in a b; do
     cp --sparse=always "$IMAGE" "$OUT/node-$n.img"
-    if ! blkid -p -o value -s LABEL \
-        -O "$(( $(partx -g -o START -s --nr 4 "$OUT/node-$n.img" | tr -d ' ') * 512 ))" \
-        "$OUT/node-$n.img" 2>/dev/null | grep -q OTWONO-DATA; then
-        echo "FAIL: $OUT/node-$n.img has no OTWONO-DATA filesystem after copying." >&2
-        echo "      Nothing would mount /var/lib/otwono, so no otwono daemon would start." >&2
-        echo "      Check that $IMAGE is complete and that no other run is writing to $OUT." >&2
-        exit 1
-    fi
+    assert_data_filesystem "$OUT/node-$n.img" || exit 1
 done
 
 # `ls a b | head -1` looks tempting here and is a trap: ls exits non-zero when any

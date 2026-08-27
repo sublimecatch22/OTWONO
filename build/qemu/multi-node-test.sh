@@ -92,6 +92,7 @@ trap cleanup EXIT
 for i in $(seq 1 "$NODES"); do
     n="n$i"
     cp --reflink=auto "$IMAGE" "$OUT/node-$n.img"
+    assert_data_filesystem "$OUT/node-$n.img" || exit 1
     if [ "$PFLASH_SIZE" -gt 0 ]; then
         dd if=/dev/zero of="$OUT/code-$n.fd" bs=1M count="$PFLASH_SIZE" status=none
         dd if="$FW_CODE" of="$OUT/code-$n.fd" conv=notrunc status=none

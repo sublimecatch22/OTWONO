@@ -28,6 +28,34 @@ segment_mac() { # total ordinal
     printf '52:54:00:07:%02x:%02x' "$1" "$2"
 }
 
+# A node's disk must carry a data filesystem before it is worth booting.
+#
+# Every otwono daemon has `RequiresMountsFor=/var/lib/otwono`, so a copy whose data
+# partition did not survive gives a VM that reaches a login prompt with *no otwono service
+# running at all* -- and a harness then reports "the nodes did not form a mesh", which is
+# true and useless. That cost a full twenty-minute timeout and a session mounting the VM
+# disk to read its journal. Two seconds of blkid says it instead.
+#
+# Here rather than in each harness, and not because it is tidier: `segment_mac` above is in
+# this file precisely because two copies of it drifted and a guest spent twelve minutes
+# waiting for sixteen neighbours that were never coming.
+assert_data_filesystem() { # image-path
+    local img="$1" start
+    start=$(partx -g -o START -s --nr 4 "$img" 2>/dev/null | tr -d ' ')
+    if [ -z "$start" ]; then
+        echo "FAIL: $img has no fourth partition to hold /var/lib/otwono." >&2
+        return 1
+    fi
+    if ! blkid -p -o value -s LABEL -O "$(( start * 512 ))" "$img" 2>/dev/null \
+        | grep -q OTWONO-DATA; then
+        echo "FAIL: $img has no OTWONO-DATA filesystem." >&2
+        echo "      Nothing would mount /var/lib/otwono, so no otwono daemon would start." >&2
+        echo "      Check the source image is complete and that no other run is writing here." >&2
+        return 1
+    fi
+    return 0
+}
+
 run_boot_test() { # log-file timeout qemu-binary args...
     local log="$1" timeout_s="$2" qemu="$3"; shift 3
     local settle="${OTWONO_BOOT_SETTLE:-15}"
