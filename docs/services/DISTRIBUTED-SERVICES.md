@@ -12,7 +12,13 @@ messages) does not exist, and no service in §2 is built.
 **Verified between booted nodes** on 2026-08-27: two VMs each published `wiki/Getting-Started`
 and each resolved the other's, then fetched the object it named. See
 `docs/build/VERIFICATION-LOG.md`, which also records what that run did *not* show — no
-rollback attempted on a wire, no tombstone, no restart, and one name per node.
+tombstone, no restart, and one name per node.
+
+The rollback rule is now **on the fetch path** rather than beside it (ADR-0027 §7). Until
+that change every pointer that arrived from a peer was verified and accepted whatever the
+reader had already seen: the defence existed, passed its tests, and was never consulted. The
+reader's memory lives in `otwono-store::PointerStore` and `otwono-netd` reaches it over the
+control plane, so it survives a restart and there is one writer to it.
 
 ## 1. Three primitives, many services
 

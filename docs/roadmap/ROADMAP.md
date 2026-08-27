@@ -283,7 +283,14 @@ between them. `onm://` addressing, local resolver, browser integration, `Trickle
 through "slice 7" are the cluster cache and the content path, which are Phase 5 item 5
 by this document. They are left under their original headings rather than renamed, because a
 verification log is a record of what was done and when, and quietly relabelling it would make
-it a worse record. Phase 6 as defined here has not started.
+it a worse record.
+
+**Started 2026-08-27** with the second of the three primitives every service in §2 of
+`docs/services/DISTRIBUTED-SERVICES.md` is composed from: **signed mutable pointers**
+(ADR-0027), which is what lets anything change over time. A pointer crosses a link between
+booted nodes, and the rollback rule that makes a mutable name safe on an untrusted network
+is on the fetch path rather than beside it (ADR-0027 §7). Primitive 3 — addressed messages —
+has not started, and none of the three services has.
 
 **Exit criterion:** a three-node QEMU network where node A's wiki page is readable on node
 B, an offline message to node C is delivered when C returns, and a network partition heals

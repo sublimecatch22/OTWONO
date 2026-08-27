@@ -131,6 +131,55 @@ under the right name.
 So the tuple the reader asked for must equal the tuple inside the signature, checked on
 every read.
 
+### 7. Where the memory lives, and what happens when it cannot be reached
+
+**Added 2026-08-27**, when §1's rule was first put on the fetch path and two things turned
+out to be undecided.
+
+The reader's memory is durable state, so it belongs to `otwono-stored` — but the code that
+fetches a pointer is `otwono-netd`. Two processes. ADR-0026 §10 settled the same shape for
+the cluster cache and the reasoning carries: the fetch path is written against a
+`SequenceMemory` trait, `otwono-stored` owns the log, and `otwono-netd` reaches it over the
+control plane under a new `pointer.write` capability. Two processes writing one log would
+each lose the other's updates, which for this log means silently losing the protection
+rather than merely miscounting bytes.
+
+**A memory that cannot be reached refuses the record.** Every other brokered call in this
+system treats a refusal as "then do less" — no cache means no replication, and that is safe.
+This one is the opposite. Falling back to verifying the signature alone accepts a pointer
+with no rollback protection while the caller believes it has some, which hands the rollback
+to anyone who can stop the reader's own store. That is a far easier attack than forging a
+signature. A reader that cannot remember does not read.
+
+The consequence is that a node granted `net.content` but not `pointer.write` cannot read
+pointers at all. That is intended, and it is the only honest reading of "the defence is state
+the reader keeps".
+
+### 8. Equal sequences: the record decides, not the number
+
+**Amended 2026-08-27.** §1 originally said a record at a sequence already seen is rejected,
+and that included equal. Putting the defence on the fetch path showed what that meant: a
+reader refuses the record it already holds, so a wiki page can be read exactly once per node
+and never again. The rule was written for the attack and was never tried against the ordinary
+case.
+
+Equal is now decided by the record rather than the number:
+
+- **The same record again** is `Unchanged` and accepted. This is what reading an unchanged
+  name looks like, and it is most of what readers do.
+- **A different record at the same number** is `Equivocation` and refused. The owner is the
+  only writer, so it can sign two different records at one sequence — and waving equal
+  through on the number alone would let a name's meaning change without ever advancing, which
+  is the rollback with an extra step.
+
+This requires the log to remember **what** it saw at the highest sequence, not merely that it
+saw a number. Ed25519 signing is deterministic, so the signature identifies the record: two
+records under one key whose signatures differ are different records.
+
+Equivocation is named separately from rollback because they are different events. A rollback
+is a third party replaying history the owner really wrote; equivocation is the owner writing
+two histories, which the sequence rule cannot order, so neither is taken.
+
 ## Consequences
 
 **Good.** All three Phase 6 services become composition rather than new mechanism. No
@@ -148,8 +197,8 @@ owner's public key, which the NodeID already is.
   from third parties, not from the owner.
 - **Sequence exhaustion** is theoretical (`u64`) but the type is fixed and cannot grow later
   without a schema break.
-- **Nothing here distributes the pointer.** This is the record and its rules; fetching one
-  from a peer is the next slice.
+- ~~**Nothing here distributes the pointer.**~~ **Built, 2026-08-27.** `content.pointer`
+  crosses a link and the fetch path consults the reader's memory (§7).
 
 ## Alternatives rejected
 
