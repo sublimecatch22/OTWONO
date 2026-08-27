@@ -128,7 +128,9 @@ about this node's reserve. That is asserted directly: a test reads the engine's
   **No GPU has ever run this.** The Vulkan variant has not been built, let alone executed,
   because the development environment has neither the Vulkan SDK nor a GPU. `STATUS:
   IMPLEMENTED` for the build path and the selection logic; nothing about GPU inference is
-  `VERIFIED`.
+  `VERIFIED`. What *is* verified is that the CPU path is unchanged by their existence — a
+  booted node still reports `backends=llama-cpp-cpu` and `local_inference=available`
+  through the refactored stage (`docs/build/VERIFICATION-LOG.md`, 2026-08-27).
 
   **A backend can be discovered and still fail to start.** Discovery is a path probe, so an
   image carrying a Vulkan engine reports `llama-cpp-vulkan` as installed even where no

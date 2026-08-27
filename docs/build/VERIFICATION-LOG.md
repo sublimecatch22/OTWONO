@@ -4318,3 +4318,69 @@ from the real thing at a glance. Both harnesses now read the image's own `manife
 which stage 37 already writes, so the flag can no longer be half-set. Recorded here because
 the defect was in the *evidence-gathering*, not the code, and that is the kind that quietly
 invalidates a log like this one.
+
+## 2026-08-27 — engine variants, and the CPU path surviving them
+
+**STATUS: VERIFIED** for the CPU path through the refactored stage. **Nothing about GPU
+execution is verified, and nothing about it has been built.**
+
+Stage 35 learned to build more than one llama.cpp variant (`AI_ENGINE_VARIANTS`, default
+`cpu`). The thing worth checking was not the new capability but the old one: that an image
+built the way every recipe builds it is unchanged.
+
+`make -C build boot-test TARGET=amd64-qemu-ubuntu AI_ENGINE=llama.cpp`, amd64, TCG:
+
+```
+[35-ai-engine] variant: cpu
+[35-ai-engine]   cpu engine is x86-64, 14088264 bytes
+[35-ai-engine]   installed /usr/lib/otwono/ai/llama.cpp/cpu/bin/llama-server
+[35-ai-engine]   all cpu engine libraries resolve inside the image
+
+[70.041741] ai-check: OTWONO-AI-OK tier=T0_MICRO local_inference=available
+            backends=llama-cpp-cpu sandbox=full models=0 publishers=0
+
+  matched: OTWONO-CAPABILITY-OK / CONTROL-PLANE-OK / CONTENT-OK / MESH-OK / AI-OK
+  guest-audit.jsonl: 52 record(s), chain intact
+  no identity, profiles, audit log or seeded machine-id in the artifact
+  otwono-amd64-qemu-ubuntu.img: OK
+```
+
+`backends=llama-cpp-cpu` is the line that matters: discovery found the engine at the path
+the refactored stage installed it to, and the install path is byte-identical to the previous
+layout. The engine manifest gained a variant column and the image manifest an
+`[cpu]` suffix; nothing else about the image changed.
+
+### The failure paths, exercised by hand
+
+Both fail in about a second, before any compile starts — which is the point of checking
+build-host tooling for every requested variant up front:
+
+```
+[35-ai-engine] ERROR: unknown llama.cpp variant: sycl (known: cpu vulkan)
+[35-ai-engine] ERROR: the vulkan variant needs the Vulkan headers (package: libvulkan-dev)
+```
+
+### What is not tested, and will not be here
+
+- **No Vulkan engine has been built.** This environment has no Vulkan SDK and no `glslc`,
+  so the `vulkan` arm of `variant_cmake_args` has never reached cmake. The code exists and
+  is unreachable here.
+- **No GPU has run any inference, on any variant.** There is no GPU.
+- **A discovered backend can still fail at exec.** Discovery is a path probe, so an image
+  carrying a Vulkan engine reports `llama-cpp-vulkan` as installed wherever it is present.
+  Selection refuses it on a machine whose profile reports no accelerator — but a machine
+  that *has* a GPU and lacks a working driver passes selection and would fail when the
+  adapter execs the engine. Untested, and the reason the variant is opt-in.
+- **`cuda` and `rocm` are not buildable by the stage at all**, only selectable. Each needs a
+  vendor toolchain and a redistribution decision.
+
+### A note on the run before this one
+
+The first attempt exited 1 with its output lost: the writable allowance filled mid-run
+(`target/` at 15 GB, stage 60's `pristine-check` tree at 4.2 GB). CLAUDE.md §11 warns about
+exactly this and it is the second time this session.
+
+It was not a functional failure — that run had already printed `OTWONO-AI-OK ...
+backends=llama-cpp-cpu` before the disk gave out. The result above is a clean re-run rather
+than that inference, because "the part I cared about had already passed" is a reasonable
+belief and not evidence.
