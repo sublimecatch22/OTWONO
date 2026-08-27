@@ -1,0 +1,37 @@
+[package]
+name = "otwono-agentctl"
+description = "The `otwono` command: the assistant's entry point for a person at a shell."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The binary is `otwono`, not `otwono-agentctl`. CLAUDE.md §4.3 names control CLIs
+# `otwono-<name>ctl`, and every one of them so far drives one daemon: otwono-hwctl drives
+# otwono-hwd. This drives no daemon — it is the assistant, and it reaches whichever service
+# a verb happens to name. `AI-RUNTIME.md` §6 and `OTWONO-ARCHITECTURE.md` §6.3 both specify
+# the command as `otwono do …`, which is what a person types. The crate keeps the §4.3 name;
+# the binary is what the design documents promised.
+[[bin]]
+name = "otwono"
+path = "src/main.rs"
+
+[dependencies]
+otwono-agent = { workspace = true }
+otwono-capability = { workspace = true }
+otwono-proto = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# Only to check our four-line base64 against a real one. Not linked into the binary: this
+# ships in the smallest image we build, and one dependency for one function is not a trade
+# worth making there.
+data-encoding = "2"
+# For the end-to-end test, which runs the real binary against real daemons. Dev-only: the
+# assistant must not link the daemons it talks to, or it could not be built for an image
+# that ships a different set of them.
+otwono-permd = { workspace = true }
+otwono-stored = { workspace = true }
+otwono-store = { workspace = true }
+otwono-hwd = { workspace = true }

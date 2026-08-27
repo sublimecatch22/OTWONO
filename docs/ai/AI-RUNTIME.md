@@ -334,9 +334,17 @@ Degradation must be **honest**: a T0 node says "I cannot do that locally; I can 
 for your workstation when it is reachable" rather than producing a bad answer.
 
 **STATUS: IMPLEMENTED** for T0 — `otwono-capability::AssistantShape` (derived from the tier,
-per CLAUDE.md §2.6) and the `otwono-agent` crate. Unit and cross-process tested; not yet
-exercised on a booted node, because nothing calls it yet: there is no `otwono-agentd` and no
-`otwono do` binary. The grammar is a library, and deliberately so.
+per CLAUDE.md §2.6), the `otwono-agent` grammar, and the `otwono` binary that `otwono do …`
+names. Unit, cross-process and end-to-end tested: the real binary runs as a process against
+real daemons, saves a file and reads it back by content id.
+
+The binary is `otwono`, not `otwono-agentctl`, and that is a deliberate departure from
+CLAUDE.md §4.3. Every other CLI in the system drives exactly one daemon — `otwono-hwctl`
+drives `otwono-hwd`. This one drives none; it reaches whichever service a verb happens to
+name, and it is the single command a person types. The crate keeps §4.3's name.
+
+**Not exercised on a booted node.** The binary is staged into images by build stage 05, but
+no boot check runs it, so there is no entry in `VERIFICATION-LOG.md` for it yet.
 
 Three properties are worth stating because they are what make a T0 assistant safe rather
 than merely small:
@@ -354,8 +362,22 @@ than merely small:
 
 What T0 does *not* have yet is delegation: `Elsewhere::Peer` and `ConfiguredProvider` are
 modelled and rendered into the refusal, but nothing queues work for a peer or forwards it to
-a provider. The refusal tells the truth about where a request could go; making it go there
-is the next slice.
+a provider. The binary therefore always answers `Nowhere`, and that is honest rather than
+lazy — a peer is only somewhere to send work if it *advertises inference*, and §7's
+`ai-provider` does not exist. Naming an authenticated peer as a candidate would produce a
+refusal pointing at a machine that would reject the request.
+
+**A note on how the refusal is chosen.** An unknown first word is two different failures, and
+telling them apart is most of what §6 asks for. "fetc" is a misspelling — the user knows the
+vocabulary and missed, and the fix is to offer the verb they nearly typed. "summarise my
+week" is not a misspelling; it is a request the machine genuinely cannot serve, and answering
+it with "I do not know how to summarise" blames the user's phrasing for a limit of the
+hardware. The discriminator is whether anything in the closed verb set is within an edit
+distance of two.
+
+The first version got this wrong — it answered both with `UnknownVerb`, which made §6's
+sentence unreachable on the only tier it was written for. Every unit test passed, because
+they asserted what the code did. It was found by running the binary and reading the output.
 
 ## 7. Remote inference over ONM
 

@@ -1160,6 +1160,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "otwono-agentctl"
+version = "0.1.0"
+dependencies = [
+ "data-encoding",
+ "otwono-agent",
+ "otwono-capability",
+ "otwono-hwd",
+ "otwono-permd",
+ "otwono-proto",
+ "otwono-store",
+ "otwono-stored",
+ "serde_json",
+]
+
+[[package]]
 name = "otwono-ai"
 version = "0.1.0"
 dependencies = [

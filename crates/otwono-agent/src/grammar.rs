@@ -168,10 +168,26 @@ pub fn parse(grammar: &Grammar, words: &[&str], elsewhere: &Elsewhere) -> Result
     let head_lower = head.to_lowercase();
 
     let Some(verb) = VERBS.iter().find(|v| v.word == head_lower) else {
-        // A shape with a model would send this to the model instead of refusing. Saying so
-        // here, rather than at the call site, is what keeps the T0 message accurate as
-        // higher shapes are built: this arm is the one that has to change.
-        if grammar.shape.uses_a_model() {
+        // Two different failures wear the same clothes here, and telling them apart is the
+        // whole of AI-RUNTIME.md §6.
+        //
+        // "fetc" is a typo: the user knows the vocabulary and missed. Offering the verb they
+        // nearly typed is the entire fix, and answering that with "this machine cannot
+        // reason" would be both untrue and insulting.
+        //
+        // "summarise my week" is not a typo. It is a request this machine genuinely cannot
+        // serve, and §6 is explicit about what to say: not "I do not understand", which
+        // blames the user's phrasing, but "I cannot do this *here*, and here is where it
+        // could happen". An earlier version returned UnknownVerb for both, which made §6's
+        // sentence unreachable on the one tier it was written for — found by running the
+        // binary rather than by any test, because the tests asserted what the code did.
+        //
+        // The discriminator is the suggestion list, which is already computed: a word near
+        // the closed set is a misspelling of it, and a word near nothing is a different kind
+        // of request. On a shape that has a model, neither is a refusal at all — the words
+        // go to the model — so that case returns NeedsAModel for the caller to route.
+        let suggestions = suggestions_for(&head_lower);
+        if grammar.shape.uses_a_model() || suggestions.is_empty() {
             return Err(Refusal::NeedsAModel {
                 said: words.join(" "),
                 shape: grammar.shape,
@@ -180,7 +196,7 @@ pub fn parse(grammar: &Grammar, words: &[&str], elsewhere: &Elsewhere) -> Result
         }
         return Err(Refusal::UnknownVerb {
             said: head.to_string(),
-            suggestions: suggestions_for(&head_lower),
+            suggestions,
         });
     };
 

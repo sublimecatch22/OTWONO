@@ -139,6 +139,8 @@ path, not yet kernel-enforced.
    that already exist and are already brokered, and `AI-RUNTIME.md` §6's honest refusal for
    everything else.
 
+   `otwono do …` exists as a binary and works end to end against real daemons.
+
    The grammar **executes nothing**. It parses words into an inert `Intent` naming a
    control-plane method and the capability the *caller* must hold; dispatch and
    authorization are unchanged. That is what makes giving a T0 node an assistant safe: its

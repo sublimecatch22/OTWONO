@@ -34,6 +34,11 @@ BINARIES=(
     otwono-hwctl otwono-aictl otwono-storectl otwono-permctl otwono-walletctl
     otwono-permd otwono-hwd otwono-idd otwono-netd otwono-aid otwono-fetchd otwono-stored
     otwono-walletd
+    # The assistant. `otwono`, not `otwono-agentctl`, because it is the one command a person
+    # types rather than a CLI that drives a daemon -- AI-RUNTIME.md §6 and
+    # OTWONO-ARCHITECTURE.md §6.3 both specify it as `otwono do …`. The crate keeps §4.3's
+    # name; the binary is what the design documents promised.
+    otwono
 )
 # AI backend adapters. Not in /usr/bin: nothing invokes them by hand, they are spawned by
 # otwono-aid, and discovery finds them by path (otwono_ai::discovery).

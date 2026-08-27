@@ -94,16 +94,42 @@ fn an_unknown_verb_is_refused_with_suggestions_from_the_closed_set() {
     assert!(err.message().contains("Did you mean"), "{}", err.message());
 }
 
-/// Nonsense gets no suggestions rather than the nearest word by force.
+/// A request that is not a misspelling gets §6's sentence, not "I do not understand".
+///
+/// This is the case AI-RUNTIME.md §6 was actually written for, and the one an earlier
+/// version got wrong: it answered every unknown word with UnknownVerb, which made §6's
+/// sentence unreachable on the only tier that needs it. "I do not know how to
+/// \"summarise\"" blames the user's phrasing for a limit of the machine.
 #[test]
-fn a_word_close_to_nothing_is_offered_nothing() {
-    let err = parse(&t0(), &["photosynthesise"], &nowhere()).expect_err("no such verb");
-    match err {
-        Refusal::UnknownVerb { suggestions, .. } => assert!(
-            suggestions.is_empty(),
-            "offered {suggestions:?} for a word like nothing in the table"
-        ),
-        other => panic!("{other:?}"),
+fn an_open_ended_request_is_told_the_machine_cannot_rather_than_that_it_misunderstood() {
+    let err = parse(&t0(), &["summarise", "my", "week"], &nowhere()).expect_err("not a verb");
+    match &err {
+        Refusal::NeedsAModel { said, shape, .. } => {
+            assert_eq!(
+                said, "summarise my week",
+                "the whole request, not just the first word"
+            );
+            assert_eq!(*shape, AssistantShape::CommandGrammar);
+        }
+        other => panic!("an open-ended request should not read as a typo: {other:?}"),
+    }
+    let m = err.message();
+    assert!(m.contains("on this machine"), "{m}");
+    assert!(!m.contains("Did you mean"), "a suggestion for a non-typo: {m}");
+}
+
+/// ...and a near miss still gets the verb it nearly typed.
+///
+/// The pair matters: if everything became NeedsAModel, a user one letter out would be told
+/// their machine is too small, which is both wrong and unhelpable.
+#[test]
+fn a_typo_is_still_treated_as_a_typo() {
+    let err = parse(&t0(), &["fetc", &"a".repeat(64)], &nowhere()).expect_err("no such verb");
+    match &err {
+        Refusal::UnknownVerb { suggestions, .. } => {
+            assert!(suggestions.contains(&"fetch".to_string()), "{suggestions:?}")
+        }
+        other => panic!("a one-letter miss should be a typo, not a tier limit: {other:?}"),
     }
 }
 
