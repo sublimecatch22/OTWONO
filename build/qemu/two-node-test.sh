@@ -80,8 +80,23 @@ rm -f "$OUT/data-check.img" "$OUT/found-key"
 echo "  source image carries no identity, as it should"
 
 # Independent disks: a shared one would mean a shared identity.
+#
+# Each copy is checked for a data filesystem before anything boots. Every otwono daemon has
+# `RequiresMountsFor=/var/lib/otwono`, so a copy whose data partition did not survive gives
+# two VMs that reach a login prompt with *no otwono service running at all* — and this
+# harness then reports "the two nodes did not form a mesh", which is true and useless. That
+# cost a full twenty-minute timeout and a disk forensics session to say "the disk was
+# broken". Two seconds of blkid says it instead.
 for n in a b; do
     cp --sparse=always "$IMAGE" "$OUT/node-$n.img"
+    if ! blkid -p -o value -s LABEL \
+        -O "$(( $(partx -g -o START -s --nr 4 "$OUT/node-$n.img" | tr -d ' ') * 512 ))" \
+        "$OUT/node-$n.img" 2>/dev/null | grep -q OTWONO-DATA; then
+        echo "FAIL: $OUT/node-$n.img has no OTWONO-DATA filesystem after copying." >&2
+        echo "      Nothing would mount /var/lib/otwono, so no otwono daemon would start." >&2
+        echo "      Check that $IMAGE is complete and that no other run is writing to $OUT." >&2
+        exit 1
+    fi
 done
 
 # `ls a b | head -1` looks tempting here and is a trap: ls exits non-zero when any
