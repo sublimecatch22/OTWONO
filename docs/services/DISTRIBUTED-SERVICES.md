@@ -20,6 +20,13 @@ reader had already seen: the defence existed, passed its tests, and was never co
 reader's memory lives in `otwono-store::PointerStore` and `otwono-netd` reaches it over the
 control plane, so it survives a restart and there is one writer to it.
 
+**Verified between booted nodes** on 2026-08-27: each node took its peer's update at sequence
+2 over the link, then refused the peer's rolled-back sequence-1 record. The replayed record is
+the rightful owner's, genuinely signed and current for that owner; it is refused because the
+reader remembers a higher number. Same log entry, which also records that no *third party*
+replay has been shown on a wire and that the log's survival across a reboot is still only
+tested in-process.
+
 ## 1. Three primitives, many services
 
 We are not building eight independent systems. Every service is composed from:

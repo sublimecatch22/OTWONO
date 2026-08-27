@@ -4548,3 +4548,138 @@ established one exists to prevent.
   was rebooted to confirm the protection persists.
 - **One name each.** No node published two, and no pointer was republished on a booted node,
   so a sequence advancing over a real link is untested.
+
+---
+
+## 2026-08-27 — a rolled-back pointer is refused between two booted nodes
+
+**STATUS: VERIFIED.** amd64, QEMU, TCG, no `/dev/kvm`. Two VMs on a segment with no DHCP,
+link-local addressing, mDNS discovery, Noise XX mutual authentication.
+
+This is the property ADR-0027 exists for, and until this run it had only ever fired in a unit
+test. It also turned out to be the property that was **not wired up at all**.
+
+### The defence was dead code
+
+`SequenceLog` existed, was tested, and was never called from anywhere a record arrives:
+
+```
+$ grep -rn "accept_from_peer\|SequenceLog" crates/otwono-netd/src/ crates/otwono-stored/src/
+$
+```
+
+Every pointer fetched from a peer was verified and then accepted regardless of what the
+reader had already seen — which is precisely the thing ADR-0027 §1 says a signature cannot
+do for you. Proving rollback on a wire meant putting the defence on the fetch path first.
+
+The reader's memory is durable state owned by `otwono-stored`; the fetch runs in
+`otwono-netd`. Same two-process problem as the cluster cache, so the same answer (ADR-0026
+§10, now ADR-0027 §7): a `SequenceMemory` trait, `PointerStore` implementing it in-process,
+`content::BrokeredPointers` implementing it over the control plane under a new
+`pointer.write` capability.
+
+**A memory that cannot be reached refuses the record.** Every other brokered call here treats
+a refusal as "then do less", and that is safe for replication. It is the opposite here:
+falling back to signature-only verification would accept a pointer with no rollback
+protection while the caller believed it had some, handing the rollback to anyone who can stop
+the local store — far easier than forging a signature.
+
+### What the two nodes did
+
+Each node published `wiki/Getting-Started`, resolved its peer's, republished at sequence 2,
+and waited to see the peer's advance. Then each **regressed its own pointer** — cleared its
+`mine` directory and republished at sequence 1 pointing somewhere new, which is what a node
+that lost its pointer store and started over looks like — and each refused the other's
+rolled-back record.
+
+Nothing synthetic is involved. The replayed record is the rightful owner's, genuinely signed,
+current for that owner, served over an authenticated channel. It is refused because the
+reader remembers a higher number, which is the entire claim.
+
+```
+content: both nodes served a public object and refused a private one
+content: each node took a replica of the other's REPLICATED object, unprompted
+content: each node resolved the other's pointer and fetched what it names
+content: each node took its peer's update, then refused the peer's rolled-back record
+PASS: two nodes discovered and mutually authenticated
+  A otw1:d494-74eh-a0c4-963f
+  B otw1:rcnm-92g4-sh8c-2cpj
+```
+
+| | published (seq 1) | resolved | advanced (seq 2) | refused a rollback |
+|---|---|---|---|---|
+| node A | `bd9aff255a72d00a…` | `5f39b3b18dbb07f6…` | `dff1bda0f393ea8a…` | yes |
+| node B | `5f39b3b18dbb07f6…` | `bd9aff255a72d00a…` | `4d8bbf7acd54d87f…` | yes |
+
+Each node's `resolved` is the other's `published`, and each `advanced` differs from its
+`resolved` — so the sequence moved *and* the name came to mean something new. Both are
+asserted by the harness across the pair, because one node cannot tell "my peer had not
+republished yet" from "the path is broken".
+
+Timings, from the kernel clock on each node:
+
+| | republished → saw the advance | regressed → refused |
+|---|---|---|
+| node A | 252.0s → 254.1s (**2.0s**) | 344.2s → 346.1s (**1.9s**) |
+| node B | 251.0s → 253.0s (**2.1s**) | 343.1s → 345.1s (**2.0s**) |
+
+The ninety seconds between the two pairs is a deliberate settle window in the check. Nothing
+coordinates the two VMs, and a node that regressed while its peer was still looking for
+sequence 2 would fail the advance assertion for the right reason at the wrong time. The
+margin is the coordination: the nodes run the same script from the same boot and reach each
+step within about a second of each other, so ninety is roughly ninety times what is needed.
+
+### A bug the wiring exposed, which would have shipped
+
+Making the defence reachable immediately broke the ordinary case. §1's rule said a record at a
+sequence already seen is rejected, and that included **equal** — so a reader refused the
+record it already held, and an unchanged name could be read exactly once per node and never
+again. The rule had been written for the attack and never tried against a re-read.
+
+Equal is now decided by the record rather than the number (ADR-0027 §8): the same bytes are
+`Accepted::Unchanged`, different bytes at the same number are `PointerError::Equivocation`.
+That required the log to remember *what* it saw and not merely that it saw a number. The boot
+check asserts the re-read next to the attack, because the rule that stops one nearly stopped
+both.
+
+### Two runs, and the first was not the code's fault
+
+**Run 1** timed out with "the two nodes did not form a mesh" — true, and useless. Both VMs
+had reached a login prompt with **no otwono service running at all**. The disk told the
+story: partition 4 carried its partition entry but no filesystem, so
+`/dev/disk/by-label/OTWONO-DATA` never appeared, and every daemon has
+`RequiresMountsFor=/var/lib/otwono`. The VM journal, read by mounting the image, shows the
+device job timing out every ninety seconds from the first minute of boot.
+
+The source image was intact throughout — `blkid` reads a valid ext4 on p4 — and
+`cp --sparse=always` reproduces it faithfully when tested by hand. The copies were most
+likely clobbered by a concurrent harness invocation sharing the output directory, which was
+my own process error.
+
+Whatever the cause, twenty minutes and a disk forensics session to learn "the disk was
+broken" is the harness's fault, not the disk's. It now checks each copy for an `OTWONO-DATA`
+filesystem before booting anything, verified in both directions: the current image passes,
+the broken `node-a.img` from run 1 fails.
+
+The same push also failed CI on `cargo fmt --all --check`. Three hand-edited hunks; I had run
+`clippy` and the full suite locally and not `fmt`. Formatting is a check like any other and
+belongs in the same pass.
+
+### What this does not show
+
+- **amd64 only, two nodes.** No arm64 run. No three-node or partition test.
+- **The reader is never rolled back by a third party.** The replay here comes from the
+  rightful owner, because two VMs contain no malicious peer to serve someone else's old
+  record. A cache or gateway replaying a record it holds is the case ADR-0027 §1 opens with,
+  and it is still only an integration test.
+- **Nothing survived a restart.** The sequence log's durability is tested in-process; no VM
+  was rebooted to confirm the protection persists across one. That is the property the whole
+  design leans on, and it is the most valuable thing left untested here.
+- **The equivocation refusal never crossed a wire.** Two different records at one sequence is
+  a unit test only.
+- **The sequence log has no version field on disk.** A format change is read as corruption,
+  which prints "rollback protection restarts from first use" and continues — loud, and the
+  safe direction, but a version would be better than a warning.
+- **No tombstone crossed**, and no `MemoryUnavailable` refusal was exercised on a booted node:
+  the test image grants `pointer.write`, so nothing there ever had to read a pointer without
+  a memory.

@@ -289,8 +289,9 @@ it a worse record.
 `docs/services/DISTRIBUTED-SERVICES.md` is composed from: **signed mutable pointers**
 (ADR-0027), which is what lets anything change over time. A pointer crosses a link between
 booted nodes, and the rollback rule that makes a mutable name safe on an untrusted network
-is on the fetch path rather than beside it (ADR-0027 §7). Primitive 3 — addressed messages —
-has not started, and none of the three services has.
+is on the fetch path rather than beside it (ADR-0027 §7) — two VMs took each other's update
+and then refused each other's rolled-back record. Primitive 3 — addressed messages — has not
+started, and none of the three services has.
 
 **Exit criterion:** a three-node QEMU network where node A's wiki page is readable on node
 B, an offline message to node C is delivered when C returns, and a network partition heals
