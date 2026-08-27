@@ -545,6 +545,47 @@ fn replication_pass_after_dial(state: &Arc<NetState>, candidate: &Candidate) {
 /// How long the discovery loop waits for a new advertisement before retrying known peers.
 const DISCOVERY_SWEEP: Duration = Duration::from_secs(30);
 
+/// Take at most one replica from one already-connected peer, on the sweep tick.
+///
+/// The dial-time pass is not enough on its own, and finding out why corrected ADR-0026 §9.
+/// A peer is marked `Connected` once and `retry_candidates` then skips it forever, while
+/// `dial_inner` drops its channel as soon as the handshake is done. So a "connection" is a
+/// momentary event that happens **once per peer for the life of the daemon** — which would
+/// have made a dial-time-only pass replicate one object per peer, ever, and only content
+/// that already existed when the two nodes first met. Anything published afterwards would
+/// never be offered to anybody.
+///
+/// This rides the sweep the discovery loop already runs, so §9's reasons survive intact:
+/// no new timer and no interval to configure; nothing happens offline, because a node with
+/// no peers has nothing to iterate; and it is still rate-limited, now by the sweep rather
+/// than by chance meetings.
+///
+/// **It is self-limiting rather than bounded by a rule.** A node whose budget is full
+/// answers `NotReplicating` before the dial, so it makes no traffic at all. A node with room
+/// asks around until it has none. One peer per tick, rotating, so no single peer is asked
+/// repeatedly while another is never asked.
+fn replication_sweep(state: &Arc<NetState>, turn: &mut usize) {
+    if state.holder.is_none() {
+        return;
+    }
+    let connected = state.peers.lock().unwrap().connected();
+    if connected.is_empty() {
+        return;
+    }
+    let peer = &connected[*turn % connected.len()];
+    *turn = turn.wrapping_add(1);
+    let Some(address) = peer.addresses.first().and_then(|a| a.parse().ok()) else {
+        return;
+    };
+    replication_pass_after_dial(
+        state,
+        &Candidate {
+            claimed_node_id: peer.node_id,
+            address,
+        },
+    );
+}
+
 /// Discovery loop: browse the LAN, dial whoever we are supposed to dial, and keep trying.
 ///
 /// The retry sweep is not optional. mDNS delivers `ServiceResolved` once per resolution,
@@ -553,9 +594,11 @@ const DISCOVERY_SWEEP: Duration = Duration::from_secs(30);
 /// forever having discovered each other and connected to nothing.
 pub fn run_discovery(state: Arc<NetState>, discovery: otwono_net::Discovery) {
     let local = *state.node_id();
+    let mut turn = 0usize;
     loop {
         let Some(candidate) = discovery.next_candidate(DISCOVERY_SWEEP) else {
             retry_known_peers(&state, &local);
+            replication_sweep(&state, &mut turn);
             continue;
         };
         if candidate.claimed_node_id == local {

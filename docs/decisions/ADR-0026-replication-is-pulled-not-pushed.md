@@ -239,6 +239,47 @@ unattended, which is the only condition under which replication is worth anythin
 smallest-that-fits (§9); the owner still cannot count replicas (§3); nothing new is pushed.
 The split is about which process holds the bytes, not about who decides.
 
+### §11 "On connection" needed a second trigger, because connections happen once
+
+**Amended 2026-08-27, on booting it.** §9 said a node asks its peers when it connects to
+them, and rejected a timer for four reasons. Wiring it exposed a false assumption underneath
+that: **there is no recurring connection event to hang it on.**
+
+`otwono-netd` dials a peer, authenticates it, marks it `Connected`, and drops the channel.
+`retry_candidates` then skips every `Connected` peer forever. So a dial is a momentary event
+that happens **once per peer for the life of the daemon**. A dial-time-only pass would have
+replicated one object per peer, ever, and only content that already existed when the two
+nodes first met — anything published afterwards would never be offered to anybody. The
+subsystem would have looked like it worked in every test that publishes before the mesh
+forms, which is every test that existed.
+
+**So the pass also runs on the discovery sweep**, against one connected peer per tick,
+rotating. §9's four reasons survive this, which is why it is the right place rather than a
+new timer:
+
+- It is the tick the discovery loop already runs, so there is no new timer and no interval
+  for an operator to set differently on two nodes.
+- A node with no peers iterates nothing, so an offline node still does no replication work.
+- It is still rate-limited — by the sweep now rather than by chance meetings, which is a
+  bound that actually exists.
+- The per-session offer index (§7) is unchanged: each pass is a fresh session, which is what
+  makes newly-published content visible at all.
+
+**It is self-limiting rather than capped by a rule.** A node whose budget is full answers
+before the dial and makes no traffic; a node with room asks around until it has none. That
+is the same shape as §9's "nothing is asked when replication is off": the consent gate and
+the budget gate are both checked before anything reaches the wire.
+
+**What this costs, named plainly:** a replicating node with spare budget opens one
+connection per sweep tick. That is real traffic that the dial-time-only design would not
+have made, and it is the price of the label meaning anything after the first minute of
+uptime. A node that does not want it grants no `cache.replicate`, and a node that has filled
+its budget stops on its own.
+
+**§9 is not withdrawn**, and the dial-time pass stays: meeting a new peer is still the
+moment there is most likely something new to take. What changed is that it is no longer the
+only moment.
+
 ## Consequences
 
 **Good.** No consent mechanism to design, because nothing arrives unasked. No push
