@@ -467,10 +467,9 @@ impl std::fmt::Display for PointerError {
                 f,
                 "the owner signed two different records at sequence {sequence}; neither is taken"
             ),
-            PointerError::MemoryUnavailable(m) => write!(
-                f,
-                "cannot check for a rollback, so the record is refused: {m}"
-            ),
+            PointerError::MemoryUnavailable(m) => {
+                write!(f, "cannot check for a rollback, so the record is refused: {m}")
+            }
             PointerError::Encoding(m) => write!(f, "cannot encode the pointer: {m}"),
         }
     }

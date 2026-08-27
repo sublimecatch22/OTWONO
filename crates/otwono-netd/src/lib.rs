@@ -359,14 +359,8 @@ impl NetState {
         let content::PeerSource {
             mut channel, link, ..
         } = source;
-        content::fetch_pointer(
-            &mut channel,
-            service,
-            name,
-            &link,
-            self.pointer_memory.as_ref(),
-        )
-        .map_err(|e| e.to_string())
+        content::fetch_pointer(&mut channel, service, name, &link, self.pointer_memory.as_ref())
+            .map_err(|e| e.to_string())
     }
 
     /// Fetch one object from several peers at once (ADR-0015).

@@ -793,7 +793,11 @@ impl otwono_pointer::SequenceMemory for BrokeredPointers {
                     .unwrap_or(pointer.sequence),
             });
         }
-        if reply.get("equivocation").and_then(Value::as_bool).unwrap_or(false) {
+        if reply
+            .get("equivocation")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
             return Err(PointerError::Equivocation {
                 sequence: reply
                     .get("sequence")
