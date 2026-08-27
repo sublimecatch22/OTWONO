@@ -12,6 +12,7 @@ repository.workspace = true
 # sealing itself lives with the identity types because that is where the key formats are.
 # One direction only: otwono-identity knows nothing about storage.
 otwono-identity = { workspace = true }
+otwono-pointer = { workspace = true }
 # statvfs, for the reserve floor that stops the cache filling the disk.
 rustix = { version = "0.38", features = ["fs", "process"] }
 serde = { workspace = true }

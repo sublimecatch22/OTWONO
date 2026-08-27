@@ -68,6 +68,19 @@ decision = "allow"
 ttl_seconds = 300
 
 [[rule]]
+action = "pointer.publish"
+decision = "allow"
+ttl_seconds = 300
+
+# Deliberately granted where store.read is denied: a node that serves peers must know its
+# own next sequence to publish at all, and that is a different authority from opening every
+# object the user has stored.
+[[rule]]
+action = "pointer.read"
+decision = "allow"
+ttl_seconds = 300
+
+[[rule]]
 action = "store.read"
 decision = "deny"
 "#;
@@ -84,6 +97,8 @@ struct Harness {
     server_node: otwono_identity::NodeId,
     /// The asking node.
     client: Arc<NetState>,
+    /// The signing identity behind otwono-idd, for publishing as the serving node.
+    node_signing: otwono_identity::SigningIdentity,
     shutdown: Shutdown,
 }
 
@@ -116,6 +131,12 @@ impl Harness {
         let keystore = SigningKeystore::new(dir.join("identity"));
         let sharing_store = SharingKeystore::new(dir.join("identity"));
         let (signing, _) = keystore.load_or_generate().unwrap();
+        // Loaded a second time rather than cloned: SigningIdentity holds key material and
+        // deliberately is not Clone. The keystore returns the same key, which is the point —
+        // this is the identity otwono-idd fronts, and the handshake proves it.
+        let (node_signing, _) = SigningKeystore::new(dir.join("identity"))
+            .load_or_generate()
+            .unwrap();
         let idd = Arc::new(
             IdentityService::new(
                 keystore,
@@ -136,10 +157,12 @@ impl Harness {
         // the store, as on a real node: what the user put there and what the node picked up
         // on its neighbours' behalf never share a path (ADR-0015).
         let cache = otwono_store::Cache::at(dir.join("cache"), StorageKey::generate(), 8 << 20).unwrap();
+        let pointers = otwono_store::PointerStore::at(dir.join("pointers")).unwrap();
         let service = Arc::new(
             StoreService::new(store, perm_socket.clone())
                 .with_identity(id_socket.clone())
-                .with_cache(cache),
+                .with_cache(cache)
+                .with_pointers(pointers),
         );
         let s = shutdown.clone();
         let server = Server::bind(&store_socket).unwrap();
@@ -193,6 +216,7 @@ impl Harness {
             server_addr,
             server_node,
             client,
+            node_signing,
             shutdown,
         }
     }
@@ -344,6 +368,53 @@ impl Harness {
 
     /// A responder wired to the same store, for asking questions the wire types cannot
     /// express through `fetch_object` — a hand-built request, for instance.
+    /// Publish a pointer as the serving node, signed by the harness's own identity.
+    ///
+    /// Signed here rather than by otwono-idd because what is under test is the wire and the
+    /// verification, and a second signing path would be a second thing to get wrong. The
+    /// bytes are the same either way: `id.sign` prepends the application domain, which
+    /// `domain_separated` does here.
+    fn publish(&self, service: &str, name: &str, content: Option<&str>) -> u64 {
+        let signer = &self.node_signing;
+        // A token per call. pointer.publish is Egress, and Egress tokens are one-shot by
+        // default, so reusing one across two calls fails on the second -- as it should.
+        let mut client = Client::connect(&self.store_socket).unwrap();
+        let next = client
+            .call_with_capability(
+                "pointer.next_sequence",
+                json!({ "service": service, "name": name }),
+                &self.token("pointer.read"),
+            )
+            .unwrap()
+            .unwrap()["next_sequence"]
+            .as_u64()
+            .unwrap();
+
+        let mut pointer = otwono_pointer::Pointer::new(
+            signer.node_id(),
+            service,
+            name,
+            next,
+            content.map(str::to_string),
+            1_700_000_000_000 + next,
+        );
+        let payload = pointer.payload_for_id_sign().unwrap();
+        pointer.signature = data_encoding::BASE64.encode(
+            &signer
+                .sign(&otwono_identity::domain_separated(&payload))
+                .to_bytes(),
+        );
+        client
+            .call_with_capability(
+                "pointer.publish",
+                json!({ "record": pointer }),
+                &self.token("pointer.publish"),
+            )
+            .unwrap()
+            .expect("publish");
+        next
+    }
+
     fn responder(&self) -> ContentResponder {
         ContentResponder::new(&self.store_socket, &self.perm_socket)
     }
@@ -694,6 +765,8 @@ fn a_peer_that_serves_the_wrong_bytes_is_caught() {
                 Request::Replicable { .. } => {
                     Response::Replicable(otwono_net::content::ReplicablePage { entries: Vec::new() })
                 }
+                // It publishes nothing either, so there is no pointer to lie about.
+                Request::Pointer { .. } => Response::not_available(""),
                 Request::Manifest { content_id, .. } => {
                     Response::Manifest(otwono_net::content::ManifestPage {
                         content_id,
@@ -1463,4 +1536,157 @@ fn a_peer_offering_endless_pages_is_cut_off_after_a_bounded_number() {
     drop(channel);
     let _ = serving.join();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A pointer crosses a real link and is verified against the key the handshake proved.
+///
+/// The second OTWONO primitive on the wire (ADR-0027). What makes this worth a test over a
+/// real channel rather than a function call is precisely where the verification key comes
+/// from: not from the record, not from a directory, but from the Noise handshake — so a peer
+/// cannot serve a record for anybody but itself, and there is no third party to trust.
+#[test]
+fn a_pointer_crosses_a_link_and_is_verified_against_the_handshake() {
+    let h = Harness::start("pointer");
+    let target = h.put(b"the page this name points at", "public");
+    let sequence = h.publish("wiki", "Home", Some(&target));
+    assert_eq!(sequence, 1, "the store assigns the first sequence");
+
+    let found = h
+        .client
+        .pointer_from(&h.candidate(), "wiki", "Home")
+        .expect("a pointer fetch over a real link")
+        .expect("the peer publishes that name");
+
+    assert_eq!(found.content_id.as_deref(), Some(target.as_str()));
+    assert_eq!(found.sequence, 1);
+    assert_eq!(found.service, "wiki");
+    assert_eq!(found.name, "Home");
+    assert!(!found.is_tombstone());
+    // The owner is the peer the handshake authenticated, not whatever the record claimed.
+    assert_eq!(found.node_id, h.server_node.to_text());
+}
+
+/// A name the peer does not publish is indistinguishable from a refusal.
+///
+/// One answer for both, deliberately: a distinct "no such name" would let a stranger
+/// enumerate which names a node has by the shape of the reply, which is the same leak
+/// `not_available` closes everywhere else in this protocol.
+#[test]
+fn a_name_that_is_not_published_gets_the_same_answer_as_a_refusal() {
+    let h = Harness::start("pointer-absent");
+    assert!(h
+        .client
+        .pointer_from(&h.candidate(), "wiki", "Never-Written")
+        .expect("asking is not an error")
+        .is_none());
+
+    // And a service that does not exist at all answers the same way.
+    assert!(h
+        .client
+        .pointer_from(&h.candidate(), "forum", "Anything")
+        .expect("asking is not an error")
+        .is_none());
+}
+
+/// Publishing again advances the sequence, and the new record is what crosses.
+#[test]
+fn republishing_advances_the_sequence_over_the_wire() {
+    let h = Harness::start("pointer-advance");
+    let first = h.put(b"version one", "public");
+    let second = h.put(b"version two", "public");
+
+    h.publish("wiki", "Home", Some(&first));
+    let got = h
+        .client
+        .pointer_from(&h.candidate(), "wiki", "Home")
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.sequence, 1);
+    assert_eq!(got.content_id.as_deref(), Some(first.as_str()));
+
+    assert_eq!(h.publish("wiki", "Home", Some(&second)), 2);
+    let got = h
+        .client
+        .pointer_from(&h.candidate(), "wiki", "Home")
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.sequence, 2, "the peer served a stale record");
+    assert_eq!(got.content_id.as_deref(), Some(second.as_str()));
+}
+
+/// A deletion crosses as a tombstone, not as an absence.
+///
+/// The distinction matters on the wire: an absent reply means "no such name, or I will not
+/// say", and a tombstone means "the owner says this is gone" — signed, sequenced, and
+/// impossible to roll back to the live version (ADR-0027 §4).
+#[test]
+fn a_tombstone_crosses_as_a_signed_record_rather_than_an_absence() {
+    let h = Harness::start("pointer-tombstone");
+    let target = h.put(b"here for now", "public");
+    h.publish("wiki", "Home", Some(&target));
+    h.publish("wiki", "Home", None);
+
+    let got = h
+        .client
+        .pointer_from(&h.candidate(), "wiki", "Home")
+        .unwrap()
+        .expect("a tombstone is a record, not an absence");
+    assert!(got.is_tombstone());
+    assert_eq!(got.sequence, 2);
+    assert_eq!(got.content_id, None);
+}
+
+/// A peer that serves a record for somebody else is refused.
+///
+/// The property the whole narrow scope buys. The record here is perfectly signed by Mallory
+/// and claims Mallory's NodeID — it would verify in isolation. It is refused because the
+/// handshake proved this peer is somebody else, and a pointer is only ever fetched from its
+/// owner.
+#[test]
+fn a_peer_cannot_serve_a_pointer_it_does_not_own() {
+    use otwono_net::content::{PointerReply, Request, Response};
+
+    let mallory = NodeIdentity::generate().unwrap();
+    let bob = NodeIdentity::generate().unwrap();
+    let alice = NodeIdentity::generate().unwrap();
+    let (client_link, server_link) = MemoryLink::pair();
+
+    // Bob answers every pointer request with a genuine record of Mallory's.
+    let serving = std::thread::spawn(move || {
+        let mut channel = SecureChannel::accept(server_link, &bob).unwrap();
+        while let Ok(frame) = channel.recv() {
+            let request: Request = otwono_net::content::decode(&frame).unwrap();
+            let Request::Pointer { service, name } = request else {
+                break;
+            };
+            let mut record =
+                otwono_pointer::Pointer::new(mallory.node_id(), service, name, 1, Some("aa".repeat(32)), 1);
+            let payload = record.payload_for_id_sign().unwrap();
+            record.signature = data_encoding::BASE64.encode(
+                &mallory
+                    .sign(&otwono_identity::domain_separated(&payload))
+                    .to_bytes(),
+            );
+            // Genuinely signed, genuinely Mallory's, genuinely current.
+            record.verify(&mallory.public_key_bytes()).expect("a real record");
+            let reply = serde_json::to_vec(&Response::Pointer(PointerReply {
+                record: serde_json::to_value(&record).unwrap(),
+            }))
+            .unwrap();
+            if channel.send(&reply).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut channel = SecureChannel::initiate(client_link, &alice).unwrap();
+    let err = otwono_netd::fetch_pointer(&mut channel, "wiki", "Home", &LinkProperties::internet())
+        .expect_err("a record for another node must be refused");
+    assert!(
+        matches!(err, ProtocolError::Mismatched(_)),
+        "expected a mismatch, got {err:?}"
+    );
+
+    drop(channel);
+    let _ = serving.join();
 }

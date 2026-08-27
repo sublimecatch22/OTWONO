@@ -112,6 +112,21 @@ pub enum Request {
         /// How many entries the requester can receive in one reply.
         max_entries: u32,
     },
+    /// What does this name point at right now? (ADR-0027)
+    ///
+    /// The second primitive on the wire. There is no `node_id` field, and that is the
+    /// decision: a peer answers only for **itself**, so the owner is the NodeID the Noise
+    /// handshake authenticated and the key that verifies the answer is the one the handshake
+    /// proved. Asking a peer for somebody else's pointer would need that somebody's public
+    /// key from a third place, and would reintroduce the caching question ADR-0027 left
+    /// open — a cached pointer is a rollback risk with a friendly face.
+    #[serde(rename = "content.pointer")]
+    Pointer {
+        /// Which namespace: `wiki`, `profile`, `forum`.
+        service: String,
+        /// The path within it.
+        name: String,
+    },
     /// One range of one chunk of one object.
     #[serde(rename = "content.chunk")]
     Chunk {
@@ -207,6 +222,17 @@ pub struct ReplicableEntry {
     pub allow_rereplication: bool,
 }
 
+/// One pointer record, as the owner signed it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PointerReply {
+    /// The record, verbatim. Carried as a JSON value rather than a typed struct so this
+    /// crate does not have to depend on `otwono-pointer` — the transport's job is to deliver
+    /// it unaltered, and a type here would mean a record this build did not understand could
+    /// not even be relayed.
+    pub record: serde_json::Value,
+}
+
 /// A page of what one node is willing to have copied (ADR-0026 §7).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplicablePage {
@@ -230,6 +256,9 @@ pub struct SharedIndexPage {
 /// Ceiling on one index page, whatever the link would allow. A responder builds the page in
 /// memory, so an unbounded request is an allocation a peer chooses.
 pub const MAX_SHARED_ENTRIES_PER_REQUEST: u32 = 256;
+
+/// Longest pointer name this protocol will carry, matching `pointer.schema.json`.
+pub const MAX_POINTER_NAME_BYTES: usize = 512;
 
 /// Bytes of JSON one [`SharedIndexEntry`] costs: 64 hex characters, the field names, a size
 /// and the punctuation. Measured at 125 for the widest possible size;
@@ -295,6 +324,13 @@ pub enum Response {
     /// noun, and the schema is where the inconsistency showed up.
     #[serde(rename = "replicable")]
     Replicable(ReplicablePage),
+    /// The signed record itself, passed through unexamined by the transport.
+    ///
+    /// Deliberately opaque here: `otwono-net` moves bytes and must not become a second place
+    /// that knows how a pointer verifies. The asker checks it against the key the handshake
+    /// proved, in `otwono-netd`.
+    #[serde(rename = "pointer")]
+    Pointer(PointerReply),
     /// Absent, refused, damaged, or not part of that object. One answer for all of them.
     #[serde(rename = "not_available")]
     NotAvailable { content_id: String },
@@ -397,7 +433,9 @@ impl Request {
     pub fn content_id(&self) -> Option<&str> {
         match self {
             Request::Manifest { content_id, .. } | Request::Chunk { content_id, .. } => Some(content_id),
-            Request::SharedWithMe { .. } | Request::Replicable { .. } => None,
+            // A pointer request names no content id either — it asks what a *name* points
+            // at, and the id is the answer rather than the question.
+            Request::SharedWithMe { .. } | Request::Replicable { .. } | Request::Pointer { .. } => None,
         }
     }
 
@@ -440,6 +478,27 @@ impl Request {
             }
             // Same bounds for both index requests: they are the same shape of question and
             // a divergence would be an accident rather than a decision.
+            Request::Pointer { service, name } => {
+                // Bounded here rather than at the store: these strings arrive from a
+                // stranger and become a lookup key. The limits match the pointer schema's.
+                if service.is_empty() || service.len() > 32 {
+                    return Err(ProtocolError::TooLarge {
+                        field: "service",
+                        asked: service.len() as u64,
+                        ceiling: 32,
+                    });
+                }
+                if name.is_empty() {
+                    return Err(ProtocolError::ZeroLength { field: "name" });
+                }
+                if name.len() > MAX_POINTER_NAME_BYTES {
+                    return Err(ProtocolError::TooLarge {
+                        field: "name",
+                        asked: name.len() as u64,
+                        ceiling: MAX_POINTER_NAME_BYTES as u64,
+                    });
+                }
+            }
             Request::SharedWithMe { after, max_entries } | Request::Replicable { after, max_entries } => {
                 if let Some(after) = after {
                     if !is_hex_digest(after) {

@@ -249,6 +249,23 @@ impl ActionRegistry {
                 // is disposable by construction. Not always_confirm, because a node that had
                 // to prompt before holding one could not replicate while unattended, which
                 // is the only condition under which replication is worth anything.
+                // Publishing changes what a *name* means to every peer that reads it, where
+                // store.write only adds bytes nobody has asked for. Egress blast radius
+                // because the record is meant to leave the node -- that is what publishing
+                // is -- and a person may reasonably run a node that stores and publishes
+                // nothing (ADR-0027).
+                ActionSpec::new(
+                    "pointer.read",
+                    "Read which names this node publishes, and at what sequence",
+                    BlastRadius::Read,
+                    false,
+                ),
+                ActionSpec::new(
+                    "pointer.publish",
+                    "Publish a signed pointer under this node's name",
+                    BlastRadius::Egress,
+                    false,
+                ),
                 ActionSpec::new(
                     "cache.replicate",
                     "Hold content offered by a peer as a replica for the cluster",

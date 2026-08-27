@@ -165,8 +165,19 @@ owner's public key, which the NodeID already is.
 
 ## What is deliberately not decided
 
-- **How a pointer reaches another node.** A new ONM request in ADR-0017's shape, most
-  likely, and the next slice.
+- ~~**How a pointer reaches another node.**~~ **Settled, 2026-08-27.** `content.pointer` in
+  ADR-0017's shape, carrying `service` and `name` and **no owner field**.
+
+  The absent field is the decision. A peer answers only for itself, so the owner is the
+  NodeID the Noise handshake authenticated — which means the key that verifies the answer is
+  one the reader established independently, before the peer said anything. There is no key
+  distribution problem in this shape and no third party to trust.
+
+  Letting a peer serve somebody else's record would need that somebody's public key from a
+  third place, and would make every node a pointer cache, which is the question left open
+  below. A cached pointer is a rollback risk with a friendly face: the cache has no way to
+  know it is stale, and the reader can no longer tell "this is what the owner says" from
+  "this is what somebody had lying about".
 - **Whether pointers are cached or replicated** the way blocks are (ADR-0015, ADR-0026). A
   cached pointer is a rollback risk with a friendly face, and it needs its own thinking.
 - **Petnames.** `DISTRIBUTED-SERVICES.md` §3 says local assignment with no global registry;

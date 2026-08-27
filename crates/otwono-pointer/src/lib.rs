@@ -222,7 +222,29 @@ pub enum Accepted {
 /// and why this type keeps no opinion about where.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SequenceLog {
+    /// Serialized as a list of pairs, not a map.
+    ///
+    /// JSON object keys must be strings, and a `PointerKey` is three of them — flattening it
+    /// into one would need an escaping rule for whatever separator was chosen, and a name
+    /// containing that separator would then collide with a different pointer. A list keeps
+    /// the three parts separate, which is the same reason the store hashes them separately.
+    #[serde(with = "pairs")]
     highest: BTreeMap<PointerKey, u64>,
+}
+
+/// `BTreeMap<PointerKey, u64>` as `[[key, sequence], ...]`.
+mod pairs {
+    use super::PointerKey;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<S: Serializer>(map: &BTreeMap<PointerKey, u64>, s: S) -> Result<S::Ok, S::Error> {
+        map.iter().collect::<Vec<_>>().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<PointerKey, u64>, D::Error> {
+        Ok(Vec::<(PointerKey, u64)>::deserialize(d)?.into_iter().collect())
+    }
 }
 
 impl SequenceLog {

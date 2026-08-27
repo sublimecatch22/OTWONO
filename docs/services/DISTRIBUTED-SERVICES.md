@@ -3,10 +3,13 @@
 **Status:** `SPECIFIED`, with the second primitive built.
 
 Primitive 1 (content-addressed blocks) is `VERIFIED` — `otwono-store`, ADR-0016, exercised
-between booted nodes. Primitive 2 (signed mutable pointers) is `IMPLEMENTED` in
-`otwono-pointer` per ADR-0027: the record, its canonical encoding, and the rollback rules,
-unit tested with no network. Nothing yet fetches a pointer from a peer, and primitive 3
-(addressed messages) does not exist. No service in §2 is built.
+between booted nodes. Primitive 2 (signed mutable pointers) is `IMPLEMENTED` per ADR-0027:
+the record and its rollback rules in `otwono-pointer`, durable storage in
+`otwono-store::PointerStore`, and `content.pointer` on the wire — a pointer crosses a real
+channel and is verified against the key the Noise handshake proved. Primitive 3 (addressed
+messages) does not exist, and no service in §2 is built.
+
+**Not yet exercised between booted nodes**, so nothing here is `VERIFIED`.
 
 ## 1. Three primitives, many services
 

@@ -19,6 +19,7 @@ otwono-net = { workspace = true }
 # exactly the derivation the store uses. Note that the *label* check is deliberately NOT
 # shared with otwono-store: see content::may_leave_a_node.
 otwono-store = { workspace = true }
+otwono-pointer = { workspace = true }
 # For the identity daemon's capability names. A dependency on the interface, not the
 # implementation: renaming a capability must be a compile error here, not a runtime denial.
 otwono-idd = { workspace = true }

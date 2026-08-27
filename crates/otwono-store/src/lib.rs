@@ -5,6 +5,7 @@ pub mod crypt;
 pub mod handoff;
 pub mod label;
 pub mod object;
+pub mod pointers;
 pub mod shared;
 
 pub use cache::{
@@ -16,4 +17,5 @@ pub use crypt::{CryptError, StorageKey, DEFAULT_KEY_PATH};
 pub use handoff::{Exported, Handoff, HandoffError, DEFAULT_EXPORT_DIR, EXPORT_MAX_AGE};
 pub use label::Visibility;
 pub use object::{ContentId, Object, ObjectError};
+pub use pointers::{PointerStore, PointerStoreError, DEFAULT_POINTER_DIR};
 pub use shared::{ContentKey, SharedError, FRAME_BYTES, SHARED_ENCRYPTION};

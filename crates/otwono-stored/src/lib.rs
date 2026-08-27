@@ -73,6 +73,20 @@ pub const CAPABILITY_CACHE_WRITE: &str = "cache.write";
 /// be unattended. "Cache what I fetch, but do not host for strangers" is a sentence an
 /// operator will want to say, and only a separate capability lets them say it.
 pub const CAPABILITY_REPLICATE: &str = "cache.replicate";
+/// Publishing one of this node's own pointers (ADR-0027).
+///
+/// Its own capability rather than `store.write`: publishing changes what a *name* means to
+/// every peer that reads it, where store.write only adds bytes nobody has asked for yet. A
+/// person may reasonably want a node that stores things and publishes nothing.
+pub const CAPABILITY_PUBLISH: &str = "pointer.publish";
+/// Reading this node's own pointer state (ADR-0027).
+///
+/// Its own capability rather than `store.read`, and the difference is what each one reaches:
+/// `store.read` opens objects — every byte the user has stored — where this reads only which
+/// names this node publishes and at what sequence. A node that serves peers is deliberately
+/// run without `store.read` so a bug in a label check cannot reach private data, and that
+/// node still has to know its own next sequence in order to publish at all.
+pub const CAPABILITY_POINTER_READ: &str = "pointer.read";
 
 /// A cap on one inline object, in **raw** bytes before base64.
 ///
@@ -114,6 +128,10 @@ pub struct StoreService {
     /// configured — and then every cache method answers "not available" rather than
     /// pretending to have cached something.
     cache: Option<Cache>,
+    /// The pointers this node publishes and has read (ADR-0027). `None` on a daemon started
+    /// without one, and then every pointer method says so rather than answering "no such
+    /// name" — which would be a different and misleading claim.
+    pointers: Option<otwono_store::PointerStore>,
     /// Where `otwono-idd` listens, so a content key sealed to this node can be unwrapped
     /// without this daemon ever holding the sharing key (ADR-0019 §3). `None` on a daemon
     /// started without one, and then `store.open_shared` says so.
@@ -353,6 +371,7 @@ impl StoreService {
             store,
             handoff: None,
             cache: None,
+            pointers: None,
             id_socket: None,
             perm_socket,
         }
@@ -396,6 +415,72 @@ impl StoreService {
     pub fn with_cache(mut self, cache: Cache) -> Self {
         self.cache = Some(cache);
         self
+    }
+
+    /// Give this daemon somewhere to keep pointers (ADR-0027).
+    pub fn with_pointers(mut self, pointers: otwono_store::PointerStore) -> Self {
+        self.pointers = Some(pointers);
+        self
+    }
+
+    fn pointers(&self) -> Result<&otwono_store::PointerStore, RpcError> {
+        self.pointers
+            .as_ref()
+            .ok_or_else(|| RpcError::unavailable("this node keeps no pointers; none was configured"))
+    }
+
+    /// Publish one of this node's own pointers.
+    ///
+    /// The record arrives already signed. This daemon does not sign and must not: signing
+    /// needs the node key, which lives in `otwono-idd` and reaches nothing else (ADR-0010).
+    /// What this adds is the monotonicity check, which is the one thing a store can enforce
+    /// that a caller might forget — and forgetting it is unrecoverable, because a pointer
+    /// that goes backwards is refused as a rollback by every peer that saw the higher one.
+    fn handle_pointer_publish(&self, params: Value) -> Result<Value, RpcError> {
+        let record = params
+            .get("record")
+            .ok_or_else(|| RpcError::invalid_params("pointer.publish needs a record"))?;
+        let pointer: otwono_pointer::Pointer = serde_json::from_value(record.clone())
+            .map_err(|e| RpcError::invalid_params(format!("pointer.publish: {e}")))?;
+        self.pointers()?
+            .publish(&pointer)
+            .map_err(|e| RpcError::invalid_params(format!("pointer.publish: {e}")))?;
+        Ok(json!({
+            "schema_version": DESCRIBE_SCHEMA_VERSION,
+            "service": pointer.service,
+            "name": pointer.name,
+            "sequence": pointer.sequence,
+            "tombstone": pointer.is_tombstone(),
+        }))
+    }
+
+    /// What sequence this node should sign next for a name.
+    fn handle_pointer_next(&self, params: Value) -> Result<Value, RpcError> {
+        let service = params.get("service").and_then(Value::as_str).unwrap_or_default();
+        let name = params.get("name").and_then(Value::as_str).unwrap_or_default();
+        let next = self
+            .pointers()?
+            .next_sequence(service, name)
+            .map_err(|e| RpcError::internal(e.to_string()))?;
+        Ok(json!({ "schema_version": DESCRIBE_SCHEMA_VERSION, "next_sequence": next }))
+    }
+
+    /// One of this node's own pointers, for serving to a peer.
+    ///
+    /// `record: null` for a name this node does not publish. A distinct error would let a
+    /// caller — and through `otwono-netd`, a stranger — tell "no such name" from "refused",
+    /// which is the enumeration `not_available` exists to prevent everywhere else.
+    fn handle_pointer_mine(&self, params: Value) -> Result<Value, RpcError> {
+        let service = params.get("service").and_then(Value::as_str).unwrap_or_default();
+        let name = params.get("name").and_then(Value::as_str).unwrap_or_default();
+        let found = self
+            .pointers()?
+            .mine(service, name)
+            .map_err(|e| RpcError::internal(e.to_string()))?;
+        Ok(json!({
+            "schema_version": DESCRIBE_SCHEMA_VERSION,
+            "record": found.map(|p| serde_json::to_value(p).unwrap_or(Value::Null)),
+        }))
     }
 
     fn cache(&self) -> Result<&Cache, RpcError> {
@@ -1568,6 +1653,21 @@ impl Service for StoreService {
                     CAPABILITY_CACHE_WRITE,
                 ),
                 MethodDescription::guarded(
+                    "pointer.publish",
+                    "Publish one of this node's own signed pointers",
+                    CAPABILITY_PUBLISH,
+                ),
+                MethodDescription::guarded(
+                    "pointer.next_sequence",
+                    "What sequence this node should sign next for a name",
+                    CAPABILITY_POINTER_READ,
+                ),
+                MethodDescription::guarded(
+                    "pointer.mine",
+                    "One of this node's own pointers, for serving to a peer",
+                    CAPABILITY_SERVE,
+                ),
+                MethodDescription::guarded(
                     "cache.replica_room",
                     "How much this node will still promise, and which offered ids it holds",
                     CAPABILITY_REPLICATE,
@@ -1659,6 +1759,27 @@ impl Service for StoreService {
             "cache.put" => {
                 self.authorize(ctx, CAPABILITY_CACHE_WRITE)?;
                 self.handle_cache_put(params)
+            }
+            "pointer.publish" => {
+                self.authorize(ctx, CAPABILITY_PUBLISH)?;
+                self.handle_pointer_publish(params)
+            }
+            // pointer.read, not pointer.publish and not store.read. Not publish, because
+            // this reads local state and moves nothing off the machine -- and since Egress
+            // tokens are one-shot by default, that guard would make every caller burn a
+            // publish token to ask a question. Not store.read either: that opens objects,
+            // and a node that serves peers is deliberately run without it.
+            "pointer.next_sequence" => {
+                self.authorize(ctx, CAPABILITY_POINTER_READ)?;
+                self.handle_pointer_next(params)
+            }
+            // store.serve, not pointer.publish: this is the read side, and it is what
+            // otwono-netd calls to answer a peer. Guarding it with the publish capability
+            // would mean a node could not serve what it publishes without also being able to
+            // publish more.
+            "pointer.mine" => {
+                self.authorize(ctx, CAPABILITY_SERVE)?;
+                self.handle_pointer_mine(params)
             }
             "cache.replica_room" => {
                 self.authorize(ctx, CAPABILITY_REPLICATE)?;

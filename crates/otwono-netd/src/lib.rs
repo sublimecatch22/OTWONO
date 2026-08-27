@@ -20,8 +20,8 @@ pub mod content;
 pub mod signer;
 
 pub use content::{
-    fetch_object, fetch_object_from_peers, fetch_object_to_file, fetch_shared_index, serve_session,
-    ContentResponder, FanOutReport, FetchedMeta, FetchedObject, PeerSource,
+    fetch_object, fetch_object_from_peers, fetch_object_to_file, fetch_pointer, fetch_shared_index,
+    serve_session, ContentResponder, FanOutReport, FetchedMeta, FetchedObject, PeerSource,
 };
 pub use otwono_net::content::SharedIndexEntry;
 pub use signer::{BindError, BrokeredSigner};
@@ -316,6 +316,28 @@ impl NetState {
             mut channel, link, ..
         } = source;
         content::replication_pass(&mut channel, &link, holder.as_ref(), self.now()).map_err(|e| e.to_string())
+    }
+
+    /// Ask one peer what one of its names points at (ADR-0027).
+    ///
+    /// A fresh channel, for the reason [`Self::fetch_from`] opens one: roles are fixed for a
+    /// channel's life and this node has to be the one that dialled in order to ask.
+    ///
+    /// The answer is verified against the key the handshake proved, inside
+    /// [`content::fetch_pointer`], so a peer cannot serve a record for anyone but itself.
+    /// `Ok(None)` means it does not publish that name, or would not say — one answer, so
+    /// asking cannot enumerate a node's names.
+    pub fn pointer_from(
+        &self,
+        candidate: &Candidate,
+        service: &str,
+        name: &str,
+    ) -> Result<Option<otwono_pointer::Pointer>, String> {
+        let source = self.open_content_channel(candidate)?;
+        let content::PeerSource {
+            mut channel, link, ..
+        } = source;
+        content::fetch_pointer(&mut channel, service, name, &link).map_err(|e| e.to_string())
     }
 
     /// Fetch one object from several peers at once (ADR-0015).

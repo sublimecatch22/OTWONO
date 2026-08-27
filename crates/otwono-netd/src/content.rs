@@ -178,6 +178,11 @@ impl ContentResponder {
             Request::Replicable { .. } => {
                 Response::Replicable(otwono_net::content::ReplicablePage { entries: Vec::new() })
             }
+            // `not_available` naming the pointer, because unlike the index questions this one
+            // is about a *named* thing. An empty page would be the wrong shape, and inventing
+            // a "no such pointer" reply distinct from a refusal would tell a stranger which
+            // names this node has -- the same leak `not_available` exists to close.
+            Request::Pointer { .. } => Response::not_available(""),
         };
         if request.validate().is_err() {
             return refuse();
@@ -187,6 +192,9 @@ impl ContentResponder {
         }
         if let Request::Replicable { after, max_entries } = request {
             return self.replicable(peer, after.as_deref(), *max_entries, session);
+        }
+        if let Request::Pointer { service, name } = request {
+            return self.pointer(service, name);
         }
         match self.ask_store(peer, request) {
             Some(reply) => self
@@ -240,6 +248,40 @@ impl ContentResponder {
     /// Deliberately not scoped to the asking peer, unlike `shared_with`: `REPLICATED` means
     /// copying is permitted, so every peer gets the same answer and there is no filter to
     /// get wrong.
+    /// One of this node's own pointers, if it publishes that name (ADR-0027).
+    ///
+    /// Answers only for **this** node. The request carries no owner because there is nothing
+    /// to carry: a peer serving somebody else's record would be handing over something the
+    /// asker cannot verify without a third party's key, and would make this node a cache for
+    /// pointers, which ADR-0027 left open precisely because a cached pointer is a rollback
+    /// risk wearing a friendly face.
+    ///
+    /// A name this node does not publish is refused with the same `not_available` an
+    /// unpublishable one gets. Distinguishing them would let a stranger enumerate which
+    /// names exist by the shape of the refusal.
+    fn pointer(&self, service: &str, name: &str) -> Response {
+        let refused = || Response::not_available("");
+        let Some(token) = self.token() else {
+            return refused();
+        };
+        let Ok(mut client) = Client::connect(&self.store_socket) else {
+            return refused();
+        };
+        let Ok(Ok(reply)) = client.call_with_capability(
+            "pointer.mine",
+            json!({ "service": service, "name": name }),
+            &token,
+        ) else {
+            return refused();
+        };
+        match reply.get("record") {
+            Some(record) if !record.is_null() => Response::Pointer(otwono_net::content::PointerReply {
+                record: record.clone(),
+            }),
+            _ => refused(),
+        }
+    }
+
     fn replicable(
         &self,
         _peer: &NodeId,
@@ -353,8 +395,10 @@ impl ContentResponder {
                 request.content_id().is_some_and(|id| session.was_released(id))
             }
             Request::Chunk { .. } => may_leave_a_node(label),
-            // Never reaches translate: answered from the session snapshot in `answer`.
-            Request::SharedWithMe { .. } | Request::Replicable { .. } => false,
+            // Never reaches translate: the index questions are answered from the session
+            // snapshot in `answer`, and a pointer is answered before the store is asked for
+            // an object at all.
+            Request::SharedWithMe { .. } | Request::Replicable { .. } | Request::Pointer { .. } => false,
         };
         if !allowed {
             // Reachable only if otwono-stored regressed: it has already applied its own
@@ -396,7 +440,11 @@ impl ContentResponder {
                     })
                     .collect::<Option<Vec<_>>>()?,
             })),
-            Request::SharedWithMe { .. } | Request::Replicable { .. } => None,
+            // Unreachable: `allowed` above refuses all three, and `answer` routes a pointer
+            // before the store is asked for an object. Written out rather than caught by a
+            // wildcard so a future request kind has to be considered here instead of
+            // silently becoming a manifest.
+            Request::SharedWithMe { .. } | Request::Replicable { .. } | Request::Pointer { .. } => None,
             Request::Chunk { digest, .. } => {
                 let served = reply.get("digest")?.as_str()?;
                 if served != digest {
@@ -415,6 +463,9 @@ impl ContentResponder {
 
     fn ask_store(&self, peer: &NodeId, request: &Request) -> Option<serde_json::Value> {
         let (method, params) = match request {
+            // A pointer is fetched by `pointer` above, not through the object path: it names
+            // no content id, so there is no object for the store to authorize.
+            Request::Pointer { .. } => return None,
             Request::Manifest {
                 content_id,
                 from_chunk,
@@ -732,7 +783,10 @@ pub fn fetch_replicable_index<L: LinkAdapter>(
         )? {
             Response::Replicable(p) => p,
             Response::NotAvailable { .. } => return Ok(all),
-            Response::Manifest(_) | Response::Chunk(_) | Response::SharedWithYou(_) => {
+            Response::Manifest(_)
+            | Response::Chunk(_)
+            | Response::SharedWithYou(_)
+            | Response::Pointer(_) => {
                 return Err(ProtocolError::Mismatched(
                     "the wrong kind of reply in place of an offer page".into(),
                 ))
@@ -869,6 +923,69 @@ pub fn replication_pass<L: LinkAdapter, H: otwono_store::ReplicaHolder + ?Sized>
     }
 }
 
+/// Ask a peer what one of its names points at, and verify the answer (ADR-0027).
+///
+/// # The key comes from the handshake, not from the record
+///
+/// This is what makes the narrow scope worth having. The Noise handshake already proved the
+/// peer's public key, so a pointer fetched **from its owner** is verified against a key this
+/// node established independently of anything the peer said afterwards. There is no key
+/// distribution problem here at all, and no third party to trust — which is exactly the
+/// property that would be lost if a peer could serve somebody else's pointer.
+///
+/// `Ok(None)` means the peer does not publish that name, or would not say. Those are one
+/// answer on purpose: telling them apart would let a stranger enumerate a node's names.
+pub fn fetch_pointer<L: LinkAdapter>(
+    channel: &mut SecureChannel<L>,
+    service: &str,
+    name: &str,
+    link: &LinkProperties,
+) -> Result<Option<otwono_pointer::Pointer>, ProtocolError> {
+    // Taken before the round trip so the owner cannot be whatever the reply claims.
+    let owner = channel.peer().node_id;
+    let public_key = channel.peer().public_key;
+
+    let mut budget = MAX_ROUND_TRIPS;
+    let reply = match round_trip(
+        channel,
+        &Request::Pointer {
+            service: service.to_string(),
+            name: name.to_string(),
+        },
+        &mut budget,
+    )? {
+        Response::Pointer(p) => p,
+        Response::NotAvailable { .. } => return Ok(None),
+        Response::Manifest(_) | Response::Chunk(_) | Response::SharedWithYou(_) | Response::Replicable(_) => {
+            return Err(ProtocolError::Mismatched(
+                "the wrong kind of reply in place of a pointer".into(),
+            ))
+        }
+    };
+    let _ = link;
+
+    let pointer: otwono_pointer::Pointer = serde_json::from_value(reply.record)
+        .map_err(|e| ProtocolError::Mismatched(format!("not a pointer record: {e}")))?;
+
+    // What was asked for, not what arrived. A record valid for a different name would
+    // otherwise be accepted under this one (ADR-0027 §6).
+    let expected = otwono_pointer::PointerKey {
+        node_id: owner.to_text(),
+        service: service.to_string(),
+        name: name.to_string(),
+    };
+    if pointer.key() != expected {
+        return Err(ProtocolError::Mismatched(format!(
+            "asked for {}/{} and got {}/{}",
+            expected.service, expected.name, pointer.service, pointer.name
+        )));
+    }
+    pointer
+        .verify(&public_key)
+        .map_err(|e| ProtocolError::Mismatched(format!("pointer: {e}")))?;
+    Ok(Some(pointer))
+}
+
 pub fn fetch_shared_index<L: LinkAdapter>(
     channel: &mut SecureChannel<L>,
     link: &LinkProperties,
@@ -889,7 +1006,7 @@ pub fn fetch_shared_index<L: LinkAdapter>(
         )? {
             Response::SharedWithYou(p) => p,
             Response::NotAvailable { .. } => return Ok(all),
-            Response::Manifest(_) | Response::Chunk(_) | Response::Replicable(_) => {
+            Response::Manifest(_) | Response::Chunk(_) | Response::Replicable(_) | Response::Pointer(_) => {
                 return Err(ProtocolError::Mismatched(
                     "the wrong kind of reply in place of a sharing index page".into(),
                 ))
@@ -1076,7 +1193,7 @@ fn fetch_manifest<L: LinkAdapter>(
             Response::Chunk(_) => {
                 return Err(ProtocolError::Mismatched("a chunk in place of a manifest".into()))
             }
-            Response::SharedWithYou(_) | Response::Replicable(_) => {
+            Response::SharedWithYou(_) | Response::Replicable(_) | Response::Pointer(_) => {
                 return Err(ProtocolError::Mismatched(
                     "an index page in place of a manifest".into(),
                 ))
@@ -1199,7 +1316,7 @@ fn fetch_chunk<L: LinkAdapter>(
             Response::Manifest(_) => {
                 return Err(ProtocolError::Mismatched("a manifest in place of a chunk".into()))
             }
-            Response::SharedWithYou(_) | Response::Replicable(_) => {
+            Response::SharedWithYou(_) | Response::Replicable(_) | Response::Pointer(_) => {
                 return Err(ProtocolError::Mismatched(
                     "an index page in place of a chunk".into(),
                 ))
