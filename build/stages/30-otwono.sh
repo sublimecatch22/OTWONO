@@ -847,6 +847,46 @@ LockPersonality=yes
 WantedBy=multi-user.target
 UNIT
 
+log "installing the assistant self check"
+# No policy drop-in, and that is the assertion. Every capability the verbs name is already
+# granted to uid:0 by 10-default.toml, so this exercises `otwono do` on a *release* image
+# rather than on one widened for a test — unlike the mesh content check, which has to grant
+# the two capabilities that are the network boundary.
+install -m 0755 "$BUILD_DIR/files/otwono-assistant-check" "$ROOTFS/usr/lib/otwono/assistant-check"
+cat > "$ROOTFS/etc/systemd/system/otwono-assistant-check.service" <<'UNIT'
+[Unit]
+Description=OTWONO assistant self check
+Documentation=file:/usr/share/doc/otwono/AI-RUNTIME.md
+# It drives the store and the hardware daemon through the broker, so all three must be up.
+After=otwono-stored.service otwono-hwd.service otwono-permd.service
+Requires=otwono-stored.service otwono-hwd.service otwono-permd.service
+RequiresMountsFor=/var/lib/otwono
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/otwono/assistant-check
+StandardOutput=journal+console
+StandardError=journal+console
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# The parent, not /var/lib/otwono/assistant-check. Naming a subdirectory of the data
+# partition races the mount: before it is mounted the rootfs directory underneath exists and
+# the namespace sets up fine; once mounted the partition is empty and setup fails before
+# ExecStart. That trap has cost this project two daemons already — otwono-walletd and
+# otwono-fetchd — and the check creates its own scratch dir at startup.
+ReadWritePaths=/var/lib/otwono
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
 log "installing the AI daemon unit"
 # Whether this node can run a model is a property of the filesystem, not of the build: the
 # daemon discovers backends under /usr/libexec/otwono/ai-backends and /usr/lib/otwono/ai at
@@ -1066,7 +1106,7 @@ LockPersonality=yes
 WantedBy=multi-user.target
 UNIT
 
-for unit in otwono-permd otwono-hwd otwono-idd otwono-netd otwono-aid otwono-fetchd otwono-stored otwono-walletd otwono-ai-check otwono-control-plane-check otwono-content-check otwono-mesh-check otwono-mesh-check.timer; do
+for unit in otwono-permd otwono-hwd otwono-idd otwono-netd otwono-aid otwono-fetchd otwono-stored otwono-walletd otwono-ai-check otwono-control-plane-check otwono-content-check otwono-assistant-check otwono-mesh-check otwono-mesh-check.timer; do
     # The list carries a .timer as well as services, so only append .service when the
     # entry does not already name a unit type.
     case "$unit" in

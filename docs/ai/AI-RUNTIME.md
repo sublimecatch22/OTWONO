@@ -343,6 +343,17 @@ CLAUDE.md §4.3. Every other CLI in the system drives exactly one daemon — `ot
 drives `otwono-hwd`. This one drives none; it reaches whichever service a verb happens to
 name, and it is the single command a person types. The crate keeps §4.3's name.
 
+**The subcommand name has a cost, found by using it.** `do` is a shell keyword, so
+`otwono do help` makes shellcheck warn SC1010 on every line that calls it — it cannot tell a
+subcommand from a malformed `for` loop. It parses correctly; the warning is real but wrong.
+Any script driving the assistant has to quote it (`otwono 'do' help`) or wrap it in a
+helper, which `build/files/otwono-assistant-check` does once at the top.
+
+That is a small, permanent tax on every shell script in the project that touches the
+assistant, and it is worth weighing against the reason for the name: `otwono do …` is what
+two design documents promised and what reads naturally to a person. Recorded here so the
+trade is visible if the name is ever revisited.
+
 **Not exercised on a booted node.** The binary is staged into images by build stage 05, but
 no boot check runs it, so there is no entry in `VERIFICATION-LOG.md` for it yet.
 
