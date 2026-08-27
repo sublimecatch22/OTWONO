@@ -286,10 +286,20 @@ if pt=$(otwono-storectl put --file "$WORK/for-pointer.txt" --visibility public 2
 
     # Retried: the peer may not have published yet, and unlike the offer index there is no
     # per-session snapshot here -- each ask is a fresh channel and a fresh answer.
+    # Matched on the *shape* of the value, scanning every field, rather than on a field
+    # index. The first version of this tested $3 for a number -- but $3 is the literal word
+    # "sequence", so the condition was never true and the check could not have passed at
+    # all. The shared-with-me step above already used shape matching; departing from it here
+    # was the mistake.
+    #
+    # stderr is kept, not discarded. Discarding it is what made the failure unreadable: a
+    # resolve that errored and a resolve that returned nothing looked identical, and the
+    # retry loop hid both for six minutes.
     i=0
     while [ "$i" -lt 60 ]; do
-        line=$(otwono-netd --pointer wiki/Getting-Started --socket /run/otwono/net.sock 2>/dev/null \
-            | awk '$3 ~ /^[0-9]+$/ { print $4; exit }')
+        pointer_out=$(otwono-netd --pointer wiki/Getting-Started --socket /run/otwono/net.sock 2>&1)
+        line=$(echo "$pointer_out" \
+            | awk '{ for (f = 1; f <= NF; f++) if ($f ~ /^[0-9a-f]{64}$/) { print $f; exit } }')
         case "$line" in
             [0-9a-f]*) pointer_resolved=$line; break ;;
         esac
@@ -308,9 +318,11 @@ if pt=$(otwono-storectl put --file "$WORK/for-pointer.txt" --visibility public 2
             || fail "the object a resolved pointer names could not be fetched: $got"
         step "resolved the peer's pointer and fetched what it names"
     else
-        # Not a failure on its own: a peer that has not published yet has nothing to resolve,
-        # and one node cannot tell that from a broken path. The harness asserts across both.
-        step "no peer pointer resolved within the retry window"
+        # Not a failure on its own: a peer that has not published yet has nothing to
+        # resolve, and one node cannot tell that from a broken path. The harness asserts
+        # across both. What the last attempt actually said is printed, because "nothing
+        # resolved" with no other information is what made this take two runs to diagnose.
+        step "no peer pointer resolved within the retry window; last reply: $pointer_out"
     fi
 fi
 
@@ -508,25 +520,40 @@ step "asking the peer what it has sealed to this node"
 discovered=none
 i=0
 while [ "$i" -lt 60 ]; do
-    line=$(otwono-netd --shared-with-me --socket /run/otwono/net.sock 2>/dev/null \
-        | awk '$1 ~ /^[0-9a-f]{64}$/ { print $1; exit }')
-    [ -n "$line" ] && { discovered=$line; break; }
+    # Every id, not just the first. The peer seals more than one thing to this node during a
+    # run, and one of them -- the grant/revoke object above -- is revoked moments after it is
+    # granted. Taking only the first meant that whichever the index happened to list first
+    # decided whether the check passed.
+    all=$(otwono-netd --shared-with-me --socket /run/otwono/net.sock 2>&1 \
+        | awk '$1 ~ /^[0-9a-f]{64}$/ { print $1 }')
+    [ -n "$all" ] && break
     i=$((i + 1))
     sleep 5
 done
 
-if [ "$discovered" != none ]; then
-    # It must not be the object this node sealed: that one is sealed to the peer, and this
-    # node holds no copy of its key. Discovering it would mean the index answered with
-    # something it holds rather than something it was given.
-    [ "$discovered" != "$shared_to_peer" ] \
-        || fail "the index offered back the object this node sealed to its peer"
+if [ -n "$all" ]; then
+    for candidate in $all; do
+        # It must not be the object this node sealed: that one is sealed to the peer, and
+        # this node holds no copy of its key. Discovering it would mean the index answered
+        # with something it holds rather than something it was given.
+        [ "$candidate" != "$shared_to_peer" ] \
+            || fail "the index offered back the object this node sealed to its peer"
 
-    # Fetch it, keep it, and open it -- with the id having come only from the peer's answer.
-    got=$(otwono-netd --fetch "$discovered" --socket /run/otwono/net.sock 2>&1) \
-        || fail "the peer would not serve what it said it had sealed to this node: $got"
-    echo "$got" | grep -q "$discovered" || fail "the fetch returned something else: $got"
-    step "fetched an object discovered over the mesh"
+        # A discovered id that will not fetch is not a failure by itself. The index is a
+        # snapshot, and ADR-0019 §5 is explicit that a revoke stops future serving -- so an
+        # id discovered inside the peer's grant/revoke window is *correctly* unfetchable by
+        # the time it is asked for. Asserting otherwise would be asserting a guarantee the
+        # system does not make, which is what this step used to do: it took the first id and
+        # failed on it, and passed or failed on the order the index happened to return.
+        if got=$(otwono-netd --fetch "$candidate" --socket /run/otwono/net.sock 2>&1); then
+            echo "$got" | grep -q "$candidate" || fail "the fetch returned something else: $got"
+            discovered=$candidate
+            step "fetched an object discovered over the mesh"
+            break
+        fi
+    done
+    [ "$discovered" != none ] \
+        || fail "the peer sealed things to this node and would serve none of them: $all"
 fi
 
 rm -rf "$WORK"
