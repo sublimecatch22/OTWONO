@@ -532,6 +532,13 @@ impl ContentResponder {
 pub struct BrokeredCache {
     store_socket: PathBuf,
     perm_socket: PathBuf,
+    /// Whether the "not replicating" line has already been printed.
+    ///
+    /// A stock node grants no `cache.replicate`, so without this the daemon would say the
+    /// same thing on every connection for the life of the machine. A daemon that repeats an
+    /// unchanging fact into the journal is teaching its operator to stop reading the
+    /// journal, and the one line that matters gets lost with it. Said once, then dropped.
+    quiet: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for BrokeredCache {
@@ -547,6 +554,7 @@ impl BrokeredCache {
         BrokeredCache {
             store_socket: store_socket.as_ref().to_path_buf(),
             perm_socket: perm_socket.as_ref().to_path_buf(),
+            quiet: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -576,7 +584,9 @@ impl otwono_store::ReplicaHolder for BrokeredCache {
         ) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("otwono-netd: not replicating: {e}");
+                if !self.quiet.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("otwono-netd: not replicating: {e}");
+                }
                 return None;
             }
         };
