@@ -4793,3 +4793,115 @@ second boot cannot have written.
 - **amd64 only, two nodes.** No arm64. No three-node or partition test.
 - **Still no third-party replay on a wire**, and no equivocation across a link. Both remain
   integration tests only.
+
+---
+
+## 2026-08-27 — three nodes again, now carrying the pointer work
+
+**STATUS: VERIFIED.** amd64, QEMU, TCG, no `/dev/kvm`. Three VMs on one UDP-multicast L2
+segment, no DHCP, link-local addressing, mDNS discovery, Noise XX between every pair.
+
+### A correction, first
+
+I set this work up believing `multi-node-test.sh` had never been run. **It had** — on
+2026-08-25, recorded in this file above, with the same `fan-out: 3 of 3` result. I reached
+the wrong conclusion from a `grep -c` whose matches I never read plus the absence of a
+Makefile target, and then repeated it. The target really was missing; "never run" was not.
+
+So the fan-out result below is a **re-confirmation**, not a first. What is genuinely new here
+is that three nodes now carry the pointer work, which did not exist on 25 August: all three
+advanced a peer's pointer to sequence 2 and all three refused a rolled-back record, where
+that had only been shown between two.
+
+### Fan-out still holds, after everything since
+
+`CLUSTER-CACHE.md` §8 asks for "a fetch with three peers holding disjoint pieces". With every
+node holding a whole object, a fetch that spreads across peers is nice but not *necessary* —
+any one of them could have served it alone. The check makes it necessary: node *i* deletes
+the chunks whose index mod N is *i*, so no single peer can serve the object and any two
+together can.
+
+Worth re-running rather than assuming: the pointer path, the durability fix, the replication
+sweep and the content check itself have all changed since 25 August.
+
+```
+node n1: otw1:jgxf-s43f-5zdw-4pv8 at 169.254.34.183/16, 2 peer(s)
+node n2: otw1:aq6m-nq7z-r2he-xted at 169.254.83.56/16, 2 peer(s)
+node n3: otw1:m9km-n26j-khz8-3esk at 169.254.115.2/16, 2 peer(s)
+fan-out: 3 of 3 node(s) drew the large object from several peers
+PASS: 3 nodes discovered and mutually authenticated
+```
+
+Every node reports `large_served=2`: each drew a multi-chunk object from two peers, neither
+of which could have served it alone.
+
+And the part that is new: all three nodes advanced their peer's pointer to sequence 2 and all
+three refused a rolled-back record (`pointer_rollback_refused=yes` on every node). ADR-0027's
+defence had been shown between two nodes; this is it holding where a node has two peers to
+keep straight.
+
+| | content check finished |
+|---|---|
+| node n1 | 625.4s |
+| node n2 | 626.4s |
+| node n3 | 1032.0s |
+
+n3 is not slow for an interesting reason: it is last in the ordinal order, so it waits
+through the other two nodes' disjoint-share deletions and the ninety-second pointer settle
+window before its own fetches can succeed.
+
+### It took three attempts, and neither failure was in OTWONO
+
+**Run 1** failed on one node: n3 could dial n1 but every dial to n2 came back
+`Connection refused`, while n2 dialled n3 successfully. With disjoint shares that is fatal
+rather than slow — n3 could only ever reach two of three shares. Diagnosing it meant mounting
+a VM disk and reading its journal, because **three separate messages had thrown away the fact
+needed to answer it**:
+
+- `connect: Connection refused` never said *which address*. On a mesh where the address comes
+  from an advertisement that is the only fact that matters, and a stale entry, a wrong
+  address family and a genuinely-down peer all read identically without it.
+- The content check discarded the failing fetch's output — the same mistake the pointer step
+  above it had already been fixed for.
+- `fetch_from_peers` collected unreachable candidates and reported them **only when every
+  peer failed**. The partial case is exactly the fatal one under disjoint shares, and it said
+  nothing.
+
+All three are fixed (`23e5599`), the last with unit tests in both directions. A wrong number
+went too: the check claimed "within 300s" while spending 60 attempts plus their fetch time —
+510s on the run that hit it.
+
+**Run 2** explained the shape of both. A guest stopped executing about **one second into its
+kernel** and never resumed over the following twenty-four minutes: no panic, no QEMU error, a
+complete final line mid-PCI-enumeration, and an **empty journal**, because it never reached
+userspace. Its two siblings ran on, and one then failed to assemble a disjoint-share object —
+which it could not have done with a third of the shares sitting on a machine that never
+booted.
+
+Every guest here is TCG, so a vCPU is a host thread spinning at emulation speed. Three guests
+at `-smp 2` is six of them on four cores. The harness now divides the host's cores among the
+guests, at least one each:
+
+```
+  vcpus      1 per guest (3 guests on 4 host cores)
+```
+
+**Run 3 passed** with nothing else changed — same image, same check, same timeouts. The three
+guests' kernel clocks stayed within nine seconds of each other where run 2 had one frozen at
+1.07s, which is the diagnosis confirmed by the fix rather than argued for.
+
+Run 1's asymmetric dial refusal is *probably* the same starvation wearing a different mask,
+and it did not recur. It is not proven to be, and the run that would prove it is one that
+reproduces it — so it is recorded here as unexplained rather than closed.
+
+### What this does not show
+
+- **Three nodes, not more.** `--nodes` accepts up to 8; only 3 has been run.
+- **No partition test.** Phase 6's exit criterion wants a network partition that heals with
+  convergence asserted. Nothing here partitions anything.
+- **No store-and-forward.** The shape that needs three parties (ADR-0028) has no wire yet;
+  this run only makes testing it possible.
+- **amd64 only.** No arm64 multi-node run.
+- **One vCPU per guest** on this host, so nothing here says the code behaves the same on a
+  machine with cores to spare. The failures that forced the change were the harness's, but a
+  concurrency bug that only appears on a genuinely parallel guest would not have been caught.
