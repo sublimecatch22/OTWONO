@@ -260,6 +260,16 @@ impl ActionRegistry {
                     BlastRadius::Read,
                     false,
                 ),
+                // Local state only: recording what a peer said about its own names, and the
+                // sequence it said it at. Reversible -- losing it costs rollback protection,
+                // which is a real loss but not an irreversible one, and the record can be
+                // fetched again (ADR-0027 §1).
+                ActionSpec::new(
+                    "pointer.write",
+                    "Record what a peer published, and remember its sequence",
+                    BlastRadius::Reversible,
+                    false,
+                ),
                 ActionSpec::new(
                     "pointer.publish",
                     "Publish a signed pointer under this node's name",

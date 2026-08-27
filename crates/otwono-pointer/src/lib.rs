@@ -213,6 +213,27 @@ pub enum Accepted {
     FirstSeen,
     /// Strictly newer than anything seen before.
     Advanced { from: u64, to: u64 },
+    /// The same record, at the same sequence, offered again.
+    ///
+    /// Accepted, and it has to be: a name that has not changed is the ordinary case for
+    /// anything a person reads twice. Refusing it — which this log did until the defence was
+    /// put on the fetch path — would mean a wiki page could be read exactly once per node.
+    /// It is still distinct from `Advanced`, because nothing moved and a caller polling for
+    /// a change should be able to tell.
+    Unchanged { sequence: u64 },
+}
+
+/// What was seen at the highest sequence, not merely that a number was.
+///
+/// The signature is kept alongside the number so the log can tell "the same record again"
+/// from "a different record at the same number". Ed25519 signing is deterministic, so one
+/// record under one key has exactly one signature: two records whose signatures differ are
+/// two different records, and two whose signatures match are the same bytes. That
+/// distinction is the difference between a re-read and equivocation by the owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Seen {
+    pub sequence: u64,
+    pub signature: String,
 }
 
 /// The highest sequence seen for each pointer.
@@ -229,21 +250,21 @@ pub struct SequenceLog {
     /// containing that separator would then collide with a different pointer. A list keeps
     /// the three parts separate, which is the same reason the store hashes them separately.
     #[serde(with = "pairs")]
-    highest: BTreeMap<PointerKey, u64>,
+    highest: BTreeMap<PointerKey, Seen>,
 }
 
-/// `BTreeMap<PointerKey, u64>` as `[[key, sequence], ...]`.
+/// `BTreeMap<PointerKey, Seen>` as `[[key, seen], ...]`.
 mod pairs {
-    use super::PointerKey;
+    use super::{PointerKey, Seen};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::collections::BTreeMap;
 
-    pub fn serialize<S: Serializer>(map: &BTreeMap<PointerKey, u64>, s: S) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(map: &BTreeMap<PointerKey, Seen>, s: S) -> Result<S::Ok, S::Error> {
         map.iter().collect::<Vec<_>>().serialize(s)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<PointerKey, u64>, D::Error> {
-        Ok(Vec::<(PointerKey, u64)>::deserialize(d)?.into_iter().collect())
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<PointerKey, Seen>, D::Error> {
+        Ok(Vec::<(PointerKey, Seen)>::deserialize(d)?.into_iter().collect())
     }
 }
 
@@ -254,7 +275,7 @@ impl SequenceLog {
 
     /// The highest sequence seen, or `None` if this pointer is new to us.
     pub fn highest_seen(&self, key: &PointerKey) -> Option<u64> {
-        self.highest.get(key).copied()
+        self.highest.get(key).map(|s| s.sequence)
     }
 
     pub fn len(&self) -> usize {
@@ -272,9 +293,14 @@ impl SequenceLog {
     /// from `wiki/Home` and served as `profile/index` with the signature still verifying
     /// (ADR-0027 §6).
     ///
-    /// A record at a sequence already seen is **refused**, not ignored and not ranked
-    /// against. Equal counts as refused too: re-serving the same sequence with different
-    /// content would otherwise be a way to change what a name means without advancing it.
+    /// A record at a **lower** sequence is refused, not ignored and not ranked against.
+    ///
+    /// At an equal sequence the record itself decides. The same bytes again are the ordinary
+    /// re-read and are accepted as [`Accepted::Unchanged`]; *different* bytes at the same
+    /// number are the owner having signed two different things at one sequence, which is
+    /// refused as [`PointerError::Equivocation`]. Treating equal as a flat refusal — which
+    /// this did first — would have made the defence unusable, because reading an unchanged
+    /// name twice is what readers mostly do.
     pub fn accept(
         &mut self,
         pointer: &Pointer,
@@ -289,20 +315,36 @@ impl SequenceLog {
         }
         pointer.verify(public_key)?;
 
-        match self.highest.get(expected).copied() {
+        let offered = Seen {
+            sequence: pointer.sequence,
+            signature: pointer.signature.clone(),
+        };
+        match self.highest.get(expected) {
             None => {
-                self.highest.insert(expected.clone(), pointer.sequence);
+                self.highest.insert(expected.clone(), offered);
                 Ok(Accepted::FirstSeen)
             }
-            Some(seen) if pointer.sequence > seen => {
-                self.highest.insert(expected.clone(), pointer.sequence);
+            Some(seen) if pointer.sequence > seen.sequence => {
+                let from = seen.sequence;
+                self.highest.insert(expected.clone(), offered);
                 Ok(Accepted::Advanced {
-                    from: seen,
+                    from,
                     to: pointer.sequence,
                 })
             }
+            Some(seen) if pointer.sequence == seen.sequence => {
+                if seen.signature == offered.signature {
+                    Ok(Accepted::Unchanged {
+                        sequence: pointer.sequence,
+                    })
+                } else {
+                    Err(PointerError::Equivocation {
+                        sequence: pointer.sequence,
+                    })
+                }
+            }
             Some(seen) => Err(PointerError::Rollback {
-                seen,
+                seen: seen.sequence,
                 offered: pointer.sequence,
             }),
         }
@@ -310,6 +352,55 @@ impl SequenceLog {
 }
 
 /// Which pointer was asked for, and which one arrived.
+/// Somewhere the highest sequence seen is remembered (ADR-0027 §1, ADR-0026 §10's shape).
+///
+/// The rollback defence is state, not cryptography, so it has to live somewhere durable —
+/// and on a real node that somewhere is `otwono-stored`, while the code that fetches a
+/// pointer is `otwono-netd`. Two processes, so the fetch path is written against this trait:
+/// `PointerStore` implements it in-process for tests, and `otwono-netd` implements it over
+/// the control plane. Neither knows about the other.
+///
+/// Without this, [`SequenceLog`] is a defence that exists, passes its tests, and is never
+/// consulted — which is exactly what it was until the boot check went looking for it.
+pub trait SequenceMemory {
+    /// Verify a record and, if it is genuinely newer than anything seen, remember it.
+    ///
+    /// Takes `&self` because a real implementation is shared and long-lived; interior
+    /// mutability is the implementation's problem, not the caller's.
+    fn accept(
+        &self,
+        pointer: &Pointer,
+        public_key: &[u8; 32],
+        expected: &PointerKey,
+    ) -> Result<Accepted, PointerError>;
+}
+
+/// A memory that remembers nothing.
+///
+/// For a caller that genuinely wants only verification — and it is named rather than being
+/// `Option<...>` so that choosing it is a decision someone wrote down. Every fetch through
+/// this is a first read, with no rollback protection at all.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoMemory;
+
+impl SequenceMemory for NoMemory {
+    fn accept(
+        &self,
+        pointer: &Pointer,
+        public_key: &[u8; 32],
+        expected: &PointerKey,
+    ) -> Result<Accepted, PointerError> {
+        if &pointer.key() != expected {
+            return Err(PointerError::WrongPointer(Box::new(WrongPointer {
+                asked: expected.clone(),
+                got: pointer.key(),
+            })));
+        }
+        pointer.verify(public_key)?;
+        Ok(Accepted::FirstSeen)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WrongPointer {
     pub asked: PointerKey,
@@ -336,6 +427,22 @@ pub enum PointerError {
         seen: u64,
         offered: u64,
     },
+    /// The owner signed two different records at the same sequence (ADR-0027 §1).
+    ///
+    /// Worse than a rollback and not the same thing: a rollback is a third party replaying
+    /// history the owner really wrote, while this is the owner writing two histories. The
+    /// sequence rule cannot order them, so neither is taken.
+    Equivocation {
+        sequence: u64,
+    },
+    /// The reader could not consult its own record of what it has already seen.
+    ///
+    /// Not a fault in the record, and deliberately not silent. The tempting alternative is
+    /// to fall back to verifying the signature alone, but that accepts a pointer with no
+    /// rollback protection while the caller believes it has some — so anyone who can stop
+    /// the reader's own store gets the rollback for free. A reader that cannot remember
+    /// refuses to read.
+    MemoryUnavailable(String),
     Encoding(String),
 }
 
@@ -355,6 +462,14 @@ impl std::fmt::Display for PointerError {
             PointerError::Rollback { seen, offered } => write!(
                 f,
                 "refused a rollback: sequence {offered} is not newer than {seen} already seen"
+            ),
+            PointerError::Equivocation { sequence } => write!(
+                f,
+                "the owner signed two different records at sequence {sequence}; neither is taken"
+            ),
+            PointerError::MemoryUnavailable(m) => write!(
+                f,
+                "cannot check for a rollback, so the record is refused: {m}"
             ),
             PointerError::Encoding(m) => write!(f, "cannot encode the pointer: {m}"),
         }

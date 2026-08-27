@@ -326,6 +326,107 @@ if pt=$(otwono-storectl put --file "$WORK/for-pointer.txt" --visibility public 2
     fi
 fi
 
+# --- A pointer advances, and a regressed one is refused (ADR-0027 §1) -------------------
+# The property the whole design exists for, and the one that had only ever fired in a unit
+# test. Two things happen here, in order, and each needs the one before it.
+#
+# First the name moves: this node republishes at sequence 2 pointing somewhere else, and
+# waits until the peer reports *its* name at sequence 2. That proves an advance crossed a
+# link and that the reader took it -- which nothing had shown before.
+#
+# Then this node **regresses its own pointer**, and the peer must refuse it. That is the
+# rollback case with no synthetic actor in it: the record is genuinely the owner's, genuinely
+# signed, genuinely current for that owner, and refused only because the reader remembers a
+# higher number. ADR-0027's consequences name this exactly -- "an owner can roll itself
+# back" -- and the reader is the thing that stops it mattering.
+#
+# A node cannot publish backwards while it still holds its own record, and should not be able
+# to: `pointer.publish` refuses it. So the store is made to forget, which is not a trick but
+# the real way this happens -- a node that lost its pointer directory and started over. This
+# node publishes exactly one pointer, so `mine` holds exactly that one.
+pointer_advanced=none
+pointer_rollback_refused=no
+if [ "$pointer_resolved" != none ]; then
+    step "republishing the pointer and waiting for the peer's to advance"
+    printf 'otwono pointer check node %s update %s\n' "$node_ordinal" "$(date -u +%s%N)" \
+        > "$WORK/for-pointer-2.txt"
+    pt2=$(otwono-storectl put --file "$WORK/for-pointer-2.txt" --visibility public 2>&1) \
+        || fail "storing the pointer's second target failed: $pt2"
+    pointer_target2=$(echo "$pt2" | awk 'NR==1 {print $1}')
+    [ -n "$pointer_target2" ] || fail "storing the pointer's second target returned no content id"
+    otwono-storectl pointer-publish --service wiki --name Getting-Started \
+        "$pointer_target2" >/dev/null 2>&1 \
+        || fail "republishing the pointer failed"
+
+    # The sequence is read by field *name*, not position: the reply is
+    # "<node_id> wiki/Getting-Started sequence <n> <content_id>", and a check that counted
+    # fields is how the first version of the step above managed to be unpassable.
+    #
+    # Sequence and content id are taken from the *same line*, because `--pointer` prints one
+    # line per connected peer. On two nodes there is only ever one; on three there are two,
+    # at different sequences while the republish propagates, and reading the number from one
+    # line and the id from another would report a pairing that never existed.
+    i=0
+    while [ "$i" -lt 60 ]; do
+        pointer_out=$(otwono-netd --pointer wiki/Getting-Started --socket /run/otwono/net.sock 2>&1)
+        pointer_advanced=$(echo "$pointer_out" | awk '
+            {
+                seq = ""; cid = ""
+                for (f = 1; f <= NF; f++) {
+                    if ($f == "sequence") seq = $(f + 1)
+                    else if ($f ~ /^[0-9a-f]{64}$/) cid = $f
+                }
+                if (seq != "" && seq + 0 >= 2 && cid != "") { print cid; exit }
+            }')
+        [ -n "$pointer_advanced" ] && break
+        pointer_advanced=none
+        i=$((i + 1))
+        sleep 5
+    done
+    [ "$pointer_advanced" != none ] \
+        || fail "the peer's pointer never reached sequence 2; last reply: $pointer_out"
+    [ "$pointer_advanced" != "$pointer_resolved" ] \
+        || fail "the peer advanced its sequence without changing what the name points at"
+    step "the peer's pointer advanced to sequence 2 over the link"
+
+    # A settle window before regressing. Both nodes run this same script from the same boot
+    # and reach here within seconds of each other, but "seconds" is not a guarantee -- and a
+    # node that regressed while its peer was still looking for sequence 2 would fail the
+    # assertion above for the right reason at the wrong time. Nothing coordinates the two
+    # VMs, so the margin is the coordination.
+    sleep 90
+
+    step "regressing this node's own pointer, and expecting to refuse the peer's"
+    printf 'otwono pointer check node %s rolled back %s\n' "$node_ordinal" "$(date -u +%s%N)" \
+        > "$WORK/for-pointer-3.txt"
+    pt3=$(otwono-storectl put --file "$WORK/for-pointer-3.txt" --visibility public 2>&1) \
+        || fail "storing the regressed pointer's target failed: $pt3"
+    pointer_target3=$(echo "$pt3" | awk 'NR==1 {print $1}')
+    [ -n "$pointer_target3" ] || fail "storing the regressed target returned no content id"
+    rm -f /var/lib/otwono/pointers/mine/*.json
+    otwono-storectl pointer-publish --service wiki --name Getting-Started \
+        "$pointer_target3" >/dev/null 2>&1 \
+        || fail "republishing at sequence 1 failed after clearing this node's own records"
+
+    # Matched on the refusal text rather than on exit status: `--pointer` asks every
+    # connected peer and one peer's refusal must not be reported as the command failing.
+    i=0
+    while [ "$i" -lt 60 ]; do
+        pointer_out=$(otwono-netd --pointer wiki/Getting-Started --socket /run/otwono/net.sock 2>&1)
+        case "$pointer_out" in
+            *"refused a rollback"*)
+                pointer_rollback_refused=yes
+                break
+                ;;
+        esac
+        i=$((i + 1))
+        sleep 5
+    done
+    [ "$pointer_rollback_refused" = yes ] \
+        || fail "a regressed pointer was not refused; last reply: $pointer_out"
+    step "refused the peer's regressed pointer"
+fi
+
 # --- REPLICATED replicates itself, with nothing driving it (ADR-0026) -------------------
 # The claim this step exists for: a node that meets a peer takes a copy of what that peer
 # offers, without anyone asking it to. Every other replication test drives the pass by
@@ -557,4 +658,4 @@ if [ -n "$all" ]; then
 fi
 
 rm -rf "$WORK"
-echo "OTWONO-MESH-CONTENT-OK node=$node_ordinal/$node_total public=$pub_id large=$big_id large_served=$big_served private_refused=$prv_id cache_budget=$cache_state cache_held=$cache_held shared_to_peer=$shared_to_peer granted=$granted discovered=$discovered replicated=$replicated_id replica_taken=$replica_taken pointer_published=$pointer_published pointer_resolved=$pointer_resolved"
+echo "OTWONO-MESH-CONTENT-OK node=$node_ordinal/$node_total public=$pub_id large=$big_id large_served=$big_served private_refused=$prv_id cache_budget=$cache_state cache_held=$cache_held shared_to_peer=$shared_to_peer granted=$granted discovered=$discovered replicated=$replicated_id replica_taken=$replica_taken pointer_published=$pointer_published pointer_resolved=$pointer_resolved pointer_advanced=$pointer_advanced pointer_rollback_refused=$pointer_rollback_refused"

@@ -243,9 +243,19 @@ fn run(args: &[String]) -> Result<String, Error> {
         otwono_store::EXPORT_MAX_AGE,
     );
 
-    let mut state = NetState::new(Arc::new(signer)).with_handoff(handoff);
+    let store_socket = store_socket.unwrap_or_else(|| otwono_proto::socket_path("store"));
+    // Attached whatever else this node does. Remembering pointer sequences is not a service
+    // offered to peers -- it is this node's own defence against being rolled back by one
+    // (ADR-0027 §1), so it does not belong behind `--no-serve-content` and there is no flag
+    // to turn it off. `pointer.write` in the broker is the operator's control, and a node
+    // that is not granted it refuses pointer reads rather than doing them blind.
+    let mut state = NetState::new(Arc::new(signer))
+        .with_handoff(handoff)
+        .with_pointer_memory(Arc::new(otwono_netd::content::BrokeredPointers::new(
+            &store_socket,
+            &perm_socket,
+        )));
     if serve_content {
-        let store_socket = store_socket.unwrap_or_else(|| otwono_proto::socket_path("store"));
         // Not fatal if otwono-stored is not up: the responder connects per request and
         // refuses when it cannot, which is the same answer a peer gets for anything else it
         // may not have. A mesh that authenticates but serves nothing is still a mesh.
@@ -484,8 +494,21 @@ fn pointer_report(
                 &token,
             )
             .map_err(|e| Error::Startup(format!("net.pointer transport failure: {e}")))?;
-        // One unreachable peer must not lose the answers from the others.
-        let Ok(reply) = reply else { continue };
+        // One unreachable peer must not lose the answers from the others -- but a refusal
+        // is not unreachability, and printing nothing for it would be the worst possible
+        // report. A rollback especially: it means something on the path served this node a
+        // record older than one it has already seen (ADR-0027 §1), and an operator must not
+        // learn that as silence.
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(e) => {
+                out.push_str(&format!(
+                    "{} {}/{} refused: {}\n",
+                    node_id, service, name, e.message
+                ));
+                continue;
+            }
+        };
         let Some(record) = reply.get("record").filter(|r| !r.is_null()) else {
             continue;
         };

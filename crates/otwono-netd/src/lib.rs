@@ -88,6 +88,14 @@ pub struct NetState {
     /// Not a `Cache`: the cache belongs to `otwono-stored`, and this daemon reaches it over
     /// the control plane precisely so there is only ever one writer to its index.
     pub holder: Option<Arc<dyn otwono_store::ReplicaHolder + Send + Sync>>,
+    /// What this node remembers about pointer sequences it has already seen (ADR-0027 §1).
+    ///
+    /// Not an `Option`, because "no memory" is a security decision and not an absence: a
+    /// node that forgot to configure one would silently drop to first-use trust on every
+    /// read. The default is [`otwono_pointer::NoMemory`], which is explicit about accepting
+    /// whatever it is given; the daemon replaces it with a
+    /// [`content::BrokeredPointers`] that asks `otwono-stored`.
+    pub pointer_memory: Arc<dyn otwono_pointer::SequenceMemory + Send + Sync>,
     /// Whatever can sign for this node. In the daemon it is a [`BrokeredSigner`]; in a
     /// test it is usually a whole `NodeIdentity`, which signs locally.
     pub signer: Arc<dyn SessionSigner>,
@@ -103,6 +111,7 @@ impl NetState {
             handoff: None,
             responder: None,
             holder: None,
+            pointer_memory: Arc::new(otwono_pointer::NoMemory),
             signer,
             node_id,
             peers: Mutex::new(PeerTable::new()),
@@ -129,6 +138,19 @@ impl NetState {
     /// that goes over the control plane. The pass cannot tell them apart, which is the point.
     pub fn with_holder(mut self, holder: Arc<dyn otwono_store::ReplicaHolder + Send + Sync>) -> Self {
         self.holder = Some(holder);
+        self
+    }
+
+    /// Give this node a memory of the pointer sequences it has seen.
+    ///
+    /// Without one, every pointer read is a first read: correctly signed, possibly ancient,
+    /// and accepted (ADR-0027 §1). A test that only cares whether a record crosses the wire
+    /// can leave the default; anything asserting the rollback rule must set this.
+    pub fn with_pointer_memory(
+        mut self,
+        memory: Arc<dyn otwono_pointer::SequenceMemory + Send + Sync>,
+    ) -> Self {
+        self.pointer_memory = memory;
         self
     }
 
@@ -337,7 +359,14 @@ impl NetState {
         let content::PeerSource {
             mut channel, link, ..
         } = source;
-        content::fetch_pointer(&mut channel, service, name, &link).map_err(|e| e.to_string())
+        content::fetch_pointer(
+            &mut channel,
+            service,
+            name,
+            &link,
+            self.pointer_memory.as_ref(),
+        )
+        .map_err(|e| e.to_string())
     }
 
     /// Fetch one object from several peers at once (ADR-0015).

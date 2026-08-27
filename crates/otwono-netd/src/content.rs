@@ -687,6 +687,129 @@ impl otwono_store::ReplicaHolder for BrokeredCache {
     }
 }
 
+/// This daemon's memory of the pointer sequences it has seen, over the control plane.
+///
+/// Same shape and same reason as [`BrokeredCache`] (ADR-0026 §10): the sequence log is
+/// durable state owned by `otwono-stored`, and two processes writing one log would each lose
+/// the other's updates — which for this log means silently losing rollback protection rather
+/// than merely miscounting bytes.
+///
+/// # A failure here refuses the record
+///
+/// Every other brokered call in this file treats a refusal as "then do less": no cache means
+/// no replication, and that is safe. This one is the opposite. If the store cannot say what
+/// sequence it last saw, the choice is between refusing the record and accepting it with no
+/// rollback protection — and accepting it would hand the rollback to anyone who can stop the
+/// local store, which is a far easier attack than forging a signature. So it refuses, loudly,
+/// as [`otwono_pointer::PointerError::MemoryUnavailable`].
+pub struct BrokeredPointers {
+    store_socket: PathBuf,
+    perm_socket: PathBuf,
+}
+
+impl std::fmt::Debug for BrokeredPointers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrokeredPointers")
+            .field("store", &self.store_socket)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BrokeredPointers {
+    pub fn new(store_socket: impl AsRef<Path>, perm_socket: impl AsRef<Path>) -> Self {
+        BrokeredPointers {
+            store_socket: store_socket.as_ref().to_path_buf(),
+            perm_socket: perm_socket.as_ref().to_path_buf(),
+        }
+    }
+}
+
+impl otwono_pointer::SequenceMemory for BrokeredPointers {
+    fn accept(
+        &self,
+        pointer: &otwono_pointer::Pointer,
+        public_key: &[u8; 32],
+        expected: &otwono_pointer::PointerKey,
+    ) -> Result<otwono_pointer::Accepted, otwono_pointer::PointerError> {
+        use otwono_pointer::{Accepted, PointerError};
+
+        // A token per call, not a cached one. `pointer.write` is reversible and cheap to
+        // ask for, and a pointer is read when a person asks for one -- so the extra local
+        // round trip is invisible, and an operator who revokes it stops pointer reads at the
+        // next read rather than whenever a cached token happened to expire.
+        let unavailable = |e: String| PointerError::MemoryUnavailable(e);
+        let token = request_token(
+            &self.perm_socket,
+            otwono_stored::CAPABILITY_POINTER_WRITE,
+            "otwono-netd is checking a peer's pointer against the sequences this node has seen",
+        )
+        .map_err(unavailable)?;
+        let mut client = Client::connect(&self.store_socket)
+            .map_err(|e| unavailable(format!("{}: {e}", self.store_socket.display())))?;
+        let reply = client
+            .call_with_capability(
+                "pointer.accept",
+                json!({
+                    "record": pointer,
+                    "public_key": data_encoding::BASE64.encode(public_key),
+                    "node_id": expected.node_id,
+                    "service": expected.service,
+                    "name": expected.name,
+                }),
+                &token,
+            )
+            .map_err(|e| unavailable(format!("pointer.accept: {e}")))?
+            // A store that answers "no" to the call itself -- an unparseable record, a bad
+            // signature -- is answering about the record, not failing to remember. That is a
+            // refusal of this pointer, not an unavailable memory.
+            .map_err(|e| PointerError::Malformed(e.message))?;
+
+        if reply.get("accepted").and_then(Value::as_bool).unwrap_or(false) {
+            let to = reply
+                .get("sequence")
+                .and_then(Value::as_u64)
+                .unwrap_or(pointer.sequence);
+            return match reply.get("outcome").and_then(Value::as_str) {
+                Some("first_seen") => Ok(Accepted::FirstSeen),
+                Some("advanced") => Ok(Accepted::Advanced {
+                    from: reply.get("from").and_then(Value::as_u64).unwrap_or(0),
+                    to,
+                }),
+                Some("unchanged") => Ok(Accepted::Unchanged { sequence: to }),
+                // An outcome this daemon does not know is not a success it can report. A
+                // newer store saying something older code cannot read must not be flattened
+                // into whichever variant happens to be first.
+                other => Err(PointerError::Malformed(format!(
+                    "pointer.accept said it accepted the record but described it as {other:?}"
+                ))),
+            };
+        }
+        if reply.get("rollback").and_then(Value::as_bool).unwrap_or(false) {
+            return Err(PointerError::Rollback {
+                seen: reply.get("seen").and_then(Value::as_u64).unwrap_or(0),
+                offered: reply
+                    .get("offered")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(pointer.sequence),
+            });
+        }
+        if reply.get("equivocation").and_then(Value::as_bool).unwrap_or(false) {
+            return Err(PointerError::Equivocation {
+                sequence: reply
+                    .get("sequence")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(pointer.sequence),
+            });
+        }
+        // `accepted: false` with no reason means this daemon and the store disagree about
+        // what the answer looks like. Refusing is the only safe reading of a reply we do not
+        // understand.
+        Err(PointerError::Malformed(
+            "pointer.accept neither accepted the record nor said why".into(),
+        ))
+    }
+}
+
 fn request_token(perm_socket: &Path, action: &str, reason: &str) -> Result<String, String> {
     let mut broker = Client::connect(perm_socket).map_err(|e| format!("{}: {e}", perm_socket.display()))?;
     let value = broker
@@ -931,11 +1054,20 @@ pub fn replication_pass<L: LinkAdapter, H: otwono_store::ReplicaHolder + ?Sized>
 ///
 /// `Ok(None)` means the peer does not publish that name, or would not say. Those are one
 /// answer on purpose: telling them apart would let a stranger enumerate a node's names.
-pub fn fetch_pointer<L: LinkAdapter>(
+///
+/// # Why a memory is a parameter and not an option
+///
+/// A signature proves who wrote a record, never that it is current (ADR-0027 §1), so the
+/// only thing standing between this function and a replay is what the reader remembers. That
+/// memory is therefore passed in and consulted on every fetch. A caller that genuinely wants
+/// verification alone passes [`otwono_pointer::NoMemory`] and has written down that every
+/// read is a first read; there is no way to get here having simply forgotten.
+pub fn fetch_pointer<L: LinkAdapter, M: otwono_pointer::SequenceMemory + ?Sized>(
     channel: &mut SecureChannel<L>,
     service: &str,
     name: &str,
     link: &LinkProperties,
+    memory: &M,
 ) -> Result<Option<otwono_pointer::Pointer>, ProtocolError> {
     // Taken before the round trip so the owner cannot be whatever the reply claims.
     let owner = channel.peer().node_id;
@@ -964,22 +1096,25 @@ pub fn fetch_pointer<L: LinkAdapter>(
         .map_err(|e| ProtocolError::Mismatched(format!("not a pointer record: {e}")))?;
 
     // What was asked for, not what arrived. A record valid for a different name would
-    // otherwise be accepted under this one (ADR-0027 §6).
+    // otherwise be accepted under this one (ADR-0027 §6). The memory checks this, the
+    // signature, and the sequence together, in that order, and remembers the result -- so
+    // there is one place where "is this record acceptable" is decided, rather than a check
+    // here and a different one wherever the record is stored.
     let expected = otwono_pointer::PointerKey {
         node_id: owner.to_text(),
         service: service.to_string(),
         name: name.to_string(),
     };
-    if pointer.key() != expected {
-        return Err(ProtocolError::Mismatched(format!(
-            "asked for {}/{} and got {}/{}",
-            expected.service, expected.name, pointer.service, pointer.name
-        )));
+    match memory.accept(&pointer, &public_key, &expected) {
+        Ok(_) => Ok(Some(pointer)),
+        // Surfaced as itself, not folded into `Mismatched`: this is the attack the whole
+        // design exists to stop, and an operator seeing it needs to know that what failed
+        // was a replay and not a broken peer.
+        Err(otwono_pointer::PointerError::Rollback { seen, offered }) => {
+            Err(ProtocolError::Rollback { seen, offered })
+        }
+        Err(e) => Err(ProtocolError::Mismatched(format!("pointer: {e}"))),
     }
-    pointer
-        .verify(&public_key)
-        .map_err(|e| ProtocolError::Mismatched(format!("pointer: {e}")))?;
-    Ok(Some(pointer))
 }
 
 pub fn fetch_shared_index<L: LinkAdapter>(

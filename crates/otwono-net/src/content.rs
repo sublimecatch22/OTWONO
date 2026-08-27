@@ -372,6 +372,17 @@ pub enum ProtocolError {
     },
     /// The peer refused, or does not have it. Indistinguishable by design.
     NotAvailable(String),
+    /// A correctly signed pointer older than one this node has already seen (ADR-0027 §1).
+    ///
+    /// Its own variant rather than a `Mismatched`, because it is the only failure here that
+    /// is not a fault at either end: the record is genuine, the signature verifies, and the
+    /// peer may be relaying it in good faith. What is wrong is that it is old. A caller that
+    /// cannot tell this apart from a protocol fault cannot report the one thing an operator
+    /// needs to know, which is that somebody on the path is replaying history.
+    Rollback {
+        seen: u64,
+        offered: u64,
+    },
     /// Two replies in a row moved nothing. A peer that will not make progress is a peer to
     /// give up on, not one to keep asking (see defect 29, `docs/build/VERIFICATION-LOG.md`).
     NoProgress,
@@ -404,6 +415,10 @@ impl std::fmt::Display for ProtocolError {
             ProtocolError::NotAvailable(id) => {
                 write!(f, "the peer will not serve {id}, or does not have it")
             }
+            ProtocolError::Rollback { seen, offered } => write!(
+                f,
+                "refused a rollback: sequence {offered} is not newer than {seen} already seen"
+            ),
             ProtocolError::NoProgress => write!(f, "the peer stopped making progress"),
         }
     }

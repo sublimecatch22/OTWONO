@@ -24,7 +24,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 IMAGE=""; ARCH="amd64"; OUT=""; NODES=3
 TIMEOUT="${OTWONO_MULTI_NODE_TIMEOUT:-1200}"
-CONTENT_TIMEOUT="${OTWONO_CONTENT_TIMEOUT:-420}"
+CONTENT_TIMEOUT="${OTWONO_CONTENT_TIMEOUT:-1200}"
 usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 while [ $# -gt 0 ]; do

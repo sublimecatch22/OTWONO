@@ -29,7 +29,7 @@ IMAGE=""; ARCH="amd64"; OUT=""; TIMEOUT="${OTWONO_TWO_NODE_TIMEOUT:-900}"
 # work reports a failure that is only slowness. Raised after a run reached 363s with the
 # check still running and nothing in the log to say so -- which is also why the check now
 # prints a line per section.
-CONTENT_TIMEOUT="${OTWONO_CONTENT_TIMEOUT:-900}"
+CONTENT_TIMEOUT="${OTWONO_CONTENT_TIMEOUT:-1200}"
 usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 while [ $# -gt 0 ]; do
@@ -323,6 +323,29 @@ if [ "${MESH_CONTENT_SMOKE:-0}" != 0 ]; then
         fi
     done
     echo "content: each node resolved the other's pointer and fetched what it names"
+
+    # The pointer advanced, and then a regressed one was refused (ADR-0027 §1). Asserted
+    # here as well as inside the check, because these are the two claims most worth being
+    # sure of: a green run that skipped them would be a run that proved the design's central
+    # property by not testing it. `pointer_advanced` must also differ from the first read,
+    # or the sequence moved without the name meaning anything new.
+    for node in a b; do
+        line=$(grep -hoa "OTWONO-MESH-CONTENT-OK.*" "$OUT/node-$node.log" | tail -1 | tr -d '\r')
+        resolved=$(echo "$line" | grep -o 'pointer_resolved=[^ ]*' | cut -d= -f2)
+        advanced=$(echo "$line" | grep -o 'pointer_advanced=[^ ]*' | cut -d= -f2)
+        refused=$(echo "$line" | grep -o 'pointer_rollback_refused=[^ ]*' | cut -d= -f2)
+        if [ -z "$advanced" ] || [ "$advanced" = none ] || [ "$advanced" = "$resolved" ]; then
+            echo "FAIL: node $node never saw its peer's pointer advance (pointer_advanced=${advanced:-absent})" >&2
+            echo "  $line" >&2
+            exit 1
+        fi
+        if [ "$refused" != yes ]; then
+            echo "FAIL: node $node did not refuse a regressed pointer (pointer_rollback_refused=${refused:-absent})" >&2
+            echo "  $line" >&2
+            exit 1
+        fi
+    done
+    echo "content: each node took its peer's update, then refused the peer's rolled-back record"
 fi
 
 echo "PASS: two nodes discovered and mutually authenticated"

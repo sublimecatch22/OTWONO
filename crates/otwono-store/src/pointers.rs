@@ -12,7 +12,7 @@
 //! Hashing also makes the layout flat and case-exact, which matters on a filesystem that
 //! would otherwise fold `Home` and `home` into one file and quietly serve the wrong record.
 
-use otwono_pointer::{Accepted, Pointer, PointerError, PointerKey, SequenceLog};
+use otwono_pointer::{Accepted, Pointer, PointerError, PointerKey, SequenceLog, SequenceMemory};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -257,3 +257,25 @@ impl std::fmt::Display for PointerStoreError {
 }
 
 impl std::error::Error for PointerStoreError {}
+
+impl SequenceMemory for PointerStore {
+    /// The durable half of the rollback defence.
+    ///
+    /// Errors from the store itself are mapped onto `PointerError` so a caller sees one kind
+    /// of failure. A record that verified and advanced but could not be written is reported
+    /// as a malformed store rather than silently accepted — the in-memory log has already
+    /// moved, and returning success would promise a protection that will not survive a
+    /// restart.
+    fn accept(
+        &self,
+        pointer: &Pointer,
+        public_key: &[u8; 32],
+        expected: &PointerKey,
+    ) -> Result<Accepted, PointerError> {
+        match self.accept_from_peer(pointer, public_key, expected) {
+            Ok(accepted) => Ok(accepted),
+            Err(PointerStoreError::Pointer(e)) => Err(e),
+            Err(other) => Err(PointerError::Malformed(other.to_string())),
+        }
+    }
+}

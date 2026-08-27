@@ -80,6 +80,13 @@ action = "pointer.read"
 decision = "allow"
 ttl_seconds = 300
 
+# What the reader needs to remember a sequence. Reversible, unlike `pointer.publish`:
+# recording what a peer said is not saying anything to anyone.
+[[rule]]
+action = "pointer.write"
+decision = "allow"
+ttl_seconds = 300
+
 [[rule]]
 action = "store.read"
 decision = "deny"
@@ -192,10 +199,20 @@ impl Harness {
         // The asking node replicates through the control plane, exactly as the daemon does:
         // it never opens the cache directory itself, because the store daemon owns that
         // index and two writers would lose each other's updates (ADR-0026 §10).
+        //
+        // It remembers pointer sequences the same way, and for a sharper version of the same
+        // reason: a per-process memory of what it has seen would be lost on restart, and a
+        // reader that forgets is a reader with no rollback protection (ADR-0027 §1).
         let client = Arc::new(
-            NetState::new(Arc::new(signer(dir.join("agreement-client")))).with_holder(Arc::new(
-                otwono_netd::content::BrokeredCache::new(&store_socket, &perm_socket),
-            )),
+            NetState::new(Arc::new(signer(dir.join("agreement-client"))))
+                .with_holder(Arc::new(otwono_netd::content::BrokeredCache::new(
+                    &store_socket,
+                    &perm_socket,
+                )))
+                .with_pointer_memory(Arc::new(otwono_netd::content::BrokeredPointers::new(
+                    &store_socket,
+                    &perm_socket,
+                ))),
         );
 
         // The asking node's control plane, so net.fetch is exercised through a socket and a
@@ -219,6 +236,19 @@ impl Harness {
             node_signing,
             shutdown,
         }
+    }
+
+    /// A second signer over the serving node's agreement key.
+    ///
+    /// The same NodeID as the peer the client already trusts — which is the whole point. A
+    /// replay is not an impersonation: it is the rightful owner's own record, served by
+    /// something that authenticates correctly, so it has to be tested with a channel that
+    /// authenticates correctly.
+    fn server_signer(&self) -> BrokeredSigner {
+        let (agreement, _) = AgreementKeystore::new(self.dir.join("agreement-server"))
+            .load_or_generate()
+            .unwrap();
+        BrokeredSigner::bind(agreement, &self.id_socket, &self.perm_socket).expect("bind")
     }
 
     fn identity_dir(&self) -> PathBuf {
@@ -1636,6 +1666,102 @@ fn a_tombstone_crosses_as_a_signed_record_rather_than_an_absence() {
     assert_eq!(got.content_id, None);
 }
 
+/// A replayed older record is refused over a real link, by a peer that is genuinely the owner.
+///
+/// The property ADR-0027 exists for, and until now the one thing in it never shown outside a
+/// unit test. Everything here is legitimate except the age: the handshake authenticates, the
+/// record is the owner's own, and the signature verifies. What refuses it is the reader's
+/// memory of a higher sequence — held by `otwono-stored` and reached over the control plane,
+/// which is the path a booted node uses.
+#[test]
+fn an_older_record_replayed_by_its_owner_is_refused() {
+    use otwono_net::content::{PointerReply, Request, Response};
+
+    let h = Harness::start("pointer-rollback");
+    let was = h.put(b"what the name meant first", "public");
+    let now = h.put(b"what the name means now", "public");
+
+    h.publish("wiki", "Home", Some(&was));
+    let first = h
+        .client
+        .pointer_from(&h.candidate(), "wiki", "Home")
+        .unwrap()
+        .expect("the first read");
+    assert_eq!(first.sequence, 1);
+    assert_eq!(first.content_id.as_deref(), Some(was.as_str()));
+
+    // Reading the unchanged name again must keep working. This is the ordinary case, and it
+    // is asserted next to the attack because the rule that stops one nearly stopped both.
+    assert_eq!(
+        h.client
+            .pointer_from(&h.candidate(), "wiki", "Home")
+            .unwrap()
+            .expect("an unchanged name is still readable")
+            .sequence,
+        1
+    );
+
+    h.publish("wiki", "Home", Some(&now));
+    let second = h
+        .client
+        .pointer_from(&h.candidate(), "wiki", "Home")
+        .unwrap()
+        .expect("the update");
+    assert_eq!(second.sequence, 2);
+    assert_eq!(second.content_id.as_deref(), Some(now.as_str()));
+
+    // Now the owner's own sequence-1 record, served again by something that authenticates as
+    // the owner. A second signer over the same agreement key: the same NodeID the client
+    // already trusts, because a replay is not an impersonation.
+    let replayed = serde_json::to_value(&first).unwrap();
+    let (client_link, server_link) = MemoryLink::pair();
+    let replaying = h.server_signer();
+    let serving = std::thread::spawn(move || {
+        let mut channel = SecureChannel::accept(server_link, &replaying).unwrap();
+        while let Ok(frame) = channel.recv() {
+            let Ok(Request::Pointer { .. }) = otwono_net::content::decode(&frame) else {
+                break;
+            };
+            let reply = serde_json::to_vec(&Response::Pointer(PointerReply {
+                record: replayed.clone(),
+            }))
+            .unwrap();
+            if channel.send(&reply).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut channel = SecureChannel::initiate(client_link, h.client.signer.as_ref()).unwrap();
+    let err = otwono_netd::fetch_pointer(
+        &mut channel,
+        "wiki",
+        "Home",
+        &LinkProperties::internet(),
+        h.client.pointer_memory.as_ref(),
+    )
+    .expect_err("a replayed record must be refused");
+    assert!(
+        matches!(err, ProtocolError::Rollback { seen: 2, offered: 1 }),
+        "expected a rollback naming both sequences, got {err:?}"
+    );
+
+    // And the refusal changed nothing: the honest peer still answers with the current record.
+    assert_eq!(
+        h.client
+            .pointer_from(&h.candidate(), "wiki", "Home")
+            .unwrap()
+            .expect("still readable")
+            .content_id
+            .as_deref(),
+        Some(now.as_str()),
+        "a refused replay disturbed what the reader holds"
+    );
+
+    drop(channel);
+    let _ = serving.join();
+}
+
 /// A peer that serves a record for somebody else is refused.
 ///
 /// The property the whole narrow scope buys. The record here is perfectly signed by Mallory
@@ -1680,8 +1806,17 @@ fn a_peer_cannot_serve_a_pointer_it_does_not_own() {
     });
 
     let mut channel = SecureChannel::initiate(client_link, &alice).unwrap();
-    let err = otwono_netd::fetch_pointer(&mut channel, "wiki", "Home", &LinkProperties::internet())
-        .expect_err("a record for another node must be refused");
+    // `NoMemory` deliberately: this test is about the owner check, which happens whether or
+    // not the reader remembers anything. A record from the wrong node is refused on the
+    // first read as much as the hundredth.
+    let err = otwono_netd::fetch_pointer(
+        &mut channel,
+        "wiki",
+        "Home",
+        &LinkProperties::internet(),
+        &otwono_pointer::NoMemory,
+    )
+    .expect_err("a record for another node must be refused");
     assert!(
         matches!(err, ProtocolError::Mismatched(_)),
         "expected a mismatch, got {err:?}"

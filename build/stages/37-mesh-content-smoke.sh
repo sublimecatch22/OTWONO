@@ -93,6 +93,19 @@ action = "id.sign"
 subjects = ["uid:0"]
 decision = "allow"
 ttl_seconds = 300
+
+# Reading a peer's pointer needs this, and reading one without it is refused rather than
+# done blind. The rollback defence is the reader's memory of the highest sequence it has
+# seen (ADR-0027 §1), that memory lives in otwono-stored, and otwono-netd reaches it over
+# the control plane -- so a node granted net.content but not this cannot read pointers at
+# all. That is the intended failure: a reader that cannot remember does not read.
+#
+# Reversible, unlike pointer.publish: recording what a peer said says nothing to anyone.
+[[rule]]
+action = "pointer.write"
+subjects = ["uid:0"]
+decision = "allow"
+ttl_seconds = 300
 POLICY
 chmod 0644 "$ROOTFS/etc/otwono/policy.d/91-mesh-content-smoke.toml"
 
@@ -156,7 +169,7 @@ UNIT
 chroot "$ROOTFS" systemctl enable otwono-mesh-content-check.service 2>/dev/null \
     || warn "could not enable otwono-mesh-content-check.service"
 
-log "NOTE: this image grants store.serve, net.content, cache.replicate and id.sign. It is a test image."
+log "NOTE: this image grants store.serve, net.content, cache.replicate, id.sign and the pointer capabilities. It is a test image."
 manifest_add "mesh-content-smoke" "policy drop-in and boot check installed"
 stage_mark_complete 37-mesh-content-smoke
 stage_done

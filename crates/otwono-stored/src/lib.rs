@@ -87,6 +87,12 @@ pub const CAPABILITY_PUBLISH: &str = "pointer.publish";
 /// run without `store.read` so a bug in a label check cannot reach private data, and that
 /// node still has to know its own next sequence in order to publish at all.
 pub const CAPABILITY_POINTER_READ: &str = "pointer.read";
+/// Recording what a peer published, and remembering its sequence (ADR-0027 §1).
+///
+/// Distinct from `pointer.publish`, which is Egress and is about this node's own names. This
+/// writes local state only: it is how the rollback defence remembers, and a node that could
+/// read pointers but never record them would have no protection at all after the first read.
+pub const CAPABILITY_POINTER_WRITE: &str = "pointer.write";
 
 /// A cap on one inline object, in **raw** bytes before base64.
 ///
@@ -481,6 +487,87 @@ impl StoreService {
             "schema_version": DESCRIBE_SCHEMA_VERSION,
             "record": found.map(|p| serde_json::to_value(p).unwrap_or(Value::Null)),
         }))
+    }
+
+    /// Take a record a peer served, applying the rollback rules (ADR-0027 §1).
+    ///
+    /// The whole reason the pointer subsystem has state. `otwono-netd` verifies what it
+    /// fetched against the key the handshake proved, then hands it here — the daemon that
+    /// owns the sequence log and can make the comparison durable. A rollback is refused with
+    /// the sequences named, because "refused" without them is indistinguishable to an
+    /// operator from a network fault.
+    fn handle_pointer_accept(&self, params: Value) -> Result<Value, RpcError> {
+        let record = params
+            .get("record")
+            .ok_or_else(|| RpcError::invalid_params("pointer.accept needs a record"))?;
+        let pointer: otwono_pointer::Pointer = serde_json::from_value(record.clone())
+            .map_err(|e| RpcError::invalid_params(format!("pointer.accept: {e}")))?;
+        let public_key = params
+            .get("public_key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::invalid_params("pointer.accept needs the owner's public_key"))?;
+        let key: [u8; 32] = data_encoding::BASE64
+            .decode(public_key.as_bytes())
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| RpcError::invalid_params("public_key must be 32 base64 bytes"))?;
+        let expected = otwono_pointer::PointerKey {
+            node_id: params
+                .get("node_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            service: params
+                .get("service")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            name: params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        };
+
+        use otwono_pointer::SequenceMemory;
+        match self.pointers()?.accept(&pointer, &key, &expected) {
+            // Three different situations for a caller, so three names rather than a bool: a
+            // first read had no rollback protection at all, an advance did, and an unchanged
+            // read means nothing moved (ADR-0027 §1).
+            Ok(accepted) => Ok(json!({
+                "schema_version": DESCRIBE_SCHEMA_VERSION,
+                "accepted": true,
+                "outcome": match accepted {
+                    otwono_pointer::Accepted::FirstSeen => "first_seen",
+                    otwono_pointer::Accepted::Advanced { .. } => "advanced",
+                    otwono_pointer::Accepted::Unchanged { .. } => "unchanged",
+                },
+                // What it moved from, so a caller can report the advance rather than just
+                // the new number. Absent where nothing moved.
+                "from": match accepted {
+                    otwono_pointer::Accepted::Advanced { from, .. } => Some(from),
+                    _ => None,
+                },
+                "sequence": pointer.sequence,
+            })),
+            // A refusal on the merits, not a fault: the record verified and the caller asked
+            // correctly. Reported as a reply rather than an error so a caller can tell it
+            // from a malformed request and say which of the two happened.
+            Err(otwono_pointer::PointerError::Rollback { seen, offered }) => Ok(json!({
+                "schema_version": DESCRIBE_SCHEMA_VERSION,
+                "accepted": false,
+                "rollback": true,
+                "seen": seen,
+                "offered": offered,
+            })),
+            Err(otwono_pointer::PointerError::Equivocation { sequence }) => Ok(json!({
+                "schema_version": DESCRIBE_SCHEMA_VERSION,
+                "accepted": false,
+                "equivocation": true,
+                "sequence": sequence,
+            })),
+            Err(e) => Err(RpcError::invalid_params(format!("pointer.accept: {e}"))),
+        }
     }
 
     fn cache(&self) -> Result<&Cache, RpcError> {
@@ -1663,6 +1750,11 @@ impl Service for StoreService {
                     CAPABILITY_POINTER_READ,
                 ),
                 MethodDescription::guarded(
+                    "pointer.accept",
+                    "Take a record a peer served, refusing a rollback",
+                    CAPABILITY_POINTER_WRITE,
+                ),
+                MethodDescription::guarded(
                     "pointer.mine",
                     "One of this node's own pointers, for serving to a peer",
                     CAPABILITY_SERVE,
@@ -1777,6 +1869,10 @@ impl Service for StoreService {
             // otwono-netd calls to answer a peer. Guarding it with the publish capability
             // would mean a node could not serve what it publishes without also being able to
             // publish more.
+            "pointer.accept" => {
+                self.authorize(ctx, CAPABILITY_POINTER_WRITE)?;
+                self.handle_pointer_accept(params)
+            }
             "pointer.mine" => {
                 self.authorize(ctx, CAPABILITY_SERVE)?;
                 self.handle_pointer_mine(params)

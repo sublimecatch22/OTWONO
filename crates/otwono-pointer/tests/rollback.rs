@@ -109,9 +109,14 @@ fn an_older_record_verifies_perfectly_and_is_still_refused() {
 
 /// The same sequence with different content is refused too.
 ///
-/// Equal counts as a rollback: re-serving a sequence with changed bytes would otherwise be a
-/// way to change what a name means without advancing it, which is the same attack wearing a
-/// different number.
+/// This is what "the same record again is fine" must not become. The owner is the only
+/// writer, so it can sign a second, different record at a number a reader has already seen —
+/// and if equal were waved through on the number alone, that would change what a name means
+/// without ever advancing it, which is the same attack wearing a different number.
+///
+/// Refused as [`PointerError::Equivocation`] rather than a rollback: nothing here went
+/// backwards, and the two are worth telling apart. A rollback is a third party replaying
+/// history the owner really wrote; this is the owner writing two histories.
 #[test]
 fn the_same_sequence_cannot_be_reused_for_different_content() {
     let alice = identity(4);
@@ -130,8 +135,14 @@ fn the_same_sequence_cannot_be_reused_for_different_content() {
     restated.verify(&key).expect("genuinely signed by the owner");
     assert!(matches!(
         log.accept(&restated, &key, &asked),
-        Err(PointerError::Rollback { seen: 5, offered: 5 })
+        Err(PointerError::Equivocation { sequence: 5 })
     ));
+    // The record already held is untouched, and still reads back.
+    assert_eq!(log.highest_seen(&asked), Some(5));
+    assert_eq!(
+        log.accept(&first, &key, &asked).unwrap(),
+        Accepted::Unchanged { sequence: 5 }
+    );
 }
 
 /// A first read has no protection, and the API says which case it was.
@@ -352,4 +363,33 @@ fn one_pointer_advancing_does_not_move_another() {
     assert_eq!(log.highest_seen(&home), Some(50));
     assert_eq!(log.highest_seen(&recipes), Some(1));
     assert_eq!(log.len(), 2);
+}
+
+/// Reading an unchanged name twice works, and is reported as unchanged.
+///
+/// The rule that "a sequence already seen is refused" was written for the rollback case and
+/// quietly broke the ordinary one: a reader that refuses the record it already holds can
+/// read a wiki page exactly once and never again. The defence only became reachable when it
+/// was put on the fetch path, which is when this surfaced — so it is pinned here.
+#[test]
+fn the_same_record_offered_again_is_a_re_read_and_not_a_rollback() {
+    let alice = identity(20);
+    let key = key_of(&alice);
+    let asked = PointerKey {
+        node_id: alice.node_id().to_text(),
+        service: "wiki".into(),
+        name: "Home".into(),
+    };
+    let mut log = SequenceLog::new();
+
+    let current = published(&alice, "Home", 4, Some(&cid(0x0c)));
+    assert_eq!(log.accept(&current, &key, &asked).unwrap(), Accepted::FirstSeen);
+    for _ in 0..3 {
+        assert_eq!(
+            log.accept(&current, &key, &asked).unwrap(),
+            Accepted::Unchanged { sequence: 4 },
+            "an unchanged name became unreadable after the first read"
+        );
+    }
+    assert_eq!(log.highest_seen(&asked), Some(4));
 }
