@@ -4384,3 +4384,84 @@ It was not a functional failure — that run had already printed `OTWONO-AI-OK .
 backends=llama-cpp-cpu` before the disk gave out. The result above is a clean re-run rather
 than that inference, because "the part I cared about had already passed" is a reasonable
 belief and not evidence.
+
+## 2026-08-27 — `otwono do` on a booted node, against the shipped policy
+
+**STATUS: VERIFIED.** amd64, QEMU, TCG (no `/dev/kvm`). Booted from
+`otwono-amd64-qemu-ubuntu.img` built with `AI_ENGINE=llama.cpp`, via
+`build/qemu/run-amd64.sh --boot-test`.
+
+```
+PASS: every required pattern appeared
+  matched: otwono login:
+  matched: OTWONO-CAPABILITY-OK
+  matched: OTWONO-CONTROL-PLANE-OK
+  matched: OTWONO-CONTENT-OK
+  matched: OTWONO-MESH-OK
+  matched: OTWONO-AI-OK
+  matched: OTWONO-ASSISTANT-OK
+
+[  78.020409] assistant-check: OTWONO-ASSISTANT-OK tier=T0_MICRO
+              saved=eebe1dd5c559f00098265e581a2cc44a27dda4d64751df8b781f48d58704bb33
+              verbs=8 declined=honestly
+```
+
+Zero `OTWONO-ASSISTANT-FAIL`, zero failed units.
+
+### What the marker stands for
+
+Seven assertions, all on the booted node through the real binary, real sockets and real
+systemd units:
+
+1. Help names the shape — a T0 user is told the limit before being refused into learning it.
+2. The tier `otwono do tier` reports equals what `otwono-hwctl tier` reports on the same
+   machine. Cross-checked rather than compared to a constant, so the assertion is about the
+   two agreeing rather than about either matching a number in a script.
+3. A file goes in through `otwono do save` and comes back byte for byte through
+   `otwono-storectl get`. This is the only place a base64 bug would surface.
+4. It is `PRIVATE`, because nobody said otherwise (CLAUDE.md §8).
+5. An open-ended request is declined with `AI-RUNTIME.md` §6's message — naming the
+   machine's limit, not the user's phrasing — and exit code 3.
+6. A near miss is still offered the verb it nearly typed, rather than being told the
+   hardware is too small.
+7. No verb reaches past what the shipped policy granted.
+
+### The point of this one: no policy drop-in
+
+Unlike `otwono-mesh-content-check`, which has to install a drop-in granting `store.serve`
+and `net.content`, this check runs under **`10-default.toml` alone**. Every capability the
+eight verbs name — `hw.read`, `store.read`, `store.write`, `net.read`, `cache.read` — is
+already granted to `uid:0` on a release image.
+
+So this is a claim about the product rather than about a harness: the assistant works on an
+image a person would actually install. If a future policy change breaks that, this check is
+what says so, on the next boot rather than in a bug report.
+
+### What is not shown
+
+- **amd64 only.** The arm64 runner has the marker in its required list, but no arm64 boot
+  has been run since the check was added.
+- **Nothing delegates.** `Elsewhere` is always `Nowhere`, so the "I can queue it for your
+  workstation" arm of §6 has never rendered on a node — only in unit tests. It cannot until
+  something advertises inference (`AI-RUNTIME.md` §7).
+- **One tier.** The node is `T0_MICRO`, so the command-grammar shape is the only one a boot
+  has exercised. The larger shapes are covered by host tests with a pinned tier and nothing
+  else.
+- **No model.** `models=0`; the assistant has never shared a machine with a running model,
+  which is the condition under which T1+ shapes would matter.
+
+### A note on the runs before this one
+
+Two attempts exited 1 with their output lost, both because the writable allowance filled —
+`target/debug` at 15 GB, plus stage 60's `pristine-check` tree at 4.2 GB on top. The third
+time this session; CLAUDE.md §11 warns about exactly it.
+
+Neither was a functional failure — the first had already printed `OTWONO-ASSISTANT-OK`
+before the disk gave out. That marker is a fact, but the run around it did not complete, and
+a verification log that quietly absorbs truncated runs is worth less than one that does not.
+So the result above is a clean re-run.
+
+It also changed the method, for the better: this boots the image directly with
+`build/qemu/run-amd64.sh` rather than through `make boot-test`. Stage 60's artifact
+re-verification is a separate claim with its own green result; running it again to observe a
+boot marker cost 4.2 GB for nothing. Booting a copy also leaves the artifact pristine.

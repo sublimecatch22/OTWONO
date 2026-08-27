@@ -354,8 +354,16 @@ assistant, and it is worth weighing against the reason for the name: `otwono do 
 two design documents promised and what reads naturally to a person. Recorded here so the
 trade is visible if the name is ever revisited.
 
-**Not exercised on a booted node.** The binary is staged into images by build stage 05, but
-no boot check runs it, so there is no entry in `VERIFICATION-LOG.md` for it yet.
+**STATUS: VERIFIED** on a booted node as of 2026-08-27. `otwono-assistant-check` runs at
+boot and asserts seven properties through the real binary and the real sockets — including
+that a file saved through `otwono do save` comes back byte for byte, that it is `PRIVATE`
+because nobody said otherwise, and that an open-ended request is declined with §6's message
+and exit 3.
+
+It needs **no policy drop-in**: every capability the verbs name is already granted on a
+release image, so the check is a claim about the product rather than about a harness. See
+`docs/build/VERIFICATION-LOG.md`, which also records what it does not show — amd64 only, one
+tier, no model on the machine, and nothing delegating.
 
 Three properties are worth stating because they are what make a T0 assistant safe rather
 than merely small:
