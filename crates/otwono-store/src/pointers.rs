@@ -198,15 +198,64 @@ fn read_record(path: &Path) -> Result<Option<Pointer>, PointerStoreError> {
     }
 }
 
-/// Write through a temporary file and rename.
+/// Write through a temporary file and rename, and make it survive losing power.
 ///
 /// A pointer that is half-written is a pointer that cannot be read, and the moment a node is
 /// most likely to be interrupted is while it is publishing. Rename within a directory is
 /// atomic on every filesystem this targets.
+///
+/// # Atomic is not durable, and this file needs both
+///
+/// Rename alone means a reader never sees half a record. It does **not** mean the record is
+/// on the disk: without the fsyncs, both the bytes and the directory entry can still be in
+/// the page cache when the power goes, and the file comes back empty, stale, or absent.
+///
+/// For most files that would be an annoyance. For `sequences.json` it is the rollback
+/// defence disappearing (ADR-0027 §1) — a reader that loses its log drops back to first-use
+/// trust, which is the whole protection gone, and gone *silently*, since a node with no
+/// memory cannot tell that it used to have one. An attacker who can arrange a power cut
+/// should not be handed that.
+///
+/// So: fsync the data before the rename, and fsync the **directory** after it, because the
+/// rename itself is a directory modification and is no more durable than the bytes were.
+///
+/// The temporary name carries a counter. Two threads writing the same key would otherwise
+/// share one temp path and interleave into it — `otwono-stored` serves each connection on
+/// its own thread, so "two at once for one pointer" is a scheduling accident away, and the
+/// file it produces would be neither record.
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), PointerStoreError> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)?;
+    use std::io::Write;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "tmp.{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+
+    let write_and_sync = || -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    };
+    if let Err(e) = write_and_sync() {
+        // A temp file left behind is invisible to every reader here (they open the hashed
+        // name), but it is still litter, and litter in a directory that gets listed.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+
+    // The rename is what makes the new bytes reachable, so it is the part that has to
+    // survive. Not fatal if the directory cannot be opened -- the record is written and
+    // correct either way, and refusing a publish that succeeded would be the worse failure.
+    if let Some(dir) = path.parent() {
+        if let Ok(handle) = std::fs::File::open(dir) {
+            let _ = handle.sync_all();
+        }
+    }
     Ok(())
 }
 

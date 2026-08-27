@@ -191,7 +191,8 @@ owner's public key, which the NodeID already is.
 
 - **First read is unprotected.** Trust-on-first-use. A reader with no stored sequence takes
   what it is given, and a hostile first response wins until a higher sequence arrives.
-- **A reader that loses its state loses its protection**, and reverts to first-use trust.
+- **A reader that loses its state loses its protection**, and reverts to first-use trust —
+  *silently*, because a node with no memory cannot tell that it used to have one. See §9.
 - **An owner can roll itself back** by signing a lower sequence — nothing stops the key
   holder rewriting history for readers who have no memory of it. The rule protects readers
   from third parties, not from the owner.
@@ -199,6 +200,29 @@ owner's public key, which the NodeID already is.
   without a schema break.
 - ~~**Nothing here distributes the pointer.**~~ **Built, 2026-08-27.** `content.pointer`
   crosses a link and the fetch path consults the reader's memory (§7).
+
+### 9. The log has to be durable, not merely atomic
+
+**Added 2026-08-27**, when "does the memory survive a reboot" stopped being a design claim
+and became something to run.
+
+The store wrote the sequence log through a temporary file and renamed it, which is the right
+shape and only half the job. Rename is atomic — no reader ever sees half a record — but it is
+not *durable*: without an fsync of the data before the rename and an fsync of the **directory**
+after it, both the bytes and the directory entry can still be in the page cache when the
+machine loses power, and the file comes back empty, stale, or absent.
+
+For most files that is an annoyance. For this one it is the defence disappearing, and
+disappearing in the direction that helps an attacker: a reader that comes back with no log
+accepts whatever it is offered as a first read. Somebody who can arrange a power cut should
+not be handed the rollback. So both fsyncs are now there.
+
+Two things this does **not** claim. The other atomic-write sites in the workspace
+(`otwono-store`'s CAS and cache, `otwono-fetch`'s spool, `otwono-ai`'s installer) have the
+same rename-without-fsync shape and have **not** been audited; whether their invariants need
+durability is a separate question and a separate change. And the boot test that exercises
+this shuts the machine down cleanly rather than cutting the power, so what is verified is
+that the log survives a boot boundary — not that it survives the moment the fsyncs exist for.
 
 ## Alternatives rejected
 

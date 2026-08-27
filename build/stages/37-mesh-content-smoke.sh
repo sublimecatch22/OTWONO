@@ -144,6 +144,11 @@ Documentation=file:/usr/share/doc/otwono/DATA-VISIBILITY.md
 After=otwono-netd.service otwono-stored.service
 Requires=otwono-netd.service otwono-stored.service
 RequiresMountsFor=/var/lib/otwono
+# Runs on the first boot only. The second boot belongs to otwono-pointer-reboot-check, and
+# a second run of this one would republish a name the peer has already seen at sequence 2
+# with different bytes -- equivocation (ADR-0027 section 8), correctly refused, and nothing
+# to do with what either check exists to prove.
+ConditionPathExists=!/var/lib/otwono/mesh-content-check.done
 
 [Service]
 Type=oneshot
@@ -168,6 +173,45 @@ UNIT
 
 chroot "$ROOTFS" systemctl enable otwono-mesh-content-check.service 2>/dev/null \
     || warn "could not enable otwono-mesh-content-check.service"
+
+# The mirror image of the check above: it runs only on a boot that follows a completed one.
+# ADR-0027's defence is state the reader keeps, so "does that state survive the machine going
+# away" is the property the whole design rests on, and it was tested in-process only.
+log "installing the pointer reboot check"
+install -m 0755 "$BUILD_DIR/files/otwono-pointer-reboot-check" \
+    "$ROOTFS/usr/lib/otwono/pointer-reboot-check"
+cat > "$ROOTFS/etc/systemd/system/otwono-pointer-reboot-check.service" <<'UNIT'
+[Unit]
+Description=OTWONO pointer reboot check (TEST IMAGES ONLY)
+Documentation=file:/usr/share/doc/otwono/DISTRIBUTED-SERVICES.md
+After=otwono-netd.service otwono-stored.service
+Requires=otwono-netd.service otwono-stored.service
+RequiresMountsFor=/var/lib/otwono
+# Only on a boot that follows a completed content check. On a first boot there is no
+# remembered sequence to survive anything, and the stamp is what says otherwise.
+ConditionPathExists=/var/lib/otwono/mesh-content-check.done
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/otwono/pointer-reboot-check
+StandardOutput=journal+console
+StandardError=journal+console
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/otwono
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+chroot "$ROOTFS" systemctl enable otwono-pointer-reboot-check.service 2>/dev/null \
+    || warn "could not enable otwono-pointer-reboot-check.service"
 
 log "NOTE: this image grants store.serve, net.content, cache.replicate, id.sign and the pointer capabilities. It is a test image."
 manifest_add "mesh-content-smoke" "policy drop-in and boot check installed"

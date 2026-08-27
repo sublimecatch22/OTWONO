@@ -5,7 +5,13 @@
 #
 #   1. two nodes on the same segment discover each other with no configuration,
 #   2. each authenticates the other's NodeID cryptographically,
-#   3. an identity generated on first boot survives a reboot of the VM that owns it.
+#   3. an identity generated on first boot survives a reboot of the VM that owns it,
+#   4. and, on a content-check image, that the pointer rollback defence survives it too.
+#
+# Claims 3 and 4 need a second boot, which this script did not do until the pointer work
+# needed it: the header promised claim 3 and nothing here rebooted anything. What stood in
+# for it was `otwono-mesh-check` asserting the key files are on disk, which is a proxy for
+# the property and not the property.
 #
 # The two VMs are joined with QEMU's socket netdev, which makes a private layer-2 segment
 # between them and nothing else — no host bridge, no root, no DHCP server. That last part
@@ -157,9 +163,34 @@ start_node() { # node netdev-spec logfile mac
         -drive if=pflash,format=raw,unit=1,file="$OUT/vars-$n.fd" \
         -drive if=virtio,format=raw,file="$OUT/node-$n.img" \
         -netdev "$netdev" -device virtio-net-pci,netdev=seg,mac="$mac" \
+        -qmp "unix:$OUT/qmp-$n.sock,server=on,wait=off" \
         -nographic -serial mon:stdio -no-reboot \
         < /dev/null > "$log" 2>&1 &
     echo $!
+}
+
+# Shut a node down the way its own power button would.
+#
+# A clean shutdown and not a kill, deliberately. What is under test is whether state written
+# on one boot is there on the next; killing the VM would *also* be testing whether every
+# daemon's writes are durable against losing power, which is a different question and one
+# this repo has audited for exactly one file (the pointer store's). Conflating them would
+# mean a failure here could be either, and the log would say neither.
+powerdown_node() { # node pid
+    local n="$1" pid="$2" waited=0
+    printf '%s\n%s\n' \
+        '{"execute":"qmp_capabilities"}' \
+        '{"execute":"system_powerdown"}' \
+        | socat -t 5 - "UNIX-CONNECT:$OUT/qmp-$n.sock" > /dev/null 2>&1 || true
+    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 240 ]; do
+        sleep 2; waited=$(( waited + 2 ))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "FAIL: node $n did not shut down within ${waited}s of the power button" >&2
+        return 1
+    fi
+    rm -f "$OUT/qmp-$n.sock"
+    return 0
 }
 
 : > "$OUT/node-a.log"; : > "$OUT/node-b.log"
@@ -361,6 +392,74 @@ if [ "${MESH_CONTENT_SMOKE:-0}" != 0 ]; then
         fi
     done
     echo "content: each node took its peer's update, then refused the peer's rolled-back record"
+
+    # --- second boot: does any of it survive the machine going away? ---------------------
+    #
+    # ADR-0027's defence is state the reader keeps, and state that does not outlive a reboot
+    # is protection an attacker gets by waiting. It had been tested by opening a PointerStore,
+    # closing it, and opening it again -- same process, same kernel, same page cache.
+    #
+    # Nothing is republished on this boot. The previous one ended with each node's own pointer
+    # regressed to sequence 1 and each node's memory of its peer at sequence 2, both on disk,
+    # so each peer is *still serving* the record the other must *still* refuse. The only thing
+    # that can refuse it is what came back off the disk.
+    echo
+    echo "shutting both nodes down and booting them again from the same disks"
+    powerdown_node a "$PID_A" || exit 1
+    powerdown_node b "$PID_B" || exit 1
+    echo "  both nodes powered off cleanly"
+
+    # Separate logs. Overwriting the first boot's would destroy the evidence for everything
+    # asserted above, and would let a marker from boot one be read as proof about boot two.
+    : > "$OUT/node-a-boot2.log"; : > "$OUT/node-b-boot2.log"
+    PID_A=$(start_node a "socket,id=seg,listen=127.0.0.1:$SEGMENT_PORT" \
+        "$OUT/node-a-boot2.log" "$(segment_mac 2 1)")
+    sleep 2
+    PID_B=$(start_node b "socket,id=seg,connect=127.0.0.1:$SEGMENT_PORT" \
+        "$OUT/node-b-boot2.log" "$(segment_mac 2 2)")
+
+    echo "waiting for both nodes to answer for what they remember (up to ${CONTENT_TIMEOUT}s)"
+    deadline=$(( $(date +%s) + CONTENT_TIMEOUT ))
+    reboot_result=timeout
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if grep -qa "OTWONO-POINTER-REBOOT-FAIL\|Kernel panic" \
+            "$OUT/node-a-boot2.log" "$OUT/node-b-boot2.log" 2>/dev/null; then
+            reboot_result=fail; break
+        fi
+        if grep -qa "OTWONO-POINTER-REBOOT-OK" "$OUT/node-a-boot2.log" 2>/dev/null \
+            && grep -qa "OTWONO-POINTER-REBOOT-OK" "$OUT/node-b-boot2.log" 2>/dev/null; then
+            reboot_result=pass; break
+        fi
+        sleep 5
+    done
+    if [ "$reboot_result" != pass ]; then
+        echo "FAIL: the rollback defence did not survive the reboot ($reboot_result)" >&2
+        grep -ha "OTWONO-POINTER-REBOOT-" "$OUT"/node-*-boot2.log >&2 || true
+        exit 1
+    fi
+
+    for node in a b; do
+        line=$(grep -hoa "OTWONO-POINTER-REBOOT-OK.*" "$OUT/node-$node-boot2.log" | tail -1 | tr -d '\r')
+        echo "  $line"
+        remembered=$(echo "$line" | grep -o 'remembered=[0-9]*' | cut -d= -f2)
+        came_back_as=$(echo "$line" | grep -o 'fingerprint=[^ ]*' | cut -d= -f2)
+        was=$(mesh_field "$OUT/node-$node.log" node)
+        case "$remembered" in ''|*[!0-9]*) remembered=0 ;; esac
+        # Asserted on the *number*, not on the fact of a refusal. A log that came back empty
+        # would make the node accept the record as a first read, and a log that came back
+        # wrong would refuse while naming something other than what it saw.
+        if [ "$remembered" -lt 2 ]; then
+            echo "FAIL: node $node refused naming sequence $remembered; it had seen 2" >&2
+            exit 1
+        fi
+        # Independent of the guest's own check: this compares against what the *first boot's*
+        # console said, which the second boot cannot have written.
+        if [ -n "$was" ] && [ "$came_back_as" != "$was" ]; then
+            echo "FAIL: node $node booted as $came_back_as, having been $was" >&2
+            exit 1
+        fi
+    done
+    echo "reboot: each node came back as itself and still refused its peer's rolled-back pointer"
 fi
 
 echo "PASS: two nodes discovered and mutually authenticated"

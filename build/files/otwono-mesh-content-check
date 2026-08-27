@@ -658,4 +658,21 @@ if [ -n "$all" ]; then
 fi
 
 rm -rf "$WORK"
+
+# What a second boot needs to know, written only on a run that got this far.
+#
+# Its existence is also what stops this check running twice: the unit is conditioned on the
+# file being absent, and `otwono-pointer-reboot-check` on it being present. A second run of
+# this script would republish under a name the peer has already seen at sequence 2, with
+# different bytes -- which is equivocation (ADR-0027 section 8), correctly refused, and
+# nothing to do with what either check is for.
+#
+# The fingerprint is recorded so the reboot check can say whether the identity survived. The
+# sequence is recorded for a reader of the file; the refusal proves it either way.
+cat > /var/lib/otwono/mesh-content-check.done <<STAMP
+fingerprint=$(otwono-netd --status --socket /run/otwono/net.sock 2>/dev/null | awk '/^fingerprint/ {print $2}')
+pointer=wiki/Getting-Started
+peer_sequence_seen=2
+STAMP
+
 echo "OTWONO-MESH-CONTENT-OK node=$node_ordinal/$node_total public=$pub_id large=$big_id large_served=$big_served private_refused=$prv_id cache_budget=$cache_state cache_held=$cache_held shared_to_peer=$shared_to_peer granted=$granted discovered=$discovered replicated=$replicated_id replica_taken=$replica_taken pointer_published=$pointer_published pointer_resolved=$pointer_resolved pointer_advanced=$pointer_advanced pointer_rollback_refused=$pointer_rollback_refused"
