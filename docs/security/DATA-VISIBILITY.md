@@ -57,10 +57,11 @@ Every object in `otwono-stored` carries exactly one visibility label.
 a cluster-cache entry that eviction will not touch. A node runs a pass against each peer it
 dials, so an object replicates without a test driving it.
 
-Unit, integration and cross-process tested — including an object crossing a real TCP link
-and landing in a *different* process's cache. **Not** yet exercised between two booted
-machines: `REPLICATED` has no entry in `docs/build/VERIFICATION-LOG.md` of the kind `SHARED`
-has, so nothing here is `VERIFIED`.
+**STATUS: VERIFIED** as of 2026-08-27. Two booted VMs on a segment with no DHCP each
+published a `REPLICATED` object and each ended up holding the other's, with no content id
+crossing between the machines and nothing driving the transfer. See
+`docs/build/VERIFICATION-LOG.md`, which also records what that run did *not* show — no arm64,
+no TTL lapse, no budget pressure, and no booted check that a stock image replicates nothing.
 
 **Settled by ADR-0026, and every field is advisory.** Replication is **pulled by a holder,
 never pushed by an owner**, which makes consent inherent — nothing arrives on a disk whose

@@ -4242,3 +4242,79 @@ all reproducible.
 - **`export-seed` still never runs**, the no-echo prompt is still never exercised, expiry is
   still only against an injected clock, and nothing notifies anybody a confirmation waits.
 - amd64 only, TCG, single node. The two-node run predates the fetchd fix.
+
+## 2026-08-27 — REPLICATED replicates between two booted nodes
+
+**STATUS: VERIFIED.** amd64, QEMU, TCG only (`/dev/kvm` absent — `ls: cannot access
+'/dev/kvm': No such file or directory`). Two VMs on a private layer-2 segment with no DHCP,
+IPv4 link-local, mDNS discovery, Noise XX mutual authentication.
+
+Image built with `MESH_CONTENT_SMOKE=1`; harness
+`build/qemu/two-node-test.sh --image out/amd64-qemu-ubuntu/otwono-amd64-qemu-ubuntu.img`.
+
+```
+node A identity: otw1:twe8-ekyb-schm-64rb   addr 169.254.44.50/16
+node B identity: otw1:4zx1-jhph-983t-jyy2   addr 169.254.97.5/16
+
+[  90.720949] mesh-check: OTWONO-MESH-OK ... known=1 connected=1
+[ 245.001719] mesh-content-check: STEP publishing a REPLICATED object and waiting for the peer's
+[ 261.868342] mesh-content-check: STEP holding a replica taken from the peer with nothing driving it
+
+content: both nodes served a public object and refused a private one
+content: each node took a replica of the other's REPLICATED object, unprompted
+PASS: two nodes discovered and mutually authenticated
+```
+
+The two summary lines cross-check, and that is the assertion that matters:
+
+| | published | took |
+|---|---|---|
+| node 1/2 | `43a1e26e7b4514f6…` | `bf9ff7331052d927…` |
+| node 2/2 | `bf9ff7331052d927…` | `43a1e26e7b4514f6…` |
+
+Each node holds exactly the object the other published. **No content id crossed between the
+VMs**: each object carries that node's ordinal and a nanosecond timestamp, so the two are
+certainly different bytes and neither node can derive the other's id from anything it has.
+A replica appearing is one the peer offered over the wire and this node chose to take.
+
+### The timing proves which trigger carried it
+
+The mesh formed at **90.7s**. The objects were published at **243–245s**. The replicas were
+taken at **262–265s**.
+
+A dial happens once per peer for the life of the daemon — `dial` marks the peer `Connected`
+and `retry_candidates` skips it forever afterwards. That dial had already happened by 90s,
+155 seconds before either object existed. So the dial-time pass **cannot** be what carried
+these replicas; the discovery sweep is. ADR-0026 §11 was written on the reasoning that
+connections happen once, and this run is the evidence for it rather than an illustration of
+it. Had the sweep not been added, this check would have timed out.
+
+### What this does not show
+
+- **amd64 only, and two nodes only.** No arm64 run. Nothing here exercises several holders
+  competing for one object, or a node choosing among offers from more than one peer — the
+  smallest-that-fits rule (ADR-0026 §9) is unit-tested and has never had to choose on a wire.
+- **The TTL never lapses.** The default is 365 days and this VM lived for minutes. Expiry
+  and the sweep that releases holds are unit-tested against an injected clock, and have
+  never run on a booted node.
+- **The refusal path is not booted.** A node whose broker denies `cache.replicate` is
+  covered by an integration test; the stock policy's *absence* of the grant is asserted
+  nowhere on a real image, so "a release image replicates nothing" is read from
+  `build/stages/30-otwono.sh` rather than observed.
+- **`allow_rereplication` is untested end to end.** Nothing has re-offered a replica it
+  holds, which is the property that makes content outlive its origin.
+- **Budget pressure never bit.** The cache budget was 512 MiB and the objects were tens of
+  bytes, so `take_replica`'s refusal path and the eviction interaction did not run.
+
+### A note on how this run was reached
+
+The first attempt printed `PASS: two nodes discovered and mutually authenticated` **having
+tested nothing**. `MESH_CONTENT_SMOKE` had to be set twice — once for the image build and
+again for the harness run — and setting it once meant the harness skipped the entire content
+block and tore the VMs down at mesh formation, before the check unit had produced a line.
+
+A green result that checked nothing is worse than a red one, and this one was indistinguishable
+from the real thing at a glance. Both harnesses now read the image's own `manifest.tsv`,
+which stage 37 already writes, so the flag can no longer be half-set. Recorded here because
+the defect was in the *evidence-gathering*, not the code, and that is the kind that quietly
+invalidates a log like this one.

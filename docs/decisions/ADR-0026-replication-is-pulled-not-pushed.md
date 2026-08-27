@@ -280,6 +280,12 @@ its budget stops on its own.
 moment there is most likely something new to take. What changed is that it is no longer the
 only moment.
 
+**Confirmed on two booted nodes, 2026-08-27.** The mesh formed at 90.7s and the objects were
+published at 243–245s — 155 seconds after the only dial either node would ever make. The
+replicas were taken at 262–265s. So the sweep is demonstrably what carried them, and without
+this amendment the check would have timed out rather than passed. `VERIFICATION-LOG.md`
+carries the run.
+
 ## Consequences
 
 **Good.** No consent mechanism to design, because nothing arrives unasked. No push

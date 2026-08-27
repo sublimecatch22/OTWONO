@@ -210,10 +210,10 @@ GPU/NPU backends, and the tiered assistant shapes.
    Off by default and deliberately so: holding a replica needs `cache.replicate`, which a
    stock image does not grant, and a node without it makes no replication traffic at all.
 
-   **Not yet verified between booted machines.** Everything above is unit, integration and
-   cross-process tested; `REPLICATED` still has no two-VM entry in
-   `docs/build/VERIFICATION-LOG.md` of the kind `SHARED` earned. Until it does, this is
-   `IMPLEMENTED` and not `VERIFIED`.
+   **Verified between booted machines** on 2026-08-27: two VMs, each published a
+   `REPLICATED` object, each ended up holding the other's, no id passing between them. The
+   timing also settled which trigger carries it — the mesh formed 155 seconds before either
+   object existed, so the dial-time pass could not have been what moved them (§11).
 5. ~~The **cluster cache** — a bounded, encrypted, tier-scaled contributed store
    (ADR-0015, `docs/services/CLUSTER-CACHE.md`).~~ **done**, including fan-out fetch
    and ADR-0018's file handoff for objects too large for the control plane. Chunking
@@ -228,10 +228,11 @@ link**: two booted VMs on a segment with no DHCP, mutually authenticated over No
 refusing the other a `PRIVATE` object it demonstrably holds, with the refusal byte-identical
 to the one an absent object gets. See `docs/build/VERIFICATION-LOG.md`.
 
-**Still outstanding here**, and named rather than folded into a later phase: `REPLICATED`
-(item 4) is implemented but has not been exercised between two booted machines the way
-`SHARED` has. The code path exists and is tested across processes; what is missing is the
-boot log, and an untested-on-real-hardware subsystem is not a finished one.
+**Nothing is outstanding in this phase's list.** `REPLICATED` (item 4) has now crossed
+between two booted machines, which was the last gap. What remains is narrower and named in
+`docs/build/VERIFICATION-LOG.md` rather than here: no arm64 run, no TTL lapse on a booted
+node, no boot-time check that a stock image replicates nothing, and no run where more than
+one holder competes for the same object.
 
 `SHARED` is no longer on that list. It has now passed between two booted nodes end to end:
 each seals an object to the other, each asks what it has been sent, and each fetches and
