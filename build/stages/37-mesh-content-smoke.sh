@@ -261,6 +261,43 @@ UNIT
 chroot "$ROOTFS" systemctl enable otwono-envelope-check.service 2>/dev/null \
     || warn "could not enable otwono-envelope-check.service"
 
+# The partition phase, after the envelope one. Ordered `After=` rather than `Requires=`: the
+# envelope check can legitimately skip — two nodes, or node 3's first boot — and a partition
+# check that refused to start because of that would turn a skip into a stall.
+install -m 0755 "$BUILD_DIR/files/otwono-partition-check" \
+    "$ROOTFS/usr/lib/otwono/partition-check"
+cat > "$ROOTFS/etc/systemd/system/otwono-partition-check.service" <<'UNIT'
+[Unit]
+Description=OTWONO partition check (TEST IMAGES ONLY)
+Documentation=file:/usr/share/doc/otwono/DISTRIBUTED-SERVICES.md
+After=otwono-netd.service otwono-stored.service otwono-envelope-check.service
+Requires=otwono-netd.service otwono-stored.service
+RequiresMountsFor=/var/lib/otwono
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Waits for a link the harness takes down on its own schedule, so it must not hold up the
+# boot. Deliberately not Before=.
+ExecStart=/usr/lib/otwono/partition-check
+StandardOutput=journal+console
+StandardError=journal+console
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/otwono
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+chroot "$ROOTFS" systemctl enable otwono-partition-check.service 2>/dev/null \
+    || warn "could not enable otwono-partition-check.service"
+
 log "NOTE: this image grants store.serve, net.content, cache.replicate, id.sign, the pointer capabilities and envelope.carry. It is a test image."
 manifest_add "mesh-content-smoke" "policy drop-in and boot check installed"
 stage_mark_complete 37-mesh-content-smoke
