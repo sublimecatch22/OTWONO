@@ -5,7 +5,10 @@
 reads and walks the history of a page over the real control plane, and a page written through
 the daemons reads back as its text with its signature verifying against the node that made it.
 
-**No page has crossed a link**, so Phase 6's first exit clause is not met — see §6.
+A page also **crosses a link**: a reading node resolves the peer's `wiki/<page>` pointer,
+fetches the revision and then the body, and verifies the revision against the key the
+*handshake* proved. Shown between two nodes over a real Noise channel;
+**not yet between booted nodes**, which is what Phase 6's first exit clause needs — see §6.
 
 The first service composed from the three primitives rather than a fourth one.
 
@@ -99,9 +102,11 @@ is the whole history" from "this is as much of it as I have":
   The pointer moves **last**, and that order is not incidental: it is what anyone else reads,
   so a pointer advanced before its revision was stored would name an id this node cannot
   serve, and a reader would see a page that exists and cannot be opened.
-- **No page has crossed a link.** Two booted nodes have published and resolved
-  `wiki/Getting-Started` as a *pointer to an opaque blob* — that is the primitive, not this
-  service. Phase 6's first exit clause needs a revision and its body to make the trip.
+- **No page has crossed a link between *booted* nodes.** It crosses one in
+  `a_wiki_page_is_readable_from_another_node`, over a real Noise channel with real daemons.
+  What the three-node QEMU harness has shown is two nodes resolving `wiki/Getting-Started` as
+  a *pointer to an opaque blob* — the primitive, not this service. Phase 6's first exit clause
+  needs a revision and its body to make that trip.
 - **No rendering, no links between pages, no `onm://` in a browser.** That is §3's local
   resolver.
 - **No multi-writer merge**, per §2 above.
@@ -120,7 +125,18 @@ ADR-0032 (the decisions), ADR-0027 (pointers, and the ordering rule this copies)
 otwono-wikictl write Getting-Started --file page.md
 otwono-wikictl read  Getting-Started --out page.md
 otwono-wikictl history Getting-Started
+otwono-wikictl read Getting-Started --from <NODEID> --at <ADDR> --out theirs.md
 ```
+
+Reading a peer's page checks three things before a byte is written, because a file on disk is
+what a person then reads and believes: the **pointer**, by `otwono-netd`, against the
+handshake key and the rollback rules; the **revision's own signature**, against that same key,
+since the pointer vouches for which id is current and says nothing about what that id
+contains; and that the revision **names the page that was asked for**.
+
+The key comes from `net.pointer`'s reply rather than from the record. A NodeID is a hash of
+the public key, so a record cannot carry its own answer to "was this really them" — the
+handshake is the only place that key is proved rather than asserted.
 
 `history` verifies every step and prints how the walk ended, so a truncated history says so
 rather than looking like a short one. It answers for revisions authored by **this** node and

@@ -112,6 +112,16 @@ pub struct NetState {
     pub listen_addr: Mutex<Option<SocketAddr>>,
 }
 
+/// A pointer resolved from a peer, with the key that peer proved in the handshake.
+#[derive(Debug, Clone)]
+pub struct Resolved {
+    /// `None` when the peer publishes no such name, or will not discuss it — one answer for
+    /// both, so asking cannot enumerate a node's names.
+    pub record: Option<otwono_pointer::Pointer>,
+    /// Ed25519, from the handshake and never from a payload.
+    pub public_key: [u8; 32],
+}
+
 impl NetState {
     pub fn new(signer: Arc<dyn SessionSigner>) -> Self {
         let node_id = signer.node_id();
@@ -500,12 +510,34 @@ impl NetState {
         service: &str,
         name: &str,
     ) -> Result<Option<otwono_pointer::Pointer>, String> {
+        Ok(self.resolve_pointer(candidate, service, name)?.record)
+    }
+
+    /// The same resolution, and the key the handshake proved the peer holds.
+    ///
+    /// A caller that resolved a pointer usually wants to check something *else* the same
+    /// author signed — a wiki page's revision chain, for one (ADR-0032) — and a NodeID is a
+    /// hash of the public key, so the key cannot be recovered from the record. It has to come
+    /// from the handshake, which is the only place it is proved rather than asserted: a key
+    /// taken from a payload would be whatever the peer put there.
+    ///
+    /// Returned even when there is no record. "This peer publishes no such name" and "this is
+    /// who I was talking to" are separate facts, and the caller may want the second to decide
+    /// whether the first is worth believing.
+    pub fn resolve_pointer(
+        &self,
+        candidate: &Candidate,
+        service: &str,
+        name: &str,
+    ) -> Result<Resolved, String> {
         let source = self.open_content_channel(candidate)?;
         let content::PeerSource {
             mut channel, link, ..
         } = source;
-        content::fetch_pointer(&mut channel, service, name, &link, self.pointer_memory.as_ref())
-            .map_err(|e| e.to_string())
+        let public_key = channel.peer().public_key;
+        let record = content::fetch_pointer(&mut channel, service, name, &link, self.pointer_memory.as_ref())
+            .map_err(|e| e.to_string())?;
+        Ok(Resolved { record, public_key })
     }
 
     /// Fetch one object from several peers at once (ADR-0015).
@@ -1277,16 +1309,21 @@ impl Service for NetService {
                     .ok_or_else(|| RpcError::invalid_params("net.pointer needs a name"))?;
                 let found = self
                     .state
-                    .pointer_from(&candidate, service, name)
+                    .resolve_pointer(&candidate, service, name)
                     .map_err(RpcError::internal)?;
                 Ok(json!({
                     "schema_version": DESCRIBE_SCHEMA_VERSION,
                     "node_id": candidate.claimed_node_id.to_text(),
                     "service": service,
                     "name": name,
+                    // The key the handshake proved this peer holds, so a caller can check
+                    // something else the same author signed — a wiki revision chain, say.
+                    // A NodeID is a hash of it and a payload's copy would be the peer's
+                    // word for it, so this is the only honest source.
+                    "public_key": data_encoding::BASE64.encode(&found.public_key),
                     // null for a name the peer does not publish or will not discuss. One
                     // answer for both, so asking cannot enumerate a node's names.
-                    "record": found.map(|p| serde_json::to_value(p).unwrap_or(Value::Null)),
+                    "record": found.record.map(|p| serde_json::to_value(p).unwrap_or(Value::Null)),
                 }))
             }
             "net.shared_with_me" => {

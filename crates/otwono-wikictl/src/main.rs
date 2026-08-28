@@ -17,11 +17,16 @@
 //! between them — the same reason `otwono-storectl pointer-publish` is one command and not
 //! three (ADR-0027).
 //!
-//! # Reading someone else's page is not here
+//! # Reading someone else's page
 //!
-//! This reads pages in *this node's* namespace, from this node's store. Fetching a peer's
-//! page is `content.pointer` plus the fetch path and belongs to `otwono-netd`; WIKI.md §6
-//! says so and this file does not pretend otherwise.
+//! `read --from <NODEID> --at <ADDR>` resolves that peer's `wiki/<page>` pointer through
+//! `otwono-netd`, fetches the revision it names and then the body. Three things are checked
+//! before a byte is written: the pointer, by `otwono-netd`, against the key the *handshake*
+//! proved and against the rollback rules; the revision's own signature, against that same
+//! key; and that the revision names the page that was asked for.
+//!
+//! The key comes from `net.pointer`'s reply and not from the record, because a NodeID is a
+//! hash of the key and a payload's copy of it would be the peer's word for it.
 
 #![forbid(unsafe_code)]
 
@@ -45,13 +50,14 @@ const USAGE: &str = "\
 otwono-wikictl — wiki pages as signed chains of revisions
 
   otwono-wikictl write <PAGE> --file <PATH> [--visibility public|private]
-  otwono-wikictl read <PAGE> --out <PATH>
+  otwono-wikictl read <PAGE> --out <PATH> [--from <NODEID> --at <ADDR>]
   otwono-wikictl history <PAGE> [--limit N]
 
 Options:
   --socket PATH        otwono-stored's socket
   --perm-socket PATH   otwono-permd's socket
   --id-socket PATH     otwono-idd's socket
+  --net-socket PATH    otwono-netd's socket, for --from
   --json               machine-readable output
 ";
 
@@ -86,7 +92,10 @@ struct Options {
     out: Option<PathBuf>,
     visibility: String,
     limit: Option<usize>,
+    from: Option<String>,
+    at: Option<String>,
     socket: Option<PathBuf>,
+    net_socket: Option<PathBuf>,
     perm_socket: Option<PathBuf>,
     id_socket: Option<PathBuf>,
     json: bool,
@@ -125,7 +134,10 @@ fn parse(args: &mut dyn Iterator<Item = String>) -> Result<Options, Error> {
                         .map_err(|_| Error::Usage("--limit needs a number".into()))?,
                 )
             }
+            "--from" => o.from = Some(value("--from")?),
+            "--at" => o.at = Some(value("--at")?),
             "--socket" => o.socket = Some(value("--socket")?.into()),
+            "--net-socket" => o.net_socket = Some(value("--net-socket")?.into()),
             "--perm-socket" => o.perm_socket = Some(value("--perm-socket")?.into()),
             "--id-socket" => o.id_socket = Some(value("--id-socket")?.into()),
             "--json" => o.json = true,
@@ -150,7 +162,10 @@ fn run() -> Result<String, Error> {
 
     match opts.command.as_str() {
         "write" => write_page(&opts, &store, &perm),
-        "read" => read_page(&opts, &store, &perm),
+        "read" => match opts.from.clone() {
+            Some(peer) => read_from_peer(&opts, &perm, &peer),
+            None => read_page(&opts, &store, &perm),
+        },
         "history" => show_history(&opts, &store, &perm),
         other => Err(Error::Usage(format!("unknown command {other}"))),
     }
@@ -528,4 +543,114 @@ fn call(
     }
     .map_err(|e| Error::Runtime(format!("{method}: {e}")))?;
     reply.map_err(|e| Error::Runtime(format!("{method} refused: {}", e.message)))
+}
+
+/// Read a page out of somebody else's namespace, over a link.
+///
+/// `onm://<peer>/wiki/<page>`, done by hand: resolve, fetch the revision, fetch the body.
+/// Nothing is written until all three checks below have passed, because a file on disk is
+/// what a person then reads and believes.
+fn read_from_peer(opts: &Options, perm: &Path, peer: &str) -> Result<String, Error> {
+    let page = page_of(opts)?;
+    let out = opts
+        .out
+        .clone()
+        .ok_or_else(|| Error::Usage("read needs --out".into()))?;
+    let address = opts
+        .at
+        .clone()
+        .ok_or_else(|| Error::Usage("--from needs --at <ADDR>, where that peer listens".into()))?;
+    let net = opts
+        .net_socket
+        .clone()
+        .unwrap_or_else(|| otwono_proto::socket_path("net"));
+
+    // `otwono-netd` verifies the record against the key the handshake proved and applies the
+    // rollback rules (ADR-0027 §7) before this sees it.
+    let resolved = call(
+        &net,
+        perm,
+        "net.pointer",
+        json!({ "node_id": peer, "address": address, "service": SERVICE, "name": page }),
+        Some("net.content"),
+    )?;
+    let record = resolved
+        .get("record")
+        .filter(|r| !r.is_null())
+        .ok_or_else(|| Error::Runtime(format!("{peer} publishes no page called {page:?}")))?;
+    let pointer: otwono_pointer::Pointer = serde_json::from_value(record.clone())
+        .map_err(|e| Error::Runtime(format!("the peer's pointer does not parse: {e}")))?;
+    let head = pointer
+        .content_id
+        .clone()
+        .ok_or_else(|| Error::Runtime(format!("{peer} has deleted {page:?}")))?;
+
+    // The key the handshake proved, not the one a payload claims: a NodeID is a hash of it,
+    // so a record cannot carry its own answer to "was this really them".
+    let key = resolved
+        .get("public_key")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Runtime("net.pointer returned no public_key".into()))?;
+    let key: [u8; 32] = data_encoding::BASE64
+        .decode(key.as_bytes())
+        .map_err(|e| Error::Runtime(format!("net.pointer's public_key is not base64: {e}")))?
+        .try_into()
+        .map_err(|_| Error::Runtime("net.pointer's public_key is not 32 bytes".into()))?;
+
+    let revision: otwono_wiki::Revision = serde_json::from_slice(&fetch(&net, perm, peer, &address, &head)?)
+        .map_err(|e| Error::Runtime(format!("{head} is not a wiki revision: {e}")))?;
+    // Its own signature, and not the pointer's. The pointer vouches for *which id is
+    // current* and says nothing about what that id contains (ADR-0032).
+    revision
+        .verify(&key)
+        .map_err(|e| Error::Runtime(format!("the head revision of {page:?} from {peer}: {e}")))?;
+    if revision.page != page {
+        return Err(Error::Runtime(format!(
+            "{peer} served a revision of {:?} as {page:?}",
+            revision.page
+        )));
+    }
+
+    let body = fetch(&net, perm, peer, &address, &revision.body)?;
+    std::fs::write(&out, &body).map_err(|e| Error::Runtime(format!("{}: {e}", out.display())))?;
+
+    if opts.json {
+        return Ok(format!(
+            "{}\n",
+            serde_json::to_string(&json!({
+                "peer": peer, "page": page, "revision": head,
+                "body": revision.body, "bytes": body.len(), "sequence": pointer.sequence
+            }))
+            .map_err(runtime)?
+        ));
+    }
+    Ok(format!(
+        "{page} from {peer}\n  revision {head} (pointer sequence {})\n  {} -> {} ({} bytes)\n",
+        pointer.sequence,
+        revision.body,
+        out.display(),
+        body.len()
+    ))
+}
+
+/// Fetch one object from the peer this page came from.
+///
+/// Named explicitly rather than left to a default. `net.fetch` takes a candidate, and a call
+/// that omitted it would be asking the daemon to guess which peer a wiki page's body lives
+/// on — which it cannot, and would refuse.
+fn fetch(net: &Path, perm: &Path, peer: &str, address: &str, content_id: &str) -> Result<Vec<u8>, Error> {
+    let out = call(
+        net,
+        perm,
+        "net.fetch",
+        json!({ "content_id": content_id, "node_id": peer, "address": address }),
+        Some("net.content"),
+    )?;
+    let data = out
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::Runtime(format!("net.fetch returned no data for {content_id}")))?;
+    data_encoding::BASE64
+        .decode(data.as_bytes())
+        .map_err(|e| Error::Runtime(format!("net.fetch's data is not base64: {e}")))
 }

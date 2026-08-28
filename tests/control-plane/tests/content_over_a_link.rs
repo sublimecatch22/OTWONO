@@ -3381,3 +3381,97 @@ fn a_recipient_that_could_not_store_its_mail_does_not_release_the_carrier() {
         "the carrier dropped an envelope the recipient never managed to store: {still_held}"
     );
 }
+
+/// A wiki page crosses a link: the pointer, the revision, and the body (ADR-0032).
+///
+/// Phase 6's first exit clause is "node A's wiki page is readable on node B", and this is the
+/// composition that makes it one thing rather than three primitives in a row. The pointer
+/// names a revision, the revision names a body, and each hop is a separate fetch — so a page
+/// that *resolves* is not yet a page that can be *read*, and only fetching all three shows it.
+#[test]
+fn a_wiki_page_is_readable_from_another_node() {
+    let h = Harness::start("wiki-link");
+
+    // The serving node writes a page the way `otwono-wikictl write` does.
+    let text = b"the first page on the serving node\n";
+    let body = h.put(text, "public");
+    let mut revision =
+        otwono_wiki::Revision::new(h.node_signing.node_id(), "Getting-Started", &body, None, 1_000);
+    revision.signature =
+        data_encoding::BASE64.encode(&h.node_signing.sign(&revision.signing_bytes().unwrap()).to_bytes());
+    let head = h.put(&serde_json::to_vec(&revision).unwrap(), "public");
+    h.publish("wiki", "Getting-Started", Some(&head));
+
+    // The reading node resolves the name, and takes the key from the handshake rather than
+    // from the record — a NodeID is a hash of it, so the record cannot vouch for itself.
+    let resolved = h
+        .client
+        .resolve_pointer(&h.candidate(), "wiki", "Getting-Started")
+        .expect("resolving over a real link");
+    let pointer = resolved.record.expect("the peer publishes that page");
+    assert_eq!(pointer.content_id.as_deref(), Some(head.as_str()));
+    assert_eq!(
+        resolved.public_key,
+        h.node_signing.public_key_bytes(),
+        "the key must be the one the handshake proved, not one the reply asserted"
+    );
+
+    // The revision, fetched and verified on its own signature. The pointer vouches for which
+    // id is current and says nothing about what that id contains.
+    let fetched = h
+        .client
+        .fetch_from(&h.candidate(), &head)
+        .expect("the head revision must cross");
+    let arrived: otwono_wiki::Revision =
+        serde_json::from_slice(&fetched.bytes).expect("the head must be a revision");
+    arrived
+        .verify(&resolved.public_key)
+        .expect("a revision the peer signed must verify against the key the handshake proved");
+    assert_eq!(arrived.page, "Getting-Started");
+
+    // And the body, which is a second fetch and the thing a person actually reads.
+    let arrived_body = h
+        .client
+        .fetch_from(&h.candidate(), &arrived.body)
+        .expect("the body must cross");
+    assert_eq!(arrived_body.bytes, text, "the page did not arrive byte for byte");
+}
+
+/// A revision signed by somebody other than the node serving it is refused.
+///
+/// The check that makes the composition worth anything. `otwono-netd` verifies the *pointer*
+/// against the handshake key; nothing it does says who signed the revision that pointer
+/// names. A serving node could otherwise publish a pointer to a revision it did not write and
+/// have a reader display it as that node's page.
+#[test]
+fn a_wiki_revision_the_serving_node_did_not_sign_is_refused() {
+    let h = Harness::start("wiki-forged");
+    let somebody_else = NodeIdentity::generate().unwrap();
+
+    let body = h.put(b"words the serving node never wrote\n", "public");
+    // Authored and signed by a third party, and served under the serving node's own name.
+    let mut revision =
+        otwono_wiki::Revision::new(somebody_else.node_id(), "Getting-Started", &body, None, 1_000);
+    revision.signature =
+        data_encoding::BASE64.encode(&somebody_else.sign(&revision.signing_bytes().unwrap()).to_bytes());
+    let head = h.put(&serde_json::to_vec(&revision).unwrap(), "public");
+    h.publish("wiki", "Getting-Started", Some(&head));
+
+    let resolved = h
+        .client
+        .resolve_pointer(&h.candidate(), "wiki", "Getting-Started")
+        .expect("resolving over a real link");
+    assert!(resolved.record.is_some(), "the pointer itself is genuine");
+
+    let fetched = h
+        .client
+        .fetch_from(&h.candidate(), &head)
+        .expect("the revision crosses; it is what it says that is wrong");
+    let arrived: otwono_wiki::Revision = serde_json::from_slice(&fetched.bytes).unwrap();
+    // The author is a third party, so checking against the peer's key fails on the identity
+    // binding before the signature is even considered.
+    let err = arrived
+        .verify(&resolved.public_key)
+        .expect_err("a revision by another author must not verify against this peer's key");
+    assert_eq!(err, otwono_wiki::WikiError::WrongKey, "{err}");
+}
