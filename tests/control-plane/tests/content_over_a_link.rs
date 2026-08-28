@@ -2560,3 +2560,76 @@ fn asking_whether_an_object_is_here_does_not_need_store_read() {
         "store.holds leaked more than a schema version and a bool: {keys:?}"
     );
 }
+
+/// `net.mail` says what is waiting and fetches none of it.
+///
+/// The read-only half of the collection question. It exists so that "the sweep delivered
+/// this" and "somebody ran the command" are two observable outcomes rather than one — a
+/// recipient cannot name an envelope it has not been given, so before this there was no way
+/// to look without also collecting.
+///
+/// Asserted both ways round: the envelope is named, and it is *not* on this node's disk
+/// afterwards.
+#[test]
+fn asking_what_is_waiting_does_not_fetch_it() {
+    let h = Harness::start("mail-without-fetching");
+
+    // A carrier holding one envelope for a recipient that is neither end of the link.
+    let recipient_signing = otwono_identity::SigningIdentity::generate().unwrap();
+    let recipient_sharing = otwono_identity::SharingKey::generate().unwrap();
+    let binding = recipient_signing.bind_sharing(&recipient_sharing.public());
+    let recipient = *recipient_signing.node_id();
+
+    let sealed = Client::connect(&h.store_socket)
+        .unwrap()
+        .call_with_capability(
+            "store.share",
+            json!({
+                "data": data_encoding::BASE64.encode(b"waiting, not fetched"),
+                "recipients": [binding],
+            }),
+            &h.token("store.share"),
+        )
+        .unwrap()
+        .expect("sealing");
+    let sealed_id = sealed["content_id"].as_str().unwrap().to_string();
+    let size_bytes = sealed["size_bytes"].as_u64().unwrap();
+
+    let envelope = otwono_envelope::Envelope::new(
+        &sealed_id,
+        &recipient,
+        size_bytes,
+        otwono_identity::now_unix_ms() + 60 * 60 * 1000,
+    );
+    Client::connect(&h.store_socket)
+        .unwrap()
+        .call_with_capability(
+            "envelope.take",
+            json!({ "envelope": envelope }),
+            &h.token("envelope.carry"),
+        )
+        .unwrap()
+        .expect("the harness node holds it for the recipient");
+
+    // The recipient asks. No inbox: looking is not keeping, so it needs none.
+    let asker = NetState::new(Arc::new(otwono_identity::NodeIdentity::from_parts(
+        recipient_signing,
+        otwono_identity::AgreementKey::generate().unwrap(),
+    )));
+    let waiting = asker.mail_at(&h.candidate()).expect("asking what is waiting");
+    assert_eq!(waiting.len(), 1, "expected one envelope waiting, got {waiting:?}");
+    assert_eq!(waiting[0].envelope_id, sealed_id);
+    assert_eq!(waiting[0].recipient, recipient.to_text());
+    assert_eq!(waiting[0].size_bytes, size_bytes);
+
+    // And nothing was fetched: a node with no inbox has nowhere to put anything, so the
+    // strong form of this is that asking works *without* one at all — which the line above
+    // already shows by not erroring. This pins the other half: no collection happened.
+    assert_eq!(
+        asker
+            .collect_from(&h.candidate())
+            .expect("collect is not an error"),
+        otwono_netd::content::Collected::NoInbox,
+        "asking what is waiting must not have configured an inbox as a side effect"
+    );
+}
