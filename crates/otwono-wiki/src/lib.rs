@@ -121,6 +121,22 @@ impl Revision {
         Ok(message)
     }
 
+    /// The bytes to hand `id.sign`, which prepends the application domain itself.
+    ///
+    /// The same message as [`Self::signing_bytes`] minus that prefix. Two functions rather
+    /// than one because the daemon adds it and an in-process signer does not, and a caller
+    /// that used the wrong one would produce a signature nothing could verify — the failure
+    /// would be a bad signature on a record that looks perfectly well formed.
+    pub fn payload_for_id_sign(&self) -> Result<Vec<u8>, WikiError> {
+        let mut value = serde_json::to_value(self).map_err(|e| WikiError::Encoding(e.to_string()))?;
+        if let Some(obj) = value.as_object_mut() {
+            obj.remove("signature");
+        }
+        let mut message = WIKI_REVISION_DOMAIN.to_vec();
+        message.extend_from_slice(&canonical_json(&value));
+        Ok(message)
+    }
+
     /// Check the signature, and that the key offered is the author's.
     ///
     /// The second half is not optional and not the caller's job, for the reason ADR-0027

@@ -1,0 +1,16 @@
+[package]
+name = "otwono-wikictl"
+description = "Write and read wiki pages from a terminal: the service composed from the three primitives."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+otwono-wiki = { workspace = true }
+otwono-pointer = { workspace = true }
+otwono-identity = { workspace = true }
+otwono-proto = { workspace = true }
+serde_json = { workspace = true }
+data-encoding = "2"

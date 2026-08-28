@@ -1242,6 +1242,7 @@ dependencies = [
  "otwono-proto",
  "otwono-store",
  "otwono-stored",
+ "otwono-wiki",
  "rustix",
  "serde_json",
  "zeroize",
@@ -1530,6 +1531,18 @@ dependencies = [
  "data-encoding",
  "otwono-identity",
  "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "otwono-wikictl"
+version = "0.1.0"
+dependencies = [
+ "data-encoding",
+ "otwono-identity",
+ "otwono-pointer",
+ "otwono-proto",
+ "otwono-wiki",
  "serde_json",
 ]
 

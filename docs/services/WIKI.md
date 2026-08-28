@@ -1,9 +1,11 @@
 # Wiki
 
-**Status:** `IMPLEMENTED`. The record and its rules are in `crates/otwono-wiki` with unit
-tests; the schema is `schemas/wiki-revision.schema.json`; the decisions are ADR-0032.
-**Nothing is wired to a daemon and no page has crossed a link**, so this is not yet a service
-you can use — see §6.
+**Status:** `IMPLEMENTED`. The record and its rules are in `crates/otwono-wiki`; the schema is
+`schemas/wiki-revision.schema.json`; the decisions are ADR-0032. `otwono-wikictl` writes,
+reads and walks the history of a page over the real control plane, and a page written through
+the daemons reads back as its text with its signature verifying against the node that made it.
+
+**No page has crossed a link**, so Phase 6's first exit clause is not met — see §6.
 
 The first service composed from the three primitives rather than a fourth one.
 
@@ -88,9 +90,15 @@ is the whole history" from "this is as much of it as I have":
 
 ## 6. What is not built
 
-- **Nothing is wired to a daemon.** There is no `otwono-wikictl`, no `wiki.*` control-plane
-  method, and nothing that turns a directory of text into a chain. Publishing today would
-  mean calling `store.put` and `pointer.publish` by hand.
+- **No `wiki.*` control-plane method.** `otwono-wikictl` composes the calls that already
+  exist — `store.put`, `pointer.next_sequence`, `id.sign`, `pointer.publish` — rather than a
+  daemon growing a wiki API. Four calls, in one command and not three, because splitting them
+  would put an unsigned record on a command line between them (ADR-0027's reason for
+  `pointer-publish` being one command).
+
+  The pointer moves **last**, and that order is not incidental: it is what anyone else reads,
+  so a pointer advanced before its revision was stored would name an id this node cannot
+  serve, and a reader would see a page that exists and cannot be opened.
 - **No page has crossed a link.** Two booted nodes have published and resolved
   `wiki/Getting-Started` as a *pointer to an opaque blob* — that is the primitive, not this
   service. Phase 6's first exit clause needs a revision and its body to make the trip.
@@ -105,3 +113,17 @@ is the whole history" from "this is as much of it as I have":
 
 ADR-0032 (the decisions), ADR-0027 (pointers, and the ordering rule this copies), ADR-0016
 (content-addressed blocks), `docs/services/DISTRIBUTED-SERVICES.md` §2–§4.
+
+## 7. Using it
+
+```
+otwono-wikictl write Getting-Started --file page.md
+otwono-wikictl read  Getting-Started --out page.md
+otwono-wikictl history Getting-Started
+```
+
+`history` verifies every step and prints how the walk ended, so a truncated history says so
+rather than looking like a short one. It answers for revisions authored by **this** node and
+refuses others: a page copied from a peer keeps its original author (ADR-0032), and there is
+nowhere yet to look a peer's key up from a terminal. Refusing is the right answer — "verify it
+later" is "never".

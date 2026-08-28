@@ -240,3 +240,37 @@ fn a_page_name_that_would_break_a_listing_is_refused() {
             .is_ok()
     );
 }
+
+#[test]
+fn the_two_signing_payloads_differ_by_exactly_the_application_domain() {
+    // `id.sign` prepends the application domain; an in-process signer does not. A caller
+    // that reached for the wrong one would make a signature nothing can verify, on a record
+    // that looks perfectly well formed — so the relationship between them is pinned here
+    // rather than left to two functions that happen to agree today.
+    let me = NodeIdentity::generate().unwrap();
+    let r = signed(&me, "Getting-Started", 0xaa, None, 1_000);
+    let full = r.signing_bytes().unwrap();
+    let for_daemon = r.payload_for_id_sign().unwrap();
+    assert_eq!(
+        full,
+        [otwono_identity::APPLICATION_DOMAIN, &for_daemon[..]].concat(),
+        "signing_bytes must be the application domain followed by the id.sign payload"
+    );
+}
+
+#[test]
+fn a_revision_signed_through_the_daemons_payload_verifies() {
+    // The round trip the CLI actually performs: sign `payload_for_id_sign` with the
+    // application domain prepended, exactly as otwono-idd does, and check `verify` accepts
+    // it. Asserting the two payloads line up is not the same as asserting a signature made
+    // that way is accepted.
+    let me = NodeIdentity::generate().unwrap();
+    let mut r = Revision::new(me.node_id(), "Getting-Started", cid(0xaa), None, 1_000);
+    let as_the_daemon_would = [
+        otwono_identity::APPLICATION_DOMAIN,
+        &r.payload_for_id_sign().unwrap()[..],
+    ]
+    .concat();
+    r.signature = data_encoding::BASE64.encode(&me.sign(&as_the_daemon_would).to_bytes());
+    r.verify(&me.verifying_key().to_bytes()).expect("must verify");
+}

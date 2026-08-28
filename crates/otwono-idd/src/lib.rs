@@ -289,6 +289,10 @@ impl Service for IdentityService {
                 MethodDescription::open("id.node", "This node's public identity"),
                 MethodDescription::open("id.fingerprint", "The human-checkable fingerprint"),
                 MethodDescription::open(
+                    "id.public_key",
+                    "This node's Ed25519 public key, for verifying records it signed",
+                ),
+                MethodDescription::open(
                     "id.agreement_binding",
                     "The signed binding between this NodeID and its X25519 agreement key",
                 ),
@@ -350,6 +354,25 @@ impl Service for IdentityService {
                 Ok(json!({
                     "node_id": identity.node_id().to_text(),
                     "fingerprint": identity.node_id().fingerprint(),
+                }))
+            }
+            // The signing key's public half, and nothing bundled with it.
+            //
+            // `id.node` also carries it, and is the wrong method to reach for: it builds a
+            // *publishable* identity and so needs an agreement key bound, which only
+            // `otwono-netd` does at startup. A node with no network daemon still has a
+            // signing key and still has records of its own to verify — a wiki page's chain,
+            // for one — and coupling that to the mesh coming up would make local work
+            // depend on the network, which §4.1 of DISTRIBUTED-SERVICES.md refuses.
+            //
+            // Open, like the fingerprint. A public key is public: it travels in every
+            // handshake and in every `id.node` reply, and guarding it would protect nothing
+            // while making a node unable to check its own writing.
+            "id.public_key" => {
+                let identity = self.current();
+                Ok(json!({
+                    "node_id": identity.node_id().to_text(),
+                    "public_key": data_encoding::BASE64.encode(&identity.public_key_bytes()),
                 }))
             }
             "id.agreement_binding" => {
