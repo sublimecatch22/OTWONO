@@ -317,7 +317,7 @@ with convergence asserted.
 |---|---|
 | A's wiki page readable on B | not started; no service is built |
 | an offline message to C delivered when C returns | `VERIFIED` 2026-08-28, see `CARRIAGE.md` |
-| a partition heals with convergence asserted | not started |
+| a partition heals with convergence asserted | `VERIFIED` 2026-08-28, one break, one writer |
 
 ---
 

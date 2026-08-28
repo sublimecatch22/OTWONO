@@ -5423,3 +5423,67 @@ trade a silent result for a flaky one.
 - Everything the previous two entries record as unshown is unchanged: booted-node expiry, the
   second hop in QEMU, clock skew, arm64, and the freed count being the daemon's own rather
   than an independent look at the disk.
+
+## 2026-08-28 — a partition, and content that crossed it after it healed
+
+**STATUS: VERIFIED.** amd64, QEMU, TCG, three nodes. Image built from `8d15c3a` with
+`MESH_CONTENT_SMOKE=1`. The third clause of Phase 6's exit criterion: *a network partition
+heals with convergence asserted*.
+
+```
+partition: taking node 3's link down
+  node 3 noticed the break
+partition: waiting for node 2 to write while it is alone
+  OTWONO-PARTITION-WROTE id=47ddbb7b1d182557ecc5a2046689b86a9b78d20228241ef4aa85eb6d2b63d0d1
+partition: putting node 3's link back
+  the mesh healed: node 2 authenticated an inbound peer again
+partition: waiting for node 3 to converge on what it missed
+  OTWONO-PARTITION-CONVERGED id=47ddbb7b…2b63d0d1 bytes=62
+  both nodes name the same object after the heal
+```
+
+Node 3 reported `addr=none known=1 connected=0` for the whole break and logged
+`Network is unreachable` against node 2's address twice a minute. QMP `set_link` takes the
+NIC down inside QEMU, so the guest keeps running and keeps its state — a partition, not the
+restart the store-and-forward phase already covers.
+
+### Why the ordering is the assertion
+
+Node 2 publishes only once it has **zero** peers. Node 1 is powered off by then, so zero means
+node 3's link is down too, and the harness waits for that marker *before* healing. A heal
+first and the write could have crossed an unbroken link, and everything after it would prove
+nothing.
+
+`partition/Healed` is a name nothing published before, and a pointer is served only by its
+owner and pulled on demand, never pushed. So node 3 resolving it cannot be a stale answer it
+already had; it can only have come from node 2 after the link returned.
+
+Node 3 resolves the name **and** fetches what it points at, because a name that crosses
+without its content is not convergence and the two are separate mechanisms — a signed record
+against the fetch path. Then the two ids are compared: node 2 succeeding at a write and node 3
+succeeding at a read are two facts, and that they name the same object is the one this phase is
+about.
+
+### The run before this one, which failed for the wrong reason
+
+Run 19 reported `node 3's link went down and it did not notice within 240s`. The partition had
+worked perfectly — node 3 was logging `Network is unreachable` throughout. The assertion
+counted those lines in `node-n3.log`, the *first* boot's log, which stopped being written when
+node 3 was powered off for the store-and-forward phase. It spent 240 seconds waiting for a
+number that could not move.
+
+It failed closed rather than passing on stale data, which is the only reason the mistake was
+visible. Counting before and requiring an increase is what made that true: a bare grep for
+"someone logged a connection failure" would have passed before the link was ever touched,
+because node 2 had spent the whole previous phase failing to reach the powered-off node 1.
+
+### What this does not show
+
+- **One break, one direction, two nodes.** Node 3 is cut off from a segment that still has
+  node 2 on it. Nothing splits the mesh into two live halves that both make progress and then
+  have to reconcile, which is the harder half of "convergence".
+- **Nothing conflicted.** Only one side wrote. Two sides advancing the same pointer during a
+  break and meeting afterwards is the case ADR-0027's rollback rule exists for, and it is not
+  exercised here.
+- **The break was seconds to minutes, not hours**, and no envelope expired during it.
+- **amd64 only**, TCG, one vCPU per guest.
