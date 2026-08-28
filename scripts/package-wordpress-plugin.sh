@@ -12,6 +12,9 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 plugin_dir="$root/wordpress/otwono-ai-connector"
 out_dir="${1:-$root/releases}"
 mkdir -p "$out_dir"
+# Resolve to an absolute path. The archive is built from a staging directory,
+# so a relative one would be written relative to *that* and fail.
+out_dir="$(cd "$out_dir" && pwd)"
 zip_path="$out_dir/otwono-ai-connector.zip"
 
 if [[ ! -f "$plugin_dir/otwono-ai-connector.php" ]]; then
@@ -30,7 +33,6 @@ else
   echo "  php is not installed here; skipping the syntax check."
 fi
 
-mkdir -p "$out_dir"
 rm -f "$zip_path"
 
 # Build from a staging copy so the archive's top-level directory is the plugin
