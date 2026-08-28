@@ -2184,10 +2184,10 @@ fn an_envelope_reaches_its_recipient_through_a_carrier_that_is_neither_party() {
     );
     assert_eq!(collected[0].bytes.len() as u64, size_bytes);
 
-    // A second pass takes nothing. This is what makes running the collection on a timer safe
-    // rather than wasteful: the carrier still holds the envelope — drop on delivery is not
-    // implemented (ADR-0028 §7) — so without the `holds` check this node would re-download
-    // the same message every thirty seconds until the sender's expiry ran out.
+    // A second pass takes nothing — but say why, because there are now two reasons and only
+    // one of them is the one worth testing. Drop on delivery has already run by this point,
+    // so the carrier is offering nothing and a second pass would take nothing even if the
+    // `holds` check did not exist. That makes this assertion on its own almost vacuous.
     let again = collector
         .collect_from(&carrier_candidate)
         .expect("a second pass is not an error");
@@ -2229,6 +2229,28 @@ fn an_envelope_reaches_its_recipient_through_a_carrier_that_is_neither_party() {
         still_held["entries"].as_array().unwrap().len(),
         0,
         "the carrier is still holding an envelope it delivered: {still_held}"
+    );
+
+    // So put the offer back and ask again. Re-taking custody at the carrier is what a
+    // carrier that never heard the release looks like from here — the best-effort failure
+    // path in `collect_from`, which is otherwise covered by nothing. Now the envelope *is*
+    // offered, and `holds` is the only thing between this node and downloading it twice.
+    Client::connect(&carrier_socket)
+        .unwrap()
+        .call_with_capability(
+            "envelope.take",
+            json!({ "envelope": envelope }),
+            &h.token("envelope.carry"),
+        )
+        .unwrap()
+        .expect("the carrier takes custody again");
+    let offered_again = collector
+        .collect_from(&carrier_candidate)
+        .expect("a third pass is not an error");
+    assert_eq!(
+        offered_again,
+        otwono_netd::content::Collected::Fetched(Vec::new()),
+        "a carrier that never let go got this node to fetch the same envelope twice"
     );
 }
 

@@ -260,6 +260,21 @@ flatter than the cache's.
 
 ## 7. What is not built
 
+- **The ciphertext is never freed.** ADR-0026 §8 puts a carried envelope's bytes in the
+  cluster cache, which has a budget, a TTL and eviction. `otwono-netd` puts them in the
+  permanent content store instead, via `store.accept_shared` — and nothing in this repository
+  can delete an object from there. The cache has `remove` and `purge`; the CAS has neither.
+
+  So §3b frees the custody record and the carriage budget with it, and leaves the bytes on
+  the carrier's disk for good. Expiry does the same. A carrier's disk footprint grows without
+  bound, driven by what strangers ask it to carry — which is the amplification ADR-0028 §7
+  exists to bound, arriving through the one dimension §7 does not measure.
+
+  The budget is not wrong, it is measuring the wrong thing: `bytes_held` sums custody records,
+  so a carrier that has delivered everything reports zero bytes held while holding all of them.
+  Fixing it means the cache learning to hold a `SHARED` object with its sharing metadata —
+  today it inserts replicas as `REPLICATED` with none — and `keep_sealed` splitting: a
+  recipient's own mail belongs in the permanent store, a stranger's does not.
 - **Re-relay in practice.** §7 concludes that a carrier may pass an envelope on, and the
   record's shape makes it structural rather than a permission. No test exercises a second hop.
 - **Forward secrecy.** The sharing key is long-lived, so compromising it opens every envelope

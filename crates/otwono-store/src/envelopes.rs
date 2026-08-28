@@ -2,14 +2,30 @@
 //!
 //! # This store holds custody, not content
 //!
-//! The sealed ciphertext is an ordinary object and lives where objects live — the cluster
-//! cache, with its budget, its encryption at rest and its refcounted chunks. What is here is
-//! the **custody record**: which envelope, for whom, and until when *this carrier* said it
-//! would keep it.
+//! What is here is the **custody record**: which envelope, for whom, and until when *this
+//! carrier* said it would keep it. The sealed ciphertext is an ordinary object and lives
+//! where objects live.
 //!
 //! That split is ADR-0026 §8's, and it is deliberate reuse rather than a shortcut. A carrier
 //! that invented its own byte store would be re-implementing eviction, encryption and
-//! refcounting to hold bytes the cache already knows how to hold.
+//! refcounting to hold bytes the object layer already knows how to hold.
+//!
+//! ## Where the ciphertext actually goes, and why that is a defect
+//!
+//! ADR-0026 §8 puts it in the **cluster cache**, which has a budget, a TTL and an eviction
+//! policy. `otwono-netd` does not: it calls `store.accept_shared`, which writes to the
+//! permanent content store, and nothing in this repository can delete an object from there
+//! — the cache has `remove` and `purge`, the CAS has neither.
+//!
+//! So [`Self::release`] frees the custody record and the carriage budget with it, and leaves
+//! the bytes on the carrier's disk permanently. Expiry does the same. A carrier's footprint
+//! therefore grows without bound, driven by what remote peers ask it to carry, which is the
+//! amplification ADR-0028 §7 exists to bound.
+//!
+//! Recorded rather than quietly fixed here because the fix is in the cache and the store
+//! daemon, not in this file: the cache inserts replicas as `REPLICATED` with no sharing
+//! metadata, and a carried envelope is `SHARED` and has some. `docs/network/CARRIAGE.md` §7
+//! carries the same note.
 //!
 //! # The deadline is the carrier's, not the sender's
 //!
