@@ -354,6 +354,29 @@ if [ "${MESH_CONTENT_SMOKE:-0}" != 0 ]; then
         kill -0 "${GUEST_PID[1]}" 2>/dev/null \
             && { echo "FAIL: node 1 was running at the end of the collection" >&2; exit 1; }
         echo "store-and-forward: node 3 collected and opened its envelope from node 2, with node 1 off"
+
+        # And node 2 gave up custody (ADR-0028 §7). The recipient reports delivery once the
+        # bytes are on its own disk; the carrier drops what it was holding. Asserted here
+        # because this is the only place it can be seen happening between real nodes — the
+        # unit tests cover the rule, not the round trip.
+        echo "store-and-forward: waiting for node 2 to drop what it delivered"
+        deadline=$(( $(date +%s) + CONTENT_TIMEOUT ))
+        dropped=timeout
+        while [ "$(date +%s)" -lt "$deadline" ]; do
+            if grep -qa "OTWONO-ENVELOPE-DROPPED" "$OUT/node-n2.log" 2>/dev/null; then
+                dropped=pass; break
+            fi
+            if grep -qa "OTWONO-ENVELOPE-FAIL" "$OUT/node-n2.log" 2>/dev/null; then
+                dropped=fail; break
+            fi
+            sleep 5
+        done
+        if [ "$dropped" != pass ]; then
+            echo "FAIL: node 2 is still carrying an envelope it delivered ($dropped)" >&2
+            grep -ha "OTWONO-ENVELOPE-" "$OUT/node-n2.log" >&2 || true
+            exit 1
+        fi
+        echo "  $(grep -hoa "OTWONO-ENVELOPE-DROPPED.*" "$OUT/node-n2.log" | tail -1 | tr -d "\r")"
     fi
 fi
 

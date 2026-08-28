@@ -189,6 +189,26 @@ case "$node_ordinal" in
     done
     [ -n "$carried" ] || fail "took custody of nothing within the window"
     echo "OTWONO-ENVELOPE-CARRIED envelope=$carried"
+
+    # And then watch it go (ADR-0028 §7). The recipient reports delivery once the bytes are
+    # on its own disk, and this node gives up custody in response — so this marker is the
+    # only place a *booted* node shows drop on delivery happening. Without it the feature
+    # would be unit-tested and unobserved.
+    #
+    # Nothing here drives it. If this never empties, the carrier is holding an envelope that
+    # was delivered, which is the thing being tested and a failure worth reporting.
+    step "waiting to be told the envelope arrived, so this node can stop holding it"
+    i=0
+    while [ "$i" -lt 240 ]; do
+        still=$(otwono-storectl envelope-held 2>/dev/null | awk 'NR==1 {print $1}') || still=""
+        case "$still" in
+            [0-9a-f]*) ;;
+            *) echo "OTWONO-ENVELOPE-DROPPED envelope=$carried"; exit 0 ;;
+        esac
+        i=$((i + 1))
+        sleep 5
+    done
+    fail "still carrying $carried after its recipient collected it"
     ;;
 3)
     # --- recipient ---------------------------------------------------------------------
