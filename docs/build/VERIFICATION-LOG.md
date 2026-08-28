@@ -5379,3 +5379,47 @@ rather than passes.
   Producing that collision needs a peer holding the exact sealed bytes.
 - **Still one hop, one envelope, 87 bytes**, nothing expired, no clock skew, amd64 only, TCG.
   The second hop remains control-plane tier only.
+
+## 2026-08-28 — both sweeps, and the markers now say so
+
+**STATUS: VERIFIED.** amd64, QEMU, TCG, three nodes. Image built from `1e812e2` with
+`MESH_CONTENT_SMOKE=1`. Run to see a marker that had never been printed, after the previous
+run showed the carrier's half was not testing what it claimed.
+
+```
+n2          OTWONO-ENVELOPE-CARRIED envelope=8f78ea13…ef24dcd3 by=sweep
+n2          otwono-netd: carrying 8f78ea13949dcf7b… (87 bytes) for somebody until
+            1787922666493, taken from otw1:mn4a-89v3-tmy9-n…
+n3  [ 130.7] OTWONO-ENVELOPE-SWEPT envelope=8f78ea13…ef24dcd3
+n3          OTWONO-ENVELOPE-COLLECTED envelope=8f78ea13…ef24dcd3 bytes=71
+n2          OTWONO-ENVELOPE-DROPPED envelope=8f78ea13…ef24dcd3 freed=87
+```
+
+Zero `carry:` lines on node 2 and no `collect by hand` on node 3: neither fallback fired at
+all, so both daemons did their own work and the markers record it rather than leaving it to
+be inferred from a log line somebody has to know to look for.
+
+### What the previous run had shown
+
+Run 17 printed `OTWONO-ENVELOPE-CARRIED` with no `otwono-netd: carrying` line behind it. The
+carriage sweep had not taken custody — the check's own `--carry` fallback had, half a second
+before the sweep's next turn. The marker is identical either way, so a run in which the daemon
+never carried anything passes and reads exactly like one in which it did.
+
+It was a coin toss by construction. The sender does not seal until a peer has stayed away for
+a minute, so the envelope always appears long after the carrier starts polling, and the
+fallback was firing from one minute onward. Runs 15 and 16 were won by the sweep, which is why
+their logs carry the daemon's line and their entries could claim it; nothing asserted it.
+
+The fallback now waits four minutes and then fires every two, giving the thirty-second sweep
+at least eight turns first, and the marker carries `by=sweep` or `by=hand`. `by=hand` does not
+fail the run — a sweep can legitimately be slow on one TCG vCPU, and failing for that would
+trade a silent result for a flaky one.
+
+### What this does not show
+
+- **`by=hand` has still never been printed.** Only the branch that was already working has
+  been seen; the branch that reports the problem has not.
+- Everything the previous two entries record as unshown is unchanged: booted-node expiry, the
+  second hop in QEMU, clock skew, arm64, and the freed count being the daemon's own rather
+  than an independent look at the disk.
