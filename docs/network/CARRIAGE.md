@@ -301,6 +301,15 @@ flatter than the cache's.
 - **Re-relay on booted nodes.** The second hop runs over real daemons and real Noise channels
   and has never run in QEMU: the three-node harness arranges one carrier, and a second would
   need a fourth node or a different power-off order.
+- **Expiry on booted nodes**, and not for want of trying. An envelope lapsing needs a
+  recipient that provably never collects, and the three-node run has no such node: seal to the
+  absent one and it collects when it returns, seal to the sender and it collects before it
+  powers off. Timing the deadline to fall inside the window between those two is possible and
+  would be a test that fails when a TCG guest is slow, which is worse than no test. Doing it
+  properly needs either a fourth identity nothing can log in as — which means a way to
+  fabricate a sharing binding, test-only surface in a shipped tool — or a fourth node that
+  never boots. `an_envelope_that_expires_frees_its_bytes_as_well_as_its_record` covers the
+  behaviour over real daemons with a real wall-clock deadline in the meantime.
 - **Forward secrecy.** The sharing key is long-lived, so compromising it opens every envelope
   ever sealed to it.
 - **UserID addressing.** NodeID only; a person with two devices must be messaged twice.
