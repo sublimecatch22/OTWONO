@@ -50,7 +50,7 @@ const USAGE: &str = "\
 otwono-wikictl — wiki pages as signed chains of revisions
 
   otwono-wikictl write <PAGE> --file <PATH> [--visibility public|private]
-  otwono-wikictl read <PAGE> --out <PATH> [--from <NODEID> --at <ADDR>]
+  otwono-wikictl read <PAGE> --out <PATH> [--from <NODEID>] [--at <ADDR>]
   otwono-wikictl history <PAGE> [--limit N]
 
 Options:
@@ -556,14 +556,18 @@ fn read_from_peer(opts: &Options, perm: &Path, peer: &str) -> Result<String, Err
         .out
         .clone()
         .ok_or_else(|| Error::Usage("read needs --out".into()))?;
-    let address = opts
-        .at
-        .clone()
-        .ok_or_else(|| Error::Usage("--from needs --at <ADDR>, where that peer listens".into()))?;
     let net = opts
         .net_socket
         .clone()
         .unwrap_or_else(|| otwono_proto::socket_path("net"));
+    // `--at` is an override, not a requirement. A node already knows where the peers it is
+    // connected to are listening, and making a caller repeat that back would mean anything
+    // driving this — a boot check, a script — had to join two commands' output to say
+    // something the daemon already knows.
+    let address = match opts.at.clone() {
+        Some(at) => at,
+        None => address_of(&net, perm, peer)?,
+    };
 
     // `otwono-netd` verifies the record against the key the handshake proved and applies the
     // rollback rules (ADR-0027 §7) before this sees it.
@@ -638,6 +642,43 @@ fn read_from_peer(opts: &Options, perm: &Path, peer: &str) -> Result<String, Err
 /// Named explicitly rather than left to a default. `net.fetch` takes a candidate, and a call
 /// that omitted it would be asking the daemon to guess which peer a wiki page's body lives
 /// on — which it cannot, and would refuse.
+/// Where a peer this node is connected to is listening.
+///
+/// Only a *connected* peer, and its first address. A peer this node has merely heard of has
+/// an address that may be stale or may never have worked, and reading a page is not the place
+/// to find that out — `--at` is there for the case where somebody knows better.
+fn address_of(net: &Path, perm: &Path, peer: &str) -> Result<String, Error> {
+    let out = call(net, perm, "net.peers", json!({}), Some("net.read"))?;
+    let peers = out
+        .get("peers")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::Runtime("net.peers returned no peer list".into()))?;
+    for entry in peers {
+        if entry.get("node_id").and_then(Value::as_str) != Some(peer) {
+            continue;
+        }
+        if entry.get("state").and_then(Value::as_str) != Some("connected") {
+            return Err(Error::Runtime(format!(
+                "{peer} is known but not connected; pass --at <ADDR> to try anyway"
+            )));
+        }
+        if let Some(address) = entry
+            .get("addresses")
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
+            .and_then(Value::as_str)
+        {
+            return Ok(address.to_string());
+        }
+        return Err(Error::Runtime(format!(
+            "{peer} is connected but has no dialable address"
+        )));
+    }
+    Err(Error::Runtime(format!(
+        "this node knows no peer called {peer}; pass --at <ADDR> to name one"
+    )))
+}
+
 fn fetch(net: &Path, perm: &Path, peer: &str, address: &str, content_id: &str) -> Result<Vec<u8>, Error> {
     let out = call(
         net,

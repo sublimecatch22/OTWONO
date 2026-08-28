@@ -405,6 +405,36 @@ if [ "${MESH_CONTENT_SMOKE:-0}" != 0 ]; then
     fi
 fi
 
+# --- a wiki page, read on another node ---------------------------------------------------
+#
+# Phase 6's *first* exit clause, and the one thing here that is a service rather than a
+# primitive. The content check already resolves a peer's `wiki/Getting-Started` — but what it
+# names there is an opaque blob. This asserts a real page: a revision verified on its own
+# signature and the body behind it, on every node.
+#
+# Every node, not one: each writes and each reads somebody else's, and a page that only ever
+# travelled in one direction would leave half the nodes' writing untested.
+if [ "${MESH_CONTENT_SMOKE:-0}" != 0 ]; then
+    echo "waiting for every node to read a peer's wiki page (up to ${CONTENT_TIMEOUT}s)"
+    deadline=$(( $(date +%s) + CONTENT_TIMEOUT ))
+    wiki=timeout
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if grep -qa "OTWONO-WIKI-FAIL" "$OUT"/node-*.log 2>/dev/null; then wiki=fail; break; fi
+        ok=0
+        for i in $(seq 1 "$NODES"); do
+            grep -qa "OTWONO-WIKI-OK" "$OUT/node-n$i.log" 2>/dev/null && ok=$(( ok + 1 ))
+        done
+        [ "$ok" -eq "$NODES" ] && { wiki=pass; break; }
+        sleep 5
+    done
+    if [ "$wiki" != pass ]; then
+        echo "FAIL: not every node read a peer's wiki page ($wiki)" >&2
+        grep -ha "OTWONO-WIKI-" "$OUT"/node-*.log >&2 || true
+        exit 1
+    fi
+    grep -hoa "OTWONO-WIKI-OK.*" "$OUT"/node-*.log | sed 's/^/  /' | tr -d '\r'
+fi
+
 # --- a partition, and the healing of it ------------------------------------------------
 #
 # The third clause of Phase 6's exit criterion, in the half that can be asserted without any

@@ -1,0 +1,106 @@
+#!/bin/sh
+# OTWONO wiki check — is one node's wiki page readable on another?
+#
+# BUILT FOR TESTING. Installed only by build stage 37 (MESH_CONTENT_SMOKE=1).
+#
+# Phase 6's first exit criterion clause, and the thing that distinguishes a *service* from
+# the primitives under it. The mesh content check already publishes `wiki/Getting-Started`
+# and resolves a peer's — but what that names is an opaque blob. This writes a real page and
+# reads a peer's, which means three fetches and three checks rather than one:
+#
+#   the pointer      verified by otwono-netd against the key the handshake proved
+#   the revision     verified on its own signature, against that same key
+#   the body         the bytes a person actually reads
+#
+# The middle one is why this is not just the pointer test again. `otwono-netd` vouches for
+# *which id is current* and says nothing about what that id contains, so a node could
+# otherwise publish a pointer to a revision it did not write.
+#
+# Every node writes and every node reads, rather than one of each. A page that only travels
+# in one direction would leave the other node's write untested, and the two are the same code.
+set -eu
+
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+
+fail() { echo "OTWONO-WIKI-FAIL $*" >&2; exit 1; }
+step() { echo "OTWONO-WIKI-STEP $*"; }
+
+node_total=1
+node_ordinal=1
+for dev in /sys/class/net/*/address; do
+    a=$(cat "$dev" 2>/dev/null) || continue
+    case "$a" in
+        52:54:00:07:*)
+            node_total=$(( 0x$(echo "$a" | cut -d: -f5) ))
+            node_ordinal=$(( 0x$(echo "$a" | cut -d: -f6) ))
+            break
+            ;;
+    esac
+done
+
+[ "$node_total" -ge 2 ] || {
+    echo "OTWONO-WIKI-SKIP reading a peer's page needs two nodes; this segment has $node_total"
+    exit 0
+}
+
+# --- write this node's page --------------------------------------------------------------
+#
+# The text names the node that wrote it, so a page read back on another node can be checked
+# for being *that node's* page rather than merely being a page. Two nodes serving identical
+# bytes would make a swapped answer invisible.
+step "writing this node's page"
+printf 'This is node %s of %s.\nWritten before any peer was asked for anything.\n' \
+    "$node_ordinal" "$node_total" > "$WORK/mine.md"
+wrote=$(otwono-wikictl write Getting-Started --file "$WORK/mine.md" 2>&1) \
+    || fail "writing this node's page failed: $wrote"
+mine=$(echo "$wrote" | awk 'NR==1 {print $2}')
+case "$mine" in
+    [0-9a-f]*) ;;
+    *) fail "write named no revision: $wrote" ;;
+esac
+
+# It reads back locally before anything crosses a link. A page that cannot be read on the
+# node that wrote it is a local fault, and finding that out through a peer would blame the
+# network for it.
+otwono-wikictl read Getting-Started --out "$WORK/mine-back.md" >/dev/null 2>&1 \
+    || fail "this node cannot read the page it just wrote"
+cmp -s "$WORK/mine.md" "$WORK/mine-back.md" \
+    || fail "this node's page did not read back as what was written"
+
+history=$(otwono-wikictl history Getting-Started 2>&1) \
+    || fail "walking this node's own history failed: $history"
+echo "$history" | grep -q "^end: complete" \
+    || fail "this node's own history is not complete: $history"
+
+# --- read a peer's ------------------------------------------------------------------------
+step "waiting for a peer to publish a page"
+peer=""
+read_out=""
+i=0
+while [ "$i" -lt 150 ]; do
+    for candidate in $(otwono-netd --peer-ids --socket /run/otwono/net.sock \
+        --perm-socket /run/otwono/perm.sock 2>/dev/null); do
+        # No --at: a node knows where the peers it is connected to are listening, and
+        # `otwono-wikictl` asks it rather than making this script join two commands' output.
+        if read_out=$(otwono-wikictl read Getting-Started --from "$candidate" \
+            --out "$WORK/theirs.md" 2>&1); then
+            peer=$candidate
+            break
+        fi
+        read_out=""
+    done
+    [ -n "$peer" ] && break
+    i=$((i + 1))
+    sleep 5
+done
+[ -n "$peer" ] || fail "no peer served a wiki page within 750s; last reply: $read_out"
+
+theirs=$(echo "$read_out" | awk '/revision/ {print $2}' | head -1)
+grep -q "^This is node " "$WORK/theirs.md" \
+    || fail "what arrived from $peer is not a wiki page: $(head -c 120 "$WORK/theirs.md")"
+# Their page, not this node's own read back through the network.
+cmp -s "$WORK/mine.md" "$WORK/theirs.md" \
+    && fail "the peer served this node's own page back to it"
+
+echo "OTWONO-WIKI-OK node=$node_ordinal/$node_total wrote=$mine read_from=$peer their_revision=${theirs:-unknown} bytes=$(wc -c < "$WORK/theirs.md")"
