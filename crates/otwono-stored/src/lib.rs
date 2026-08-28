@@ -316,6 +316,27 @@ struct OpenSharedParams {
     content_id: String,
 }
 
+/// Hold a stranger's sealed mail while carrying it (ADR-0031).
+///
+/// The carriage counterpart of [`AcceptSharedParams`], and separate from it because the two
+/// go to different places. A recipient's own mail belongs in the permanent store; a
+/// stranger's belongs in the cache, where it has a budget, an eviction policy and a way to
+/// be deleted again.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvelopeKeepParams {
+    /// The descriptor the peer offered. Carried whole so the carriage policy can be asked
+    /// the same question it will be asked again at `envelope.take` — one rule, one place,
+    /// no way for the two steps to disagree about whether this envelope is carryable.
+    envelope: otwono_envelope::Envelope,
+    /// Base64 ciphertext, exactly as it arrived. The id is the envelope's.
+    data: String,
+    encryption: String,
+    nonce_prefix: String,
+    plaintext_size_bytes: u64,
+    sealed_key: otwono_identity::SealedKey,
+}
+
 /// Keep a sealed object fetched from a peer, with the one key that came with it.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1129,8 +1150,22 @@ impl StoreService {
         if object.visibility.may_leave_the_node_unattended() {
             return true;
         }
-        if object.visibility != Visibility::Shared || source != Source::Own {
+        if object.visibility != Visibility::Shared {
             return false;
+        }
+        // Where it was found decides which rule applies, and the two are not the same rule.
+        //
+        // A `SHARED` object in **this node's own store** is normally mail addressed to this
+        // node, which it can open. Serving those is ADR-0019's rule: the asking peer must be
+        // named on the sealed-key list, and the carriage exception below is the one way past
+        // it.
+        //
+        // A `SHARED` object in **the cache** is only ever a carried envelope (ADR-0031) —
+        // `insert` refuses the label and `take_carried` is the one door that does not. So
+        // custody is the whole of the rule there: no custody, no serving, and a recipient's
+        // own mail can never reach this branch because it is never put in the cache.
+        if source == Source::Cached {
+            return carried();
         }
         match (peer, &object.sharing) {
             (Some(peer), Some(sharing)) => sharing.names(peer) || carried(),
@@ -1469,6 +1504,88 @@ impl StoreService {
     /// the fact that a refusal is a *reply*, not an error. A full node saying "not this one"
     /// is the normal case on a small machine, exactly as `cache.take_replica` returns
     /// `Ok(None)` rather than failing (ADR-0026 §8).
+    /// Hold the ciphertext of an envelope this node is about to carry (ADR-0031).
+    ///
+    /// Separate from `envelope.take`, and called first, because a custody record naming
+    /// bytes this node does not have is a promise it cannot keep: the carrier would offer
+    /// the envelope and fail to serve it, and on a mesh where the sender may be gone that
+    /// loses the message.
+    ///
+    /// It goes to the **cache**, not the permanent store. A carrier accumulates other
+    /// people's mail at their request, and the permanent store has no delete — releasing
+    /// custody there frees the record and leaves the bytes for ever. The cache has a
+    /// budget, eviction and `remove`, which is what makes ADR-0028 §7's bounds mean
+    /// anything on disk as well as in the index.
+    ///
+    /// The same carriage policy that will decide `envelope.take` decides here, so an
+    /// envelope this node will refuse to carry never costs it a byte. Refusal is reported
+    /// the same way, with the same codes: a full node saying no is normal.
+    fn handle_envelope_keep(&self, params: Value) -> Result<Value, RpcError> {
+        let p: EnvelopeKeepParams = serde_json::from_value(params)
+            .map_err(|e| RpcError::invalid_params(format!("envelope.keep: {e}")))?;
+        p.envelope
+            .validate()
+            .map_err(|e| RpcError::invalid_params(format!("envelope.keep: {e}")))?;
+        let bytes = data_encoding::BASE64
+            .decode(p.data.as_bytes())
+            .map_err(|e| RpcError::invalid_params(format!("data must be base64: {e}")))?;
+        if bytes.len() > MAX_INLINE_BYTES {
+            return Err(RpcError::invalid_params(format!(
+                "{} bytes is over the {MAX_INLINE_BYTES}-byte inline cap",
+                bytes.len()
+            )));
+        }
+        let id = Self::parse_id(&p.envelope.envelope_id)?;
+        let cache = self.cache.as_ref().ok_or_else(|| {
+            RpcError::unavailable("this node has no cache, so it has nowhere to put other people's mail")
+        })?;
+
+        let (store, budget) = self.envelopes()?;
+        let now = otwono_store::cache::now_unix_ms();
+        let committed = store
+            .bytes_held(now)
+            .map_err(|e| RpcError::internal(e.to_string()))?;
+        let policy = otwono_envelope::CarryPolicy::with_room(budget.saturating_sub(committed));
+        let until_ms = match policy.decide(&p.envelope, now) {
+            otwono_envelope::Carry::Accept { until_ms } => until_ms,
+            otwono_envelope::Carry::Decline(why) => {
+                return Ok(json!({
+                    "schema_version": DESCRIBE_SCHEMA_VERSION,
+                    "kept": false,
+                    "declined": why.code(),
+                    "detail": why.to_string(),
+                }))
+            }
+        };
+
+        let sharing = otwono_store::object::Sharing {
+            encryption: p.encryption,
+            nonce_prefix: p.nonce_prefix,
+            plaintext_size_bytes: p.plaintext_size_bytes,
+            sealed_keys: vec![p.sealed_key],
+        };
+        match cache
+            .take_carried(bytes.as_slice(), &id, sharing, until_ms, now)
+            .map_err(cache_rpc)?
+        {
+            Some(object) => Ok(json!({
+                "schema_version": DESCRIBE_SCHEMA_VERSION,
+                "kept": true,
+                "content_id": object.content_id.to_hex(),
+                "until_ms": until_ms,
+            })),
+            // The cache would not make room. Reported as a refusal rather than an error for
+            // the reason every other carriage refusal is: a small machine declining is the
+            // normal case, and the caller must simply not take custody.
+            None => Ok(json!({
+                "schema_version": DESCRIBE_SCHEMA_VERSION,
+                "kept": false,
+                "declined": "no_room",
+                "detail": "the cache would not make room for it",
+            })),
+        }
+    }
+
     fn handle_envelope_take(&self, params: Value) -> Result<Value, RpcError> {
         let record = params
             .get("envelope")
@@ -1490,11 +1607,23 @@ impl StoreService {
             .take(&envelope, &policy, now)
             .map_err(|e| RpcError::internal(e.to_string()))?
         {
-            Ok(held) => Ok(json!({
-                "schema_version": DESCRIBE_SCHEMA_VERSION,
-                "taken": true,
-                "until_ms": held.until_ms,
-            })),
+            Ok(held) => {
+                // The bytes were kept a moment ago, by a policy asked the same question with
+                // an earlier `now`, so its deadline is the earlier of the two. Without this
+                // the record outlives the hold and the envelope can be evicted while this
+                // node is still telling peers it holds it. A no-op when there is no cache
+                // entry, which is every node that has not moved to ADR-0031's path yet.
+                if let Some(cache) = self.cache.as_ref() {
+                    if let Ok(id) = Self::parse_id(&envelope.envelope_id) {
+                        let _ = cache.hold_carried_until(&id, held.until_ms);
+                    }
+                }
+                Ok(json!({
+                    "schema_version": DESCRIBE_SCHEMA_VERSION,
+                    "taken": true,
+                    "until_ms": held.until_ms,
+                }))
+            }
             // Named, so an operator reading a log can tell a full machine from a late
             // envelope from a peer sending nonsense. `declined` is the stable code to match
             // on; `detail` carries the numbers behind it, because "no_room" without them
@@ -1560,7 +1689,23 @@ impl StoreService {
         store
             .release(envelope_id)
             .map_err(|e| RpcError::internal(e.to_string()))?;
-        Ok(json!({ "schema_version": DESCRIBE_SCHEMA_VERSION, "released": true }))
+        // And the bytes (ADR-0031). Releasing the record alone is what made drop on delivery
+        // free a budget and no disk: the carriage index emptied and the ciphertext stayed.
+        //
+        // Only ever a carried envelope's own id, so this cannot be used to evict something
+        // else — `envelope_id` *is* the content id, and reaching here means this node held a
+        // custody record under it. A failure is not escalated: custody is already gone, the
+        // caller has been told the truth, and an entry the cache would not drop is evictable
+        // like anything else once its hold lapses.
+        let freed = match (self.cache.as_ref(), Self::parse_id(envelope_id)) {
+            (Some(cache), Ok(id)) => cache.remove(&id).unwrap_or(0),
+            _ => 0,
+        };
+        Ok(json!({
+            "schema_version": DESCRIBE_SCHEMA_VERSION,
+            "released": true,
+            "freed_bytes": freed,
+        }))
     }
 
     fn handle_replica_room(&self, params: Value) -> Result<Value, RpcError> {
@@ -1963,6 +2108,11 @@ impl Service for StoreService {
                     CAPABILITY_POINTER_WRITE,
                 ),
                 MethodDescription::guarded(
+                    "envelope.keep",
+                    "Hold the ciphertext of an envelope this node is about to carry",
+                    CAPABILITY_CARRY,
+                ),
+                MethodDescription::guarded(
                     "envelope.take",
                     "Take custody of an envelope addressed to somebody else (ADR-0028)",
                     CAPABILITY_CARRY,
@@ -2104,6 +2254,10 @@ impl Service for StoreService {
             "pointer.accept" => {
                 self.authorize(ctx, CAPABILITY_POINTER_WRITE)?;
                 self.handle_pointer_accept(params)
+            }
+            "envelope.keep" => {
+                self.authorize(ctx, CAPABILITY_CARRY)?;
+                self.handle_envelope_keep(params)
             }
             "envelope.take" => {
                 self.authorize(ctx, CAPABILITY_CARRY)?;

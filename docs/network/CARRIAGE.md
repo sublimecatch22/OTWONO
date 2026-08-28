@@ -208,6 +208,30 @@ This does not widen ADR-0019:
   custody of its id. It can only widen the audience of an object that was already going to
   leave the node sealed.
 
+### Where a carrier's copy lives
+
+Not with this node's own objects. A carried envelope's ciphertext goes in the **cluster
+cache**, and its custody record in the envelope store (ADR-0031).
+
+The reason is that a carrier must be able to give the bytes back. The permanent content store
+has no delete — nothing in this repository can remove an object from it — so a carrier that
+put strangers' mail there freed the *record* on §3b's release and never freed a byte of disk.
+Its footprint grew without bound at strangers' request, and `bytes_held` reported zero while
+it happened, because it sums custody records rather than bytes. The cache has a budget, an
+eviction policy and `remove`.
+
+That means the serving rule above is really two rules, one per place:
+
+- In this node's **own store**, a `SHARED` object is normally mail addressed to this node,
+  which it can open, so ADR-0019's rule applies and the custody exception is the way past it.
+- In the **cache**, a `SHARED` object is only ever a carried envelope — the ordinary cache
+  door refuses the label and carriage's does not — so custody is the whole rule. A
+  recipient's own mail cannot reach that branch, because it is never put there.
+
+A carrier therefore needs a cache. `otwono-stored` refuses carriage outright on a machine
+whose profile gives it a carriage budget and no cache budget, rather than accepting custody
+all day and failing every keep.
+
 ### Whose key travels
 
 When a node serves an object it is *carrying*, the copy of the content key in the manifest is
@@ -260,21 +284,6 @@ flatter than the cache's.
 
 ## 7. What is not built
 
-- **The ciphertext is never freed.** ADR-0026 §8 puts a carried envelope's bytes in the
-  cluster cache, which has a budget, a TTL and eviction. `otwono-netd` puts them in the
-  permanent content store instead, via `store.accept_shared` — and nothing in this repository
-  can delete an object from there. The cache has `remove` and `purge`; the CAS has neither.
-
-  So §3b frees the custody record and the carriage budget with it, and leaves the bytes on
-  the carrier's disk for good. Expiry does the same. A carrier's disk footprint grows without
-  bound, driven by what strangers ask it to carry — which is the amplification ADR-0028 §7
-  exists to bound, arriving through the one dimension §7 does not measure.
-
-  The budget is not wrong, it is measuring the wrong thing: `bytes_held` sums custody records,
-  so a carrier that has delivered everything reports zero bytes held while holding all of them.
-  Fixing it means the cache learning to hold a `SHARED` object with its sharing metadata —
-  today it inserts replicas as `REPLICATED` with none — and `keep_sealed` splitting: a
-  recipient's own mail belongs in the permanent store, a stranger's does not.
 - **Re-relay in practice.** §7 concludes that a carrier may pass an envelope on, and the
   record's shape makes it structural rather than a permission. No test exercises a second hop.
 - **Forward secrecy.** The sharing key is long-lived, so compromising it opens every envelope

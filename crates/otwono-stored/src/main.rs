@@ -200,6 +200,8 @@ fn run(args: &[String]) -> Result<String, Error> {
             pointer_dir.display()
         ),
     }
+    // Whether a cluster cache was actually opened, which carriage below now depends on.
+    let mut has_cache = false;
     if want_cache {
         // The budget is the capability policy engine's decision and nobody else's
         // (CLAUDE.md §2.6). An override is an operator saying so on purpose; absent one,
@@ -236,6 +238,7 @@ fn run(args: &[String]) -> Result<String, Error> {
                         cache.used_bytes()
                     );
                     service = service.with_cache(cache);
+                    has_cache = true;
                 }
                 Err(e) => {
                     return Err(Error::Startup(format!(
@@ -258,6 +261,15 @@ fn run(args: &[String]) -> Result<String, Error> {
         Ok(b) if b.envelope_carry_bytes == 0 => eprintln!(
             "otwono-stored: carrying no mail for other people — this machine's capability \
              profile sets its carriage budget to zero"
+        ),
+        // Carriage now needs the cache: ADR-0031 puts a carried envelope's ciphertext there,
+        // because the permanent store cannot delete and a carrier that never frees a byte is
+        // the amplification ADR-0028 §7 is trying to bound. The two budgets are still read
+        // separately and can still disagree, so say so at startup rather than accepting
+        // custody all day and refusing every keep.
+        Ok(_) if !has_cache => eprintln!(
+            "otwono-stored: carrying no mail for other people — this machine has a carriage \
+             budget but no cluster cache, and a carried envelope's bytes live in the cache"
         ),
         Ok(b) => match otwono_store::EnvelopeStore::at(&envelope_dir) {
             Ok(store) => {

@@ -1168,24 +1168,51 @@ impl otwono_store::Carrier for BrokeredCarrier {
 
     /// Store the ciphertext, under this node's own storage key, before custody is claimed.
     ///
-    /// `store.accept_shared` is the same method a *recipient* uses for mail collected on its
-    /// behalf, and that is not a coincidence: both are "keep somebody else's sealed bytes and
-    /// the one key that came with them". The difference is only whether this node can open
-    /// it, which the store never assumes either way.
+    /// Goes to the **cache**, not the permanent store, and that is the whole of ADR-0031. A
+    /// recipient keeping its own mail uses `store.accept_shared` and keeps it for good,
+    /// because it is theirs. A carrier is holding a stranger's bytes for a bounded time at
+    /// the stranger's request, and the permanent store has no delete — so a carrier that put
+    /// them there freed its carriage budget on release and never freed a byte of disk.
+    ///
+    /// Refusal is not an error. A cache that will not make room is a small machine saying no,
+    /// which is the normal case; the pass must simply not go on to claim custody.
     fn keep(
         &self,
         envelope: &otwono_envelope::Envelope,
         bytes: &[u8],
         sharing: &otwono_store::object::Sharing,
     ) -> Result<(), String> {
-        keep_sealed(
-            &self.store_socket,
-            &self.perm_socket,
-            &envelope.envelope_id,
-            bytes,
-            sharing,
+        let sealed_key = sharing
+            .sealed_keys
+            .first()
+            .ok_or("an envelope with no sealed key; nobody could ever open it")?;
+        let reply = self.call(
+            "envelope.keep",
+            json!({
+                "envelope": envelope,
+                "data": data_encoding::BASE64.encode(bytes),
+                "encryption": sharing.encryption,
+                "nonce_prefix": sharing.nonce_prefix,
+                "plaintext_size_bytes": sharing.plaintext_size_bytes,
+                "sealed_key": sealed_key,
+            }),
             "otwono-netd is keeping an envelope it is about to take custody of",
-        )
+        )?;
+        if !reply.get("kept").and_then(Value::as_bool).unwrap_or(false) {
+            let why = reply.get("declined").and_then(Value::as_str).unwrap_or("unknown");
+            let detail = reply.get("detail").and_then(Value::as_str).unwrap_or("");
+            return Err(format!("the store would not keep it: {why}: {detail}"));
+        }
+        // The store recomputes the content id from the bytes. A disagreement means the
+        // descriptor and the ciphertext are not the same object, which would put this node's
+        // name on something it cannot deliver.
+        match reply.get("content_id").and_then(Value::as_str) {
+            Some(id) if id == envelope.envelope_id => Ok(()),
+            other => Err(format!(
+                "kept bytes that hash to {other:?}, not to {}",
+                envelope.envelope_id
+            )),
+        }
     }
 
     fn take_custody(
@@ -1225,17 +1252,18 @@ impl otwono_store::Carrier for BrokeredCarrier {
     }
 }
 
-/// Store somebody else's sealed bytes, under this node's own storage key.
+/// Keep mail addressed to **this** node, under this node's own storage key.
 ///
-/// The one place `store.accept_shared` is called from, because there are two callers that
-/// mean the same thing and had drifted apart: a **carrier** keeping an envelope it is about
-/// to take custody of, and a **recipient** keeping mail collected on its behalf. The only
-/// real difference was that one checked the store's answer and the other did not.
+/// The one place `store.accept_shared` is called from. It used to serve carriage as well, on
+/// the argument that a carrier and a recipient both mean "keep somebody else's sealed bytes
+/// and the one key that came with them" — true about the bytes and wrong about the disk.
+/// This node's own mail is its own and stays; a stranger's is held for a bounded time and
+/// has to be able to go again, which the permanent store cannot do. ADR-0031 splits them, and
+/// carriage now goes through `envelope.keep` to the cache.
 ///
-/// That check is not ceremony. The store recomputes the content id from the bytes, and a
-/// disagreement means the descriptor and the ciphertext are not the same object — for a
-/// carrier, that would put this node's name on something it cannot deliver; for a recipient,
-/// it would file an envelope under a name that is not its own.
+/// The id check is not ceremony. The store recomputes the content id from the bytes, and a
+/// disagreement means the descriptor and the ciphertext are not the same object — here, that
+/// would file an envelope under a name that is not its own.
 pub(crate) fn keep_sealed(
     store_socket: &Path,
     perm_socket: &Path,

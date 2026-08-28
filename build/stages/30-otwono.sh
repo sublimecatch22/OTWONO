@@ -1162,6 +1162,14 @@ while read -r prog; do
 done < <(grep -ho '^ExecStart=[^ ]*' "$ROOTFS/etc/systemd/system/"otwono-*.service     | cut -d= -f2 | sort -u)
 [ "$missing" -eq 0 ] || die "$missing unit(s) point at a binary that is not installed"
 
+# Which source this image's OTWONO layer was built from.
+#
+# Recorded because `make multi-node-test` does not depend on `image`: it runs whatever is at
+# the output path, so committing a fix and running the harness tests the *previous* build and
+# says nothing about it. That cost two full three-node runs before anyone looked at the file's
+# mtime. The harness compares this against the tree it is run from and refuses a stale image.
+OTWONO_REVISION="$(git -C "$REPO_ROOT" describe --always --dirty --abbrev=12 2>/dev/null || echo unknown)"
+manifest_add "otwono-revision" "$OTWONO_REVISION"
 manifest_add "otwono-layer" "binaries, schemas, policy, units installed and cross-checked"
 stage_mark_complete 30-otwono
 stage_done

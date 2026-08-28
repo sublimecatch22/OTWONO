@@ -77,19 +77,41 @@ pub struct CacheEntry {
     /// keep. Absent on everything that is not a replica.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replica_expires_ms: Option<u64>,
+    /// When this node's custody of a carried envelope runs out (ADR-0028 §10, ADR-0031).
+    ///
+    /// Same shape as `replica_expires_ms` and deliberately not the same field. Both mean
+    /// "held until", but they are two subsystems' promises with two lifetimes: folding them
+    /// together would let a carriage release drop a replication hold, or a replication TTL
+    /// sweep evict an envelope somebody is still waiting for. The duplication is the cheaper
+    /// mistake.
+    ///
+    /// Absent on everything that is not a carried envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carried_until_ms: Option<u64>,
 }
 
 impl CacheEntry {
     /// Whether this entry may be evicted to make room, at `now_ms`.
     ///
-    /// Two independent reasons to keep it, and either is enough: an operator pinned it, or
-    /// this node promised to hold it as a replica and that promise has not run out.
+    /// Three independent reasons to keep it, and any one is enough: an operator pinned it,
+    /// this node promised to hold it as a replica, or this node is carrying it as somebody's
+    /// mail. The promises expire; the pin does not.
     pub fn is_evictable(&self, now_ms: u64) -> bool {
-        !self.pinned && !self.holds_a_live_replica(now_ms)
+        !self.pinned && !self.holds_a_live_replica(now_ms) && !self.holds_live_mail(now_ms)
     }
 
     pub fn holds_a_live_replica(&self, now_ms: u64) -> bool {
         self.replica_expires_ms.is_some_and(|at| now_ms < at)
+    }
+
+    /// Whether this node is still holding this as somebody else's mail.
+    ///
+    /// Evicting an envelope under custody would leave the carrier offering something it
+    /// cannot serve — the record says it holds it and the bytes are gone. ADR-0031 names
+    /// that hazard and does not otherwise resolve it; keeping the bytes for as long as the
+    /// record does is what stops it arising in the first place.
+    pub fn holds_live_mail(&self, now_ms: u64) -> bool {
+        self.carried_until_ms.is_some_and(|at| now_ms < at)
     }
 }
 
@@ -325,6 +347,7 @@ impl Cache {
                     last_access_ms: now_ms,
                     pinned: false,
                     replica_expires_ms: None,
+                    carried_until_ms: None,
                 },
             );
         }
@@ -419,6 +442,122 @@ impl Cache {
             Self::persist(&index, &self.index_path)?;
         }
         Ok(Some(object))
+    }
+
+    /// Hold a sealed envelope this node is carrying for somebody else (ADR-0031).
+    ///
+    /// The carriage counterpart of [`Self::take_replica`], and deliberately **not**
+    /// [`Self::insert`]. `insert` refuses `SHARED` through
+    /// `Visibility::may_be_cached_for_peers`, and that refusal is right for the case it was
+    /// written for: a `SHARED` object in this node's store is normally mail addressed to
+    /// *this* node, which it can open, and a cache that served those to peers would make
+    /// every recipient a redistributor of its own correspondence.
+    ///
+    /// A carried envelope is the other case. It is ciphertext this node cannot open,
+    /// addressed to a NodeID that is not its own, held for a bounded time because this node
+    /// agreed to. Widening the label predicate would have made every `SHARED` object
+    /// cacheable everywhere that predicate is consulted; a separate entry point makes
+    /// carriage the only caller that can put one here, and says so at the call site.
+    ///
+    /// `expected` is the id the descriptor named. Chunking is deterministic, so storing the
+    /// ciphertext must reproduce it — a mismatch means the bytes are not the envelope that
+    /// was offered, and nothing is written.
+    ///
+    /// `until_ms` is this carrier's own deadline, the same wall-clock value the custody
+    /// record commits to, and it holds the entry against eviction for exactly that long. A
+    /// carrier whose cache evicted an envelope it still has a record for would offer
+    /// something it cannot serve.
+    ///
+    /// Returns `Ok(None)` when the cache will not make room, exactly as `take_replica` does
+    /// when the policy will not: a full node declining is the normal case on a small machine
+    /// and not an error. The caller must not take custody after that.
+    pub fn take_carried(
+        &self,
+        ciphertext: &[u8],
+        expected: &ContentId,
+        sharing: crate::object::Sharing,
+        until_ms: u64,
+        now_ms: u64,
+    ) -> Result<Option<Object>, CacheError> {
+        if !self.enabled() {
+            return Err(CacheError::Disabled);
+        }
+        let size = ciphertext.len() as u64;
+        if size > self.budget_bytes {
+            return Err(CacheError::LargerThanBudget {
+                size,
+                budget: self.budget_bytes,
+            });
+        }
+        self.ensure_disk_room(size)?;
+        // Room first, bytes second. `evict_to_fit` refuses rather than overrunning the
+        // budget when everything left is held, and a refusal here must leave the cache as
+        // it was — not with a half-stored envelope nothing points at.
+        if self.evict_to_fit(size, now_ms).is_err() {
+            return Ok(None);
+        }
+
+        let object = self
+            .store
+            .accept_shared(ciphertext, expected, sharing)
+            .map_err(CacheError::Store)?;
+
+        let mut index = self.index.lock().expect("cache index poisoned");
+        let hex = object.content_id.to_hex();
+        match index.objects.get_mut(&hex) {
+            // Already here — as a replica, as something this node fetched, or as an
+            // envelope taken from another carrier. Content addressing means the chunks are
+            // the same files, so this is a hold on what is already there. The later
+            // deadline wins: two custody records for one object both have to be honoured.
+            Some(entry) => {
+                entry.last_access_ms = now_ms;
+                entry.carried_until_ms = Some(entry.carried_until_ms.unwrap_or(0).max(until_ms));
+            }
+            None => {
+                for chunk in &object.chunks {
+                    *index.chunk_refs.entry(chunk.blake3.clone()).or_insert(0) += 1;
+                }
+                index.objects.insert(
+                    hex.clone(),
+                    CacheEntry {
+                        content_id: hex,
+                        size_bytes: object.size_bytes,
+                        last_access_ms: now_ms,
+                        pinned: false,
+                        replica_expires_ms: None,
+                        carried_until_ms: Some(until_ms),
+                    },
+                );
+            }
+        }
+        Self::persist(&index, &self.index_path)?;
+        Ok(Some(object))
+    }
+
+    /// Extend the carriage hold on something already here, to a deadline decided later.
+    ///
+    /// Carriage keeps the bytes before it records custody, so that a custody record never
+    /// names bytes this node does not have. The two steps ask the same policy a moment
+    /// apart and get deadlines a few milliseconds apart, and the custody record's is the
+    /// later one — so without this the record can outlive the hold and an envelope can be
+    /// evicted while a carrier still says it holds it.
+    ///
+    /// Only ever moves a deadline later. A caller cannot use this to shorten somebody
+    /// else's hold, and passing an earlier value is a no-op rather than a mistake.
+    ///
+    /// Does nothing for an object the cache does not have: there is no hold to extend, and
+    /// creating an entry with no bytes behind it would be worse than the gap it closes.
+    pub fn hold_carried_until(&self, id: &ContentId, until_ms: u64) -> Result<bool, CacheError> {
+        let mut index = self.index.lock().expect("cache index poisoned");
+        let Some(entry) = index.objects.get_mut(&id.to_hex()) else {
+            return Ok(false);
+        };
+        if entry.carried_until_ms.unwrap_or(0) >= until_ms {
+            return Ok(true);
+        }
+        entry.carried_until_ms = Some(until_ms);
+        Self::persist(&index, &self.index_path)?;
+        Ok(true)
     }
 
     /// Drop the hold on replicas whose promise has run out (ADR-0026).
@@ -778,6 +917,130 @@ mod tests {
                 .is_some(),
             "within both"
         );
+    }
+
+    /// A sealed object, its ciphertext, and the id it must reproduce.
+    ///
+    /// Built by actually sealing rather than by hand-writing a `Sharing`, because
+    /// `take_carried` verifies the id against the bytes and a hand-written record would
+    /// only prove that a fake passes.
+    fn sealed(plaintext: &[u8], seed: u8) -> (Vec<u8>, crate::object::Sharing, ContentId) {
+        let dir = tmpdir("sealed-source");
+        let store = crate::Store::new(&dir);
+        let key = otwono_identity::SharingKey::from_seed(&[seed; 32], 1_700_000_000_000);
+        let to = crate::cas::Recipient {
+            node_id: "otw1somebody".to_string(),
+            sharing_public_key: key.public(),
+        };
+        let (object, _) = store
+            .put_shared_reader(plaintext, std::slice::from_ref(&to))
+            .expect("sealing");
+        let ciphertext = store.read_object(&object).expect("the ciphertext back out");
+        let sharing = object.sharing.clone().expect("a sealed object has sharing");
+        let _ = std::fs::remove_dir_all(&dir);
+        (ciphertext, sharing, object.content_id)
+    }
+
+    #[test]
+    fn a_carried_envelope_goes_in_the_cache_and_keeps_its_key() {
+        // ADR-0031. The cache refuses SHARED through `insert`, and must not through this
+        // door — and the sharing record has to survive, or the carrier holds ciphertext the
+        // recipient can never open.
+        let c = cache("carried", 100_000);
+        let (bytes, sharing, id) = sealed(&data(2_000, 200), 7);
+        let held = c
+            .take_carried(&bytes, &id, sharing, 5_000, 1_000)
+            .unwrap()
+            .expect("the cache had room");
+        assert_eq!(held.content_id, id);
+        assert_eq!(held.visibility, Visibility::Shared);
+        assert_eq!(
+            held.sharing.as_ref().expect("no key travelled").sealed_keys[0].recipient,
+            "otw1somebody"
+        );
+        // And `stat` finds it, which is the path `servable` takes.
+        assert_eq!(c.stat(&id).unwrap().content_id, id);
+    }
+
+    #[test]
+    fn the_ordinary_cache_door_still_refuses_a_sealed_object() {
+        // The rule `take_carried` steps around, still standing for everything else. A
+        // recipient's own mail reaching the peer-serving cache through `insert` would make
+        // every recipient a redistributor of its own correspondence.
+        let c = cache("carried-insert", 100_000);
+        let err = c
+            .insert(&data(100, 201), Visibility::Shared, 0)
+            .expect_err("insert must refuse SHARED");
+        assert!(
+            matches!(err, CacheError::NotCacheable(Visibility::Shared)),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_envelope_under_custody_is_not_evicted_to_make_room() {
+        // The hazard ADR-0031 names: a carrier whose cache dropped the bytes still holds the
+        // record, offers the envelope, and cannot serve it. The recipient's message is gone
+        // and nothing anywhere says so.
+        let c = cache("carried-hold", 4_000);
+        let (bytes, sharing, id) = sealed(&data(900, 202), 8);
+        c.take_carried(&bytes, &id, sharing, 10_000, 1_000)
+            .unwrap()
+            .expect("taken");
+        for i in 0..6u8 {
+            let _ = c.insert(&data(900, 300 + i as u64), Visibility::Public, 2_000 + i as u64);
+        }
+        assert!(c.contains(&id), "an envelope under custody was evicted");
+    }
+
+    #[test]
+    fn an_envelope_past_its_deadline_is_evictable_like_anything_else() {
+        // The other half. A hold that outlived the custody record would be a pin nobody can
+        // remove, and the carrier's disk would never come back.
+        let c = cache("carried-lapse", 4_000);
+        let (bytes, sharing, id) = sealed(&data(900, 203), 9);
+        c.take_carried(&bytes, &id, sharing, 10_000, 1_000)
+            .unwrap()
+            .expect("taken");
+        for i in 0..6u8 {
+            let _ = c.insert(&data(900, 400 + i as u64), Visibility::Public, 20_000 + i as u64);
+        }
+        assert!(!c.contains(&id), "the hold outlived the deadline that set it");
+    }
+
+    #[test]
+    fn a_second_custody_of_one_envelope_keeps_the_later_deadline() {
+        // Two carriers' records for one object, or one taken twice. Both promises have to be
+        // honoured, so the shorter must not shorten the longer.
+        let c = cache("carried-twice", 100_000);
+        let (bytes, sharing, id) = sealed(&data(500, 204), 10);
+        c.take_carried(&bytes, &id, sharing.clone(), 9_000, 1_000)
+            .unwrap()
+            .expect("taken");
+        c.take_carried(&bytes, &id, sharing, 3_000, 1_000)
+            .unwrap()
+            .expect("taken again");
+        let entry = c
+            .entries()
+            .into_iter()
+            .find(|e| e.content_id == id.to_hex())
+            .expect("held");
+        assert_eq!(entry.carried_until_ms, Some(9_000), "the later deadline lost");
+    }
+
+    #[test]
+    fn bytes_that_are_not_the_envelope_offered_are_refused() {
+        // The descriptor names an id; the carrier must not file somebody else's bytes under
+        // it. Same check `accept_shared` makes, asserted through this door because this door
+        // is what carriage uses.
+        let c = cache("carried-mismatch", 100_000);
+        let (bytes, sharing, _) = sealed(&data(400, 205), 11);
+        let (_, _, other) = sealed(&data(400, 206), 12);
+        let err = c
+            .take_carried(&bytes, &other, sharing, 5_000, 1_000)
+            .expect_err("a mismatched id must be refused");
+        assert!(matches!(err, CacheError::Store(_)), "{err}");
+        assert!(!c.contains(&other), "the cache kept bytes it had just refused");
     }
 
     #[test]

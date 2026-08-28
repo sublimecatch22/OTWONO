@@ -2051,6 +2051,18 @@ fn an_envelope_reaches_its_recipient_through_a_carrier_that_is_neither_party() {
     let service = std::sync::Arc::new(
         otwono_stored::StoreService::new(store, h.perm_socket.clone())
             .with_identity(h.id_socket.clone())
+            // A carrier needs a cache, since ADR-0031: the custody record goes in the
+            // envelope store and the ciphertext goes here, where it can be deleted again.
+            // `otwono-stored` refuses carriage outright on a node with a carriage budget and
+            // no cache, so a carrier without one is not a configuration this has to model.
+            .with_cache(
+                otwono_store::Cache::at(
+                    carrier_dir.join("cache"),
+                    otwono_store::StorageKey::generate(),
+                    8 << 20,
+                )
+                .unwrap(),
+            )
             .with_envelopes(
                 otwono_store::EnvelopeStore::at(carrier_dir.join("envelopes")).unwrap(),
                 8 << 20,
@@ -2231,10 +2243,52 @@ fn an_envelope_reaches_its_recipient_through_a_carrier_that_is_neither_party() {
         "the carrier is still holding an envelope it delivered: {still_held}"
     );
 
-    // So put the offer back and ask again. Re-taking custody at the carrier is what a
-    // carrier that never heard the release looks like from here — the best-effort failure
-    // path in `collect_from`, which is otherwise covered by nothing. Now the envelope *is*
-    // offered, and `holds` is the only thing between this node and downloading it twice.
+    // And the bytes went with the record (ADR-0031). Releasing the record alone is what made
+    // drop on delivery free a budget and no disk: the index emptied, the ciphertext stayed,
+    // and the permanent store has no way to delete it. The carrier keeps its mail in the
+    // cache precisely so this assertion can hold.
+    let gone = Client::connect(&carrier_socket)
+        .unwrap()
+        .call_with_capability(
+            "store.serve_manifest",
+            json!({ "content_id": sealed_id, "from_chunk": 0, "max_chunks": 64,
+                    "peer": recipient.to_text() }),
+            &h.token("store.serve"),
+        )
+        .unwrap();
+    assert!(
+        gone.is_err(),
+        "the carrier gave up custody and kept the ciphertext: {gone:?}"
+    );
+
+    // So put the whole offer back — bytes and record — and ask again. That is a carrier
+    // which never heard the release, or one that took the same envelope again from another
+    // peer, and it is the best-effort failure path in `collect_from`, which is otherwise
+    // covered by nothing. Now the envelope really is offered and really is servable, and
+    // `holds` is the only thing between this node and downloading it twice.
+    //
+    // Both halves, because either alone tests the wrong thing: the record without the bytes
+    // makes the third pass fail on the fetch rather than skip on `holds`.
+    let back = collected[0]
+        .sharing
+        .as_ref()
+        .expect("the collected envelope had no key");
+    Client::connect(&carrier_socket)
+        .unwrap()
+        .call_with_capability(
+            "envelope.keep",
+            json!({
+                "envelope": envelope,
+                "data": data_encoding::BASE64.encode(&collected[0].bytes),
+                "encryption": back.encryption,
+                "nonce_prefix": back.nonce_prefix,
+                "plaintext_size_bytes": back.plaintext_size_bytes,
+                "sealed_key": back.sealed_key,
+            }),
+            &h.token("envelope.carry"),
+        )
+        .unwrap()
+        .expect("the carrier keeps the ciphertext again");
     Client::connect(&carrier_socket)
         .unwrap()
         .call_with_capability(
@@ -2244,6 +2298,20 @@ fn an_envelope_reaches_its_recipient_through_a_carrier_that_is_neither_party() {
         )
         .unwrap()
         .expect("the carrier takes custody again");
+    let servable_again = Client::connect(&carrier_socket)
+        .unwrap()
+        .call_with_capability(
+            "store.serve_manifest",
+            json!({ "content_id": sealed_id, "from_chunk": 0, "max_chunks": 64,
+                    "peer": recipient.to_text() }),
+            &h.token("store.serve"),
+        )
+        .unwrap();
+    assert!(
+        servable_again.is_ok(),
+        "the carrier took the envelope back and cannot serve it, so the next assertion \
+         would pass for the wrong reason: {servable_again:?}"
+    );
     let offered_again = collector
         .collect_from(&carrier_candidate)
         .expect("a third pass is not an error");
