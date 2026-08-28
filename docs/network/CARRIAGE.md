@@ -180,6 +180,11 @@ flatter than the cache's.
   carrier currently holds until expiry even after the recipient has collected. Closing it
   needs either an explicit release from the recipient — a third wire method — or per-envelope
   chunk-serving state, and neither is written.
+- **Nothing collects automatically.** `content.addressed_to_me` exists and works, and the
+  carriage sweep runs unprompted, but nothing on the receiving side ever asks. A node learns
+  it has mail only when somebody runs `otwono-netd --collect`. The carriage half is a
+  daemon; the collection half is a command, and until that is fixed "the message arrives"
+  means "the message becomes fetchable".
 - **Re-relay in practice.** §7 concludes that a carrier may pass an envelope on, and the
   record's shape makes it structural rather than a permission. No test exercises a second hop.
 - **Forward secrecy.** The sharing key is long-lived, so compromising it opens every envelope

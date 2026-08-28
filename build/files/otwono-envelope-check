@@ -84,25 +84,62 @@ case "$node_ordinal" in
     step "captured $captured bindings"
 
     # Now wait for one of them to go away. That peer is the recipient.
-    step "waiting for a peer to go away, so there is somebody to send to who cannot receive"
+    #
+    # "Gone" means *sustainedly* gone, and the distinction is the whole correctness of this
+    # check. A guest under TCG with one vCPU that is busy — running the content check, say —
+    # can miss enough heartbeats to drop out of `connected` for a poll or two and come
+    # straight back. The first version treated the first absence as departure and sealed to
+    # a node that was still running: on a three-node run it picked the *carrier*, which then
+    # correctly declined to carry its own mail ("1 addressed to this node") and the run hung
+    # waiting for a delivery that was never going to happen.
+    #
+    # So a peer must be missing for GONE_POLLS consecutive polls, and at least one other
+    # peer must still be present — a moment where everything vanishes is this node's network
+    # going quiet, not a peer departing, and picking a victim from it would be a guess.
+    step "waiting for a peer to stay away, so there is somebody to send to who cannot receive"
+    GONE_POLLS=12
     gone=""
     i=0
-    while [ "$i" -lt 120 ]; do
+    absent_id=""
+    absent_count=0
+    while [ "$i" -lt 240 ]; do
         here=$(connected_ids)
+        missing=""
+        present=0
         for f in "$WORK"/*.binding; do
             [ -f "$f" ] || continue
             id=$(basename "$f" .binding)
             case " $here " in
-                *" $id "*) ;;
-                *) gone=$id; break ;;
+                *" $id "*) present=$(( present + 1 )) ;;
+                *) missing="$missing $id" ;;
             esac
         done
-        [ -n "$gone" ] && break
+
+        # One candidate at a time, and only while somebody else is still answering.
+        candidate=""
+        if [ "$present" -ge 1 ]; then
+            candidate=$(echo "$missing" | awk '{print $1}')
+        fi
+
+        if [ -n "$candidate" ] && [ "$candidate" = "$absent_id" ]; then
+            absent_count=$(( absent_count + 1 ))
+        else
+            absent_id="$candidate"
+            absent_count=$([ -n "$candidate" ] && echo 1 || echo 0)
+        fi
+
+        if [ "$absent_count" -ge "$GONE_POLLS" ]; then
+            gone="$absent_id"
+            break
+        fi
         i=$((i + 1))
         sleep 5
     done
-    [ -n "$gone" ] || fail "no peer went away within the window; nothing to send to"
-    step "peer $gone is gone; sealing to it"
+    [ -n "$gone" ] || fail "no peer stayed away within the window; nothing to send to"
+    # The whole peer set at the moment of the decision, so a future misfire is one line to
+    # diagnose rather than three disk mounts.
+    step "peer $gone stayed away for $(( GONE_POLLS * 5 ))s; still connected: $(connected_ids | tr '\n' ' ')"
+    step "sealing to $gone"
 
     printf 'otwono envelope check: for a node that is not here %s\n' "$(date -u +%s%N)" \
         > "$WORK/message.txt"
@@ -122,7 +159,9 @@ case "$node_ordinal" in
     step "waiting to be offered somebody else's mail"
     carried=""
     i=0
-    while [ "$i" -lt 120 ]; do
+    # Wider than it looks it needs to be: the sender does not seal until a peer has stayed
+    # away for a full minute, and every step here is a subprocess on a single TCG vCPU.
+    while [ "$i" -lt 240 ]; do
         carried=$(otwono-storectl envelope-held 2>/dev/null | awk 'NR==1 {print $1}') || carried=""
         case "$carried" in
             [0-9a-f]*) break ;;
