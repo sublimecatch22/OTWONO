@@ -72,6 +72,24 @@ echo "image built from ${IMAGE_REVISION:-an unstamped tree}"
 OUT="${OUT:-$(dirname "$IMAGE")/multi-node}"
 mkdir -p "$OUT"
 
+# Whether a node has printed a marker, on either of its boots.
+#
+# A node that is powered off and booted again writes to `node-nN-boot2.log`, and its first log
+# stops changing the moment it shut down. A phase that greps `node-nN.log` is therefore asking
+# a file that can no longer answer — which has now caused two harness failures that looked
+# like product failures: the partition phase waited 240s for a count that could not move, and
+# the wiki phase waited for a marker node 3 had already printed in the other file.
+#
+# So no phase names a node's log directly. Both files, in order, and the caller almost never
+# cares which one answered.
+node_said() { # ordinal pattern
+    for f in "$OUT/node-n$1.log" "$OUT/node-n$1-boot2.log"; do
+        [ -f "$f" ] || continue
+        grep -qa "$2" "$f" 2>/dev/null && return 0
+    done
+    return 1
+}
+
 # A multicast group and port for this run. Not a service; just how QEMU joins the guests.
 MCAST_GROUP="${OTWONO_MCAST_GROUP:-230.7.11.1}"
 MCAST_PORT="${OTWONO_MCAST_PORT:-0}"
@@ -422,7 +440,7 @@ if [ "${MESH_CONTENT_SMOKE:-0}" != 0 ]; then
         if grep -qa "OTWONO-WIKI-FAIL" "$OUT"/node-*.log 2>/dev/null; then wiki=fail; break; fi
         ok=0
         for i in $(seq 1 "$NODES"); do
-            grep -qa "OTWONO-WIKI-OK" "$OUT/node-n$i.log" 2>/dev/null && ok=$(( ok + 1 ))
+            node_said "$i" "OTWONO-WIKI-OK" && ok=$(( ok + 1 ))
         done
         [ "$ok" -eq "$NODES" ] && { wiki=pass; break; }
         sleep 5
