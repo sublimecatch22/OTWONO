@@ -249,6 +249,24 @@ pub trait Carrier {
     /// reason because a pass that reports only "took none" is indistinguishable from a pass
     /// that was never offered anything, and that ambiguity has cost a debugging cycle.
     fn take_custody(&self, envelope: &Envelope, now_ms: u64) -> Result<Took, String>;
+
+    /// Keep the sealed bytes this node is about to take custody of.
+    ///
+    /// Called **before** [`Carrier::take_custody`], and the order is the whole point:
+    /// custody of bytes a node does not hold is a promise it cannot keep. A carrier that
+    /// recorded custody and dropped the ciphertext would count the envelope against its
+    /// budget, offer it onward, and have nothing to serve when the recipient finally came
+    /// to collect — which is what the first implementation did, and what three booted nodes
+    /// were needed to notice.
+    ///
+    /// `sharing` is the envelope the *sender* served, carrying the content key sealed to the
+    /// recipient. It is stored as it arrived: a carrier cannot open it and does not try.
+    fn keep(
+        &self,
+        envelope: &Envelope,
+        bytes: &[u8],
+        sharing: &crate::object::Sharing,
+    ) -> Result<(), String>;
 }
 
 /// What a carrier has room for, and what it is already holding.
@@ -263,29 +281,10 @@ pub struct CarriageRoom {
     pub already_held: Vec<String>,
 }
 
-impl Carrier for EnvelopeStore {
-    fn carriage_room(&self, candidates: &[String], now_ms: u64) -> Option<CarriageRoom> {
-        // The in-process implementation has no budget of its own -- the budget is the
-        // daemon's, from the capability profile -- so this reports only what is held. The
-        // brokered implementation in otwono-netd is where the number comes from.
-        let held = self.held(now_ms).ok()?;
-        Some(CarriageRoom {
-            room_bytes: u64::MAX,
-            already_held: held
-                .iter()
-                .filter(|c| candidates.is_empty() || candidates.contains(&c.envelope.envelope_id))
-                .map(|c| c.envelope.envelope_id.clone())
-                .collect(),
-        })
-    }
-
-    fn take_custody(&self, envelope: &Envelope, now_ms: u64) -> Result<Took, String> {
-        let held = self.held(now_ms).map_err(|e| e.to_string())?;
-        let committed: u64 = held.iter().map(|c| c.envelope.size_bytes).sum();
-        let policy = CarryPolicy::with_room(u64::MAX - committed);
-        match self.take(envelope, &policy, now_ms).map_err(|e| e.to_string())? {
-            Ok(custody) => Ok(Took::Custody(custody)),
-            Err(declined) => Ok(Took::Declined(declined.to_string())),
-        }
-    }
-}
+// Deliberately no `impl Carrier for EnvelopeStore`.
+//
+// A carrier must be able to *keep* the ciphertext it takes custody of, and this store holds
+// custody records only — the bytes belong to the object store, which lives behind
+// `otwono-stored`. An in-process implementation that recorded custody and silently kept
+// nothing was what made a carrier look like it was working while holding an envelope it
+// could never deliver. The only carrier is the brokered one in `otwono-netd`.

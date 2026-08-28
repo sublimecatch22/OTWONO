@@ -1093,6 +1093,56 @@ impl otwono_store::Carrier for BrokeredCarrier {
         })
     }
 
+    /// Store the ciphertext, under this node's own storage key, before custody is claimed.
+    ///
+    /// `store.accept_shared` is the same method a *recipient* uses for mail collected on its
+    /// behalf, and that is not a coincidence: both are "keep somebody else's sealed bytes and
+    /// the one key that came with them". The difference is only whether this node can open
+    /// it, which the store never assumes either way.
+    fn keep(
+        &self,
+        envelope: &otwono_envelope::Envelope,
+        bytes: &[u8],
+        sharing: &otwono_store::object::Sharing,
+    ) -> Result<(), String> {
+        let sealed_key = sharing
+            .sealed_keys
+            .first()
+            .ok_or("the sender served an envelope with no sealed key; it would be undeliverable")?;
+        let token = request_token(
+            &self.perm_socket,
+            otwono_stored::CAPABILITY_WRITE,
+            "otwono-netd is keeping an envelope it is about to take custody of",
+        )?;
+        let mut client = Client::connect(&self.store_socket)
+            .map_err(|e| format!("{}: {e}", self.store_socket.display()))?;
+        let stored = client
+            .call_with_capability(
+                "store.accept_shared",
+                json!({
+                    "content_id": envelope.envelope_id,
+                    "data": data_encoding::BASE64.encode(bytes),
+                    "encryption": sharing.encryption,
+                    "nonce_prefix": sharing.nonce_prefix,
+                    "plaintext_size_bytes": sharing.plaintext_size_bytes,
+                    "sealed_key": sealed_key,
+                }),
+                &token,
+            )
+            .map_err(|e| format!("store.accept_shared: {e}"))?
+            .map_err(|e| e.message)?;
+        // The store recomputes the content id from the bytes. A disagreement means the
+        // descriptor and the ciphertext are not the same object, and taking custody of it
+        // would put this node's name on something it cannot deliver.
+        match stored.get("content_id").and_then(Value::as_str) {
+            Some(id) if id == envelope.envelope_id => Ok(()),
+            other => Err(format!(
+                "kept bytes that hash to {other:?}, not to the offered {}",
+                envelope.envelope_id
+            )),
+        }
+    }
+
     fn take_custody(
         &self,
         envelope: &otwono_envelope::Envelope,
@@ -1538,7 +1588,7 @@ pub fn carry_pass<L: LinkAdapter, C: otwono_store::Carrier + ?Sized>(
         .validate()
         .map_err(|e| ProtocolError::Mismatched(format!("offered envelope: {e}")))?;
 
-    let fetched = fetch_object(channel, &pick.envelope_id, link)?;
+    let fetched = fetch_object_for(channel, &pick.envelope_id, link, Some(&pick.recipient))?;
     // An envelope is a SHARED object: sealed to exactly one recipient (ADR-0019). A carrier
     // offering one as anything else is contradicting itself, and the manifest is the half
     // that carries the object.
@@ -1555,6 +1605,28 @@ pub fn carry_pass<L: LinkAdapter, C: otwono_store::Carrier + ?Sized>(
             fetched.bytes.len()
         )));
     }
+
+    // Kept before custody is claimed. A carrier that recorded custody and dropped the
+    // ciphertext would offer an envelope it could not serve — which is precisely what the
+    // first version did, and it took a three-node run to see, because a carrier holding
+    // nothing looks identical to a carrier holding something until a recipient asks.
+    let sharing = fetched.sharing.as_ref().ok_or_else(|| {
+        ProtocolError::Mismatched(
+            "the peer served an envelope with no sealed key; nobody could ever open it".into(),
+        )
+    })?;
+    carrier
+        .keep(
+            &envelope,
+            &fetched.bytes,
+            &otwono_store::object::Sharing {
+                encryption: sharing.encryption.clone(),
+                nonce_prefix: sharing.nonce_prefix.clone(),
+                plaintext_size_bytes: sharing.plaintext_size_bytes,
+                sealed_keys: vec![sharing.sealed_key.clone()],
+            },
+        )
+        .map_err(|e| ProtocolError::Mismatched(format!("could not keep the envelope: {e}")))?;
 
     match carrier.take_custody(&envelope, now_ms) {
         Ok(otwono_store::Took::Declined(why)) => Ok(CarryPass::NothingTaken {
@@ -1777,6 +1849,21 @@ pub fn fetch_object<L: LinkAdapter>(
     content_id: &str,
     link: &LinkProperties,
 ) -> Result<FetchedObject, ProtocolError> {
+    fetch_object_for(channel, content_id, link, None)
+}
+
+/// [`fetch_object`], for a caller that is not the intended recipient.
+///
+/// `expect_key_for` is the NodeID the sealed key must name. A carry pass passes the
+/// envelope's recipient: the carrier is fetching ciphertext it cannot open, on purpose, and
+/// the default check — "the key must be sealed to me" — would reject exactly the case
+/// store-and-forward exists for. Every other caller passes `None` and gets that check.
+pub fn fetch_object_for<L: LinkAdapter>(
+    channel: &mut SecureChannel<L>,
+    content_id: &str,
+    link: &LinkProperties,
+    expect_key_for: Option<&str>,
+) -> Result<FetchedObject, ProtocolError> {
     if !content::is_hex_digest(content_id) {
         return Err(ProtocolError::NotHex { field: "content_id" });
     }
@@ -1791,7 +1878,7 @@ pub fn fetch_object<L: LinkAdapter>(
         });
     }
     let mut budget = MAX_ROUND_TRIPS;
-    let (header, entries) = fetch_manifest(channel, content_id, link, &mut budget)?;
+    let (header, entries) = fetch_manifest(channel, content_id, link, &mut budget, expect_key_for)?;
 
     // Before any chunk is asked for: the declared chunk list must hash to the id that was
     // requested. A peer with a substituted manifest is caught here rather than after a
@@ -1870,8 +1957,15 @@ fn fetch_manifest<L: LinkAdapter>(
     content_id: &str,
     link: &LinkProperties,
     budget: &mut usize,
+    expect_key_for: Option<&str>,
 ) -> Result<(ManifestPage, Vec<ChunkEntry>), ProtocolError> {
-    let me = channel.local().to_text();
+    // Normally this node: a shared object whose key is sealed to somebody else is one this
+    // node could never open, so downloading it would be work thrown away. A carry pass is
+    // the exception and says so — a carrier is fetching bytes it is *not* meant to open, and
+    // the key it must receive is the recipient's (ADR-0028 §11).
+    let me = expect_key_for
+        .map(str::to_string)
+        .unwrap_or_else(|| channel.local().to_text());
     let window = content::max_chunks_per_page(link);
     let mut entries: Vec<ChunkEntry> = Vec::new();
     let mut header: Option<ManifestPage> = None;
@@ -2295,7 +2389,7 @@ fn fan_out<L: LinkAdapter + Send + 'static>(
             continue;
         }
         let mut budget = MAX_ROUND_TRIPS;
-        match fetch_manifest(&mut peer.channel, content_id, &peer.link, &mut budget)
+        match fetch_manifest(&mut peer.channel, content_id, &peer.link, &mut budget, None)
             .and_then(|(h, e)| verified_refs(content_id, &e).map(|r| (h, e, r)))
         {
             Ok((h, e, r)) => {

@@ -1031,8 +1031,33 @@ impl StoreService {
                 .map(|o| (o, Source::Cached))
         });
         found
-            .filter(|(o, source)| Self::may_go_to(o, *source, peer))
+            .filter(|(o, source)| {
+                Self::may_go_to(o, *source, peer) || self.carried_for(id).is_some()
+            })
             .ok_or_else(|| not_available(id))
+    }
+
+    /// Who this node is carrying `id` for, if it is carrying it at all (ADR-0028 §11).
+    ///
+    /// The exception to ADR-0019's serving rule, and the reason store-and-forward can exist:
+    /// that rule admits only a named recipient, so without this an envelope can never reach a
+    /// carrier — the sender would refuse to hand it over, and a message would only ever
+    /// travel when the sender met the recipient directly, which is the case store-and-forward
+    /// is for. Found by running it on three nodes and watching the sender refuse.
+    ///
+    /// It widens nothing beyond ciphertext. A carrier receives the sealed bytes, a key
+    /// sealed to the recipient's sharing key that it cannot open, and the recipient's
+    /// NodeID — which it already read off the descriptor before it asked.
+    ///
+    /// Returns the recipient rather than a bool because the manifest needs it: the copy of
+    /// the content key that travels is *the recipient's*, not the asking peer's, and the
+    /// asking peer has none.
+    fn carried_for(&self, id: &ContentId) -> Option<String> {
+        let (store, _) = self.envelopes.as_ref()?;
+        let custody = store
+            .get(&id.to_hex(), otwono_store::cache::now_unix_ms())
+            .ok()??;
+        Some(custody.envelope.recipient)
     }
 
     /// Whether this object may go to this peer (ADR-0019 §4).
@@ -1151,8 +1176,15 @@ impl StoreService {
         //
         // Unreachable unless the object is Shared and this peer is named, because
         // `servable` already refused every other case.
+        //
+        // When this node is *carrying* the object, the copy that travels is the one sealed
+        // to the recipient named in the custody record, not to the peer asking: a carrier is
+        // not on the recipient list and has no copy of its own, and an envelope that arrived
+        // without a key would be undeliverable when the recipient finally collected it.
+        let carried = self.carried_for(&id);
+        let key_for = carried.as_deref().or(p.peer.as_deref());
         if let (Visibility::Shared, Some(sharing), Some(peer)) =
-            (object.visibility, &object.sharing, p.peer.as_deref())
+            (object.visibility, &object.sharing, key_for)
         {
             if let Some(copy) = sharing.copy_for(peer) {
                 out["sharing"] = json!({

@@ -1975,88 +1975,6 @@ fn a_carrier_offers_what_it_holds_after_serving_ordinary_content() {
     );
 }
 
-/// A carry pass takes custody of an envelope a peer is offering.
-///
-/// The whole pass end to end against real daemons: the peer offers, this node fetches the
-/// sealed bytes and asks its own store to hold them. Written because a three-node run got as
-/// far as "offered 1 envelope(s), took none" and no part of the system said why — the pass
-/// reports that it took nothing without reporting the refusal it was given.
-#[test]
-fn a_carry_pass_takes_custody_of_what_a_peer_offers() {
-    let h = Harness::start("carry-pass");
-
-    // The serving node has a sealed object and is holding it for somebody else.
-    // Sealed inline rather than through `share_with_myself`, because the size of the
-    // *ciphertext* is what the descriptor must carry and only the share reply knows it —
-    // exactly as `otwono-storectl envelope-send` reads it.
-    let binding: otwono_identity::SharingBinding = serde_json::from_value(
-        Client::connect(&h.id_socket)
-            .unwrap()
-            .call("id.sharing_binding", json!({}))
-            .unwrap()
-            .unwrap(),
-    )
-    .unwrap();
-    let sealed = Client::connect(&h.store_socket)
-        .unwrap()
-        .call_with_capability(
-            "store.share",
-            json!({
-                "data": data_encoding::BASE64.encode(b"an envelope for a node that is not here"),
-                "recipients": [binding],
-            }),
-            &h.token("store.share"),
-        )
-        .unwrap()
-        .expect("sealing");
-    let sealed_id = sealed["content_id"].as_str().unwrap().to_string();
-    let size_bytes = sealed["size_bytes"].as_u64().expect("the share reply names a size");
-
-    let recipient = NodeIdentity::generate().unwrap();
-    let envelope = otwono_envelope::Envelope::new(
-        &sealed_id,
-        recipient.node_id(),
-        size_bytes,
-        otwono_identity::now_unix_ms() + 2 * 60 * 60 * 1000,
-    );
-    let taken = Client::connect(&h.store_socket)
-        .unwrap()
-        .call_with_capability(
-            "envelope.take",
-            json!({ "envelope": envelope }),
-            &h.token("envelope.carry"),
-        )
-        .unwrap()
-        .expect("the serving node takes custody of what it is sending");
-    assert_eq!(taken["taken"], json!(true), "the sender would not hold its own envelope: {taken}");
-
-    // A second node, with its own carriage store, runs the pass.
-    let carrier_dir = h.dir.join("carrier-envelopes");
-    let carrier = std::sync::Arc::new(otwono_store::EnvelopeStore::at(&carrier_dir).unwrap());
-    let client = std::sync::Arc::new(
-        NetState::new(std::sync::Arc::clone(&h.client).signer.clone())
-            .with_carrier(carrier.clone()),
-    );
-
-    let pass = client
-        .carry_from(&h.candidate())
-        .expect("a carry pass against a peer offering one envelope");
-    match pass {
-        otwono_netd::content::CarryPass::Took { envelope_id, .. } => {
-            assert_eq!(envelope_id, sealed_id);
-        }
-        other => panic!("the peer offered an envelope and the pass reported {other:?}"),
-    }
-
-    // And it is in custody, durably, for the recipient it names.
-    let held = otwono_store::EnvelopeStore::at(&carrier_dir)
-        .unwrap()
-        .held(otwono_identity::now_unix_ms())
-        .unwrap();
-    assert_eq!(held.len(), 1, "the pass reported taking one and the store holds {}", held.len());
-    assert_eq!(held[0].envelope.recipient, recipient.node_id().to_text());
-}
-
 /// The same pass, but through the carrier a real node uses.
 ///
 /// The test above runs the pass against an in-process [`otwono_store::EnvelopeStore`], which
@@ -2073,14 +1991,16 @@ fn a_carry_pass_takes_custody_of_what_a_peer_offers() {
 fn a_brokered_carrier_takes_custody_through_its_own_store_daemon() {
     let h = Harness::start("brokered-carry");
 
-    let binding: otwono_identity::SharingBinding = serde_json::from_value(
-        Client::connect(&h.id_socket)
-            .unwrap()
-            .call("id.sharing_binding", json!({}))
-            .unwrap()
-            .unwrap(),
-    )
-    .unwrap();
+    // A recipient that is nowhere near this test's identities, and the envelope is sealed to
+    // *its* sharing key. Sealing to the harness's own binding instead would have hidden the
+    // bug this test exists for: the sender must serve the copy of the content key belonging
+    // to the node it is carrying for, not to the node asking, and if those are the same node
+    // there is nothing to get wrong.
+    let recipient_signing = otwono_identity::SigningIdentity::generate().unwrap();
+    let recipient_sharing = otwono_identity::SharingKey::generate().unwrap();
+    let binding = recipient_signing.bind_sharing(&recipient_sharing.public());
+    let recipient = *recipient_signing.node_id();
+
     let sealed = Client::connect(&h.store_socket)
         .unwrap()
         .call_with_capability(
@@ -2096,10 +2016,9 @@ fn a_brokered_carrier_takes_custody_through_its_own_store_daemon() {
     let sealed_id = sealed["content_id"].as_str().unwrap().to_string();
     let size_bytes = sealed["size_bytes"].as_u64().unwrap();
 
-    let recipient = NodeIdentity::generate().unwrap();
     let envelope = otwono_envelope::Envelope::new(
         &sealed_id,
-        recipient.node_id(),
+        &recipient,
         size_bytes,
         otwono_identity::now_unix_ms() + 2 * 60 * 60 * 1000,
     );
@@ -2160,7 +2079,26 @@ fn a_brokered_carrier_takes_custody_through_its_own_store_daemon() {
         .expect("the carrier's store lists what it holds");
     let entries = held["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 1, "the carrier's own store holds {entries:?}");
-    assert_eq!(entries[0]["recipient"], json!(recipient.node_id().to_text()));
+    assert_eq!(entries[0]["recipient"], json!(recipient.to_text()));
+
+    // And the carrier kept the bytes, with the key sealed to the recipient. Custody of an
+    // envelope this node cannot serve on would be a promise it could not keep.
+    let kept = Client::connect(&carrier_socket)
+        .unwrap()
+        .call_with_capability(
+            "store.serve_manifest",
+            json!({ "content_id": sealed_id, "from_chunk": 0, "max_chunks": 64,
+                    "peer": recipient.to_text() }),
+            &h.token("store.serve"),
+        )
+        .unwrap()
+        .expect("the carrier serves what it carries to the node it carries it for");
+    assert_eq!(kept["visibility"], json!("shared"));
+    assert_eq!(
+        kept["sharing"]["sealed_key"]["recipient"],
+        json!(recipient.to_text()),
+        "the carrier holds the ciphertext but not the recipient's key: {kept}"
+    );
 }
 
 /// A node whose broker refuses `envelope.carry` carries nobody's mail and asks nobody.
