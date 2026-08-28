@@ -2248,3 +2248,62 @@ fn an_inbound_connection_records_no_dialable_address() {
         "the peer is still connected; only its address is unknown"
     );
 }
+
+/// Custody widens the audience of a sealed object. It does not unlock a private one.
+///
+/// `envelope.take` records custody by content id and needs only a local capability, so a
+/// carriage exception applied beside the label check rather than inside it would be a way to
+/// make a `PRIVATE` object servable by taking custody of its id. This is the assertion that
+/// the exception sits under the `shared`-and-own-store guard.
+#[test]
+fn taking_custody_of_a_private_objects_id_does_not_make_it_servable() {
+    let h = Harness::start("custody-not-a-key");
+
+    let private = Client::connect(&h.store_socket)
+        .unwrap()
+        .call_with_capability(
+            "store.put",
+            json!({
+                "data": data_encoding::BASE64.encode(b"this never leaves the node"),
+                "visibility": "private",
+            }),
+            &h.token("store.write"),
+        )
+        .unwrap()
+        .expect("storing a private object");
+    let private_id = private["content_id"].as_str().unwrap().to_string();
+
+    // Custody of that exact id, taken through the ordinary method with the ordinary
+    // capability — which is all an operator of this node can do.
+    let recipient = NodeIdentity::generate().unwrap();
+    let envelope = otwono_envelope::Envelope::new(
+        &private_id,
+        recipient.node_id(),
+        private["size_bytes"].as_u64().unwrap(),
+        otwono_identity::now_unix_ms() + 60 * 60 * 1000,
+    );
+    let taken = Client::connect(&h.store_socket)
+        .unwrap()
+        .call_with_capability(
+            "envelope.take",
+            json!({ "envelope": envelope }),
+            &h.token("envelope.carry"),
+        )
+        .unwrap()
+        .expect("the store records custody of whatever id it is given");
+    assert_eq!(taken["taken"], json!(true), "the premise of this test: {taken}");
+
+    let refused = Client::connect(&h.store_socket)
+        .unwrap()
+        .call_with_capability(
+            "store.serve_manifest",
+            json!({ "content_id": private_id, "from_chunk": 0, "max_chunks": 8,
+                    "peer": recipient.node_id().to_text() }),
+            &h.token("store.serve"),
+        )
+        .unwrap();
+    assert!(
+        refused.is_err(),
+        "custody of a PRIVATE object's id made it servable: {refused:?}"
+    );
+}

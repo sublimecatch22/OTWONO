@@ -1032,7 +1032,7 @@ impl StoreService {
         });
         found
             .filter(|(o, source)| {
-                Self::may_go_to(o, *source, peer) || self.carried_for(id).is_some()
+                Self::may_go_to(o, *source, peer, || self.carried_for(id).is_some())
             })
             .ok_or_else(|| not_available(id))
     }
@@ -1082,7 +1082,21 @@ impl StoreService {
     /// A peer that is not named gets exactly what a peer asking for an object this node does
     /// not have gets. Distinguishing them would let anyone enumerate both what a node holds
     /// and who it shares with.
-    fn may_go_to(object: &Object, source: Source, peer: Option<&str>) -> bool {
+    /// `carried` is consulted **inside** the `Shared`-and-own-store guard, never beside it.
+    /// Custody records are keyed by content id and created by a capability a local operator
+    /// holds, so a carriage exception applied before the label check would be a way to make
+    /// a `PRIVATE` object servable by taking custody of its id. Placed here it can only ever
+    /// widen the audience of an object that was already going to leave this node sealed.
+    ///
+    /// A closure rather than a bool because it reads the custody store from disk, and the
+    /// overwhelmingly common case — a public object, or a peer that is on the list — must
+    /// not pay for it.
+    fn may_go_to(
+        object: &Object,
+        source: Source,
+        peer: Option<&str>,
+        carried: impl Fn() -> bool,
+    ) -> bool {
         if object.visibility.may_leave_the_node_unattended() {
             return true;
         }
@@ -1090,10 +1104,11 @@ impl StoreService {
             return false;
         }
         match (peer, &object.sharing) {
-            (Some(peer), Some(sharing)) => sharing.names(peer),
+            (Some(peer), Some(sharing)) => sharing.names(peer) || carried(),
             // An anonymous request cannot be on anybody's list. This is the case a local
             // caller hits by leaving `peer` out, and it must fail closed rather than
-            // matching everyone.
+            // matching everyone. Carriage does not change that: an envelope goes to a peer
+            // this daemon can name, and a request with no peer names nobody.
             _ => false,
         }
     }
