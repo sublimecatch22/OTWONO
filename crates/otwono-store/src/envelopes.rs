@@ -230,14 +230,25 @@ impl From<serde_json::Error> for EnvelopeStoreError {
 /// budget, no store, or the capability refused. A pass that gets it makes no carriage traffic
 /// whatever, which is ADR-0028 §2's consent kept structural rather than left to a check
 /// somebody could forget.
+/// The answer to "will you hold this?".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Took {
+    /// Held, to the deadline the custody names.
+    Custody(Custody),
+    /// Not held, and why. A refusal is a reply, not an error (ADR-0028 §8).
+    Declined(String),
+}
+
 pub trait Carrier {
     fn carriage_room(&self, candidates: &[String], now_ms: u64) -> Option<CarriageRoom>;
 
-    /// Take custody, or report that this node will not.
+    /// Take custody, or say why not.
     ///
-    /// `Ok(None)` is "not this one" — a full node, a late envelope — and is the normal answer
-    /// on a small machine rather than something to escalate.
-    fn take_custody(&self, envelope: &Envelope, now_ms: u64) -> Result<Option<Custody>, String>;
+    /// [`Took::Declined`] is "not this one" -- a full node, a late envelope -- and is the
+    /// normal answer on a small machine rather than something to escalate. It carries the
+    /// reason because a pass that reports only "took none" is indistinguishable from a pass
+    /// that was never offered anything, and that ambiguity has cost a debugging cycle.
+    fn take_custody(&self, envelope: &Envelope, now_ms: u64) -> Result<Took, String>;
 }
 
 /// What a carrier has room for, and what it is already holding.
@@ -268,13 +279,13 @@ impl Carrier for EnvelopeStore {
         })
     }
 
-    fn take_custody(&self, envelope: &Envelope, now_ms: u64) -> Result<Option<Custody>, String> {
+    fn take_custody(&self, envelope: &Envelope, now_ms: u64) -> Result<Took, String> {
         let held = self.held(now_ms).map_err(|e| e.to_string())?;
         let committed: u64 = held.iter().map(|c| c.envelope.size_bytes).sum();
         let policy = CarryPolicy::with_room(u64::MAX - committed);
         match self.take(envelope, &policy, now_ms).map_err(|e| e.to_string())? {
-            Ok(custody) => Ok(Some(custody)),
-            Err(_) => Ok(None),
+            Ok(custody) => Ok(Took::Custody(custody)),
+            Err(declined) => Ok(Took::Declined(declined.to_string())),
         }
     }
 }

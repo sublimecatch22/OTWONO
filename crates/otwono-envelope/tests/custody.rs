@@ -279,3 +279,30 @@ fn a_skewed_clock_still_drops_the_envelope_eventually() {
     );
     assert!(held.is_due(skewed_now + p.max_hold_ms));
 }
+
+/// A refusal names both a code and the numbers behind it.
+///
+/// Both matter, and they are not the same string. A carrier's reply names the code so a
+/// caller can branch on it; a log carries the long form so an operator can tell an oversized
+/// envelope from a full disk without reproducing the run that produced it.
+#[test]
+fn a_refusal_names_both_a_code_and_the_numbers_behind_it() {
+    let cases = [
+        (Declined::Expired, "expired"),
+        (Declined::TooLarge { size_bytes: 9, ceiling_bytes: 4 }, "too_large"),
+        (Declined::NoRoom { size_bytes: 9, room_bytes: 4 }, "no_room"),
+        (Declined::Malformed("bad id".into()), "malformed"),
+    ];
+    for (declined, code) in cases {
+        assert_eq!(declined.code(), code);
+        assert!(
+            declined.to_string().starts_with(code),
+            "{declined} does not begin with its own code"
+        );
+    }
+    assert_eq!(
+        Declined::NoRoom { size_bytes: 9, room_bytes: 4 }.to_string(),
+        "no_room: 9 bytes, 4 free",
+        "the numbers are the reason this exists"
+    );
+}

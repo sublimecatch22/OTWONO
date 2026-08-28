@@ -1097,7 +1097,7 @@ impl otwono_store::Carrier for BrokeredCarrier {
         &self,
         envelope: &otwono_envelope::Envelope,
         _now_ms: u64,
-    ) -> Result<Option<otwono_envelope::Custody>, String> {
+    ) -> Result<otwono_store::Took, String> {
         let reply = self.call(
             "envelope.take",
             json!({ "envelope": envelope }),
@@ -1105,14 +1105,21 @@ impl otwono_store::Carrier for BrokeredCarrier {
         )?;
         if !reply.get("taken").and_then(Value::as_bool).unwrap_or(false) {
             // A named refusal is not an error: a full node saying "not this one" is the
-            // normal answer on a small machine (ADR-0026 §8).
-            return Ok(None);
+            // normal answer on a small machine (ADR-0026 §8). The reason is carried out of
+            // here rather than dropped -- a pass that could only say "took none" made a
+            // capability bug and a policy refusal look identical from the log.
+            let detail = reply
+                .get("detail")
+                .and_then(Value::as_str)
+                .or_else(|| reply.get("declined").and_then(Value::as_str))
+                .unwrap_or("the store refused and named no reason");
+            return Ok(otwono_store::Took::Declined(detail.to_string()));
         }
         let until_ms = reply
             .get("until_ms")
             .and_then(Value::as_u64)
             .ok_or("envelope.take said taken but named no deadline")?;
-        Ok(Some(otwono_envelope::Custody::taken(
+        Ok(otwono_store::Took::Custody(otwono_envelope::Custody::taken(
             envelope, until_ms, until_ms,
         )))
     }
@@ -1265,7 +1272,11 @@ pub enum ReplicationPass {
     /// This node does not replicate, or has no budget. Nothing was asked.
     NotReplicating,
     /// The peer offered nothing, or nothing this node could take.
-    NothingTaken { offered: usize },
+    ///
+    /// `why` names which filter emptied the list, for the reason [`CarryPass::NothingTaken`]
+    /// carries one: the bare count is the same sentence for an empty page, a duplicate, and
+    /// a budget refusal.
+    NothingTaken { offered: usize, why: String },
     /// One object was copied and is now held to a TTL.
     Took { content_id: String, size_bytes: u64 },
 }
@@ -1304,9 +1315,14 @@ pub fn replication_pass<L: LinkAdapter, H: otwono_store::ReplicaHolder + ?Sized>
     let mut offers = fetch_replicable_index(channel, link)?;
     let offered = offers.len();
     if offers.is_empty() {
-        return Ok(ReplicationPass::NothingTaken { offered });
+        return Ok(ReplicationPass::NothingTaken {
+            offered,
+            why: "the peer offered nothing".into(),
+        });
     }
+    let before = offers.len();
     offers.retain(|o| o.size_bytes <= o.max_size_bytes && o.size_bytes <= room.room_bytes);
+    let unfit = before - offers.len();
 
     // One call for the whole page rather than one per offer: the holder may be another
     // process, and a round trip per offer would make a large page cost more than the
@@ -1318,11 +1334,18 @@ pub fn replication_pass<L: LinkAdapter, H: otwono_store::ReplicaHolder + ?Sized>
         // and nothing needs undoing.
         None => return Ok(ReplicationPass::NotReplicating),
     };
+    let before = offers.len();
     offers.retain(|o| !held.contains(&o.content_id));
+    let dupes = before - offers.len();
 
     offers.sort_by_key(|o| (o.size_bytes, o.content_id.clone()));
     let Some(pick) = offers.first().cloned() else {
-        return Ok(ReplicationPass::NothingTaken { offered });
+        return Ok(ReplicationPass::NothingTaken {
+            offered,
+            why: format!(
+                "nothing left after filtering: {unfit} over a size limit, {dupes} already held"
+            ),
+        });
     };
 
     let fetched = fetch_object(channel, &pick.content_id, link)?;
@@ -1344,7 +1367,10 @@ pub fn replication_pass<L: LinkAdapter, H: otwono_store::ReplicaHolder + ?Sized>
     match holder.take_replica(&fetched.bytes, &policy, now_ms) {
         // Refused between the check and the take -- another thread filled the budget, or
         // the object turned out larger than advertised. Not an error: "not this one".
-        Ok(None) => Ok(ReplicationPass::NothingTaken { offered }),
+        Ok(None) => Ok(ReplicationPass::NothingTaken {
+            offered,
+            why: format!("{} refused by the holder at the take", pick.content_id),
+        }),
         Ok(Some(taken)) => Ok(ReplicationPass::Took {
             content_id: taken.content_id,
             size_bytes: taken.size_bytes,
@@ -1411,7 +1437,12 @@ pub enum CarryPass {
     /// This node carries no mail, or has no room. Nothing was asked.
     NotCarrying,
     /// The peer offered nothing, or nothing this node would take.
-    NothingTaken { offered: usize },
+    ///
+    /// `why` is not decoration. "Took none" alone is the same sentence for a peer with an
+    /// empty bag, a carrier already holding the envelope, and a store refusing on budget,
+    /// and telling those apart from a boot log is the difference between a fix and another
+    /// twenty-five minute run.
+    NothingTaken { offered: usize, why: String },
     /// One envelope was taken into custody until a deadline this node chose.
     Took {
         envelope_id: String,
@@ -1452,27 +1483,46 @@ pub fn carry_pass<L: LinkAdapter, C: otwono_store::Carrier + ?Sized>(
     let mut offers = fetch_carried_index(channel, link, false)?;
     let offered = offers.len();
     if offers.is_empty() {
-        return Ok(CarryPass::NothingTaken { offered });
+        return Ok(CarryPass::NothingTaken {
+            offered,
+            why: "the peer offered nothing".into(),
+        });
     }
 
     // Never take an envelope addressed to this node through the *carriage* path: that is
     // collection, it belongs on the scoped question, and taking custody of one's own mail
     // would leave it sitting in the carriage store instead of being opened.
     let me = channel.local();
+    let before = offers.len();
     offers.retain(|o| o.recipient != me.to_text());
+    let mine = before - offers.len();
+    let before = offers.len();
     offers.retain(|o| o.size_bytes <= room.room_bytes && !o.expires_at_ms.eq(&0));
+    let unfit = before - offers.len();
 
     let ids: Vec<String> = offers.iter().map(|o| o.envelope_id.clone()).collect();
     let held = match carrier.carriage_room(&ids, now_ms) {
         Some(r) => r.already_held,
         None => return Ok(CarryPass::NotCarrying),
     };
+    let before = offers.len();
     offers.retain(|o| !held.contains(&o.envelope_id));
+    let dupes = before - offers.len();
 
     // Soonest deadline first, ties broken by id so the choice is total and deterministic.
     offers.sort_by_key(|o| (o.expires_at_ms, o.envelope_id.clone()));
     let Some(pick) = offers.first().cloned() else {
-        return Ok(CarryPass::NothingTaken { offered });
+        // Which filter emptied the list, by name. Each of these is a different bug when it
+        // is wrong: mail addressed to this node means the collector is not running, an
+        // oversized offer means the budget is misconfigured, and an already-held one means
+        // the pass is repeating work.
+        return Ok(CarryPass::NothingTaken {
+            offered,
+            why: format!(
+                "nothing left after filtering: {mine} addressed to this node, \
+                 {unfit} too large or undated, {dupes} already held"
+            ),
+        });
     };
 
     let envelope = otwono_envelope::Envelope {
@@ -1507,8 +1557,11 @@ pub fn carry_pass<L: LinkAdapter, C: otwono_store::Carrier + ?Sized>(
     }
 
     match carrier.take_custody(&envelope, now_ms) {
-        Ok(None) => Ok(CarryPass::NothingTaken { offered }),
-        Ok(Some(custody)) => Ok(CarryPass::Took {
+        Ok(otwono_store::Took::Declined(why)) => Ok(CarryPass::NothingTaken {
+            offered,
+            why: format!("{} declined: {why}", pick.envelope_id),
+        }),
+        Ok(otwono_store::Took::Custody(custody)) => Ok(CarryPass::Took {
             envelope_id: custody.envelope.envelope_id,
             size_bytes: custody.envelope.size_bytes,
             until_ms: custody.until_ms,

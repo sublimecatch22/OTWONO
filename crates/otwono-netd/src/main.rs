@@ -708,7 +708,12 @@ fn carriage_report(
                 } else if v.get("carrying").and_then(|c| c.as_bool()) == Some(false) {
                     out.push_str(&format!("{node_id} this node carries no mail\n"));
                 } else {
-                    out.push_str(&format!("{node_id} nothing\n"));
+                    // With the reason, when the pass gave one. `nothing` on its own sent a
+                    // previous debugging attempt to the wrong half of the system.
+                    match v.get("why").and_then(|w| w.as_str()) {
+                        Some(why) => out.push_str(&format!("{node_id} nothing: {why}\n")),
+                        None => out.push_str(&format!("{node_id} nothing\n")),
+                    }
                 }
             }
             Err(e) => out.push_str(&format!("{node_id} refused: {}\n", e.message)),

@@ -662,8 +662,8 @@ fn replication_pass_after_dial(state: &Arc<NetState>, candidate: &Candidate) {
             &content_id[..content_id.len().min(16)],
             candidate.claimed_node_id.fingerprint()
         ),
-        Ok(content::ReplicationPass::NothingTaken { offered }) => eprintln!(
-            "otwono-netd: {} offered {offered} object(s) for replication, took none",
+        Ok(content::ReplicationPass::NothingTaken { offered, why }) => eprintln!(
+            "otwono-netd: {} offered {offered} object(s) for replication, took none: {why}",
             candidate.claimed_node_id.fingerprint()
         ),
         Ok(content::ReplicationPass::NotReplicating) => {}
@@ -763,8 +763,8 @@ fn carriage_sweep(state: &Arc<NetState>, turn: &mut usize, last: &mut std::time:
             &envelope_id[..envelope_id.len().min(16)],
             candidate.claimed_node_id.fingerprint()
         ),
-        Ok(content::CarryPass::NothingTaken { offered }) => eprintln!(
-            "otwono-netd: {} offered {offered} envelope(s), took none",
+        Ok(content::CarryPass::NothingTaken { offered, why }) => eprintln!(
+            "otwono-netd: {} offered {offered} envelope(s), took none: {why}",
             candidate.claimed_node_id.fingerprint()
         ),
         Ok(content::CarryPass::NotCarrying) => {}
@@ -1045,11 +1045,12 @@ impl Service for NetService {
                         "schema_version": DESCRIBE_SCHEMA_VERSION,
                         "carrying": false,
                     }),
-                    content::CarryPass::NothingTaken { offered } => json!({
+                    content::CarryPass::NothingTaken { offered, why } => json!({
                         "schema_version": DESCRIBE_SCHEMA_VERSION,
                         "carrying": true,
                         "offered": offered,
                         "taken": Value::Null,
+                        "why": why,
                     }),
                     content::CarryPass::Took {
                         envelope_id,

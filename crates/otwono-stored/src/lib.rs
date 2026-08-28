@@ -1421,16 +1421,14 @@ impl StoreService {
                 "until_ms": held.until_ms,
             })),
             // Named, so an operator reading a log can tell a full machine from a late
-            // envelope from a peer sending nonsense.
+            // envelope from a peer sending nonsense. `declined` is the stable code to match
+            // on; `detail` carries the numbers behind it, because "no_room" without them
+            // does not distinguish an oversized envelope from a full disk.
             Err(why) => Ok(json!({
                 "schema_version": DESCRIBE_SCHEMA_VERSION,
                 "taken": false,
-                "declined": match why {
-                    otwono_envelope::Declined::Expired => "expired",
-                    otwono_envelope::Declined::TooLarge { .. } => "too_large",
-                    otwono_envelope::Declined::NoRoom { .. } => "no_room",
-                    otwono_envelope::Declined::Malformed(_) => "malformed",
-                },
+                "declined": why.code(),
+                "detail": why.to_string(),
             })),
         }
     }

@@ -410,6 +410,11 @@ Type=exec
 ExecStart=/usr/bin/otwono-permd --socket /run/otwono/perm.sock --policy-dir /etc/otwono/policy.d --audit-log /var/log/otwono/audit.jsonl
 Restart=on-failure
 RestartSec=2
+# Errors to the console as well as the journal. Not the routine output — a headless node's
+# console is not a log — but a daemon's refusals are exactly what somebody staring at a
+# serial console needs, and having them journal-only cost a whole QEMU cycle to learn that a
+# carrier had declined an envelope without saying why.
+StandardError=journal+console
 
 NoNewPrivileges=yes
 ProtectSystem=strict
@@ -678,6 +683,11 @@ Type=exec
 ExecStart=/usr/bin/otwono-netd --socket /run/otwono/net.sock --perm-socket /run/otwono/perm.sock --id-socket /run/otwono/id.sock --store-socket /run/otwono/store.sock --export-dir /var/lib/otwono/net-export
 Restart=on-failure
 RestartSec=2
+# Errors to the console as well as the journal. Not the routine output — a headless node's
+# console is not a log — but a daemon's refusals are exactly what somebody staring at a
+# serial console needs, and having them journal-only cost a whole QEMU cycle to learn that a
+# carrier had declined an envelope without saying why.
+StandardError=journal+console
 
 NoNewPrivileges=yes
 ProtectSystem=strict
@@ -987,6 +997,11 @@ Type=exec
 ExecStart=/usr/bin/otwono-stored --socket /run/otwono/store.sock --perm-socket /run/otwono/perm.sock --id-socket /run/otwono/id.sock --store-dir /var/lib/otwono/store --key /var/lib/otwono/storage.key --cache-dir /var/lib/otwono/cache --export-dir /var/lib/otwono/export
 Restart=on-failure
 RestartSec=2
+# Errors to the console as well as the journal. Not the routine output — a headless node's
+# console is not a log — but a daemon's refusals are exactly what somebody staring at a
+# serial console needs, and having them journal-only cost a whole QEMU cycle to learn that a
+# carrier had declined an envelope without saying why.
+StandardError=journal+console
 
 NoNewPrivileges=yes
 ProtectSystem=strict

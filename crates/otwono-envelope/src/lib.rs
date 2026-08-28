@@ -142,6 +142,38 @@ pub enum Declined {
     Malformed(String),
 }
 
+impl Declined {
+    /// The stable short name for the wire and for logs: `expired`, `too_large`, `no_room`,
+    /// `malformed`. Matching on this is what a caller should do; the [`std::fmt::Display`]
+    /// text is for a human and may change.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Declined::Expired => "expired",
+            Declined::TooLarge { .. } => "too_large",
+            Declined::NoRoom { .. } => "no_room",
+            Declined::Malformed(_) => "malformed",
+        }
+    }
+}
+
+impl std::fmt::Display for Declined {
+    /// The numbers, not just the name. `no_room` on its own tells an operator nothing about
+    /// whether the envelope was enormous or the disk was full, and a refusal that cannot be
+    /// diagnosed from a log line costs a whole run to reproduce.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Declined::Expired => write!(f, "expired"),
+            Declined::TooLarge { size_bytes, ceiling_bytes } => {
+                write!(f, "too_large: {size_bytes} bytes, ceiling {ceiling_bytes}")
+            }
+            Declined::NoRoom { size_bytes, room_bytes } => {
+                write!(f, "no_room: {size_bytes} bytes, {room_bytes} free")
+            }
+            Declined::Malformed(why) => write!(f, "malformed: {why}"),
+        }
+    }
+}
+
 /// What a node is willing to carry for other people.
 ///
 /// Held by the carrier, never sent by the sender — which is the whole point of ADR-0028 §2.

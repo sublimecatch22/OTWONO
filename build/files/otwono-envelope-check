@@ -131,7 +131,14 @@ case "$node_ordinal" in
         # After the first minute, ask directly as well. If the sweep is what delivered it the
         # marker is already printed; if it is not, this says so and the difference is visible
         # in the timing rather than hidden.
-        [ "$i" -gt 12 ] && otwono-netd --carry --socket /run/otwono/net.sock >/dev/null 2>&1
+        #
+        # The reply is printed, not discarded. A carry pass now names why it took nothing —
+        # a peer with an empty bag, an envelope already held, a store refusing on budget —
+        # and throwing that away is what made the previous failure cost a run to diagnose.
+        if [ "$i" -gt 12 ]; then
+            carry_out=$(otwono-netd --carry --socket /run/otwono/net.sock 2>&1) || carry_out="carry pass failed: $carry_out"
+            [ -n "$carry_out" ] && echo "OTWONO-ENVELOPE-STEP carry: $(echo "$carry_out" | tr '\n' ';')"
+        fi
         i=$((i + 1))
         sleep 5
     done
