@@ -14,3 +14,15 @@ otwono-identity = { workspace = true }
 otwono-proto = { workspace = true }
 serde_json = { workspace = true }
 data-encoding = "2"
+
+[dev-dependencies]
+# For the end-to-end test, which runs the real binary against real daemons. Dev-only: a CLI
+# must not link the daemons it talks to — it is a control-plane client like any other, and
+# linking them would make that a claim rather than a fact.
+otwono-permd = { workspace = true }
+otwono-stored = { workspace = true }
+otwono-store = { workspace = true }
+otwono-idd = { workspace = true }
+otwono-identity = { workspace = true }
+otwono-proto = { workspace = true }
+serde_json = { workspace = true }

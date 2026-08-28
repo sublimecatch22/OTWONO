@@ -5487,3 +5487,71 @@ because node 2 had spent the whole previous phase failing to reach the powered-o
   exercised here.
 - **The break was seconds to minutes, not hours**, and no envelope expired during it.
 - **amd64 only**, TCG, one vCPU per guest.
+
+## 2026-08-28 — a wiki page read on another node, and all three exit clauses in one run
+
+**STATUS: VERIFIED.** amd64, QEMU, TCG, three nodes. Image built from `998732e` with
+`MESH_CONTENT_SMOKE=1`. Phase 6's **first** exit criterion clause — *node A's wiki page is
+readable on node B* — and the first run in which all three clauses are asserted together.
+
+```
+  OTWONO-WIKI-OK node=1/3 wrote=3390b22d… read_from=otw128g0qtngc… their_revision=9b76c2e4… bytes=69
+  OTWONO-WIKI-OK node=2/3 wrote=9b76c2e4… read_from=otw128gbj78vm… their_revision=3390b22d… bytes=69
+  OTWONO-WIKI-OK node=3/3 wrote=9b1dd0df… read_from=otw128g0qtngc… their_revision=9b76c2e4… bytes=69
+  OTWONO-ENVELOPE-DROPPED envelope=7cc614ad… freed=87
+  OTWONO-PARTITION-WROTE id=c2f0243e…
+  OTWONO-PARTITION-CONVERGED id=c2f0243e… bytes=62
+  both nodes name the same object after the heal
+```
+
+Each node's `their_revision` is another node's `wrote`: real cross-reads, not a node handed
+its own page back. Node 3's marker comes from its second boot, after the store-and-forward
+phase powered it off — so that write also shows a chain extended across a power cycle, since
+`may_extend` had to accept the node's own earlier revision as a parent.
+
+### What a wiki page crossing is, that a pointer crossing is not
+
+Two nodes have resolved each other's `wiki/Getting-Started` since 2026-08-27. What that named
+was an opaque blob: the pointer primitive, tested, and not a wiki. A page is three fetches and
+three checks —
+
+- the **pointer**, verified by `otwono-netd` against the key the handshake proved and against
+  the rollback rules;
+- the **revision**, verified on its own signature against that same key, because the pointer
+  vouches for *which id is current* and says nothing about what that id contains — a serving
+  node could otherwise publish a pointer to a revision it did not write;
+- the **body**, which is what a person reads.
+
+The check refuses a read that comes back byte-identical to the reader's own page, so a peer
+serving the wrong thing is visible rather than flattering.
+
+### The two failures it took to get here, both worth the runs
+
+**A name is not proof of a page.** The first booted run wrote a page whose history came back
+`truncated` for ever after. `otwono-wikictl write` had taken whatever `wiki/<name>` pointed at
+as the new revision's parent — and the mesh content check publishes `wiki/Getting-Started`
+naming a plain text blob, deliberately, because it exercises the pointer primitive. A head is
+now adopted only once it parses as a revision *of this page* (`otwono_wiki::may_extend`), and
+the write is refused rather than quietly restarted, since ignoring the head would move a name
+somebody else is using.
+
+**Resource temporarily unavailable is a timeout.** The next run died in the *content* check
+with `a put returned no content id`, preceded by `perm.request transport failure: Resource
+temporarily unavailable (os error 11)` on two daemons. That reads like a full listen backlog.
+It is how a Unix socket read timeout surfaces: `otwono-permd` took longer than the
+fifteen-second default with a fourth boot check now in the image. A timed-out call now names
+the window it exceeded, and `connect_waiting` carries its patience into the call — a caller
+willing to spend thirty seconds finding a socket is on a slow machine, and answering it on the
+default times out a daemon that is merely queued. No `did not answer within` appeared anywhere
+in this run.
+
+### What this does not show
+
+- **One page, one revision each, 69 bytes.** No page with a long history has crossed, and no
+  reader has walked a *peer's* chain — `history` answers only for revisions this node
+  authored, because there is nowhere yet to look a peer's key up from a terminal.
+- **No `onm://` resolver and no rendering.** `DISTRIBUTED-SERVICES.md` §3's local resolver and
+  browser integration are not built, so a page is readable by a command and not by a browser.
+- **No multi-writer merge**, which ADR-0032 §7 leaves open deliberately: `onm://<nodeid>/…`
+  gives each page one writer, so two nodes editing one page is not a thing that can happen.
+- **amd64 only**, TCG, one vCPU per guest, as every run before it.

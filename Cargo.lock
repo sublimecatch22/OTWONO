@@ -1539,9 +1539,13 @@ name = "otwono-wikictl"
 version = "0.1.0"
 dependencies = [
  "data-encoding",
+ "otwono-idd",
  "otwono-identity",
+ "otwono-permd",
  "otwono-pointer",
  "otwono-proto",
+ "otwono-store",
+ "otwono-stored",
  "otwono-wiki",
  "serde_json",
 ]

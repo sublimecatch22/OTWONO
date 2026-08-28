@@ -315,7 +315,7 @@ with convergence asserted.
 
 | Clause | State |
 |---|---|
-| A's wiki page readable on B | not started; no service is built |
+| A's wiki page readable on B | `VERIFIED` 2026-08-28 — one page each, no resolver |
 | an offline message to C delivered when C returns | `VERIFIED` 2026-08-28, see `CARRIAGE.md` |
 | a partition heals with convergence asserted | `VERIFIED` 2026-08-28, one break, one writer |
 
