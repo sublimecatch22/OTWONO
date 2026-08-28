@@ -187,23 +187,44 @@ case "$node_ordinal" in
 3)
     # --- recipient ---------------------------------------------------------------------
     # On the first boot there is nothing to collect: the sender has not sealed yet, and will
-    # not until this node is gone. The stamp is what tells the two boots apart.
+    # not until this node is gone. The stamp records that this node has been here before.
+    #
+    # It is deliberately not *relied* on. This unit is ordered after the content check, and
+    # on the slowest node — which is this one, being last in the ordinal order — the harness
+    # can power the machine off in the seconds between that check finishing and this one
+    # starting. Then the second boot finds no stamp, reports "first boot", and the run fails
+    # for a reason that has nothing to do with store-and-forward.
+    #
+    # So what makes it the second boot is that a carrier is holding something, not that a
+    # file exists. Either way this node asks; the stamp only decides whether finding nothing
+    # is news. A first boot that has genuinely nothing to collect costs one short window and
+    # is powered off in the middle of it anyway.
+    was_here=1
     if [ ! -f "$STAMP" ]; then
+        was_here=0
         : > "$STAMP"
-        echo "OTWONO-ENVELOPE-SKIP first boot; the sender seals once this node is away"
-        exit 0
     fi
+    attempts=240
+    [ "$was_here" -eq 0 ] && attempts=12
+
     step "collecting what a carrier is holding for this node"
     collected=""
+    out=""
     i=0
-    while [ "$i" -lt 120 ]; do
+    while [ "$i" -lt "$attempts" ]; do
         out=$(otwono-netd --collect --socket /run/otwono/net.sock 2>&1)
         collected=$(echo "$out" | awk '$2 == "collected" { print $3; exit }')
         [ -n "$collected" ] && break
         i=$((i + 1))
         sleep 5
     done
-    [ -n "$collected" ] || fail "collected nothing within the window; last reply: $out"
+    if [ -z "$collected" ]; then
+        [ "$was_here" -eq 0 ] && {
+            echo "OTWONO-ENVELOPE-SKIP nothing held for this node yet; the sender seals once this node is away"
+            exit 0
+        }
+        fail "collected nothing within the window; last reply: $out"
+    fi
 
     # Collected is not enough: the point is that the recipient can *read* it, which needs the
     # key that was sealed to this node and nobody else (ADR-0019).
