@@ -303,10 +303,11 @@ pub trait Inbox {
 
     /// Whether this node already holds `content_id`.
     ///
-    /// The reason a sweep can run on a timer at all. A carrier keeps an envelope until it
-    /// expires even after handing it over — drop on delivery is not implemented (ADR-0028
-    /// §7) — so without this a recipient would re-download the same mail on every pass,
-    /// for ever.
+    /// The reason a sweep can run on a timer at all. Drop on delivery (ADR-0028 §7) is best
+    /// effort: a carrier that refuses the release, answers something else, or never hears it
+    /// keeps the envelope to its deadline and keeps offering it. Without this a recipient
+    /// would re-download the same mail on every pass until then, and this is the only thing
+    /// that stops it.
     fn holds(&self, content_id: &str) -> bool;
 
     /// Keep a collected envelope where its recipient can open it.

@@ -7,10 +7,15 @@
 ## Context
 
 `otwono-netd` collects mail addressed to this node on a timer (ADR-0028 §9, `CARRIAGE.md`
-§3a). A carrier keeps an envelope until it expires **even after handing it over** — drop on
-delivery is named in ADR-0028 §7 and is not built — so a sweep that did not check what it
-already had would re-download the same message every thirty seconds for as long as the
-sender's expiry allowed. Nothing would be corrupted; `store.accept_shared` is
+§3a). At the time of this decision a carrier kept an envelope until it expired **even after
+handing it over** — drop on delivery was named in ADR-0028 §7 and not built — so a sweep that
+did not check what it already had would re-download the same message every thirty seconds for
+as long as the sender's expiry allowed.
+
+Drop on delivery was built afterwards, and it does not retire this. The release is best
+effort: a carrier that refuses it, answers something else, or never hears it keeps the
+envelope to its deadline and keeps offering it. `store.holds` is what stops the sweep
+re-fetching in exactly that case, and it is the only thing that does. Nothing would be corrupted; `store.accept_shared` is
 content-addressed and idempotent. It would simply cost bandwidth for ever, and it would
 amplify: one envelope with a week-long expiry is twenty thousand fetches.
 

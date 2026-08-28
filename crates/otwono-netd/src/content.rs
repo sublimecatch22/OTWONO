@@ -1941,10 +1941,11 @@ pub fn collect_addressed<L: LinkAdapter>(
                 "a carrier offered mail addressed to somebody else".into(),
             ));
         }
-        // Already open on this node's disk. A carrier holds an envelope until it expires even
-        // after handing it over, because drop on delivery is not implemented (ADR-0028 §7),
-        // so a sweep that did not check this would re-download the same message every pass
-        // for as long as the sender's expiry allowed.
+        // Already open on this node's disk. Drop on delivery (ADR-0028 §7) usually means the
+        // carrier stops offering it, but the release is best effort — a carrier that refuses
+        // it, answers something else, or never hears it keeps the envelope to its deadline
+        // and keeps offering it. This check is what stops the sweep re-downloading the same
+        // message every pass until then.
         if inbox.holds(&entry.envelope_id) {
             continue;
         }

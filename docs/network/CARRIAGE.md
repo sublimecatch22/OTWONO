@@ -125,7 +125,7 @@ Three things a sweep needs that a command does not:
 
 | | |
 |---|---|
-| **Not re-download** | A carrier holds an envelope until it expires even after handing it over — §7's drop on delivery is not built — so a sweep that did not check would refetch the same message every thirty seconds until the sender's expiry ran out. `Inbox::holds` is the check. |
+| **Not re-download** | §3b's release is best effort, so a carrier that refuses it, answers something else or never hears it keeps the envelope to its deadline and keeps offering it. A sweep that did not check would refetch the same message every thirty seconds until then. `Inbox::holds` is the check, and in that case the only one. |
 | **Not need `store.read`** | `otwono-netd` is the Z3 hostile-input daemon and does not hold it. So the check is `store.holds`, which answers one **named** content id with a bool and nothing else, guarded by `store.write`. That is the authority to avoid a redundant write, not the authority to read the store — see ADR-0030. |
 | **Not ask when it cannot keep** | `Inbox::accepting` is checked before the connect, as carriage checks its budget before the connect. A node that dialled and then found it had nowhere to put the mail would have told a carrier it was interested for nothing. |
 
