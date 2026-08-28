@@ -58,7 +58,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: npm ci
-      - run: npm run desktop:build -- --bundles deb
+      - run: npm run desktop:build:linux
       - name: Collect
         run: |
           mkdir -p artefacts
@@ -84,7 +84,7 @@ jobs:
       - run: npm ci
       # The installers are unsigned. Signing needs a certificate the project
       # owner must provide; see docs/RELEASE.md.
-      - run: npm run desktop:build -- --bundles nsis,msi
+      - run: npm run desktop:build:windows
       - name: Collect
         shell: pwsh
         run: |
@@ -111,7 +111,7 @@ jobs:
       - run: npm ci
       # Unsigned and un-notarised; users must right-click → Open on first
       # launch until the owner provides a Developer ID. See docs/RELEASE.md.
-      - run: npm run desktop:build -- --bundles dmg
+      - run: npm run desktop:build:macos
       - name: Collect
         run: |
           mkdir -p artefacts

@@ -24,7 +24,10 @@
     "verify": "npm run format:check && npm run typecheck && npm run test && npm run rust:lint && npm run rust:test",
     "desktop:dev": "npm run dev --workspace @otwono/desktop",
     "desktop:build": "npm run build --workspace @otwono/desktop",
-    "service": "cargo run -p otwono-local-service"
+    "service": "cargo run -p otwono-local-service",
+    "desktop:build:linux": "npm run build:linux --workspace @otwono/desktop",
+    "desktop:build:windows": "npm run build:windows --workspace @otwono/desktop",
+    "desktop:build:macos": "npm run build:macos --workspace @otwono/desktop"
   },
   "devDependencies": {
     "@playwright/test": "1.49.1",

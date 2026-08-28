@@ -38,20 +38,28 @@ echo "== WordPress plugin =="
 echo
 echo "== Desktop application =="
 platform="$(uname -s)"
-bundles=""
+# One npm script per platform rather than a forwarded flag: npm treats an
+# unknown `--flag value` pair as its own config, so the flag never arrives.
+bundle_script=""
 case "$platform" in
-  Linux)  bundles="deb" ;;
-  Darwin) bundles="dmg,app" ;;
+  Linux)  bundle_script="desktop:build:linux" ;;
+  Darwin) bundle_script="desktop:build:macos" ;;
   *)      echo "  Unrecognised platform $platform; skipping the desktop bundle." ;;
 esac
 
-if [[ -n "$bundles" ]]; then
-  if npm run desktop:build -- --bundles "$bundles"; then
+if [[ -n "$bundle_script" ]]; then
+  if npm run "$bundle_script"; then
     find target/release/bundle -type f \( -name '*.deb' -o -name '*.AppImage' -o -name '*.dmg' \) \
       -exec cp {} "$out/" \;
   else
     echo "  The desktop bundle failed. The rest of the release folder is still valid." >&2
   fi
+fi
+
+if [[ -f "$root/RELEASE_NOTES.md" ]]; then
+  cp "$root/RELEASE_NOTES.md" "$out/"
+else
+  echo "  RELEASE_NOTES.md is missing; write it before publishing." >&2
 fi
 
 echo
