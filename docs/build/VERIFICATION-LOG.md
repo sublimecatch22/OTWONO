@@ -5138,3 +5138,43 @@ hostile-input daemon and a collection sweep is not a reason to hand it the user'
   nodes some node routinely has nothing sealed to it and spends ten minutes proving so. Now
   commented at the step rather than rediscovered each time.
 
+## 2026-08-28 — the discovery step is an assertion now, and the run is seven minutes shorter
+
+**STATUS: VERIFIED.** amd64, QEMU, TCG, no `/dev/kvm`, three nodes. Image built from
+`8292232`. A harness change with no product code in it, run because it gates every phase of
+every three-node run.
+
+Three runs in a row ended with one node reporting `discovered=none` after spending the full
+six-hundred-second retry window. Each time it looked like a failure in ADR-0020's discovery
+and each time it was not: every node sealed to **one** peer, chosen by `--peer-binding` with
+no `--peer`, which takes whichever the peer table ordered first. On three nodes that is not a
+permutation — two nodes can pick the same third — so some node routinely had nothing sealed
+to it, discovered nothing, and was right to.
+
+Now every node seals to every connected peer, so finding nothing means something is wrong and
+the step says so instead of tolerating it. All three nodes discovered, all three distinct:
+
+```
+n1: discovered=d1202fd3b8c21da940888d09c6fb61cda292f37c0216be6d21e8afa31b4b0a1d
+n2: discovered=a8dc4515361b50282e5eaf8a32ff24f1163ead233f241aa11a7b030255396fe6
+n3: discovered=1a6181ee9fe97ede3c4654073fc07849b980be3ba7bef5a41a851c908f0d0cf6
+```
+
+The step resolved in **seven seconds** where it had been taking six hundred. Node 3's whole
+check finished at guest t=549s against t=998s on the previous run.
+
+Store-and-forward re-verified on the same run, both halves unprompted again and with zero
+`collect by hand` lines — the second consecutive run of that, now with the sender sealing at
+t=638s rather than t=1059s.
+
+### What this does not show
+
+- **It is still one arbitrary peer for the binding assertions.** The tampered-signature
+  refusal and the open-it-back check run against a single peer, as before; only the sealing
+  that discovery depends on is exhaustive.
+- **The retry window is unchanged and still needed.** The nodes run the check with no barrier
+  between them, so a node can reach discovery before its peers have sealed. Seven seconds is
+  what it costs when they have; it is not a bound.
+- Everything the previous two entries record as unshown is still unshown: drop on delivery,
+  a second hop, expiry on a booted node, clock skew, arm64.
+
