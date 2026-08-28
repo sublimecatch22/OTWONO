@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://otwono.org/schemas/wiki-revision-1.0.0.json",
+  "title": "OTWONO Wiki Revision",
+  "description": "One signed revision of a wiki page (ADR-0032). A page's current state is a signed mutable pointer under the service namespace 'wiki'; what the pointer names is a revision, and each revision names its parent, so the page is a chain and the pointer names its head. Every revision is signed and not only the head: history is walked by fetching parents, and a peer serving the chain could otherwise substitute an ancestor -- content addressing stops the bytes being altered, but the id is only as good as whatever vouches for it, and nothing does once a reader steps off the head.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "page",
+    "body",
+    "author",
+    "written_at_ms",
+    "signature"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$"
+    },
+    "page": {
+      "type": "string",
+      "description": "The page this revision belongs to, matching the pointer's name. Carried inside the signed record rather than inferred from where the revision was found: a revision lifted from one page and served under another would otherwise still verify, which is the mistake ADR-0027 §6 refuses for a pointer's service namespace.",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[^\\u0000-\\u001f/]+$"
+    },
+    "body": {
+      "type": "string",
+      "description": "Content id of the page text. Held separately from the revision so identical text costs one copy, and so the body is fetched, cached and replicated by the machinery that already exists rather than by anything new.",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "parent": {
+      "type": "string",
+      "description": "Content id of the previous revision. Absent on the first revision of a page, which is what terminates a history walk. Not trusted to be older -- 'older' is not something the record can prove; a reader checks that the chain terminates and does not revisit an id it has already seen, so a cycle is a malformed page rather than a hang.",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "author": {
+      "type": "string",
+      "description": "Who wrote it, as NodeId::to_text produces it. Equal to the pointer's owner for a page in its own namespace, and deliberately NOT equal once a page has been copied from elsewhere -- that inequality is how provenance survives a copy.",
+      "pattern": "^otw1[0-9abcdefghjkmnpqrstvwxyz]{55}$"
+    },
+    "written_at_ms": {
+      "type": "integer",
+      "description": "Unix milliseconds, as the author's clock read them. Shown to people and NEVER used for ordering: a mesh with no NTP guarantee cannot order by wall clock, which is the same rule ADR-0027 §5 applies to a pointer's published_at_ms. The order of a page's history is the parent chain and nothing else.",
+      "minimum": 0
+    },
+    "signature": {
+      "type": "string",
+      "description": "Base64 Ed25519 over APPLICATION_DOMAIN || WIKI_REVISION_DOMAIN || canonical JSON of this record with 'signature' removed. Domain-separated so a signature over some other OTWONO record can never be replayed as a revision. Empty on a record that has not been signed yet.",
+      "contentEncoding": "base64"
+    }
+  }
+}

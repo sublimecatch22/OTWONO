@@ -28,6 +28,7 @@ members = [
     "crates/otwono-agentctl",
     "crates/otwono-envelope",
     "crates/otwono-pointer",
+    "crates/otwono-wiki",
     "tests/schema",
     "tests/control-plane",
 ]
