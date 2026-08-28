@@ -4,5 +4,35 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Agent templates, tools, orchestration and verification for OTWONO AI."
+
+[lints]
+workspace = true
 
 [dependencies]
+otwono-types.workspace = true
+otwono-store.workspace = true
+otwono-permissions.workspace = true
+otwono-providers.workspace = true
+otwono-knowledge.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+reqwest.workspace = true
+futures-util.workspace = true
+async-trait = "0.1"
+
+[features]
+# Exposes a scripted `AgentExecutor` so orchestration can be tested without a
+# model. Never enabled by the application's own builds.
+test-support = []
+
+[dev-dependencies]
+otwono-agent-core = { path = ".", features = ["test-support"] }
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

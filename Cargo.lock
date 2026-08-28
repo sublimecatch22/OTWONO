@@ -1490,6 +1490,26 @@ dependencies = [
 [[package]]
 name = "otwono-agent-core"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "futures-util",
+ "otwono-agent-core",
+ "otwono-knowledge",
+ "otwono-permissions",
+ "otwono-providers",
+ "otwono-store",
+ "otwono-types",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "url",
+]
 
 [[package]]
 name = "otwono-desktop"
