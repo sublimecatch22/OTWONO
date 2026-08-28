@@ -531,6 +531,29 @@ impl NetState {
         &self,
         candidate: &Candidate,
     ) -> Result<content::PeerSource<TcpLink>, String> {
+        // Every failure path records the failure, the same discipline `dial` already has and
+        // for a sharper reason. `retry_candidates` returns peers that are `Discovered` or
+        // `Failed`, never `Connected`, so a peer that dies while connected is dialled by the
+        // sweeps, fails every time, and is *never demoted* — it stays "connected" for the
+        // life of the process. `net.peers` then reports a machine that is switched off as
+        // connected, and every sweep works from that. Seen on a three-node run: node 3 was
+        // powered down, both survivors logged `No route to host` against it every cycle, and
+        // both kept printing `connected=2`.
+        let result = self.open_content_channel_inner(candidate);
+        if let Err(e) = &result {
+            let now = self.now();
+            self.peers
+                .lock()
+                .unwrap()
+                .record_failure(&candidate.claimed_node_id, e.clone(), now);
+        }
+        result
+    }
+
+    fn open_content_channel_inner(
+        &self,
+        candidate: &Candidate,
+    ) -> Result<content::PeerSource<TcpLink>, String> {
         // The address, not just the error. "connect: Connection refused" says a peer is
         // unreachable and nothing about *where* this node tried, which on a mesh where the
         // address came from an advertisement is the only fact that matters -- a stale entry,

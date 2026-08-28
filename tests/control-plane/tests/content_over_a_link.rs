@@ -2441,3 +2441,55 @@ fn the_envelope_ceiling_fits_what_a_carrier_can_actually_keep() {
         otwono_stored::MAX_INLINE_BYTES
     );
 }
+
+/// A peer that cannot be reached stops being reported as connected.
+///
+/// `retry_candidates` returns peers that are `Discovered` or `Failed` and never `Connected`,
+/// so a peer that dies while connected is in a state nothing moves it out of: the sweeps
+/// dial it, fail, and leave it exactly where it was. It stays "connected" for the life of
+/// the process, `net.peers` reports a switched-off machine as connected, and everything that
+/// reads `connected()` works from that.
+///
+/// Seen on a three-node run. Node 3 was powered down; both survivors logged
+///
+/// ```text
+/// carry pass with otw1:wc6h-… failed: connect to 169.254.71.187:8443:
+///   link I/O failed: No route to host (os error 113)
+/// ```
+///
+/// every cycle, and both went on printing `connected=2`.
+#[test]
+fn a_peer_that_stops_answering_stops_being_connected() {
+    let h = Harness::start("unreachable-peer");
+
+    // Connected for real, so the state under test is reached the way it is on a node.
+    let live = h.candidate();
+    h.client.dial(&live).expect("the first dial authenticates");
+    assert_eq!(
+        h.client.peers.lock().unwrap().connected().len(),
+        1,
+        "the premise: the peer is connected"
+    );
+
+    // Now it is gone. A port nothing listens on stands in for a machine that was powered
+    // off: what reaches this node either way is a failed connect.
+    let gone = Candidate {
+        claimed_node_id: live.claimed_node_id,
+        address: "127.0.0.1:1".parse().unwrap(),
+    };
+    assert!(
+        h.client.open_content_channel(&gone).is_err(),
+        "a dial to a dead address must not succeed"
+    );
+
+    assert!(
+        h.client.peers.lock().unwrap().connected().is_empty(),
+        "a peer that could not be reached is still being reported as connected"
+    );
+    // And it is a retry candidate again, so it comes back when the machine does.
+    assert_eq!(
+        h.client.peers.lock().unwrap().retry_candidates().len(),
+        1,
+        "a failed peer must be redialled, or the mesh never heals"
+    );
+}
