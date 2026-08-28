@@ -1146,7 +1146,7 @@ impl otwono_store::Carrier for BrokeredCarrier {
     fn take_custody(
         &self,
         envelope: &otwono_envelope::Envelope,
-        _now_ms: u64,
+        now_ms: u64,
     ) -> Result<otwono_store::Took, String> {
         let reply = self.call(
             "envelope.take",
@@ -1169,8 +1169,13 @@ impl otwono_store::Carrier for BrokeredCarrier {
             .get("until_ms")
             .and_then(Value::as_u64)
             .ok_or("envelope.take said taken but named no deadline")?;
+        // `now_ms`, not `until_ms`. The deadline is the store's answer; the moment custody
+        // began is this caller's, and passing the deadline for both made the returned record
+        // say custody started when it ends. The record the store writes was always right —
+        // this was only ever a lie in a value handed back — but a value that disagrees with
+        // the one on disk is a thing somebody will eventually believe.
         Ok(otwono_store::Took::Custody(otwono_envelope::Custody::taken(
-            envelope, until_ms, until_ms,
+            envelope, now_ms, until_ms,
         )))
     }
 }
