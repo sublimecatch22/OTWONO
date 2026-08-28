@@ -109,4 +109,20 @@ grep -q "^This is node " "$WORK/theirs.md" \
 cmp -s "$WORK/mine.md" "$WORK/theirs.md" \
     && fail "the peer served this node's own page back to it"
 
-echo "OTWONO-WIKI-OK node=$node_ordinal/$node_total wrote=$mine read_from=$peer their_revision=${theirs:-unknown} bytes=$(wc -c < "$WORK/theirs.md")"
+# And walk their history, which is a different thing from taking their head. The pointer
+# vouches for the head alone, so every ancestor arrives from the same peer with nothing behind
+# it but that peer's word — this is the path that verifies each one against the key the
+# handshake proved (ADR-0032).
+#
+# `end: complete` is the assertion. A peer that served an ancestor it could not vouch for
+# would fail the walk outright; one that served none would come back truncated, which is a
+# true answer and not this one, because every node here wrote its page from nothing and its
+# history is one revision long.
+step "walking the peer's history"
+their_history=$(otwono-wikictl history Wiki-Check --from "$peer" 2>&1) \
+    || fail "walking $peer's history failed: $their_history"
+echo "$their_history" | grep -q "^end: complete" \
+    || fail "$peer's history did not come back complete: $their_history"
+their_steps=$(echo "$their_history" | grep -c "^[0-9a-f]\{64\} body=") || their_steps=0
+
+echo "OTWONO-WIKI-OK node=$node_ordinal/$node_total wrote=$mine read_from=$peer their_revision=${theirs:-unknown} bytes=$(wc -c < "$WORK/theirs.md") their_history=$their_steps"
