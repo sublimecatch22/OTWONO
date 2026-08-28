@@ -88,6 +88,11 @@ decision = "allow"
 ttl_seconds = 300
 
 [[rule]]
+action = "envelope.carry"
+decision = "allow"
+ttl_seconds = 300
+
+[[rule]]
 action = "store.read"
 decision = "deny"
 "#;
@@ -165,11 +170,13 @@ impl Harness {
         // on its neighbours' behalf never share a path (ADR-0015).
         let cache = otwono_store::Cache::at(dir.join("cache"), StorageKey::generate(), 8 << 20).unwrap();
         let pointers = otwono_store::PointerStore::at(dir.join("pointers")).unwrap();
+        let envelopes = otwono_store::EnvelopeStore::at(dir.join("envelopes")).unwrap();
         let service = Arc::new(
             StoreService::new(store, perm_socket.clone())
                 .with_identity(id_socket.clone())
                 .with_cache(cache)
-                .with_pointers(pointers),
+                .with_pointers(pointers)
+                .with_envelopes(envelopes, 8 << 20),
         );
         let s = shutdown.clone();
         let server = Server::bind(&store_socket).unwrap();
@@ -1873,4 +1880,90 @@ fn a_pointer_is_served_after_the_responder_has_spent_a_token() {
         .expect("a second pointer fetch")
         .expect("still published");
     assert_eq!(again.sequence, found.sequence);
+}
+
+/// A carrier offers what it holds, over a responder that has already served content.
+///
+/// This is the test for a failure that is **invisible by design**, which is why it cost a
+/// three-node run to find. `envelope.held` is guarded by `envelope.carry` and not by
+/// `store.serve`, because ADR-0028 §8 made carrying mail a different agreement from serving
+/// content. The responder was asking with its cached serve token, and an index question
+/// answers a denial with an *empty page* — the same answer a node with nothing gives,
+/// deliberately, so that asking cannot reveal whether a node carries at all (ADR-0020).
+///
+/// So the wrong token produced a carrier that looked exactly like an empty one, to itself and
+/// to every peer, and the only symptom anywhere was "offered 0 envelope(s)" in a journal.
+#[test]
+fn a_carrier_offers_what_it_holds_after_serving_ordinary_content() {
+    use otwono_net::content::{Request, Response};
+
+    let h = Harness::start("carriage-offer");
+
+    // Something for the serving node to carry, taken into custody through the control plane
+    // exactly as `envelope-send` and the carry pass both do.
+    let recipient = NodeIdentity::generate().unwrap();
+    let envelope = otwono_envelope::Envelope::new(
+        &"cd".repeat(32),
+        recipient.node_id(),
+        4096,
+        otwono_identity::now_unix_ms() + 60 * 60 * 1000,
+    );
+    let mut store = Client::connect(&h.store_socket).unwrap();
+    let taken = store
+        .call_with_capability(
+            "envelope.take",
+            json!({ "envelope": envelope }),
+            &h.token("envelope.carry"),
+        )
+        .unwrap()
+        .expect("the node takes custody");
+    assert_eq!(taken["taken"], json!(true));
+
+    // Spend a token on the ordinary content path first, so the responder's cached
+    // `store.serve` token is the one it would reach for next. Without this the test can pass
+    // with the wrong capability.
+    let object = h.put(b"served before anyone asks about carriage", "public");
+    h.client
+        .fetch_from(&h.candidate(), &object)
+        .expect("an ordinary fetch");
+
+    // Now ask the carriage question over a fresh channel, as a carry pass does.
+    let source = h.client.open_content_channel(&h.candidate()).unwrap();
+    let otwono_netd::content::PeerSource { mut channel, .. } = source;
+    let frame = serde_json::to_vec(&Request::Relayable {
+        after: None,
+        max_entries: 32,
+    })
+    .unwrap();
+    channel.send(&frame).unwrap();
+    let reply: Response = otwono_net::content::decode(&channel.recv().unwrap()).unwrap();
+    let Response::Carried(page) = reply else {
+        panic!("a carriage question must be answered with a carriage page, got {reply:?}");
+    };
+    assert_eq!(
+        page.entries.len(),
+        1,
+        "the carrier holds one envelope and offered {} — an empty page here is what a denied \
+         capability looks like, which is exactly the bug this test exists for",
+        page.entries.len()
+    );
+    assert_eq!(page.entries[0].envelope_id, envelope.envelope_id);
+    assert_eq!(page.entries[0].recipient, recipient.node_id().to_text());
+
+    // And the scoped question tells a different node nothing about it (ADR-0028 §9).
+    let frame = serde_json::to_vec(&Request::AddressedToMe {
+        after: None,
+        max_entries: 32,
+    })
+    .unwrap();
+    channel.send(&frame).unwrap();
+    let reply: Response = otwono_net::content::decode(&channel.recv().unwrap()).unwrap();
+    let Response::Carried(scoped) = reply else {
+        panic!("expected a carriage page, got {reply:?}");
+    };
+    assert!(
+        scoped.entries.is_empty(),
+        "the asking node is not the recipient and must be told nothing: {:?}",
+        scoped.entries
+    );
 }

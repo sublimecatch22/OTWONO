@@ -514,7 +514,16 @@ impl NetState {
         Ok((meta, report, exported.path))
     }
 
-    fn open_content_channel(&self, candidate: &Candidate) -> Result<content::PeerSource<TcpLink>, String> {
+    /// Dial a peer and authenticate it, returning a channel ready for content requests.
+    ///
+    /// Public because it is the seam every method above sits on — `fetch_from`,
+    /// `pointer_from`, `replicate_from`, `carry_from` and `collect_from` are all this plus one
+    /// exchange — and a test that needs to send one request without a wrapper around it
+    /// should use the same dialling and the same authentication, not a second copy of them.
+    pub fn open_content_channel(
+        &self,
+        candidate: &Candidate,
+    ) -> Result<content::PeerSource<TcpLink>, String> {
         // The address, not just the error. "connect: Connection refused" says a peer is
         // unreachable and nothing about *where* this node tried, which on a mesh where the
         // address came from an advertisement is the only fact that matters -- a stale entry,

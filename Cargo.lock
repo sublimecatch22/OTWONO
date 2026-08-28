@@ -1228,6 +1228,7 @@ dependencies = [
  "otwono-ai",
  "otwono-aid",
  "otwono-capability",
+ "otwono-envelope",
  "otwono-fetch",
  "otwono-fetchd",
  "otwono-hal",

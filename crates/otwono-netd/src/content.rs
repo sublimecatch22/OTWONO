@@ -409,7 +409,7 @@ impl ContentResponder {
             Some(peer) => json!({ "recipient": peer.to_text() }),
             None => json!({}),
         };
-        let reply = self.call_store("envelope.held", params)?;
+        let reply = self.call_store_as(otwono_stored::CAPABILITY_CARRY, "envelope.held", params)?;
         let entries = reply.get("entries")?.as_array()?;
         entries
             .iter()
@@ -664,6 +664,33 @@ impl ContentResponder {
             }
         }
         None
+    }
+
+    /// One guarded call to `otwono-stored` under a capability that is **not** `store.serve`.
+    ///
+    /// `call_store` carries the cached serve token, which is right for every content question
+    /// and wrong for carriage: ADR-0028 §8 deliberately made carrying mail a different
+    /// agreement from serving content, so `envelope.held` is guarded by `envelope.carry` and
+    /// a serve token is refused.
+    ///
+    /// The refusal is invisible where it matters, which is why this cost a run to find: an
+    /// index question answers a denial with an *empty page* — the same answer a node with
+    /// nothing gives, deliberately, so that asking cannot reveal whether a node carries at
+    /// all (ADR-0020). A carrier using the wrong token therefore looks exactly like a carrier
+    /// with an empty bag, to itself and to everyone else.
+    ///
+    /// A token per call rather than a second cache slot: a carriage question is asked once
+    /// per session, so the extra local round trip costs nothing next to another piece of
+    /// mutable state that can be stale.
+    fn call_store_as(&self, action: &str, method: &str, params: Value) -> Option<Value> {
+        let token = request_token(
+            &self.perm_socket,
+            action,
+            "otwono-netd is answering a carriage question",
+        )
+        .ok()?;
+        let mut client = Client::connect(&self.store_socket).ok()?;
+        client.call_with_capability(method, params, &token).ok()?.ok()
     }
 
     fn token(&self) -> Option<String> {

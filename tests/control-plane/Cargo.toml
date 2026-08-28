@@ -19,6 +19,7 @@ otwono-aid = { path = "../../crates/otwono-aid" }
 otwono-fetch = { path = "../../crates/otwono-fetch" }
 otwono-fetchd = { path = "../../crates/otwono-fetchd" }
 otwono-store = { path = "../../crates/otwono-store" }
+otwono-envelope = { path = "../../crates/otwono-envelope" }
 otwono-pointer = { path = "../../crates/otwono-pointer" }
 otwono-stored = { path = "../../crates/otwono-stored" }
 otwono-ai = { path = "../../crates/otwono-ai", features = ["testing"] }
