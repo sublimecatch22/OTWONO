@@ -2155,6 +2155,10 @@ fn an_envelope_reaches_its_recipient_through_a_carrier_that_is_neither_party() {
     let collected = collector
         .collect_from(&carrier_candidate)
         .expect("collecting from the carrier");
+    let collected = match collected {
+        otwono_netd::content::Collected::Fetched(v) => v,
+        other => panic!("a collector with an inbox reported {other:?}"),
+    };
 
     assert_eq!(
         collected.len(),
@@ -2182,10 +2186,10 @@ fn an_envelope_reaches_its_recipient_through_a_carrier_that_is_neither_party() {
     let again = collector
         .collect_from(&carrier_candidate)
         .expect("a second pass is not an error");
-    assert!(
-        again.is_empty(),
-        "collected the same envelope twice: {:?}",
-        again.iter().map(|o| &o.content_id).collect::<Vec<_>>()
+    assert_eq!(
+        again,
+        otwono_netd::content::Collected::Fetched(Vec::new()),
+        "the second pass did not ask, or collected the same envelope twice"
     );
 
     // On the recipient's own disk, with the key that opens it — the step that makes an
@@ -2499,9 +2503,13 @@ fn a_node_with_nowhere_to_put_mail_does_not_go_looking_for_it() {
     let collected = Arc::clone(&h.client)
         .collect_from(&h.candidate())
         .expect("not an error");
-    assert!(
-        collected.is_empty(),
-        "a node with no inbox collected {collected:?}"
+    // `NoInbox`, not an empty list. A node that will not keep mail and a node with no mail
+    // waiting collect the same amount of nothing, and telling them apart is the difference
+    // between an operator fixing a policy and an operator staring at a blank line.
+    assert_eq!(
+        collected,
+        otwono_netd::content::Collected::NoInbox,
+        "a node with no inbox went looking anyway"
     );
 }
 

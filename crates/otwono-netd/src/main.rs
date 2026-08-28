@@ -725,7 +725,12 @@ fn carriage_report(
             Ok(v) => {
                 if let Some(taken) = v.get("taken").and_then(|t| t.as_str()) {
                     out.push_str(&format!("{node_id} took {taken}\n"));
+                } else if v.get("collecting").and_then(|c| c.as_bool()) == Some(false) {
+                    out.push_str(&format!("{node_id} this node keeps no mail\n"));
                 } else if let Some(list) = v.get("collected").and_then(|c| c.as_array()) {
+                    if list.is_empty() {
+                        out.push_str(&format!("{node_id} held nothing for this node\n"));
+                    }
                     for id in list.iter().filter_map(|i| i.as_str()) {
                         out.push_str(&format!("{node_id} collected {id}\n"));
                     }

@@ -233,15 +233,15 @@ impl NetState {
     /// The scoped question, so this node never learns who else the carrier serves. Returns
     /// the sealed objects; putting them where the recipient can open them is the caller's
     /// decision and carries its own capability.
-    pub fn collect_from(&self, candidate: &Candidate) -> Result<Vec<content::FetchedObject>, String> {
+    pub fn collect_from(&self, candidate: &Candidate) -> Result<content::Collected, String> {
         let Some(inbox) = self.inbox.clone() else {
-            return Ok(Vec::new());
+            return Ok(content::Collected::NoInbox);
         };
         // Before the connect, as carriage checks its budget before the connect: a node that
         // dialled and then found it could not keep what it collected would still have told a
         // carrier it was interested, and would have learned nothing it could act on.
         if !inbox.accepting() {
-            return Ok(Vec::new());
+            return Ok(content::Collected::NoInbox);
         }
         let source = self.open_content_channel(candidate)?;
         let content::PeerSource {
@@ -267,7 +267,7 @@ impl NetState {
                 },
             )?;
         }
-        Ok(collected)
+        Ok(content::Collected::Fetched(collected))
     }
 
     pub fn node_id(&self) -> &NodeId {
@@ -904,10 +904,12 @@ fn collection_sweep(state: &Arc<NetState>, turn: &mut usize, last: &mut std::tim
         address,
     };
     match state.collect_from(&candidate) {
-        // Silence when there is nothing, which is almost every pass. A node with no mail
-        // waiting must not fill its console every thirty seconds saying so.
-        Ok(collected) if collected.is_empty() => {}
-        Ok(collected) => {
+        // Silence when this node keeps no mail, and when there was none waiting. Both are
+        // almost every pass on almost every node, and a console filled every thirty seconds
+        // with "still nothing" is a console nobody reads. `BrokeredInbox::accepting` says the
+        // first one once, when it is a refusal an operator can act on.
+        Ok(content::Collected::NoInbox) => {}
+        Ok(content::Collected::Fetched(collected)) => {
             for object in &collected {
                 eprintln!(
                     "otwono-netd: collected {}… ({} bytes) addressed to this node, from {}",
@@ -1213,7 +1215,15 @@ impl Service for NetService {
                 let collected = self.state.collect_from(&candidate).map_err(RpcError::internal)?;
                 Ok(json!({
                     "schema_version": DESCRIBE_SCHEMA_VERSION,
-                    "collected": collected.iter().map(|o| o.content_id.clone()).collect::<Vec<_>>(),
+                    // Said explicitly, because a node that will not keep mail and a node with
+                    // no mail waiting otherwise answer identically — and a caller staring at
+                    // an empty list has no way to tell which it is looking at.
+                    "collecting": !matches!(collected, content::Collected::NoInbox),
+                    "collected": collected
+                        .objects()
+                        .iter()
+                        .map(|o| o.content_id.clone())
+                        .collect::<Vec<_>>(),
                 }))
             }
             "net.mail" => {

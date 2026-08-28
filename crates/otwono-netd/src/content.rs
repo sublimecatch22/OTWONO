@@ -1753,6 +1753,31 @@ pub fn carry_pass<L: LinkAdapter, C: otwono_store::Carrier + ?Sized>(
     }
 }
 
+/// What one collection pass did.
+///
+/// `NoInbox` is not an empty list, and keeping them apart is the point. A node that will not
+/// keep mail and a node with no mail waiting both collect nothing, and reporting them the
+/// same way is how "took none" came to mean six different things on the carriage side.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Collected {
+    /// This node keeps no mail — no inbox configured, or the broker refuses the capability.
+    /// Nothing reached the wire.
+    NoInbox,
+    /// The peer was asked. The list is what came back, and may be empty.
+    Fetched(Vec<FetchedObject>),
+}
+
+impl Collected {
+    /// What was fetched, treating "not collecting" as nothing — for a caller that genuinely
+    /// does not care which it was.
+    pub fn objects(&self) -> &[FetchedObject] {
+        match self {
+            Collected::NoInbox => &[],
+            Collected::Fetched(v) => v,
+        }
+    }
+}
+
 /// How many envelopes one collection pass will fetch.
 ///
 /// One, for the reason the other passes take one: the sweep runs inline on the thread that
