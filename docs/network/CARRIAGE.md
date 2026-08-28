@@ -20,10 +20,14 @@ over real Noise channels and real daemons, in
 `an_envelope_crosses_two_carriers_and_only_the_last_is_told_it_arrived`. The three-node
 harness builds a one-hop path.
 
+A run after that one closed the gap those markers left. `OTWONO-ENVELOPE-DROPPED` watches the
+custody store, which was already emptying before ADR-0031 moved the ciphertext to the cache —
+so it looked the same whether the bytes went or stayed. The release now reports what it freed
+and the carrier's check fails on zero: `released … (87 bytes freed)`, `DROPPED … freed=87`.
+
 That does not make every part of this document verified. No envelope has ever expired on a
-booted node, the release's failure paths have only unit tests, and no booted run has confirmed
-that §4's cached ciphertext is actually freed — `OTWONO-ENVELOPE-DROPPED` watches the custody
-store, which was already emptying before ADR-0031. See §7 and
+booted node, the release's failure paths have only unit tests, and the freed count is the
+daemon's own rather than an independent look at the disk. See §7 and
 `docs/build/VERIFICATION-LOG.md` for what the runs have and have not demonstrated.
 
 This document describes the third of `DISTRIBUTED-SERVICES.md`'s three primitives. The
