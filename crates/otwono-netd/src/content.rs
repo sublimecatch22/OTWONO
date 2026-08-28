@@ -425,13 +425,20 @@ impl ContentResponder {
             "envelope.release",
             json!({ "envelope_id": envelope_id }),
         ) {
-            Some(_) => {
+            Some(reply) => {
                 // The counterpart to the line the carriage sweep logs when custody is taken.
                 // Without it the journal shows envelopes being picked up and never put down,
                 // and a carrier still holding delivered mail looks exactly like one whose
                 // recipient has not come back yet.
+                //
+                // The byte count is the only place a running node says whether ADR-0031
+                // actually happened. Dropping the custody record has always emptied the
+                // carriage index, so every marker a booted run watches looked identical
+                // before and after the ciphertext moved to the cache; `0 bytes` here is what
+                // a carrier that freed a record and kept the bytes looks like from outside.
+                let freed = reply.get("freed_bytes").and_then(Value::as_u64).unwrap_or(0);
                 eprintln!(
-                    "otwono-netd: released {}… to {}, which says it arrived",
+                    "otwono-netd: released {}… to {}, which says it arrived ({freed} bytes freed)",
                     &envelope_id[..envelope_id.len().min(16)],
                     peer.fingerprint()
                 );

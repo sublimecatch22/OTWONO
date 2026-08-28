@@ -203,7 +203,22 @@ case "$node_ordinal" in
         still=$(otwono-storectl envelope-held 2>/dev/null | awk 'NR==1 {print $1}') || still=""
         case "$still" in
             [0-9a-f]*) ;;
-            *) echo "OTWONO-ENVELOPE-DROPPED envelope=$carried"; exit 0 ;;
+            *)
+                # The custody record is gone. That alone has never been the interesting
+                # part: dropping the record emptied the carriage index before ADR-0031 too,
+                # when the ciphertext stayed on disk for ever afterwards. So also ask the
+                # daemon what it *freed*, which is the one place a running node says whether
+                # the bytes went with the record.
+                freed=$(journalctl -u otwono-netd --no-pager 2>/dev/null \
+                    | sed -n 's/.*released .*which says it arrived (\([0-9][0-9]*\) bytes freed).*/\1/p' \
+                    | tail -1)
+                [ -n "$freed" ] \
+                    || fail "custody of $carried ended without the daemon reporting a release"
+                [ "$freed" -gt 0 ] \
+                    || fail "released $carried and freed $freed bytes; the record went and the ciphertext stayed"
+                echo "OTWONO-ENVELOPE-DROPPED envelope=$carried freed=$freed"
+                exit 0
+                ;;
         esac
         i=$((i + 1))
         sleep 5
