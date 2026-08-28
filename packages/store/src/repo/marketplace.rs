@@ -216,6 +216,21 @@ impl<'a> MarketplaceRepo<'a> {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// The listings a worker is actually involved in: anything they applied
+    /// for that has moved past browsing. Without this a worker cannot find the
+    /// job they were given, because browsing only shows what is still open.
+    pub fn listings_for_worker(&self, account_id: &str) -> Result<Vec<Listing>> {
+        let conn = self.db.conn()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {LISTING_COLUMNS} FROM listings
+              WHERE state <> 'published'
+                AND id IN (SELECT listing_id FROM applications WHERE worker_account_id = ?1)
+              ORDER BY updated_at DESC"
+        ))?;
+        let rows = stmt.query_map([account_id], map_listing)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Everything a given creator owns, in any state.
     pub fn listings_for_creator(&self, account_id: &str) -> Result<Vec<Listing>> {
         let conn = self.db.conn()?;

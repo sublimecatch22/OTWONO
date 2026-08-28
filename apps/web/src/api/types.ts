@@ -576,6 +576,14 @@ export interface ModerationFinding {
   matched: string;
 }
 
+/**
+ * What moderation decided. `Refused` carries the phrases that matched and the
+ * route to a person, so a creator is never left guessing or stuck.
+ */
+export type ModerationVerdict =
+  | 'Allowed'
+  | { Refused: { findings: ModerationFinding[]; escalation: string } };
+
 export interface Application {
   id: string;
   listing_id: string;

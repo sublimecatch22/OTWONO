@@ -58,6 +58,27 @@ pub async fn browse(
     }))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct MyWorkQuery {
+    #[serde(default)]
+    pub worker_account_id: Option<String>,
+}
+
+/// The listings this worker is involved in. Browsing only shows what is still
+/// open, so without this a worker cannot reach the job they were given.
+pub async fn my_work(
+    State(state): State<AppState>,
+    Query(query): Query<MyWorkQuery>,
+) -> ApiResult<Json<BrowseResponse>> {
+    let worker = query
+        .worker_account_id
+        .unwrap_or_else(|| local_account_id(&state));
+    Ok(Json(BrowseResponse {
+        listings: MarketplaceRepo::new(&state.db).listings_for_worker(&worker)?,
+        notice: SIMULATION_NOTICE,
+    }))
+}
+
 #[derive(Debug, Serialize)]
 pub struct MyListingsResponse {
     pub listings: Vec<ListingWithFindings>,
@@ -443,8 +464,16 @@ pub struct LedgerResponse {
     pub notice: &'static str,
 }
 
-pub async fn ledger(State(state): State<AppState>) -> ApiResult<Json<LedgerResponse>> {
-    let account = local_account_id(&state);
+/// The simulated ledger for one account. A payout is recorded against the
+/// worker who did the work, so the worker view has to be able to ask for that
+/// account rather than always the machine's own.
+pub async fn ledger(
+    State(state): State<AppState>,
+    Query(query): Query<MyWorkQuery>,
+) -> ApiResult<Json<LedgerResponse>> {
+    let account = query
+        .worker_account_id
+        .unwrap_or_else(|| local_account_id(&state));
     let entries = MarketplaceRepo::new(&state.db).ledger(&account)?;
     Ok(Json(LedgerResponse {
         total_minor: entries.iter().map(|entry| entry.amount_minor).sum(),
@@ -664,7 +693,14 @@ mod tests {
                 .unwrap();
         assert!(browse_response.notice.contains("simulated"));
 
-        let Json(ledger_response) = ledger(State(state)).await.unwrap();
+        let Json(ledger_response) = ledger(
+            State(state),
+            Query(MyWorkQuery {
+                worker_account_id: None,
+            }),
+        )
+        .await
+        .unwrap();
         assert!(ledger_response.notice.contains("no worker is really paid"));
     }
 }

@@ -14,6 +14,7 @@ import type {
   Listing,
   ListingDetail,
   ModerationFinding,
+  ModerationVerdict,
 } from '../api/types';
 import {
   Badge,
@@ -88,7 +89,10 @@ function CreatorPath() {
     expenses_minor: 0,
     safety_class: 'standard',
   });
-  const [findings, setFindings] = useState<ModerationFinding[] | null>(null);
+  const [refusal, setRefusal] = useState<{
+    findings: ModerationFinding[];
+    escalation: string;
+  } | null>(null);
   const [openListing, setOpenListing] = useState<string | null>(null);
 
   const listings = useQuery({
@@ -101,7 +105,7 @@ function CreatorPath() {
 
   const create = useMutation({
     mutationFn: () =>
-      api.post<{ listing: Listing; moderation: unknown }>('/api/marketplace/listings', {
+      api.post<{ listing: Listing; moderation: ModerationVerdict }>('/api/marketplace/listings', {
         ...draft,
         deliverables: splitLines(draft.deliverables),
         acceptance_criteria: splitLines(draft.acceptance_criteria),
@@ -109,14 +113,17 @@ function CreatorPath() {
       }),
     onSuccess: (result) => {
       client.invalidateQueries({ queryKey: ['marketplace'] });
-      if (result.listing.state === 'rejected') {
+      if (result.moderation !== 'Allowed') {
+        // Say why here, beside the words that caused it, rather than only on
+        // the listing further down the screen.
+        setRefusal(result.moderation.Refused);
         toast({
           tone: 'negative',
           title: 'That listing was refused',
-          body: 'Moderation found something not permitted. The reasons are on the listing.',
+          body: 'Moderation found something not permitted. The reasons are beside the form.',
         });
       } else {
-        setFindings(null);
+        setRefusal(null);
         toast({ tone: 'positive', body: 'Saved as a draft. Review it, then publish.' });
       }
     },
@@ -251,15 +258,16 @@ function CreatorPath() {
             </Field>
           </div>
 
-          {findings && findings.length > 0 && (
+          {refusal && (
             <Notice tone="negative" title="Moderation refused this">
               <ul>
-                {findings.map((finding) => (
+                {refusal.findings.map((finding) => (
                   <li key={finding.matched}>
                     {finding.explanation} (matched “{finding.matched}”)
                   </li>
                 ))}
               </ul>
+              <p>{refusal.escalation}</p>
             </Notice>
           )}
 
@@ -444,10 +452,17 @@ function WorkerPath() {
     queryKey: ['marketplace', 'browse'],
     queryFn: () => api.get<{ listings: Listing[] }>('/api/marketplace/listings'),
   });
+  const mine = useQuery({
+    queryKey: ['marketplace', 'my-work'],
+    queryFn: () =>
+      api.get<{ listings: Listing[] }>('/api/marketplace/my-work?worker_account_id=demo-worker'),
+  });
   const ledger = useQuery({
     queryKey: ['marketplace', 'ledger'],
     queryFn: () =>
-      api.get<{ entries: LedgerEntry[]; total_minor: number }>('/api/marketplace/ledger'),
+      api.get<{ entries: LedgerEntry[]; total_minor: number }>(
+        '/api/marketplace/ledger?worker_account_id=demo-worker',
+      ),
   });
 
   const apply = useMutation({
@@ -513,9 +528,6 @@ function WorkerPath() {
                   >
                     Apply
                   </Button>
-                  <Button size="sm" onClick={() => submit.mutate(listing.id)}>
-                    Submit work
-                  </Button>
                 </div>
               </div>
               {applyingTo === listing.id && (
@@ -541,6 +553,36 @@ function WorkerPath() {
                   </Button>
                 </form>
               )}
+            </li>
+          ))}
+        </ul>
+      </Card>
+
+      <Card
+        title="Work you have taken on"
+        description="Jobs you applied for. They leave the open list once someone is chosen."
+      >
+        {mine.data?.listings.length === 0 && (
+          <p className="muted">Nothing yet. Apply for something above.</p>
+        )}
+        <ul className="stack">
+          {(mine.data?.listings ?? []).map((listing) => (
+            <li key={listing.id} className="row row--between">
+              <div>
+                <strong>{listing.title}</strong>
+                <p className="muted">
+                  Simulated pay:{' '}
+                  <Money minor={listing.compensation_minor} currency={listing.currency} />
+                </p>
+              </div>
+              <div className="row row--tight">
+                <ListingStateBadge state={listing.state} />
+                {listing.state === 'assigned' && (
+                  <Button size="sm" variant="primary" onClick={() => submit.mutate(listing.id)}>
+                    Submit work
+                  </Button>
+                )}
+              </div>
             </li>
           ))}
         </ul>

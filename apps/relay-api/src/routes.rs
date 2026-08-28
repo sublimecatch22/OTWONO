@@ -366,6 +366,15 @@ struct Caller {
     scopes: Vec<String>,
 }
 
+/// One row of the `tokens` table, named so the query reads as what it is.
+struct TokenRow {
+    id: String,
+    account_id: String,
+    scopes: String,
+    expires_at: Option<String>,
+    revoked_at: Option<String>,
+}
+
 fn authenticate(state: &RelayState, headers: &HeaderMap) -> RelayResult<Caller> {
     let presented = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -375,15 +384,30 @@ fn authenticate(state: &RelayState, headers: &HeaderMap) -> RelayResult<Caller> 
         .ok_or_else(RelayError::unauthorised)?;
 
     let conn = state.db.conn().map_err(RelayError::internal)?;
-    let row: Option<(String, String, String, Option<String>, Option<String>)> = conn
+    let row = conn
         .query_row(
             "SELECT id, account_id, scopes, expires_at, revoked_at FROM tokens WHERE token_hash = ?1",
             [hash_token(presented)],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            |row| {
+                Ok(TokenRow {
+                    id: row.get(0)?,
+                    account_id: row.get(1)?,
+                    scopes: row.get(2)?,
+                    expires_at: row.get(3)?,
+                    revoked_at: row.get(4)?,
+                })
+            },
         )
         .optional()?;
 
-    let Some((token_id, account_id, scopes, expires_at, revoked_at)) = row else {
+    let Some(TokenRow {
+        id: token_id,
+        account_id,
+        scopes,
+        expires_at,
+        revoked_at,
+    }) = row
+    else {
         return Err(RelayError::unauthorised());
     };
     if revoked_at.is_some() {

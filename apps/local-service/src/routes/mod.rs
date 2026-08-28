@@ -206,6 +206,7 @@ pub fn api_router() -> Router<AppState> {
             get(marketplace::browse).post(marketplace::create_listing),
         )
         .route("/marketplace/my-listings", get(marketplace::my_listings))
+        .route("/marketplace/my-work", get(marketplace::my_work))
         .route("/marketplace/listings/{id}", get(marketplace::get_listing))
         .route(
             "/marketplace/listings/{id}/state",

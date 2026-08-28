@@ -479,7 +479,12 @@ mod tests {
         let documents = KnowledgeRepo::new(&db).list_documents(&source_id).unwrap();
         assert_eq!(documents.len(), 2);
         for document in &documents {
-            assert_eq!(document.state, IngestState::Skipped, "{}", document.file_name);
+            assert_eq!(
+                document.state,
+                IngestState::Skipped,
+                "{}",
+                document.file_name
+            );
             // The user is still told why, rather than the file vanishing.
             assert!(document.error.is_some(), "{}", document.file_name);
             assert!(!document.state.is_searchable());

@@ -481,20 +481,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn document_states_are_visible_including_failures() {
+    async fn document_states_are_visible_including_the_ones_that_did_not_index() {
+        use otwono_types::knowledge::IngestState;
+
         let state = AppState::for_tests();
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("good.md"), "Readable text.").unwrap();
-        std::fs::write(tmp.path().join("bad.md"), [0u8, 1, 2, 0]).unwrap();
+        // Nothing to index: not a fault, but the user still has to be told.
+        std::fs::write(tmp.path().join("binary.md"), [0u8, 1, 2, 0]).unwrap();
+        // Broke while being read: a failure worth reporting as one.
+        std::fs::write(tmp.path().join("broken.pdf"), b"%PDF-1.7 not really a pdf").unwrap();
         let source_id = authorised(&state, &tmp).await;
         let _ = index(State(state.clone()), AxumPath(source_id.clone()))
             .await
             .unwrap();
 
         let Json(documents) = documents(State(state), AxumPath(source_id)).await.unwrap();
-        assert_eq!(documents.len(), 2);
-        let failed = documents.iter().find(|d| d.file_name == "bad.md").unwrap();
-        assert_eq!(failed.state, otwono_types::knowledge::IngestState::Failed);
+        assert_eq!(documents.len(), 3);
+
+        let indexed = documents.iter().find(|d| d.file_name == "good.md").unwrap();
+        assert_eq!(indexed.state, IngestState::Indexed);
+
+        let skipped = documents
+            .iter()
+            .find(|d| d.file_name == "binary.md")
+            .unwrap();
+        assert_eq!(skipped.state, IngestState::Skipped);
+        assert!(skipped.error.is_some(), "the reason must be shown");
+
+        let failed = documents
+            .iter()
+            .find(|d| d.file_name == "broken.pdf")
+            .unwrap();
+        assert_eq!(failed.state, IngestState::Failed);
         assert!(failed.error.is_some());
     }
 
