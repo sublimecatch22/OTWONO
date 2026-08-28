@@ -915,29 +915,19 @@ impl NetService {
             .sharing
             .as_ref()
             .ok_or("an envelope arrived without the key to open it")?;
-        let sealed = &sharing.sealed_key;
-        let token = content::request_token(
+        content::keep_sealed(
+            &self.store_socket,
             &self.perm_socket,
-            otwono_stored::CAPABILITY_WRITE,
+            &object.content_id,
+            &object.bytes,
+            &otwono_store::object::Sharing {
+                encryption: sharing.encryption.clone(),
+                nonce_prefix: sharing.nonce_prefix.clone(),
+                plaintext_size_bytes: sharing.plaintext_size_bytes,
+                sealed_keys: vec![sharing.sealed_key.clone()],
+            },
             "otwono-netd is storing an envelope collected for this node",
         )?;
-        let mut client = otwono_proto::Client::connect(&self.store_socket)
-            .map_err(|e| format!("{}: {e}", self.store_socket.display()))?;
-        client
-            .call_with_capability(
-                "store.accept_shared",
-                json!({
-                    "content_id": object.content_id,
-                    "data": data_encoding::BASE64.encode(&object.bytes),
-                    "encryption": sharing.encryption,
-                    "nonce_prefix": sharing.nonce_prefix,
-                    "plaintext_size_bytes": sharing.plaintext_size_bytes,
-                    "sealed_key": sealed,
-                }),
-                &token,
-            )
-            .map_err(|e| format!("store.accept_shared: {e}"))?
-            .map_err(|e| e.message)?;
         Ok(object.content_id.clone())
     }
 

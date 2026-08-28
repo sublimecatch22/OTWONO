@@ -1105,42 +1105,14 @@ impl otwono_store::Carrier for BrokeredCarrier {
         bytes: &[u8],
         sharing: &otwono_store::object::Sharing,
     ) -> Result<(), String> {
-        let sealed_key = sharing
-            .sealed_keys
-            .first()
-            .ok_or("the sender served an envelope with no sealed key; it would be undeliverable")?;
-        let token = request_token(
+        keep_sealed(
+            &self.store_socket,
             &self.perm_socket,
-            otwono_stored::CAPABILITY_WRITE,
+            &envelope.envelope_id,
+            bytes,
+            sharing,
             "otwono-netd is keeping an envelope it is about to take custody of",
-        )?;
-        let mut client = Client::connect(&self.store_socket)
-            .map_err(|e| format!("{}: {e}", self.store_socket.display()))?;
-        let stored = client
-            .call_with_capability(
-                "store.accept_shared",
-                json!({
-                    "content_id": envelope.envelope_id,
-                    "data": data_encoding::BASE64.encode(bytes),
-                    "encryption": sharing.encryption,
-                    "nonce_prefix": sharing.nonce_prefix,
-                    "plaintext_size_bytes": sharing.plaintext_size_bytes,
-                    "sealed_key": sealed_key,
-                }),
-                &token,
-            )
-            .map_err(|e| format!("store.accept_shared: {e}"))?
-            .map_err(|e| e.message)?;
-        // The store recomputes the content id from the bytes. A disagreement means the
-        // descriptor and the ciphertext are not the same object, and taking custody of it
-        // would put this node's name on something it cannot deliver.
-        match stored.get("content_id").and_then(Value::as_str) {
-            Some(id) if id == envelope.envelope_id => Ok(()),
-            other => Err(format!(
-                "kept bytes that hash to {other:?}, not to the offered {}",
-                envelope.envelope_id
-            )),
-        }
+        )
     }
 
     fn take_custody(
@@ -1177,6 +1149,52 @@ impl otwono_store::Carrier for BrokeredCarrier {
         Ok(otwono_store::Took::Custody(otwono_envelope::Custody::taken(
             envelope, now_ms, until_ms,
         )))
+    }
+}
+
+/// Store somebody else's sealed bytes, under this node's own storage key.
+///
+/// The one place `store.accept_shared` is called from, because there are two callers that
+/// mean the same thing and had drifted apart: a **carrier** keeping an envelope it is about
+/// to take custody of, and a **recipient** keeping mail collected on its behalf. The only
+/// real difference was that one checked the store's answer and the other did not.
+///
+/// That check is not ceremony. The store recomputes the content id from the bytes, and a
+/// disagreement means the descriptor and the ciphertext are not the same object — for a
+/// carrier, that would put this node's name on something it cannot deliver; for a recipient,
+/// it would file an envelope under a name that is not its own.
+pub(crate) fn keep_sealed(
+    store_socket: &Path,
+    perm_socket: &Path,
+    content_id: &str,
+    bytes: &[u8],
+    sharing: &otwono_store::object::Sharing,
+    reason: &str,
+) -> Result<(), String> {
+    let sealed_key = sharing
+        .sealed_keys
+        .first()
+        .ok_or("an envelope with no sealed key; nobody could ever open it")?;
+    let token = request_token(perm_socket, otwono_stored::CAPABILITY_WRITE, reason)?;
+    let mut client = Client::connect(store_socket).map_err(|e| format!("{}: {e}", store_socket.display()))?;
+    let stored = client
+        .call_with_capability(
+            "store.accept_shared",
+            json!({
+                "content_id": content_id,
+                "data": data_encoding::BASE64.encode(bytes),
+                "encryption": sharing.encryption,
+                "nonce_prefix": sharing.nonce_prefix,
+                "plaintext_size_bytes": sharing.plaintext_size_bytes,
+                "sealed_key": sealed_key,
+            }),
+            &token,
+        )
+        .map_err(|e| format!("store.accept_shared: {e}"))?
+        .map_err(|e| e.message)?;
+    match stored.get("content_id").and_then(Value::as_str) {
+        Some(id) if id == content_id => Ok(()),
+        other => Err(format!("kept bytes that hash to {other:?}, not to {content_id}")),
     }
 }
 
