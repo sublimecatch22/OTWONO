@@ -5253,3 +5253,84 @@ indistinguishable from one whose recipient had never come back.
   its deadline. That is the old behaviour and it is correct, but only unit tests have seen it.
 - **Nothing expired**, no clock skew, **amd64 only**, TCG, one vCPU per guest — as every run
   before it.
+
+## 2026-08-28 — the whole store-and-forward round trip, asserted by the harness
+
+**STATUS: VERIFIED.** amd64, QEMU, TCG, no `/dev/kvm`, three nodes, one vCPU each. Image built
+from `f324f08` with `MESH_CONTENT_SMOKE=1`. The first run to assert drop on delivery rather
+than have it read out of the logs by hand, and the first with ADR-0031 — a carried envelope's
+ciphertext in the cache rather than the permanent store — in it at all.
+
+All three nodes passed the content check, each discovering a distinct object, with carriage
+now routed somewhere new. Then:
+
+```
+n1  [ 645.6] OTWONO-ENVELOPE-SEALED envelope=b6b3a13b…218f7dc2 recipient=otw128gd9j91nv4a1…
+n2  [ 626.1] otwono-netd: carrying b6b3a13b574ce068… (87 bytes) for somebody until
+             1787918562541, taken from otw1:j689-vmqs-h8hn-j1qs
+n2  [ 628.3] OTWONO-ENVELOPE-CARRIED envelope=b6b3a13b…218f7dc2
+    ...node 1, the sender, powered off...
+n3  [ 125.7] otwono-netd: collected b6b3a13b574ce06851126cbafc06d0de081f3eac84a2c45d5b4962
+             b6218f7dc2 (87 bytes) addressed to this node, from otw1:raqx-9gay-v5wm-dcr1
+n3  [ 130.9] OTWONO-ENVELOPE-SWEPT envelope=b6b3a13b…218f7dc2
+n3          OTWONO-ENVELOPE-COLLECTED envelope=b6b3a13b…218f7dc2 bytes=71
+n2  [ 771.7] otwono-netd: released b6b3a13b574ce068… to otw1:tk4j-3bp8-m3bp-4r6p, which says
+             it arrived
+n2  [ 773.5] OTWONO-ENVELOPE-DROPPED envelope=b6b3a13b…218f7dc2
+```
+
+`bytes=71` is plaintext, so the recipient opened what it collected. No `collect by hand` line
+anywhere: both sweeps ran on their own.
+
+### What ADR-0031 changed, and what this run says about it
+
+The carrier's copy no longer goes in the permanent content store. It goes in the cluster
+cache, because the permanent store has no delete — releasing custody there freed the record
+and left the bytes for ever, and `bytes_held` reported zero while it happened, since it sums
+records rather than bytes.
+
+That moves the serving decision. A `SHARED` object in the cache is only ever a carried
+envelope, so custody is the whole rule there, where in the node's own store ADR-0019's
+sealed-key list applies with the custody exception past it. This run is the first time a
+carrier has served an envelope out of its cache to a peer it shares nothing with, and it
+worked on the first attempt.
+
+### Three harness defects, all the same shape
+
+Every one of them made a test report success without testing what it claimed.
+
+1. **The recipient's check watched the wrong thing.** It polled `otwono-netd --mail` — what a
+   carrier is holding for this node — as its signal that mail exists. Drop on delivery empties
+   exactly that, the moment the mail lands: the id was visible for under two seconds on this
+   link, less than one poll. Runs 11 and 12 sat waiting twenty minutes for an envelope that
+   had already arrived, been decrypted, and been dropped. It now reads what the daemon logged
+   it collected, which does not go away and is better evidence anyway.
+2. **`make multi-node-test` does not rebuild the image.** It has no dependency on `image` and
+   boots whatever is at the output path. Runs 11 and 12 both tested the build from before the
+   fixes they existed to verify, and neither said so. Stage 30 now stamps the source revision
+   into the manifest and the harness refuses a mismatch before starting a VM — it caught a
+   dirty tree twice while this was being written.
+3. **An image built without `MESH_CONTENT_SMOKE=1` carries no checks at all.** The harness
+   boots three nodes, watches them find each other and prints `PASS: 3 nodes discovered`. True,
+   and one line from looking like the whole suite passed — which is how a rebuild here silently
+   dropped every content and envelope assertion, run 14. It now prints a note that is hard to
+   miss. Both footguns are in `BUILD-SYSTEM.md`, which had no section on the harness before.
+
+### What this does not show
+
+- **The image predates the deletion guards.** `e699d1a` stops carriage taking over, or a
+  delivery report deleting, bytes this node holds as a replica or an operator pinned. Cache
+  unit tests cover both; no booted node has run them.
+- **Nothing checked that the cache bytes actually went.** `OTWONO-ENVELOPE-DROPPED` asserts the
+  carrier's *custody store* is empty, which is what it asserted before ADR-0031 too. That the
+  ciphertext went with it is asserted at the control-plane tier — the carrier is asked to serve
+  it and refuses — and not here. The whole point of the change is invisible to this run.
+- **The second hop is control-plane only.** `an_envelope_crosses_two_carriers_and_only_the_last_
+  is_told_it_arrived` runs sender → A → B → recipient over real Noise channels and real
+  daemons, and asserts that the recipient's key survives both hops and that A keeps its copy
+  while B lets go. The three-node harness builds a one-hop path and nothing arranges two
+  carriers.
+- **The reconciliation sweep never fired.** No node had a custody record whose bytes were
+  missing, so all this run shows is that it does not fire spuriously — which is worth
+  something and is not what it is for.
+- **Nothing expired**, no clock skew, **amd64 only**, TCG, one vCPU per guest.

@@ -9,16 +9,22 @@ whole collection.
 A second run on 2026-08-28 showed both halves doing it **unprompted**: the carrier's sweep
 took custody and the recipient's sweep collected, with no command run by hand on either.
 
-A third run on 2026-08-28 showed drop on delivery (§3b): the recipient's sweep collected, told
-the carrier, and the carrier's custody store went empty while the run was still going. That
-run was stopped before the harness could assert it end to end — the recipient's own check was
-watching the carrier's offer list, which is the thing this feature empties — so the evidence
-is read out of the serial logs rather than asserted by the test.
+A later run on 2026-08-28 added drop on delivery (§3b) and ADR-0031's carriage store, and the
+harness asserted the whole round trip: sealed, carried unprompted, sender powered off,
+collected and opened by the recipient's own sweep, and the carrier's custody store empty
+again — the last of those a marker the test waits for rather than a line somebody read
+afterwards.
 
-That does not make every part of this document verified. Nothing has exercised a second hop,
-no envelope has ever expired on a booted node, and the release's failure paths have only unit
-tests — see §7 and `docs/build/VERIFICATION-LOG.md` for what the runs have and have not
-demonstrated.
+The second hop is exercised too, but not on booted nodes: sender to A to B to the recipient,
+over real Noise channels and real daemons, in
+`an_envelope_crosses_two_carriers_and_only_the_last_is_told_it_arrived`. The three-node
+harness builds a one-hop path.
+
+That does not make every part of this document verified. No envelope has ever expired on a
+booted node, the release's failure paths have only unit tests, and no booted run has confirmed
+that §4's cached ciphertext is actually freed — `OTWONO-ENVELOPE-DROPPED` watches the custody
+store, which was already emptying before ADR-0031. See §7 and
+`docs/build/VERIFICATION-LOG.md` for what the runs have and have not demonstrated.
 
 This document describes the third of `DISTRIBUTED-SERVICES.md`'s three primitives. The
 decisions are ADR-0028's; this is how they are built.
@@ -284,8 +290,9 @@ flatter than the cache's.
 
 ## 7. What is not built
 
-- **Re-relay in practice.** §7 concludes that a carrier may pass an envelope on, and the
-  record's shape makes it structural rather than a permission. No test exercises a second hop.
+- **Re-relay on booted nodes.** The second hop runs over real daemons and real Noise channels
+  and has never run in QEMU: the three-node harness arranges one carrier, and a second would
+  need a fourth node or a different power-off order.
 - **Forward secrecy.** The sharing key is long-lived, so compromising it opens every envelope
   ever sealed to it.
 - **UserID addressing.** NodeID only; a person with two devices must be messaged twice.
