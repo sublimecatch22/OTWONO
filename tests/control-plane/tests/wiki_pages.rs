@@ -521,6 +521,92 @@ fn writing_after_a_delete_starts_a_new_chain() {
 }
 
 #[test]
+fn listing_shows_every_page_including_the_deleted_ones() {
+    // A wiki with no way to list its pages is one you keep an index of by hand, which is the
+    // sort of thing a person stops doing.
+    //
+    // Deleted pages are listed rather than hidden. A tombstone is a fact about a name — it is
+    // why that name cannot be reused as if it were fresh, and why a write there starts a new
+    // chain — so omitting it would leave somebody wondering where a page went and why writing
+    // it back behaves oddly.
+    let h = Harness::start("listing");
+    let alive = h.write("Still-Here", "present\n");
+    h.write("Gone", "briefly\n");
+    h.delete("Gone");
+
+    let out = h.call(
+        &h.store,
+        "pointer.published",
+        json!({ "service": "wiki" }),
+        "pointer.read",
+    );
+    let records = out["records"].as_array().expect("a records array");
+    let pages: Vec<otwono_pointer::Pointer> = records
+        .iter()
+        .map(|r| serde_json::from_value(r.clone()).unwrap())
+        .collect();
+
+    assert_eq!(pages.len(), 2, "both names must be listed: {pages:?}");
+    let gone = pages.iter().find(|p| p.name == "Gone").expect("the deleted page");
+    assert!(gone.is_tombstone(), "a deleted page is listed as a tombstone");
+    let here = pages
+        .iter()
+        .find(|p| p.name == "Still-Here")
+        .expect("the live page");
+    assert_eq!(here.content_id.as_deref(), Some(alive.as_str()));
+}
+
+#[test]
+fn listing_one_service_does_not_show_another() {
+    // `wiki/<name>` shares the pointer store with every other service. A wiki listing that
+    // showed a profile's names would be reporting somebody else's namespace as its own.
+    let h = Harness::start("listing-scoped");
+    h.write("A-Page", "wiki\n");
+
+    let author = h.node_id();
+    let target = h.call(
+        &h.store,
+        "store.put",
+        json!({ "data": data_encoding::BASE64.encode(b"a profile card"), "visibility": "public" }),
+        "store.write",
+    )["content_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut elsewhere = otwono_pointer::Pointer::new(&author, "profile", "Card", 1, Some(target), 1_000);
+    elsewhere.signature = h.sign(&elsewhere.payload_for_id_sign().unwrap());
+    h.call(
+        &h.store,
+        "pointer.publish",
+        json!({ "record": elsewhere }),
+        "pointer.publish",
+    );
+
+    let wiki = h.call(
+        &h.store,
+        "pointer.published",
+        json!({ "service": "wiki" }),
+        "pointer.read",
+    );
+    let names: Vec<String> = wiki["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["A-Page"],
+        "the wiki listing showed another service's names"
+    );
+
+    // And unfiltered, both are there — the scoping is the caller's, not a rule about what
+    // the store will admit to holding.
+    let all = h.call(&h.store, "pointer.published", json!({}), "pointer.read");
+    assert_eq!(all["records"].as_array().unwrap().len(), 2);
+}
+
+#[test]
 fn a_page_that_was_never_written_has_no_head() {
     // What `write` relies on to know it is starting a chain rather than continuing one, and
     // what `read` reports as "no such page" rather than an error about a missing object.

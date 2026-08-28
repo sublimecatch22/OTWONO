@@ -146,6 +146,7 @@ otwono-wikictl read  Getting-Started --out page.md
 otwono-wikictl history Getting-Started
 otwono-wikictl read Getting-Started --from <NODEID> --out theirs.md
 otwono-wikictl delete Getting-Started
+otwono-wikictl list
 ```
 
 `--from` needs no `--at`: a node already knows where the peers it is connected to are
@@ -174,6 +175,17 @@ is holding the terminal:
 | never written | no record at all | "no page called X on this node" |
 | deleted | a tombstone, at some sequence | "X was deleted at sequence N; its revisions are still readable by id" |
 | present | a head revision | the page |
+
+`list` shows every page this node has, deleted ones included — a tombstone is why a name
+cannot be reused as if it were fresh, so hiding it would leave somebody wondering where a page
+went and why writing it back behaves oddly. It is scoped to the `wiki` namespace: the pointer
+store is shared with every other service, and a wiki listing that showed a profile's names
+would be reporting somebody else's namespace as its own.
+
+The method under it, `pointer.published`, is guarded by `pointer.read` and not `store.serve`.
+Serving is what `otwono-netd` does for a peer, one name at a time and only when asked;
+enumerating is a local question about this node's own state, and handing the Z3 mesh daemon a
+list of everything this node publishes would give it something it has no use for.
 
 Writing after a delete starts a **new chain**. Reattaching to what came before would make the
 deletion a thing that never quite happened; the old revisions stay readable by id, and this

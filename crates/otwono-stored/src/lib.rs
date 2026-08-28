@@ -542,6 +542,31 @@ impl StoreService {
         }))
     }
 
+    /// Every name this node publishes, optionally in one service's namespace.
+    ///
+    /// `pointer.mine` answers about a name you already know; this is how a caller finds out
+    /// which names there are. A wiki with no way to list its pages is one you have to keep an
+    /// index of by hand, which is the sort of thing a person stops doing.
+    ///
+    /// Guarded by `pointer.read` rather than `store.serve`. Serving is what `otwono-netd`
+    /// does for a peer, one name at a time and only when asked; enumerating is a local
+    /// question about this node's own state, and giving the mesh daemon a way to ask it would
+    /// hand a Z3 process a list of everything this node publishes for no purpose it has.
+    fn handle_pointer_published(&self, params: Value) -> Result<Value, RpcError> {
+        let service = params.get("service").and_then(Value::as_str);
+        let mut records = self
+            .pointers()?
+            .published()
+            .map_err(|e| RpcError::internal(e.to_string()))?;
+        if let Some(service) = service {
+            records.retain(|p| p.service == service);
+        }
+        Ok(json!({
+            "schema_version": DESCRIBE_SCHEMA_VERSION,
+            "records": records,
+        }))
+    }
+
     /// Take a record a peer served, applying the rollback rules (ADR-0027 §1).
     ///
     /// The whole reason the pointer subsystem has state. `otwono-netd` verifies what it
@@ -2186,6 +2211,11 @@ impl Service for StoreService {
                     CAPABILITY_CARRY,
                 ),
                 MethodDescription::guarded(
+                    "pointer.published",
+                    "Every name this node publishes, optionally in one service's namespace",
+                    CAPABILITY_POINTER_READ,
+                ),
+                MethodDescription::guarded(
                     "pointer.mine",
                     "One of this node's own pointers, for serving to a peer",
                     CAPABILITY_SERVE,
@@ -2332,6 +2362,10 @@ impl Service for StoreService {
             "pointer.mine" => {
                 self.authorize(ctx, CAPABILITY_SERVE)?;
                 self.handle_pointer_mine(params)
+            }
+            "pointer.published" => {
+                self.authorize(ctx, CAPABILITY_POINTER_READ)?;
+                self.handle_pointer_published(params)
             }
             "cache.replica_room" => {
                 self.authorize(ctx, CAPABILITY_REPLICATE)?;

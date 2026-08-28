@@ -9,6 +9,7 @@
 //! otwono-wikictl read  Getting-Started --out page.md
 //! otwono-wikictl history Getting-Started
 //! otwono-wikictl delete Getting-Started
+//! otwono-wikictl list
 //! ```
 //!
 //! # Writing is four calls, and cannot be three shell invocations
@@ -54,6 +55,7 @@ otwono-wikictl — wiki pages as signed chains of revisions
   otwono-wikictl read <PAGE> --out <PATH> [--from <NODEID>] [--at <ADDR>]
   otwono-wikictl history <PAGE> [--limit N]
   otwono-wikictl delete <PAGE>
+  otwono-wikictl list
 
 Options:
   --socket PATH        otwono-stored's socket
@@ -181,6 +183,7 @@ fn run() -> Result<String, Error> {
         },
         "history" => show_history(&opts, &store, &perm),
         "delete" => delete_page(&opts, &store, &perm),
+        "list" => list_pages(&opts, &store, &perm),
         other => Err(Error::Usage(format!("unknown command {other}"))),
     }
 }
@@ -812,4 +815,60 @@ fn delete_page(opts: &Options, store: &Path, perm: &Path) -> Result<String, Erro
             ))
         }
     }
+}
+
+/// Every page this node has, including the ones it has deleted.
+///
+/// Deleted pages are listed, not hidden. A tombstone is a fact about a name — it is why that
+/// name cannot be reused as if it were fresh, and why `write` starts a new chain there — so a
+/// listing that silently omitted them would leave somebody wondering where a page went and
+/// why writing it back behaves oddly.
+fn list_pages(opts: &Options, store: &Path, perm: &Path) -> Result<String, Error> {
+    let out = call(
+        store,
+        perm,
+        "pointer.published",
+        json!({ "service": SERVICE }),
+        Some("pointer.read"),
+    )?;
+    let records = out
+        .get("records")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::Runtime("the store returned no records".into()))?;
+
+    let mut pages: Vec<otwono_pointer::Pointer> = Vec::new();
+    for record in records {
+        let pointer: otwono_pointer::Pointer = serde_json::from_value(record.clone())
+            .map_err(|e| Error::Runtime(format!("a published record does not parse: {e}")))?;
+        pages.push(pointer);
+    }
+
+    if opts.json {
+        let listed: Vec<Value> = pages
+            .iter()
+            .map(|p| {
+                json!({
+                    "page": p.name,
+                    "sequence": p.sequence,
+                    "revision": p.content_id,
+                    "deleted": p.is_tombstone(),
+                })
+            })
+            .collect();
+        return Ok(format!(
+            "{}\n",
+            serde_json::to_string(&json!({ "pages": listed })).map_err(runtime)?
+        ));
+    }
+    if pages.is_empty() {
+        return Ok("no wiki pages on this node\n".to_string());
+    }
+    let mut out = String::new();
+    for p in &pages {
+        match &p.content_id {
+            Some(head) => out.push_str(&format!("{} {} seq={}\n", p.name, head, p.sequence)),
+            None => out.push_str(&format!("{} deleted seq={}\n", p.name, p.sequence)),
+        }
+    }
+    Ok(out)
 }
