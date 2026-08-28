@@ -1,0 +1,157 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: Verify before building anything
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            php-cli php-curl
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+      - run: |
+          npm run format:check
+          npm run typecheck
+          npm run test
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+          php wordpress/tests/run-tests.php
+          ./scripts/run-wordpress-live-tests.sh
+
+  linux:
+    name: Linux package and the plugin
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            xdg-utils
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+      - run: npm run desktop:build -- --bundles deb
+      - name: Collect
+        run: |
+          mkdir -p artefacts
+          find target/release/bundle -type f -name '*.deb' -exec cp {} artefacts/ \;
+          ./scripts/package-wordpress-plugin.sh artefacts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: artefacts/
+
+  windows:
+    name: Windows installers
+    needs: verify
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+      # The installers are unsigned. Signing needs a certificate the project
+      # owner must provide; see docs/RELEASE.md.
+      - run: npm run desktop:build -- --bundles nsis,msi
+      - name: Collect
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artefacts | Out-Null
+          Get-ChildItem -Path target/release/bundle -Recurse -Include '*.exe', '*.msi' |
+            ForEach-Object { Copy-Item $_.FullName -Destination artefacts -Force }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: artefacts/
+
+  macos:
+    name: macOS package
+    needs: verify
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+      # Unsigned and un-notarised; users must right-click → Open on first
+      # launch until the owner provides a Developer ID. See docs/RELEASE.md.
+      - run: npm run desktop:build -- --bundles dmg
+      - name: Collect
+        run: |
+          mkdir -p artefacts
+          find target/release/bundle -type f -name '*.dmg' -exec cp {} artefacts/ \;
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: artefacts/
+
+  collect:
+    name: One folder, with checksums
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: downloaded
+      - name: Assemble
+        run: |
+          mkdir -p release
+          find downloaded -type f -exec cp {} release/ \;
+          cd release
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: release/
+      # Left as a draft on purpose: publishing is a person's decision.
+      - name: Draft the GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: release/*
+          body: |
+            See `RELEASE_NOTES.md` in the repository for what changed.
+
+            The desktop installers in this release are **unsigned**. Windows
+            will warn about an unknown publisher and macOS will need
+            right-click → Open on first launch. Verify the download against
+            `SHA256SUMS` before running it.

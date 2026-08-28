@@ -11,6 +11,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 plugin_dir="$root/wordpress/otwono-ai-connector"
 out_dir="${1:-$root/releases}"
+mkdir -p "$out_dir"
 zip_path="$out_dir/otwono-ai-connector.zip"
 
 if [[ ! -f "$plugin_dir/otwono-ai-connector.php" ]]; then
