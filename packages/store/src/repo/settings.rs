@@ -94,6 +94,7 @@ pub struct SavedLayout {
 /// imported preferences file cannot reference a screen that does not exist.
 pub const KNOWN_TABS: &[&str] = &[
     "chat",
+    "workspaces",
     "projects",
     "agents",
     "tasks",

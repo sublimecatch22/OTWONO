@@ -21,7 +21,10 @@ const ROLES: Record<string, string> = {
 };
 
 async function createOffice(page: Page, name: string) {
-  await page.goto('/workspaces');
+  // Reached the way a person reaches it, so a missing link is a failing test.
+  await page.goto('/chat');
+  await page.getByRole('navigation', { name: 'Main' }).getByRole('link', { name: /Workspaces/ }).click();
+  await expect(page.getByRole('heading', { name: 'Workspaces', level: 1 })).toBeVisible();
   await page.getByLabel('Kind').selectOption({ label: 'Office' });
   await page.getByLabel('Name').fill(name);
   await page.getByRole('button', { name: 'Create', exact: true }).click();

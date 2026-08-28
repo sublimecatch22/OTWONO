@@ -26,6 +26,7 @@ export interface TabDefinition {
 
 export const ALL_TABS: TabDefinition[] = [
   { key: 'chat', label: 'Chat', path: '/chat', icon: '💬' },
+  { key: 'workspaces', label: 'Workspaces', path: '/workspaces', icon: '🏢' },
   { key: 'projects', label: 'Projects', path: '/projects', icon: '📁' },
   { key: 'agents', label: 'Agents', path: '/agents', icon: '🧠' },
   { key: 'tasks', label: 'Tasks', path: '/tasks', icon: '✓' },
