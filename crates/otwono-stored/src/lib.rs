@@ -1657,6 +1657,42 @@ impl StoreService {
         }
         .map_err(|e| RpcError::internal(e.to_string()))?;
 
+        // Drop records whose bytes this node no longer has (ADR-0031).
+        //
+        // A custody record and the ciphertext it names live in two places and can come apart:
+        // the cache evicted it, a keep failed after the record was written, a disk was
+        // restored without one of them. What is left is a carrier that offers an envelope,
+        // is asked for it, and cannot answer — and on a mesh where the sender may be gone
+        // that is a message nobody can retrieve while a node keeps advertising it.
+        //
+        // Asked of both places, not just the cache: a node upgraded across ADR-0031 has
+        // records pointing at objects in its permanent store, and treating those as missing
+        // would throw away real mail. The question is only "do I have these bytes at all",
+        // which is `servable`'s lookup without the label check.
+        //
+        // Swept here, like the expiry sweep above it, for ADR-0026 §9's reason: this is
+        // already a moment when the node is doing carriage work, and a subsystem that needs a
+        // timer needs a timer that runs.
+        let held: Vec<_> = held
+            .into_iter()
+            .filter(|c| {
+                let Ok(id) = Self::parse_id(&c.envelope.envelope_id) else {
+                    return false;
+                };
+                if self.store.get_object(&id).is_ok()
+                    || self.cache.as_ref().is_some_and(|cache| cache.contains(&id))
+                {
+                    return true;
+                }
+                eprintln!(
+                    "otwono-stored: dropping custody of {} — this node no longer has the bytes",
+                    c.envelope.envelope_id
+                );
+                let _ = store.release(&c.envelope.envelope_id);
+                false
+            })
+            .collect();
+
         // The sender's descriptor, never this carrier's own commitments: `took_at_ms` and
         // `until_ms` are on this carrier's clock and mean nothing to anyone else (§10).
         let entries: Vec<Value> = held

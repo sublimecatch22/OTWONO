@@ -1913,11 +1913,18 @@ fn a_carrier_offers_what_it_holds_after_serving_ordinary_content() {
 
     // Something for the serving node to carry, taken into custody through the control plane
     // exactly as `envelope-send` and the carry pass both do.
+    //
+    // Custody of bytes the node actually has. A made-up id used to do here, because nothing
+    // looked: since ADR-0031 the carriage listing drops records whose object this node
+    // cannot find, so a fabricated one is swept before it can be offered and this test would
+    // fail for a reason that has nothing to do with the token it exists to pin.
+    let carried_bytes = b"the ciphertext a carrier is holding for somebody".to_vec();
+    let carried = h.put(&carried_bytes, "public");
     let recipient = NodeIdentity::generate().unwrap();
     let envelope = otwono_envelope::Envelope::new(
-        &"cd".repeat(32),
+        &carried,
         recipient.node_id(),
-        4096,
+        carried_bytes.len() as u64,
         otwono_identity::now_unix_ms() + 60 * 60 * 1000,
     );
     let mut store = Client::connect(&h.store_socket).unwrap();
@@ -2319,6 +2326,75 @@ fn an_envelope_reaches_its_recipient_through_a_carrier_that_is_neither_party() {
         offered_again,
         otwono_netd::content::Collected::Fetched(Vec::new()),
         "a carrier that never let go got this node to fetch the same envelope twice"
+    );
+}
+
+/// A carrier stops offering an envelope whose bytes it no longer has (ADR-0031).
+///
+/// The custody record and the ciphertext live in two places and can come apart: the cache
+/// evicted it, a keep failed after the record was written, a disk came back with one and not
+/// the other. What is left is the worst shape carriage has — a node advertising a message,
+/// being asked for it, and having nothing to send. On a mesh where the sender may be gone,
+/// that is a message nobody can retrieve while a node keeps saying it has it.
+///
+/// The record is not just hidden from the listing, it is dropped, so the carriage budget it
+/// was occupying comes back too.
+#[test]
+fn a_carrier_that_lost_the_bytes_stops_offering_the_envelope() {
+    let h = Harness::start("carriage-orphan");
+
+    // Custody of an id this node has no object for, which is exactly what an eviction leaves
+    // behind. Taking it is allowed: `envelope.take` writes a record and does not look for
+    // bytes, and it must not — the carry pass keeps the bytes first and claims custody
+    // second, so a take that demanded them could never succeed.
+    let recipient = NodeIdentity::generate().unwrap();
+    let envelope = otwono_envelope::Envelope::new(
+        &"ab".repeat(32),
+        recipient.node_id(),
+        4096,
+        otwono_identity::now_unix_ms() + 60 * 60 * 1000,
+    );
+    let mut store = Client::connect(&h.store_socket).unwrap();
+    let taken = store
+        .call_with_capability(
+            "envelope.take",
+            json!({ "envelope": envelope }),
+            &h.token("envelope.carry"),
+        )
+        .unwrap()
+        .expect("the node takes custody");
+    assert_eq!(taken["taken"], json!(true), "the setup did not take custody");
+
+    let held = store
+        .call_with_capability("envelope.held", json!({}), &h.token("envelope.carry"))
+        .unwrap()
+        .expect("the carriage listing");
+    assert_eq!(
+        held["entries"].as_array().unwrap().len(),
+        0,
+        "a carrier offered an envelope it has no bytes for: {held}"
+    );
+
+    // And it is gone, not filtered. A record that survived the listing would keep occupying
+    // the carriage budget for as long as its deadline ran, which is the second half of the
+    // failure: the node would also refuse new mail it could actually carry.
+    let again = store
+        .call_with_capability("envelope.held", json!({}), &h.token("envelope.carry"))
+        .unwrap()
+        .expect("the carriage listing again");
+    assert_eq!(again["entries"].as_array().unwrap().len(), 0);
+    let scoped = store
+        .call_with_capability(
+            "envelope.held",
+            json!({ "recipient": recipient.node_id().to_text() }),
+            &h.token("envelope.carry"),
+        )
+        .unwrap()
+        .expect("the scoped listing");
+    assert_eq!(
+        scoped["entries"].as_array().unwrap().len(),
+        0,
+        "the scoped question still offers it: {scoped}"
     );
 }
 

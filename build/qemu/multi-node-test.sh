@@ -45,6 +45,29 @@ done
 [ -f "$IMAGE" ] || { echo "no such image: $IMAGE" >&2; exit 1; }
 case "$NODES" in ''|*[!0-9]*) echo "--nodes needs a number" >&2; exit 1 ;; esac
 [ "$NODES" -ge 2 ] || { echo "--nodes must be at least 2" >&2; exit 1; }
+# Refuse an image built from a different tree than the one being tested.
+#
+# `make multi-node-test` does not depend on `image` — it boots whatever is at the output
+# path. So committing a fix and running the harness tests the *previous* build, passes or
+# hangs for reasons that have nothing to do with the change, and never says which binaries it
+# ran. Two three-node runs went that way before anyone looked at the image's mtime.
+#
+# An unknown revision on either side is not a mismatch: an image built before this stamp
+# existed, or a tree that is not a git checkout, should still be runnable. Only a definite
+# disagreement stops the run, and `--allow-stale-image` is there for deliberately re-running
+# an older build.
+MANIFEST="$(dirname "$IMAGE")/manifest.tsv"
+IMAGE_REVISION="$(awk -F'\t' '$2 == "otwono-revision" { print $3 }' "$MANIFEST" 2>/dev/null | tail -1)"
+TREE_REVISION="$(git -C "$(dirname "$0")/../.." describe --always --dirty --abbrev=12 2>/dev/null || echo unknown)"
+if [ "${ALLOW_STALE_IMAGE:-0}" = 0 ] \
+    && [ -n "$IMAGE_REVISION" ] && [ "$IMAGE_REVISION" != unknown ] \
+    && [ "$TREE_REVISION" != unknown ] && [ "$IMAGE_REVISION" != "$TREE_REVISION" ]; then
+    echo "the image at $IMAGE was built from $IMAGE_REVISION; this tree is $TREE_REVISION" >&2
+    echo "rebuild it (make TARGET=... image) or pass --allow-stale-image to run it anyway" >&2
+    exit 2
+fi
+echo "image built from ${IMAGE_REVISION:-an unstamped tree}"
+
 [ "$NODES" -le 8 ] || { echo "--nodes above 8 is more TCG than this is worth" >&2; exit 1; }
 OUT="${OUT:-$(dirname "$IMAGE")/multi-node}"
 mkdir -p "$OUT"
@@ -218,31 +241,8 @@ distinct=$(echo "$ids" | sort -u | grep -c . || true)
 # Which image this is comes from the image's own manifest, as in two-node-test.sh: the
 # variable had to be set once for the build and again for the run, and forgetting the second
 # made the harness print PASS having tested nothing. The variable is still honoured as an
-# override; it is just no longer how the answer is normally reached.
-MANIFEST="$(dirname "$IMAGE")/manifest.tsv"
-
-# Refuse an image built from a different tree than the one being tested.
-#
-# `make multi-node-test` does not depend on `image` — it boots whatever is at the output
-# path. So committing a fix and running the harness tests the *previous* build, passes or
-# hangs for reasons that have nothing to do with the change, and never says which binaries it
-# ran. Two three-node runs went that way before anyone looked at the image's mtime.
-#
-# An unknown revision on either side is not a mismatch: an image built before this stamp
-# existed, or a tree that is not a git checkout, should still be runnable. Only a definite
-# disagreement stops the run, and `--allow-stale-image` is there for deliberately re-running
-# an older build.
-IMAGE_REVISION="$(awk -F'\t' '$2 == "otwono-revision" { print $3 }' "$MANIFEST" 2>/dev/null | tail -1)"
-TREE_REVISION="$(git -C "$(dirname "$0")/../.." describe --always --dirty --abbrev=12 2>/dev/null || echo unknown)"
-if [ "${ALLOW_STALE_IMAGE:-0}" = 0 ] \
-    && [ -n "$IMAGE_REVISION" ] && [ "$IMAGE_REVISION" != unknown ] \
-    && [ "$TREE_REVISION" != unknown ] && [ "$IMAGE_REVISION" != "$TREE_REVISION" ]; then
-    echo "the image at $IMAGE was built from $IMAGE_REVISION; this tree is $TREE_REVISION" >&2
-    echo "rebuild it (make TARGET=... image) or pass --allow-stale-image to run it anyway" >&2
-    exit 2
-fi
-echo "image built from ${IMAGE_REVISION:-an unstamped tree}"
-
+# override; it is just no longer how the answer is normally reached. `MANIFEST` is set with
+# the other image checks at the top.
 if [ "${MESH_CONTENT_SMOKE:-0}" = 0 ] && [ -f "$MANIFEST" ] \
     && awk -F'\t' '$2 == "mesh-content-smoke" && $3 != "none" { found = 1 } END { exit !found }' "$MANIFEST"; then
     echo "image manifest says it carries the content check; asserting it"
