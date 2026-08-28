@@ -1,10 +1,15 @@
 # Carrying Mail: store-and-forward on the ONM
 
-**Status:** `IMPLEMENTED`. The custody rules, both wire methods, the carry pass, collection
-and the daemon plumbing exist and are covered by unit and integration tests over a real Noise
-channel. **Whether an envelope survives its sender going away has not yet been shown on
-booted nodes** — see `docs/build/VERIFICATION-LOG.md` for what the three-node runs have and
-have not demonstrated.
+**Status:** `VERIFIED`. The custody rules, both wire methods, the carry pass, collection and
+the daemon plumbing exist, are covered by unit and integration tests over a real Noise
+channel, and on 2026-08-28 a three-node QEMU run showed an envelope sealed by one node,
+carried by a second, and collected *and opened* by a third with the sender powered off for the
+whole collection.
+
+That does not make every part of this document verified. Drop on delivery is not implemented,
+nothing on the receiving side collects unprompted, and the run's take was driven by the CLI
+rather than by the daemon's own sweep — see §7 and `docs/build/VERIFICATION-LOG.md` for what
+the runs have and have not demonstrated.
 
 This document describes the third of `DISTRIBUTED-SERVICES.md`'s three primitives. The
 decisions are ADR-0028's; this is how they are built.

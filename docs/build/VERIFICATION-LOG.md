@@ -4905,3 +4905,175 @@ reproduces it — so it is recorded here as unexplained rather than closed.
 - **One vCPU per guest** on this host, so nothing here says the code behaves the same on a
   machine with cores to spare. The failures that forced the change were the harness's, but a
   concurrency bug that only appears on a genuinely parallel guest would not have been caught.
+
+## 2026-08-28 — a message survives its sender going away
+
+**STATUS: VERIFIED.** amd64, QEMU, TCG, no `/dev/kvm`, three VMs at one vCPU each on one
+UDP-multicast L2 segment. Image built from `65149de`. ADR-0028's property, on booted nodes:
+
+```
+store-and-forward: powering off node 3, the recipient
+waiting for node 1 to seal and node 2 to take custody (up to 1200s)
+  OTWONO-ENVELOPE-SEALED envelope=1851b90c…0d2b recipient=otw128g496xez…49tr
+  OTWONO-ENVELOPE-CARRIED envelope=1851b90c…0d2b
+store-and-forward: powering off node 1, the sender
+  node 1 is off; nothing it holds can serve node 3 from here on
+store-and-forward: booting node 3 again to collect
+  OTWONO-ENVELOPE-COLLECTED envelope=1851b90c…0d2b bytes=71
+store-and-forward: node 3 collected and opened its envelope from node 2, with node 1 off
+PASS: 3 nodes discovered and mutually authenticated
+```
+
+Node 1 sealed to node 3 while node 3 was powered off, node 2 took custody of ciphertext it
+could not open, node 1 was powered down, and node 3 came back and collected — **and opened**
+— its message from node 2. `bytes=71` is plaintext: opening it needed the content key sealed
+to node 3's sharing key and to nobody else (ADR-0019), so it is the recipient that read it and
+not the carrier. The same envelope id appears at all three points; the harness asserts that
+rather than trusting the eye, and each power-down is waited for, so "node 1 was down when node
+3 collected" is established by the sequence and not inferred.
+
+The sender picked its recipient with no coordination channel, and said how:
+
+```
+peer otw128g496xez…49tr stayed away for 60s; still connected: otw128g9jh0pbtadjsx…bg0r
+```
+
+One peer gone for a sustained minute, another still answering, sealed to the one that left.
+
+Also re-confirmed on the same run, after everything this branch changed: `fan-out: 3 of 3
+node(s) drew the large object from several peers`, all three nodes advancing a peer's pointer
+to sequence 2, and all three refusing a rolled-back record.
+
+### It took several attempts, and only one failure was the harness's
+
+**Run 4** reached `offered 1 envelope(s), took none` and stopped there. Nothing said which of
+six reasons that was, because `Carrier::take_custody` collapsed the store's named refusal to
+`None` and the pass reported only a count. Diagnosing it meant mounting a VM disk and reading
+its journal — and that was necessary a second time before the cause of *that* was found: the
+OTWONO daemons had no `StandardError=journal+console`, so nothing any of them said ever
+reached a boot log. Both are fixed. A pass now names the filter that emptied its list, or the
+refusal the store gave, and `otwono-permd`, `otwono-stored` and `otwono-netd` put their errors
+on the console.
+
+**Run 5** got further and named a real defect, twice over:
+
+```
+carry pass with otw1:30am-… failed: the peer will not serve c886b03b…, or does not have it
+```
+
+Two gaps between ADR-0028 §11 and the code, neither reachable by any test that existed:
+
+- **The sender refused to hand the envelope over.** `otwono-stored` applies its own copy of
+  ADR-0019 §4 before `otwono-netd` sees the object, so the carriage exception — which existed
+  only in the mesh daemon — was never reached. The store had already answered "not available".
+- **The carrier kept nothing.** `carry_pass` fetched the ciphertext, verified it, and dropped
+  it, recording custody of bytes the node did not hold. It would have counted them against its
+  budget, offered them onward, and had nothing to serve when the recipient came.
+
+Run 5 also produced ten of these, on one node only:
+
+```
+carry pass with otw1:30am-… failed: connect to 169.254.182.65:33814:
+  link I/O failed: Connection refused (os error 111)
+```
+
+33814 was never a listening port. `serve_inbound` recorded the accepted socket's remote
+address as the peer's, and that port is the *dialer's* ephemeral source port; `observe`
+appends, so an inbound connection seen before the peer's advertisement leaves a dead entry
+first in a list every outbound pass reads with `.first()`. Run 6 had zero such lines.
+
+This is also the likely shape of the one-way `Connection refused` recorded above under "It
+took three attempts", which was left unexplained and provisionally grouped with scheduling
+starvation. It is not proven to be the same thing — the run that would prove it is one that
+reproduces it — so that entry is not rewritten.
+
+**Run 6 failed in the check, not the product.** The sender sealed at t=521s while all three
+guests were still running, and the node it picked was **node 2, the carrier**:
+
+```
+OTWONO-ENVELOPE-SEALED envelope=94eee8d6… recipient=otw128g2g8t8…
+```
+
+Node 1's peer bindings were `otw128g2g8t8…` and `otw128gfkjw2…`; node 2's peers were
+`otw128g6ph1…` and `otw128gfkjw2…`. The intersection makes `otw128g2g8t8…` node 2, and node 2
+said as much itself:
+
+```
+offered 1 envelope(s), took none: nothing left after filtering:
+  1 addressed to this node, 0 too large or undated, 0 already held
+```
+
+which is the correct refusal — one's own mail belongs on the collection path. The check had
+asked for something impossible and then waited for it. The premise was "the peer that goes
+away is the recipient by construction, because the harness is what powers it off"; a guest
+under TCG with one vCPU, busy running the content check, can miss enough heartbeats to leave
+`connected` for a poll and come straight back. "Gone" now means missing for twelve consecutive
+polls *and* at least one other peer still answering.
+
+Worth stating plainly: run 6's cause took one log line to find, where run 5's took a disk
+mount and a journal read. That difference is what the run-4 diagnostic work bought.
+
+**Run 7 found the one that mattered most, and it was not in carriage at all.** Node 3 was
+powered down at t=920s. Both survivors logged, every cycle:
+
+```
+carry pass with otw1:wc6h-… failed: connect to 169.254.71.187:8443:
+  link I/O failed: No route to host (os error 113)
+```
+
+and both went on printing `connected=2` for the next three minutes.
+`open_content_channel` returned its errors and never touched the peer table, and
+`retry_candidates` returns peers that are `Discovered` or `Failed` and never `Connected` — so
+a peer that died *while connected* was in a state nothing moved it out of. It stayed
+connected for the life of the process. `net.peers` reported a switched-off machine as
+connected, and everything that reads `connected()` worked from that, including the envelope
+check's sender, which waits for a peer to leave that list and never would.
+
+`dial` had had this discipline since an earlier bug left a peer stuck in `Connecting`;
+`open_content_channel` did not. It does now.
+
+Run 7 also settled the stamp race by measurement rather than argument. Node 3's content check
+finished at t=912s and the harness powered it down at t=920s; its envelope check wrote the
+first-boot stamp at t=915s, winning by five seconds. The fix removes the coin flip.
+
+**The pattern across all six defects** is state that is only ever *set* and never
+re-examined: an address appended to a list and never reordered, a peer marked connected and
+never demoted, custody recorded for bytes that were never kept, a refusal reduced to a count
+before anyone could read it.
+
+### What this does not show
+
+- **Nothing collects on its own.** The recipient collected because the check ran
+  `otwono-netd --collect`. The carriage sweep is a daemon; collection is a command. Until
+  that is fixed, "the message arrives" means "the message becomes fetchable by a node that
+  thinks to ask" (CARRIAGE.md §7).
+- **Drop on delivery is not implemented**, so it is not verified. A carrier holds until
+  expiry even after the recipient has collected. ADR-0028 §7 names it as one of three bounds
+  on amplification; the other two — absolute expiry and each carrier's own budget — are the
+  ones actually in force.
+- **One hop.** §7 concludes a carrier may pass an envelope on, and the descriptor's shape
+  makes that structural rather than a permission. No run and no test exercises a second hop.
+- **One envelope, 87 bytes.** Nothing here says anything about a carrier under budget
+  pressure, many envelopes at once, or the size ceiling. Those have unit and integration
+  coverage only.
+- **Nothing expired.** The envelope was held for two hours and the run took minutes, so the
+  sweep that drops lapsed custody never fired on a booted node. Only
+  `a_lapsed_envelope_is_deleted_rather_than_hidden` covers it.
+- **No clock skew.** ADR-0028 §10 exists because the mesh has no NTP guarantee; all three
+  guests took their clock from the same host.
+- **amd64 only**, TCG, no `/dev/kvm`, one vCPU per guest. No arm64 multi-node run, and
+  nothing here says the code behaves the same on a machine with cores to spare.
+- **Three nodes.** `--nodes` accepts up to 8; only 3 has been run.
+- **No partition.** Phase 6's exit criterion wants a network partition that heals with
+  convergence asserted. Nothing here partitions anything.
+- **The unprompted sweep is not what delivered it.** `otwono-netd`'s own carriage sweep looked
+  at the sender at t=1049s and was told "the peer offered nothing" — the envelope did not
+  exist yet — and the take at t=1058s was reported by the check's fallback
+  `otwono-netd --carry` poke. So this run shows a carry pass working between two booted
+  nodes; it does not show the daemon taking custody without being asked. The sweep does that
+  in `a_brokered_carrier_takes_custody_through_its_own_store_daemon`, which drives
+  `carry_from` directly, but not here.
+- **One commit behind.** The image was built from `65149de`; `052c9f5` (folding two
+  `store.accept_shared` callers into one) landed while the run was in flight and is not in
+  what booted.
+
