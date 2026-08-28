@@ -9,10 +9,16 @@ whole collection.
 A second run on 2026-08-28 showed both halves doing it **unprompted**: the carrier's sweep
 took custody and the recipient's sweep collected, with no command run by hand on either.
 
-That does not make every part of this document verified. Drop on delivery (§3b) has tests but
-no booted-node run yet, nothing has exercised a second hop, and no envelope has ever expired
-on a booted node — see §7 and `docs/build/VERIFICATION-LOG.md` for what the runs have and have
-not demonstrated.
+A third run on 2026-08-28 showed drop on delivery (§3b): the recipient's sweep collected, told
+the carrier, and the carrier's custody store went empty while the run was still going. That
+run was stopped before the harness could assert it end to end — the recipient's own check was
+watching the carrier's offer list, which is the thing this feature empties — so the evidence
+is read out of the serial logs rather than asserted by the test.
+
+That does not make every part of this document verified. Nothing has exercised a second hop,
+no envelope has ever expired on a booted node, and the release's failure paths have only unit
+tests — see §7 and `docs/build/VERIFICATION-LOG.md` for what the runs have and have not
+demonstrated.
 
 This document describes the third of `DISTRIBUTED-SERVICES.md`'s three primitives. The
 decisions are ADR-0028's; this is how they are built.

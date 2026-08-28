@@ -249,8 +249,25 @@ case "$node_ordinal" in
     out=""
     i=0
     while [ "$i" -lt "$attempts" ]; do
+        # Two ways to learn the envelope's id, because drop on delivery took the first one
+        # away. `--mail` asks the carriers what they are holding for this node, and that is
+        # empty both before the sender seals *and*, now, from the moment the sweep collects
+        # and the carrier lets go. Those two silences can be a second apart, so a five-second
+        # poll can miss the id entirely — which is exactly what happened on the run that
+        # first showed a carrier dropping: the envelope arrived, was opened, the carrier gave
+        # up custody, and this loop was still waiting for `--mail` to mention it.
+        #
+        # So also take the daemon at its word. It logs the full id of what it collected for
+        # this node, and unlike the carrier's offer list that line does not go away. It is
+        # better evidence anyway: the daemon saying what it did, rather than the test
+        # inferring it from what a peer still has.
         waiting=$(otwono-netd --mail --socket /run/otwono/net.sock 2>&1 \
             | awk '$2 == "waiting" { print $3; exit }')
+        if [ -z "$waiting" ]; then
+            waiting=$(journalctl -u otwono-netd --no-pager 2>/dev/null \
+                | sed -n 's/.*: collected \([0-9a-f][0-9a-f]*\) (.*addressed to this node.*/\1/p' \
+                | tail -1)
+        fi
         if [ -n "$waiting" ]; then
             if otwono-storectl open "$waiting" --out "$WORK/opened" >/dev/null 2>&1; then
                 collected="$waiting"

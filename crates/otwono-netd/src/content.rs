@@ -425,10 +425,21 @@ impl ContentResponder {
             "envelope.release",
             json!({ "envelope_id": envelope_id }),
         ) {
-            Some(_) => Response::Released {
-                envelope_id: envelope_id.to_string(),
-                released: true,
-            },
+            Some(_) => {
+                // The counterpart to the line the carriage sweep logs when custody is taken.
+                // Without it the journal shows envelopes being picked up and never put down,
+                // and a carrier still holding delivered mail looks exactly like one whose
+                // recipient has not come back yet.
+                eprintln!(
+                    "otwono-netd: released {}… to {}, which says it arrived",
+                    &envelope_id[..envelope_id.len().min(16)],
+                    peer.fingerprint()
+                );
+                Response::Released {
+                    envelope_id: envelope_id.to_string(),
+                    released: true,
+                }
+            }
             // The store would not, so this node is still holding it. Saying `false` is the
             // truth: the recipient learns nothing it can act on either way, and the envelope
             // will lapse on its own deadline.

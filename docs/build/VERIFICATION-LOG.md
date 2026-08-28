@@ -5178,3 +5178,78 @@ t=638s rather than t=1059s.
 - Everything the previous two entries record as unshown is still unshown: drop on delivery,
   a second hop, expiry on a booted node, clock skew, arm64.
 
+
+## 2026-08-28 — a carrier let go of an envelope, and the recipient's own check did not notice
+
+**STATUS: VERIFIED** for drop on delivery. amd64, QEMU, TCG, no `/dev/kvm`, three nodes.
+Image built from `9278b39`. The run did **not** finish: it was stopped by hand after the
+feature had been demonstrated and the harness had hung on a defect the feature exposed. Both
+halves of that are recorded below because both matter.
+
+### What was shown
+
+ADR-0028 §7's third bound on amplification — a carrier gives up custody when the recipient
+says the envelope arrived — happening between three booted machines.
+
+Node 1 sealed and powered off, node 2 took custody unprompted, node 3 came back and its
+collection sweep fetched the envelope:
+
+```
+n1  [ 609.012569] OTWONO-ENVELOPE-SEALED envelope=db19cf06…2302ce2e recipient=otw128g7jjep2p7…
+n2  [ 622.666472] otwono-netd: carrying db19cf062f769463… (87 bytes) for somebody until
+                  1787914864813, taken from otw1:1gra-ajba-x5mb-z7ge
+n2  [ 624.328824] OTWONO-ENVELOPE-CARRIED envelope=db19cf06…2302ce2e
+n3  [ 124.631604] otwono-netd: collected db19cf062f769463… (87 bytes) addressed to this node,
+                  from otw1:0e4h-2mt1-pn74-dvfs
+n2  [ 769.182449] OTWONO-ENVELOPE-DROPPED envelope=db19cf06…2302ce2e
+n2  [ 783.435438] otwono-netd: otw1:f54x-c5cf-ms00-297z offered 0 envelope(s), took none:
+                  the peer offered nothing
+```
+
+`OTWONO-ENVELOPE-DROPPED` is printed by the carrier when `envelope.held` comes back empty, so
+it is the carrier's own store saying it is no longer holding the message — not a report of
+having sent a release. The line under it is the same node, a pass later, with nothing to
+offer: the custody record is gone, not merely marked.
+
+Nothing drove any of it. No `--carry`, no `--collect`, no `content.delivered` by hand.
+
+### What broke, and why it is the interesting part
+
+Node 3's check never printed `OTWONO-ENVELOPE-SWEPT`. It sat in its poll loop until the run
+was stopped, twenty minutes after the envelope it was waiting for had arrived, been decrypted,
+and been dropped by its carrier.
+
+The loop asked `otwono-netd --mail` — *what is a carrier holding for me* — and treated a
+non-empty answer as the signal that mail exists. Drop on delivery is precisely the change
+that empties that answer the instant the mail lands. Before this feature the carrier held the
+envelope until expiry, so the id stayed visible for the whole window and the poll could not
+miss it. After it, the id is visible only between the sweep taking the envelope and the sweep
+releasing the carrier, which here was under two seconds — less than one poll interval.
+
+So the check was watching a peer's state to learn a local fact, and the feature under test
+removed the state. Two fixes, and the second is the one worth keeping:
+
+- `otwono-netd` now logs the **whole** content id when it collects, not a sixteen-character
+  prefix. The prefix was unusable: `otwono-storectl open` is what an operator does next and it
+  needs the full id.
+- The recipient's check reads that line when `--mail` is empty. That is better evidence than
+  what it replaced — the daemon stating what it did, rather than the test inferring it from
+  what a peer still has.
+
+`otwono-netd` also now logs the release on the carrier's side. It logged taking custody and
+nothing on giving it up, so from the journal alone a carrier that had delivered its mail was
+indistinguishable from one whose recipient had never come back.
+
+### What this does not show
+
+- **The run was stopped, so the harness has not asserted this end to end.** Every marker above
+  was read out of the serial logs by hand. The assertion in `multi-node-test.sh` is written
+  and has never passed.
+- **One hop.** The recipient tells the carrier it collected from and nobody else. In a
+  multi-hop path every earlier hop keeps its copy until expiry, and no run has ever built a
+  multi-hop path.
+- **The release is best effort and the failure paths are untested on booted nodes.** A carrier
+  that answers `released: false`, or never hears the report at all, keeps the envelope until
+  its deadline. That is the old behaviour and it is correct, but only unit tests have seen it.
+- **Nothing expired**, no clock skew, **amd64 only**, TCG, one vCPU per guest — as every run
+  before it.

@@ -933,9 +933,12 @@ fn collection_sweep(state: &Arc<NetState>, turn: &mut usize, last: &mut std::tim
         Ok(content::Collected::NoInbox) => {}
         Ok(content::Collected::Fetched(collected)) => {
             for object in &collected {
+                // Whole id, not the sixteen-character prefix the other carriage lines use.
+                // This is the one an operator does something with next — `otwono-storectl
+                // open <id>` — and a truncated id cannot be pasted into that.
                 eprintln!(
-                    "otwono-netd: collected {}… ({} bytes) addressed to this node, from {}",
-                    &object.content_id[..object.content_id.len().min(16)],
+                    "otwono-netd: collected {} ({} bytes) addressed to this node, from {}",
+                    object.content_id,
                     object.bytes.len(),
                     candidate.claimed_node_id.fingerprint()
                 );
