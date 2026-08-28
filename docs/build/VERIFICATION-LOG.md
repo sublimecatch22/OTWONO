@@ -5334,3 +5334,48 @@ Every one of them made a test report success without testing what it claimed.
   missing, so all this run shows is that it does not fire spuriously — which is worth
   something and is not what it is for.
 - **Nothing expired**, no clock skew, **amd64 only**, TCG, one vCPU per guest.
+
+## 2026-08-28 — the ciphertext went too, and a booted node says so
+
+**STATUS: VERIFIED.** amd64, QEMU, TCG, three nodes, one vCPU each. Image built from
+`7550560` with `MESH_CONTENT_SMOKE=1`. The same round trip as the previous entry, run to
+answer the thing that entry had to admit it could not see.
+
+```
+n2  [ 658.4] otwono-netd: carrying 2bcefeaf6c74ae18… (87 bytes) for somebody until
+             1787919743485, taken from otw1:j8d4-5a8z-5za0-9exn
+n3  [ 139.1] OTWONO-ENVELOPE-SWEPT envelope=2bcefeaf…f7016cb4
+n3          OTWONO-ENVELOPE-COLLECTED envelope=2bcefeaf…f7016cb4 bytes=71
+n2  [ 812.3] otwono-netd: released 2bcefeaf6c74ae18… to otw1:0np4-9p6h-edty-bqey, which says
+             it arrived (87 bytes freed)
+n2          OTWONO-ENVELOPE-DROPPED envelope=2bcefeaf…f7016cb4 freed=87
+```
+
+`freed=87` is the whole envelope. Before ADR-0031 that number would have been zero and every
+other marker in this run would have been identical, because dropping the custody record has
+always emptied the carriage index — which is exactly why the previous entry could not tell the
+two apart. The carrier's check now reads the count back out of the journal and fails the run
+if it is zero or missing, so a regression that put carriage back in the permanent store fails
+rather than passes.
+
+### What else this run settled
+
+- **The deletion guards do not disturb ordinary carriage.** `take_carried` declines over a pin
+  or a live replica and `release_carried` frees only an entry that is neither (`e699d1a`,
+  unit-tested and never booted until now). Node 2's cache already held a replica from the
+  content phase when it took custody, which is the realistic arrangement, and both the take
+  and the release went through.
+- **The content check passed on all three nodes** on the same build, so nothing in the guards
+  or the freed-byte accounting disturbed replication, sharing, discovery or pointers.
+
+### What this does not show
+
+- **`freed=87` is the daemon's own count, not an independent look at the disk.** It is what
+  `Cache::release_carried` returned, so it proves the release reached the cache and removed an
+  entry of that size. Nothing on the node re-read the cache afterwards to confirm the chunks
+  are gone; `removing_the_last_holder_of_a_chunk_frees_it` covers that at the unit tier.
+- **The guards were exercised only in the case where they say yes.** No booted run has arranged
+  a carried envelope whose id collides with a pin or a replica, which is what they exist for.
+  Producing that collision needs a peer holding the exact sealed bytes.
+- **Still one hop, one envelope, 87 bytes**, nothing expired, no clock skew, amd64 only, TCG.
+  The second hop remains control-plane tier only.
