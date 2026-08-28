@@ -69,6 +69,25 @@ Three things are checked at each step, and each has a test that fails if it is r
 - **That the chain does not revisit an id.** `parent` is not trusted to be older — nothing in
   the record can prove that — so a loop is a malformed page rather than a hang.
 
+## 3a. A name is not proof of a page
+
+`wiki/<name>` is an ordinary pointer, and anything holding `pointer.publish` can put anything
+under it. A writer that took whatever the pointer named and used it as a parent would produce
+a page whose history is broken from birth — a first revision with a parent nothing can parse,
+reported as truncated for ever after.
+
+That is not hypothetical. The mesh content check publishes `wiki/Getting-Started` naming a
+plain text blob, deliberately, because it exercises the pointer primitive and not this
+service; the first booted run of the wiki check chained onto it and failed exactly that way.
+
+So before an existing head is adopted as a parent it has to parse as a revision **of this
+page**. `otwono_wiki::may_extend` is the rule, kept with the other rules rather than in the
+CLI, so it is one function with tests rather than a check somewhere in a command.
+
+Refusing, and not quietly starting a fresh chain: ignoring the existing head would move a name
+somebody else is using and lose whatever they had under it, which is worse than a write that
+stops and says why.
+
 ## 4. What a reader gets back
 
 A walk returns the steps it took **and how it ended**, because a bare list cannot tell "this

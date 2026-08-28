@@ -231,6 +231,34 @@ impl std::fmt::Display for WikiError {
 
 impl std::error::Error for WikiError {}
 
+/// Whether an existing head may be extended by a new revision of `page`.
+///
+/// `wiki/<name>` is an ordinary pointer, and anything holding `pointer.publish` can put
+/// anything under it. A writer that took whatever the pointer named and used it as a parent
+/// would produce a page whose history is broken from birth — a first revision with a parent
+/// nothing can parse, reported as truncated for ever after. That is not hypothetical: the
+/// mesh content check publishes `wiki/Getting-Started` naming a plain text blob, deliberately,
+/// because it tests the pointer primitive and not this service, and the first booted run of
+/// the wiki check chained onto it.
+///
+/// Refusing is the answer rather than quietly starting a fresh chain. Ignoring the existing
+/// head would move a name somebody else is using and lose whatever they had under it, which
+/// is a worse outcome than a write that stops and says why.
+///
+/// A rule and not plumbing, so it lives here with the other rules and can be tested without
+/// a store — the CLI that calls it is one caller, not the definition.
+pub fn may_extend(head: &[u8], page: &str) -> Result<Revision, WikiError> {
+    let revision: Revision = serde_json::from_slice(head)
+        .map_err(|e| WikiError::Malformed(format!("the head is not a wiki revision: {e}")))?;
+    if revision.page != page {
+        return Err(WikiError::WrongPage {
+            wanted: page.to_string(),
+            found: revision.page,
+        });
+    }
+    Ok(revision)
+}
+
 /// Where a history walk gets revisions from.
 ///
 /// A trait rather than a store handle, so the rules can be tested against a map and the same

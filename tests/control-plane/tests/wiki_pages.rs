@@ -337,6 +337,90 @@ fn the_history_of_a_page_walks_back_to_its_first_revision() {
 }
 
 #[test]
+fn a_name_already_pointing_at_something_that_is_not_a_revision_is_refused() {
+    // Found on the first booted run of the wiki check. `wiki/<name>` is an ordinary pointer
+    // and anything holding `pointer.publish` can put anything under it — the mesh content
+    // check publishes `wiki/Getting-Started` naming a plain text blob, deliberately, because
+    // it is testing the pointer primitive and not this service.
+    //
+    // Chaining onto that produced a page whose history was broken from birth: a first
+    // revision with a parent nothing could parse, reported as truncated for ever after. The
+    // write is refused instead, and not silently restarted as a fresh chain — ignoring the
+    // existing head would move a name somebody else is using and lose what they had there.
+    let h = Harness::start("occupied");
+
+    let blob = h.call(
+        &h.store,
+        "store.put",
+        json!({ "data": data_encoding::BASE64.encode(b"not a revision, just words"), "visibility": "public" }),
+        "store.write",
+    )["content_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let author = h.node_id();
+    let mut pointer = otwono_pointer::Pointer::new(&author, "wiki", "Occupied", 1, Some(blob), 1_000);
+    pointer.signature = h.sign(&pointer.payload_for_id_sign().unwrap());
+    h.call(
+        &h.store,
+        "pointer.publish",
+        json!({ "record": pointer }),
+        "pointer.publish",
+    );
+
+    // What `write` does before adopting a head as its parent: fetch it and require that it
+    // parses as a revision of this page.
+    let head = h.head("Occupied").expect("the name is taken");
+    let out = h.call(&h.store, "store.get", json!({ "content_id": head }), "store.read");
+    let bytes = data_encoding::BASE64
+        .decode(out["data"].as_str().unwrap().as_bytes())
+        .unwrap();
+    // And the rule refuses it. Asserting only that the fixture fails to parse would be
+    // asserting the fixture, not the behaviour.
+    let err = otwono_wiki::may_extend(&bytes, "Occupied")
+        .expect_err("a head that is not a revision must not be extendable");
+    assert!(matches!(err, otwono_wiki::WikiError::Malformed(_)), "{err}");
+}
+
+#[test]
+fn a_revision_of_one_page_is_not_a_parent_for_another() {
+    // The other half of the same check. Both of these are genuine revisions signed by this
+    // node; the head under `Other` simply belongs to a different page, and extending it would
+    // graft one page's history onto another's.
+    let h = Harness::start("crossed");
+    let elsewhere = h.write("Somewhere-Else", "a page of its own\n");
+
+    let author = h.node_id();
+    let mut pointer =
+        otwono_pointer::Pointer::new(&author, "wiki", "Other", 1, Some(elsewhere.clone()), 1_000);
+    pointer.signature = h.sign(&pointer.payload_for_id_sign().unwrap());
+    h.call(
+        &h.store,
+        "pointer.publish",
+        json!({ "record": pointer }),
+        "pointer.publish",
+    );
+
+    let head = h.head("Other").expect("the name is taken");
+    let out = h.call(&h.store, "store.get", json!({ "content_id": head }), "store.read");
+    let bytes = data_encoding::BASE64
+        .decode(out["data"].as_str().unwrap().as_bytes())
+        .unwrap();
+    // It parses, and is genuinely this node's. It is simply another page's, and grafting one
+    // page's history onto another is what the rule refuses.
+    assert_eq!(
+        otwono_wiki::may_extend(&bytes, "Somewhere-Else").unwrap().page,
+        "Somewhere-Else"
+    );
+    let err = otwono_wiki::may_extend(&bytes, "Other")
+        .expect_err("a revision of another page must not be extendable");
+    assert!(
+        matches!(err, otwono_wiki::WikiError::WrongPage { ref found, .. } if found == "Somewhere-Else"),
+        "{err}"
+    );
+}
+
+#[test]
 fn a_page_that_was_never_written_has_no_head() {
     // What `write` relies on to know it is starting a chain rather than continuing one, and
     // what `read` reports as "no such page" rather than an error about a missing object.

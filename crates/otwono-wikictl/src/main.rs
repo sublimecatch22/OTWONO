@@ -84,6 +84,17 @@ enum Error {
     Runtime(String),
 }
 
+/// Just the reason. Which of the two it was decides the exit code in `main` and is not part
+/// of the sentence — an error quoted inside another error should read as the cause it is,
+/// not as `Runtime("...")`.
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Usage(why) | Error::Runtime(why) => write!(f, "{why}"),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct Options {
     command: String,
@@ -193,9 +204,33 @@ fn write_page(opts: &Options, store: &Path, perm: &Path) -> Result<String, Error
 
     let body = put_bytes(store, perm, &body_bytes, &opts.visibility)?;
 
-    // Whatever the pointer names now becomes this revision's parent. A page that does not
-    // exist yet resolves to nothing, which is a first revision rather than an error.
-    let parent = current_head(opts, store, perm, &page)?;
+    // Whatever the pointer names now becomes this revision's parent — but only once it has
+    // been shown to *be* a revision of this page. A page that does not exist yet resolves to
+    // nothing, which is a first revision rather than an error.
+    //
+    // The check is not ceremony. `wiki/<name>` is an ordinary pointer and anything holding
+    // `pointer.publish` can put anything under it; the mesh content check publishes
+    // `wiki/Getting-Started` naming a plain text blob, and chaining onto that produced a page
+    // whose history was broken from birth — a first revision with a parent nothing could
+    // parse, reported for ever after as truncated. Found on the first booted run of this.
+    //
+    // Refusing rather than starting a fresh chain: silently ignoring the existing head would
+    // move a name somebody else is using and lose whatever they had under it.
+    let parent = match current_head(opts, store, perm, &page)? {
+        None => None,
+        Some(head) => {
+            // `otwono_wiki::may_extend` and not a check written here: it is a rule about what
+            // a page is, so it belongs with the rest of them where it can be tested without a
+            // store. This is one caller of it.
+            let bytes = get_bytes(store, perm, &head)?;
+            otwono_wiki::may_extend(&bytes, &page).map_err(|e| {
+                Error::Runtime(format!(
+                    "wiki/{page} already names {head}: {e}; refusing to extend it"
+                ))
+            })?;
+            Some(head)
+        }
+    };
 
     let author = node_id_of_this_node(opts)?;
     let mut revision = otwono_wiki::Revision::new(

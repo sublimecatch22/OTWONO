@@ -4,7 +4,7 @@
 # BUILT FOR TESTING. Installed only by build stage 37 (MESH_CONTENT_SMOKE=1).
 #
 # Phase 6's first exit criterion clause, and the thing that distinguishes a *service* from
-# the primitives under it. The mesh content check already publishes `wiki/Getting-Started`
+# the primitives under it. The mesh content check already publishes `wiki/Wiki-Check`
 # and resolves a peer's — but what that names is an opaque blob. This writes a real page and
 # reads a peer's, which means three fetches and three checks rather than one:
 #
@@ -18,6 +18,12 @@
 #
 # Every node writes and every node reads, rather than one of each. A page that only travels
 # in one direction would leave the other node's write untested, and the two are the same code.
+#
+# The page is `Wiki-Check` and not `Getting-Started`, which the mesh content check owns. That
+# check publishes `wiki/Getting-Started` naming a plain blob — a pointer, deliberately, not a
+# wiki page — and the first booted run of this one chained a revision onto it and produced a
+# history that was broken from birth. `otwono-wikictl write` now refuses that outright; two
+# checks sharing one mutable name was the mistake underneath it.
 set -eu
 
 WORK=$(mktemp -d)
@@ -52,7 +58,7 @@ done
 step "writing this node's page"
 printf 'This is node %s of %s.\nWritten before any peer was asked for anything.\n' \
     "$node_ordinal" "$node_total" > "$WORK/mine.md"
-wrote=$(otwono-wikictl write Getting-Started --file "$WORK/mine.md" 2>&1) \
+wrote=$(otwono-wikictl write Wiki-Check --file "$WORK/mine.md" 2>&1) \
     || fail "writing this node's page failed: $wrote"
 mine=$(echo "$wrote" | awk 'NR==1 {print $2}')
 case "$mine" in
@@ -63,12 +69,12 @@ esac
 # It reads back locally before anything crosses a link. A page that cannot be read on the
 # node that wrote it is a local fault, and finding that out through a peer would blame the
 # network for it.
-otwono-wikictl read Getting-Started --out "$WORK/mine-back.md" >/dev/null 2>&1 \
+otwono-wikictl read Wiki-Check --out "$WORK/mine-back.md" >/dev/null 2>&1 \
     || fail "this node cannot read the page it just wrote"
 cmp -s "$WORK/mine.md" "$WORK/mine-back.md" \
     || fail "this node's page did not read back as what was written"
 
-history=$(otwono-wikictl history Getting-Started 2>&1) \
+history=$(otwono-wikictl history Wiki-Check 2>&1) \
     || fail "walking this node's own history failed: $history"
 echo "$history" | grep -q "^end: complete" \
     || fail "this node's own history is not complete: $history"
@@ -83,7 +89,7 @@ while [ "$i" -lt 150 ]; do
         --perm-socket /run/otwono/perm.sock 2>/dev/null); do
         # No --at: a node knows where the peers it is connected to are listening, and
         # `otwono-wikictl` asks it rather than making this script join two commands' output.
-        if read_out=$(otwono-wikictl read Getting-Started --from "$candidate" \
+        if read_out=$(otwono-wikictl read Wiki-Check --from "$candidate" \
             --out "$WORK/theirs.md" 2>&1); then
             peer=$candidate
             break
