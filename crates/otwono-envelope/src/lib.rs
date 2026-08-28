@@ -161,7 +161,39 @@ pub struct CarryPolicy {
     pub max_hold_ms: u64,
 }
 
+/// The largest single envelope any carrier will hold.
+///
+/// A message is small. This is comfortably above any plausible text message with a modest
+/// attachment, and comfortably below the point where one envelope could dominate a carrier —
+/// it is a sixty-fourth of a T0 node's whole carriage budget, so even the smallest machine
+/// can hold dozens of them rather than one.
+///
+/// Not in `FeatureGates`, deliberately. The *budget* varies with the machine (ADR-0028 §8);
+/// what counts as a message does not, and a per-tier answer would mean a T0 node refusing
+/// mail that a T3 node would carry, which makes delivery depend on which carrier you happen
+/// to meet.
+pub const MAX_ENVELOPE_BYTES: u64 = 1024 * 1024;
+
+/// The furthest ahead any carrier will commit to holding an envelope.
+///
+/// A week. Long enough that a laptop shut for a holiday still collects its mail; short enough
+/// that a carrier's disk is not an archive. A sender may ask for less and gets less; a sender
+/// asking for more gets this (ADR-0028 §3).
+pub const MAX_HOLD_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
 impl CarryPolicy {
+    /// The terms a carrier offers, given the room it has left.
+    ///
+    /// One constructor so the two ceilings are not restated at each call site and cannot
+    /// drift apart between the daemon and its tests.
+    pub fn with_room(room_bytes: u64) -> CarryPolicy {
+        CarryPolicy {
+            room_bytes,
+            max_size_bytes: MAX_ENVELOPE_BYTES,
+            max_hold_ms: MAX_HOLD_MS,
+        }
+    }
+
     /// Decide whether to carry one offered envelope.
     ///
     /// The single place ADR-0028 §3's rule lives: the committed expiry is the *earlier* of

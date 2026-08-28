@@ -34,7 +34,7 @@ fn policy() -> CarryPolicy {
 }
 
 fn for_node(seed: u8, id_byte: u8, expires: u64) -> Envelope {
-    Envelope::new(&cid(id_byte), &node(seed).node_id(), 4096, expires)
+    Envelope::new(&cid(id_byte), node(seed).node_id(), 4096, expires)
 }
 
 /// Custody survives a restart, or the carrier silently loses somebody's mail.
@@ -91,14 +91,14 @@ fn a_recipient_sees_only_its_own_mail() {
         .unwrap();
 
     assert_eq!(store.held(NOW).unwrap().len(), 3, "the carrier holds three");
-    let hers = store.held_for(&alice.node_id(), NOW).unwrap();
+    let hers = store.held_for(alice.node_id(), NOW).unwrap();
     assert_eq!(hers.len(), 2);
-    assert!(hers.iter().all(|c| c.envelope.is_for(&alice.node_id())));
-    assert_eq!(store.held_for(&bob.node_id(), NOW).unwrap().len(), 1);
+    assert!(hers.iter().all(|c| c.envelope.is_for(alice.node_id())));
+    assert_eq!(store.held_for(bob.node_id(), NOW).unwrap().len(), 1);
 
     // A node the carrier holds nothing for gets an empty list, not an error — the same
     // answer a node that carries nothing gives, so asking cannot reveal whether it carries.
-    assert!(store.held_for(&node(9).node_id(), NOW).unwrap().is_empty());
+    assert!(store.held_for(node(9).node_id(), NOW).unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

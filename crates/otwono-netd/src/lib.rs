@@ -96,6 +96,10 @@ pub struct NetState {
     /// whatever it is given; the daemon replaces it with a
     /// [`content::BrokeredPointers`] that asks `otwono-stored`.
     pub pointer_memory: Arc<dyn otwono_pointer::SequenceMemory + Send + Sync>,
+    /// Where envelopes taken into custody go (ADR-0028 §2). `None` is a node that carries no
+    /// mail for anyone, and it makes no carriage traffic at all rather than asking and
+    /// discarding — the same structural consent `holder` gives replication.
+    pub carrier: Option<Arc<dyn otwono_store::Carrier + Send + Sync>>,
     /// Whatever can sign for this node. In the daemon it is a [`BrokeredSigner`]; in a
     /// test it is usually a whole `NodeIdentity`, which signs locally.
     pub signer: Arc<dyn SessionSigner>,
@@ -112,6 +116,7 @@ impl NetState {
             responder: None,
             holder: None,
             pointer_memory: Arc::new(otwono_pointer::NoMemory),
+            carrier: None,
             signer,
             node_id,
             peers: Mutex::new(PeerTable::new()),
@@ -152,6 +157,49 @@ impl NetState {
     ) -> Self {
         self.pointer_memory = memory;
         self
+    }
+
+    /// Give this node somewhere to put envelopes it takes custody of.
+    ///
+    /// Takes the trait rather than a concrete store so a test can drive a real
+    /// `EnvelopeStore` in-process while the daemon passes a [`content::BrokeredCarrier`] that
+    /// goes over the control plane. The pass cannot tell them apart, which is the point.
+    pub fn with_carrier(mut self, carrier: Arc<dyn otwono_store::Carrier + Send + Sync>) -> Self {
+        self.carrier = Some(carrier);
+        self
+    }
+
+    /// Take at most one envelope into custody from one peer (ADR-0028 §2).
+    ///
+    /// A fresh channel, for the reason [`Self::replicate_from`] opens one, and the consent
+    /// check happens before the connect for the same reason: a node that dialled and then
+    /// discovered it carries nothing would still have told the peer it was interested.
+    pub fn carry_from(&self, candidate: &Candidate) -> Result<content::CarryPass, String> {
+        let Some(carrier) = self.carrier.clone() else {
+            return Ok(content::CarryPass::NotCarrying);
+        };
+        match carrier.carriage_room(&[], self.now()) {
+            Some(room) if room.room_bytes > 0 => {}
+            _ => return Ok(content::CarryPass::NotCarrying),
+        }
+        let source = self.open_content_channel(candidate)?;
+        let content::PeerSource {
+            mut channel, link, ..
+        } = source;
+        content::carry_pass(&mut channel, &link, carrier.as_ref(), self.now()).map_err(|e| e.to_string())
+    }
+
+    /// Ask one peer what it is holding for this node, and fetch it (ADR-0028 §9).
+    ///
+    /// The scoped question, so this node never learns who else the carrier serves. Returns
+    /// the sealed objects; putting them where the recipient can open them is the caller's
+    /// decision and carries its own capability.
+    pub fn collect_from(&self, candidate: &Candidate) -> Result<Vec<content::FetchedObject>, String> {
+        let source = self.open_content_channel(candidate)?;
+        let content::PeerSource {
+            mut channel, link, ..
+        } = source;
+        content::collect_addressed(&mut channel, &link).map_err(|e| e.to_string())
     }
 
     pub fn node_id(&self) -> &NodeId {
@@ -669,6 +717,55 @@ fn replication_sweep(state: &Arc<NetState>, turn: &mut usize, last: &mut std::ti
     );
 }
 
+/// Take custody of an envelope from one peer, on the sweep tick (ADR-0028 §2).
+///
+/// The mirror of [`replication_sweep`] and separate from it on purpose: a node may carry
+/// mail without replicating content, or replicate without carrying, because §8 made those
+/// two different agreements. Sharing a sweep would tie them together in code after the ADR
+/// took care to keep them apart.
+fn carriage_sweep(state: &Arc<NetState>, turn: &mut usize, last: &mut std::time::Instant) {
+    if state.carrier.is_none() {
+        return;
+    }
+    if last.elapsed() < DISCOVERY_SWEEP {
+        return;
+    }
+    *last = std::time::Instant::now();
+    let connected = state.peers.lock().unwrap().connected();
+    if connected.is_empty() {
+        return;
+    }
+    let peer = &connected[*turn % connected.len()];
+    *turn = turn.wrapping_add(1);
+    let Some(address) = peer.addresses.first().and_then(|a| a.parse().ok()) else {
+        return;
+    };
+    let candidate = Candidate {
+        claimed_node_id: peer.node_id,
+        address,
+    };
+    match state.carry_from(&candidate) {
+        Ok(content::CarryPass::Took {
+            envelope_id,
+            size_bytes,
+            until_ms,
+        }) => eprintln!(
+            "otwono-netd: carrying {}… ({size_bytes} bytes) for somebody until {until_ms},              taken from {}",
+            &envelope_id[..envelope_id.len().min(16)],
+            candidate.claimed_node_id.fingerprint()
+        ),
+        Ok(content::CarryPass::NothingTaken { offered }) => eprintln!(
+            "otwono-netd: {} offered {offered} envelope(s), took none",
+            candidate.claimed_node_id.fingerprint()
+        ),
+        Ok(content::CarryPass::NotCarrying) => {}
+        Err(e) => eprintln!(
+            "otwono-netd: carry pass with {} failed: {e}",
+            candidate.claimed_node_id.fingerprint()
+        ),
+    }
+}
+
 /// Discovery loop: browse the LAN, dial whoever we are supposed to dial, and keep trying.
 ///
 /// The retry sweep is not optional. mDNS delivers `ServiceResolved` once per resolution,
@@ -678,16 +775,20 @@ fn replication_sweep(state: &Arc<NetState>, turn: &mut usize, last: &mut std::ti
 pub fn run_discovery(state: Arc<NetState>, discovery: otwono_net::Discovery) {
     let local = *state.node_id();
     let mut turn = 0usize;
+    let mut carriage_turn = 0usize;
     // Starts one interval in the past so the first sweep does not wait for one: a node that
     // has just met its peers is a node with the most to ask them.
     let mut last_sweep = std::time::Instant::now() - DISCOVERY_SWEEP;
+    let mut last_carriage = std::time::Instant::now() - DISCOVERY_SWEEP;
     loop {
         let Some(candidate) = discovery.next_candidate(DISCOVERY_SWEEP) else {
             retry_known_peers(&state, &local);
             replication_sweep(&state, &mut turn, &mut last_sweep);
+            carriage_sweep(&state, &mut carriage_turn, &mut last_carriage);
             continue;
         };
         replication_sweep(&state, &mut turn, &mut last_sweep);
+        carriage_sweep(&state, &mut carriage_turn, &mut last_carriage);
         if candidate.claimed_node_id == local {
             continue; // our own advertisement
         }
@@ -762,6 +863,42 @@ pub struct NetService {
 }
 
 impl NetService {
+    /// Put a collected envelope where its recipient can open it (ADR-0019).
+    ///
+    /// Ciphertext stays ciphertext and only the key that came with it is kept, so this node's
+    /// record names exactly one recipient — itself. Re-sealing would produce a different
+    /// object under a key the sender never issued.
+    fn accept_collected(&self, object: &content::FetchedObject) -> Result<String, String> {
+        let sharing = object
+            .sharing
+            .as_ref()
+            .ok_or("an envelope arrived without the key to open it")?;
+        let sealed = &sharing.sealed_key;
+        let token = content::request_token(
+            &self.perm_socket,
+            otwono_stored::CAPABILITY_WRITE,
+            "otwono-netd is storing an envelope collected for this node",
+        )?;
+        let mut client = otwono_proto::Client::connect(otwono_proto::socket_path("store"))
+            .map_err(|e| format!("store socket: {e}"))?;
+        client
+            .call_with_capability(
+                "store.accept_shared",
+                json!({
+                    "content_id": object.content_id,
+                    "data": data_encoding::BASE64.encode(&object.bytes),
+                    "encryption": sharing.encryption,
+                    "nonce_prefix": sharing.nonce_prefix,
+                    "plaintext_size_bytes": sharing.plaintext_size_bytes,
+                    "sealed_key": sealed,
+                }),
+                &token,
+            )
+            .map_err(|e| format!("store.accept_shared: {e}"))?
+            .map_err(|e| e.message)?;
+        Ok(object.content_id.clone())
+    }
+
     pub fn new(state: Arc<NetState>, perm_socket: PathBuf) -> Self {
         NetService { state, perm_socket }
     }
@@ -834,6 +971,16 @@ impl Service for NetService {
                     CAPABILITY_CONTENT,
                 ),
                 MethodDescription::guarded(
+                    "net.carry",
+                    "Take at most one envelope into custody from one peer (ADR-0028)",
+                    CAPABILITY_CONTENT,
+                ),
+                MethodDescription::guarded(
+                    "net.collect",
+                    "Ask one peer what it is holding for this node, and store it",
+                    CAPABILITY_CONTENT,
+                ),
+                MethodDescription::guarded(
                     "net.pointer",
                     "Ask one peer what one of its names points at (ADR-0027)",
                     CAPABILITY_CONTENT,
@@ -880,6 +1027,58 @@ impl Service for NetService {
             // net.content, like the fetch it usually precedes: a pointer's answer is a
             // content id this node could then ask for, so being allowed to resolve a name is
             // being allowed to reach what it names.
+            "net.carry" => {
+                self.authorize(ctx, CAPABILITY_CONTENT)?;
+                let candidate = Self::candidate(&params)?;
+                let pass = self.state.carry_from(&candidate).map_err(RpcError::internal)?;
+                Ok(match pass {
+                    content::CarryPass::NotCarrying => json!({
+                        "schema_version": DESCRIBE_SCHEMA_VERSION,
+                        "carrying": false,
+                    }),
+                    content::CarryPass::NothingTaken { offered } => json!({
+                        "schema_version": DESCRIBE_SCHEMA_VERSION,
+                        "carrying": true,
+                        "offered": offered,
+                        "taken": Value::Null,
+                    }),
+                    content::CarryPass::Took {
+                        envelope_id,
+                        size_bytes,
+                        until_ms,
+                    } => json!({
+                        "schema_version": DESCRIBE_SCHEMA_VERSION,
+                        "carrying": true,
+                        "taken": envelope_id,
+                        "size_bytes": size_bytes,
+                        "until_ms": until_ms,
+                    }),
+                })
+            }
+            "net.collect" => {
+                self.authorize(ctx, CAPABILITY_CONTENT)?;
+                let candidate = Self::candidate(&params)?;
+                let collected = self.state.collect_from(&candidate).map_err(RpcError::internal)?;
+                // Handed to the store as ciphertext with the key that came with it, so this
+                // node's record names one recipient — itself (ADR-0019). Sealing it again
+                // would produce an object the sender could not recognise.
+                let mut accepted = Vec::new();
+                for object in &collected {
+                    match self.accept_collected(object) {
+                        Ok(id) => accepted.push(id),
+                        // One envelope this node cannot store must not lose the others: a
+                        // carrier may be holding several and the rest are still deliverable.
+                        Err(e) => eprintln!(
+                            "otwono-netd: collected {} but could not store it: {e}",
+                            &object.content_id[..object.content_id.len().min(16)]
+                        ),
+                    }
+                }
+                Ok(json!({
+                    "schema_version": DESCRIBE_SCHEMA_VERSION,
+                    "collected": accepted,
+                }))
+            }
             "net.pointer" => {
                 self.authorize(ctx, CAPABILITY_CONTENT)?;
                 let candidate = Self::candidate(&params)?;

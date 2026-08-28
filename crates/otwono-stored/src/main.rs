@@ -26,6 +26,7 @@ OPTIONS:
     --key <PATH>           Storage key, generated on first use (default /var/lib/otwono/storage.key)
     --cache-dir <PATH>     Cluster cache (default /var/lib/otwono/cache)
     --pointer-dir <PATH>   Signed pointers (default /var/lib/otwono/pointers)
+    --envelope-dir <PATH>  Mail carried for other people (default /var/lib/otwono/envelopes)
     --cache-bytes <N>      Override the cache budget the capability profile chose
     --no-cache             Contribute no cluster cache at all
     --export-dir <PATH>    Where large objects are handed over (default /var/lib/otwono/export)
@@ -94,6 +95,7 @@ fn run(args: &[String]) -> Result<String, Error> {
     let mut want_cache = true;
     let mut export_dir = PathBuf::from(DEFAULT_EXPORT_DIR);
     let mut pointer_dir = PathBuf::from(otwono_store::DEFAULT_POINTER_DIR);
+    let mut envelope_dir = PathBuf::from(otwono_store::DEFAULT_ENVELOPE_DIR);
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -105,6 +107,7 @@ fn run(args: &[String]) -> Result<String, Error> {
             "--key" => key_path = next_path(&mut it, "--key")?,
             "--cache-dir" => cache_dir = next_path(&mut it, "--cache-dir")?,
             "--pointer-dir" => pointer_dir = next_path(&mut it, "--pointer-dir")?,
+            "--envelope-dir" => envelope_dir = next_path(&mut it, "--envelope-dir")?,
             "--cache-bytes" => {
                 let raw = it
                     .next()
@@ -207,8 +210,8 @@ fn run(args: &[String]) -> Result<String, Error> {
                 eprintln!("otwono-stored: cache budget overridden to {n} bytes");
                 Some(n)
             }
-            None => match cache_budget_from_profile(&perm_socket) {
-                Ok(n) => Some(n),
+            None => match budgets_from_profile(&perm_socket) {
+                Ok(b) => Some(b.cluster_cache_bytes),
                 Err(e) => {
                     eprintln!(
                         "otwono-stored: no cluster cache — cannot read this machine's \
@@ -246,6 +249,36 @@ fn run(args: &[String]) -> Result<String, Error> {
     } else {
         eprintln!("otwono-stored: no cluster cache (--no-cache)");
     }
+
+    // Carriage is a separate agreement from the cache (ADR-0028 §8), so it is read, reported
+    // and refused separately. A machine that cannot read its own profile carries nothing
+    // rather than inventing a budget — the same choice the cache makes above, and for a
+    // sharper reason: dropping somebody's mail is silent at both ends (§5).
+    match budgets_from_profile(&perm_socket) {
+        Ok(b) if b.envelope_carry_bytes == 0 => eprintln!(
+            "otwono-stored: carrying no mail for other people — this machine's capability \
+             profile sets its carriage budget to zero"
+        ),
+        Ok(b) => match otwono_store::EnvelopeStore::at(&envelope_dir) {
+            Ok(store) => {
+                eprintln!(
+                    "otwono-stored: carrying mail at {} ({} bytes)",
+                    envelope_dir.display(),
+                    b.envelope_carry_bytes
+                );
+                service = service.with_envelopes(store, b.envelope_carry_bytes);
+            }
+            Err(e) => eprintln!(
+                "otwono-stored: no envelope store at {} ({e}); envelope.take will say so",
+                envelope_dir.display()
+            ),
+        },
+        Err(e) => eprintln!(
+            "otwono-stored: carrying no mail — cannot read this machine's capability \
+             profile ({e})"
+        ),
+    }
+
     let service = Arc::new(service);
     server
         .serve(service, Shutdown::new())
@@ -264,8 +297,8 @@ fn cache_key(key_path: &std::path::Path) -> Result<StorageKey, Error> {
         .map_err(|e| Error::Startup(format!("storage key: {e}")))
 }
 
-/// Ask otwono-hwd what this machine may contribute, through the broker.
-fn cache_budget_from_profile(perm_socket: &std::path::Path) -> Result<u64, String> {
+/// Ask otwono-hwd what this machine may spend on other people, through the broker.
+fn budgets_from_profile(perm_socket: &std::path::Path) -> Result<Budgets, String> {
     use std::time::Duration;
     let mut broker = otwono_proto::Client::connect_waiting(perm_socket, Duration::from_secs(10))
         .map_err(|e| format!("{}: {e}", perm_socket.display()))?;
@@ -292,11 +325,27 @@ fn cache_budget_from_profile(perm_socket: &std::path::Path) -> Result<u64, Strin
         .call_with_capability("hw.profile", serde_json::json!({}), &token)
         .map_err(|e| format!("hw.profile: {e}"))?
         .map_err(|e| format!("hw.profile refused: {}", e.message))?;
-    profile
+    let features = profile
         .get("features")
-        .and_then(|f| f.get("cluster_cache_bytes"))
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| "the capability profile carries no cluster_cache_bytes".to_string())
+        .ok_or_else(|| "the capability profile carries no features".to_string())?;
+    let bytes = |name: &str| {
+        features
+            .get(name)
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| format!("the capability profile carries no {name}"))
+    };
+    Ok(Budgets {
+        cluster_cache_bytes: bytes("cluster_cache_bytes")?,
+        envelope_carry_bytes: bytes("envelope_carry_bytes")?,
+    })
+}
+
+/// What this machine's capability profile says it may spend, on each of the two things it
+/// spends disk on for other people. Two numbers because they are two different agreements
+/// (ADR-0028 §8), read in one call because they come from one profile.
+struct Budgets {
+    cluster_cache_bytes: u64,
+    envelope_carry_bytes: u64,
 }
 
 fn next_path<'a>(it: &mut impl Iterator<Item = &'a String>, flag: &str) -> Result<PathBuf, Error> {

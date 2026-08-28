@@ -795,6 +795,11 @@ fn a_peer_that_serves_the_wrong_bytes_is_caught() {
                 Request::Replicable { .. } => {
                     Response::Replicable(otwono_net::content::ReplicablePage { entries: Vec::new() })
                 }
+                // It carries nothing for anyone either, and an empty page is what a carrier
+                // holding nothing and a carrier refusing to say both return.
+                Request::Relayable { .. } | Request::AddressedToMe { .. } => {
+                    Response::Carried(otwono_net::content::CarriedPage { entries: Vec::new() })
+                }
                 // It publishes nothing either, so there is no pointer to lie about.
                 Request::Pointer { .. } => Response::not_available(""),
                 Request::Manifest { content_id, .. } => {

@@ -145,6 +145,10 @@ pub struct StoreService {
     /// without one, and then every pointer method says so rather than answering "no such
     /// name" — which would be a different and misleading claim.
     pointers: Option<otwono_store::PointerStore>,
+    /// Envelopes this node carries for other people, with the budget it agreed to spend
+    /// (ADR-0028 §8). `None` means this node carries no mail at all — a machine whose
+    /// capability profile sets the budget to zero, or one started without the store.
+    envelopes: Option<(otwono_store::EnvelopeStore, u64)>,
     /// Where `otwono-idd` listens, so a content key sealed to this node can be unwrapped
     /// without this daemon ever holding the sharing key (ADR-0019 §3). `None` on a daemon
     /// started without one, and then `store.open_shared` says so.
@@ -385,6 +389,7 @@ impl StoreService {
             handoff: None,
             cache: None,
             pointers: None,
+            envelopes: None,
             id_socket: None,
             perm_socket,
         }
@@ -434,6 +439,26 @@ impl StoreService {
     pub fn with_pointers(mut self, pointers: otwono_store::PointerStore) -> Self {
         self.pointers = Some(pointers);
         self
+    }
+
+    /// Give this daemon somewhere to keep other people's mail, and a budget for it.
+    ///
+    /// Separate from the cluster cache's budget, which is the whole of ADR-0028 §8: holding
+    /// neighbourhood content an operator can inspect and purge is a different thing to agree
+    /// to than carrying a stranger's sealed mail, and one budget would make the second a
+    /// silent consequence of the first.
+    pub fn with_envelopes(mut self, store: otwono_store::EnvelopeStore, budget_bytes: u64) -> Self {
+        self.envelopes = Some((store, budget_bytes));
+        self
+    }
+
+    fn envelopes(&self) -> Result<(&otwono_store::EnvelopeStore, u64), RpcError> {
+        self.envelopes.as_ref().map(|(s, b)| (s, *b)).ok_or_else(|| {
+            RpcError::unavailable(
+                "this node carries no mail for other people; its capability profile \
+                     set the budget to zero, or none was configured",
+            )
+        })
     }
 
     fn pointers(&self) -> Result<&otwono_store::PointerStore, RpcError> {
@@ -1362,6 +1387,109 @@ impl StoreService {
     /// a hold that has run out is not occupying any (ADR-0026 §9). A node with no cache
     /// answers `replicating: false` rather than erroring: "this node does not replicate" is
     /// a true and useful answer to the question, not a fault.
+    /// Take custody of one envelope, if this node's own terms allow it (ADR-0028 §2).
+    ///
+    /// The decision belongs to `CarryPolicy` and is not restated here. What this adds is the
+    /// budget arithmetic — room is the agreed budget minus what is already committed — and
+    /// the fact that a refusal is a *reply*, not an error. A full node saying "not this one"
+    /// is the normal case on a small machine, exactly as `cache.take_replica` returns
+    /// `Ok(None)` rather than failing (ADR-0026 §8).
+    fn handle_envelope_take(&self, params: Value) -> Result<Value, RpcError> {
+        let record = params
+            .get("envelope")
+            .ok_or_else(|| RpcError::invalid_params("envelope.take needs an envelope"))?;
+        let envelope: otwono_envelope::Envelope = serde_json::from_value(record.clone())
+            .map_err(|e| RpcError::invalid_params(format!("envelope.take: {e}")))?;
+        envelope
+            .validate()
+            .map_err(|e| RpcError::invalid_params(format!("envelope.take: {e}")))?;
+
+        let (store, budget) = self.envelopes()?;
+        let now = otwono_store::cache::now_unix_ms();
+        let committed = store
+            .bytes_held(now)
+            .map_err(|e| RpcError::internal(e.to_string()))?;
+        let policy = otwono_envelope::CarryPolicy::with_room(budget.saturating_sub(committed));
+
+        match store
+            .take(&envelope, &policy, now)
+            .map_err(|e| RpcError::internal(e.to_string()))?
+        {
+            Ok(held) => Ok(json!({
+                "schema_version": DESCRIBE_SCHEMA_VERSION,
+                "taken": true,
+                "until_ms": held.until_ms,
+            })),
+            // Named, so an operator reading a log can tell a full machine from a late
+            // envelope from a peer sending nonsense.
+            Err(why) => Ok(json!({
+                "schema_version": DESCRIBE_SCHEMA_VERSION,
+                "taken": false,
+                "declined": match why {
+                    otwono_envelope::Declined::Expired => "expired",
+                    otwono_envelope::Declined::TooLarge { .. } => "too_large",
+                    otwono_envelope::Declined::NoRoom { .. } => "no_room",
+                    otwono_envelope::Declined::Malformed(_) => "malformed",
+                },
+            })),
+        }
+    }
+
+    /// What this node is carrying — everything, or one recipient's (ADR-0028 §9).
+    ///
+    /// The scoping happens *here*, not in `otwono-netd`, and that placement is the point: the
+    /// daemon answering a scoped question never receives the full bag, so it cannot leak one
+    /// by a mistake in its own filtering. `recipient` absent is the broad question a
+    /// prospective carrier asks; present is the collection question, and the caller passes
+    /// the NodeID its handshake authenticated rather than anything a peer sent.
+    fn handle_envelope_held(&self, params: Value) -> Result<Value, RpcError> {
+        let (store, _) = self.envelopes()?;
+        let now = otwono_store::cache::now_unix_ms();
+        let held = match params.get("recipient").and_then(Value::as_str) {
+            Some(text) => {
+                let node = otwono_identity::NodeId::parse(text)
+                    .map_err(|e| RpcError::invalid_params(format!("recipient: {e}")))?;
+                store.held_for(&node, now)
+            }
+            None => store.held(now),
+        }
+        .map_err(|e| RpcError::internal(e.to_string()))?;
+
+        // The sender's descriptor, never this carrier's own commitments: `took_at_ms` and
+        // `until_ms` are on this carrier's clock and mean nothing to anyone else (§10).
+        let entries: Vec<Value> = held
+            .iter()
+            .map(|c| {
+                json!({
+                    "envelope_id": c.envelope.envelope_id,
+                    "recipient": c.envelope.recipient,
+                    "size_bytes": c.envelope.size_bytes,
+                    "expires_at_ms": c.envelope.expires_at_ms,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "schema_version": DESCRIBE_SCHEMA_VERSION,
+            "entries": entries,
+        }))
+    }
+
+    /// Give up custody: delivered, or dropped.
+    ///
+    /// Idempotent, because delivery races the sweep and a carrier that handed an envelope
+    /// over and found it already gone has nothing to worry about.
+    fn handle_envelope_release(&self, params: Value) -> Result<Value, RpcError> {
+        let envelope_id = params
+            .get("envelope_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::invalid_params("envelope.release needs an envelope_id"))?;
+        let (store, _) = self.envelopes()?;
+        store
+            .release(envelope_id)
+            .map_err(|e| RpcError::internal(e.to_string()))?;
+        Ok(json!({ "schema_version": DESCRIBE_SCHEMA_VERSION, "released": true }))
+    }
+
     fn handle_replica_room(&self, params: Value) -> Result<Value, RpcError> {
         let p: ReplicaRoomParams = serde_json::from_value(params)
             .map_err(|e| RpcError::invalid_params(format!("cache.replica_room: {e}")))?;
@@ -1762,6 +1890,21 @@ impl Service for StoreService {
                     CAPABILITY_POINTER_WRITE,
                 ),
                 MethodDescription::guarded(
+                    "envelope.take",
+                    "Take custody of an envelope addressed to somebody else (ADR-0028)",
+                    CAPABILITY_CARRY,
+                ),
+                MethodDescription::guarded(
+                    "envelope.held",
+                    "What this node carries; scoped to one recipient when asked",
+                    CAPABILITY_CARRY,
+                ),
+                MethodDescription::guarded(
+                    "envelope.release",
+                    "Give up custody of an envelope, delivered or dropped",
+                    CAPABILITY_CARRY,
+                ),
+                MethodDescription::guarded(
                     "pointer.mine",
                     "One of this node's own pointers, for serving to a peer",
                     CAPABILITY_SERVE,
@@ -1879,6 +2022,18 @@ impl Service for StoreService {
             "pointer.accept" => {
                 self.authorize(ctx, CAPABILITY_POINTER_WRITE)?;
                 self.handle_pointer_accept(params)
+            }
+            "envelope.take" => {
+                self.authorize(ctx, CAPABILITY_CARRY)?;
+                self.handle_envelope_take(params)
+            }
+            "envelope.held" => {
+                self.authorize(ctx, CAPABILITY_CARRY)?;
+                self.handle_envelope_held(params)
+            }
+            "envelope.release" => {
+                self.authorize(ctx, CAPABILITY_CARRY)?;
+                self.handle_envelope_release(params)
             }
             "pointer.mine" => {
                 self.authorize(ctx, CAPABILITY_SERVE)?;

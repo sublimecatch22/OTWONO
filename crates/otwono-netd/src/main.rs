@@ -276,6 +276,13 @@ fn run(args: &[String]) -> Result<String, Error> {
         } else {
             eprintln!("otwono-netd: holding no replicas for the cluster (--no-replicate)");
         }
+        // Carriage is its own agreement (ADR-0028 §8), so it is attached separately from
+        // replication and gated separately: `envelope.carry` in the broker is the operator's
+        // control, and a stock image grants it to nobody.
+        state = state.with_carrier(Arc::new(otwono_netd::content::BrokeredCarrier::new(
+            &store_socket,
+            &perm_socket,
+        )));
     } else {
         // A node that will not serve does not replicate either. Holding a replica it would
         // never hand to anyone is storage spent on nothing.

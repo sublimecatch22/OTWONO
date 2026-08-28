@@ -217,3 +217,64 @@ impl From<serde_json::Error> for EnvelopeStoreError {
         EnvelopeStoreError::Encoding(e.to_string())
     }
 }
+
+/// What a node that carries mail can be asked, wherever it keeps it (ADR-0028 §2).
+///
+/// The same shape as [`ReplicaHolder`](crate::ReplicaHolder), and for the same reason
+/// (ADR-0026 §10): the custody store belongs to `otwono-stored` while the pass that fills it
+/// runs in `otwono-netd`, so the pass is written against a trait. `EnvelopeStore` implements
+/// it in-process for tests; the daemon implements it over the control plane. Neither knows
+/// about the other.
+///
+/// `None` from [`Self::carriage_room`] means **this node carries no mail at all** — no
+/// budget, no store, or the capability refused. A pass that gets it makes no carriage traffic
+/// whatever, which is ADR-0028 §2's consent kept structural rather than left to a check
+/// somebody could forget.
+pub trait Carrier {
+    fn carriage_room(&self, candidates: &[String], now_ms: u64) -> Option<CarriageRoom>;
+
+    /// Take custody, or report that this node will not.
+    ///
+    /// `Ok(None)` is "not this one" — a full node, a late envelope — and is the normal answer
+    /// on a small machine rather than something to escalate.
+    fn take_custody(&self, envelope: &Envelope, now_ms: u64) -> Result<Option<Custody>, String>;
+}
+
+/// What a carrier has room for, and what it is already holding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CarriageRoom {
+    /// Bytes still available under this node's carriage budget. May be zero, which is a node
+    /// that carries in principle and has no room today — distinct from `None`, which is a
+    /// node that carries nothing at all.
+    pub room_bytes: u64,
+    /// Which of the offered envelope ids this node already holds, so a pass does not fetch
+    /// what it has.
+    pub already_held: Vec<String>,
+}
+
+impl Carrier for EnvelopeStore {
+    fn carriage_room(&self, candidates: &[String], now_ms: u64) -> Option<CarriageRoom> {
+        // The in-process implementation has no budget of its own -- the budget is the
+        // daemon's, from the capability profile -- so this reports only what is held. The
+        // brokered implementation in otwono-netd is where the number comes from.
+        let held = self.held(now_ms).ok()?;
+        Some(CarriageRoom {
+            room_bytes: u64::MAX,
+            already_held: held
+                .iter()
+                .filter(|c| candidates.is_empty() || candidates.contains(&c.envelope.envelope_id))
+                .map(|c| c.envelope.envelope_id.clone())
+                .collect(),
+        })
+    }
+
+    fn take_custody(&self, envelope: &Envelope, now_ms: u64) -> Result<Option<Custody>, String> {
+        let held = self.held(now_ms).map_err(|e| e.to_string())?;
+        let committed: u64 = held.iter().map(|c| c.envelope.size_bytes).sum();
+        let policy = CarryPolicy::with_room(u64::MAX - committed);
+        match self.take(envelope, &policy, now_ms).map_err(|e| e.to_string())? {
+            Ok(custody) => Ok(Some(custody)),
+            Err(_) => Ok(None),
+        }
+    }
+}

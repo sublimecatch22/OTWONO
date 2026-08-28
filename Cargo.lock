@@ -1365,6 +1365,7 @@ name = "otwono-netd"
 version = "0.1.0"
 dependencies = [
  "data-encoding",
+ "otwono-envelope",
  "otwono-idd",
  "otwono-identity",
  "otwono-net",
@@ -1472,6 +1473,7 @@ name = "otwono-stored"
 version = "0.1.0"
 dependencies = [
  "data-encoding",
+ "otwono-envelope",
  "otwono-identity",
  "otwono-pointer",
  "otwono-proto",

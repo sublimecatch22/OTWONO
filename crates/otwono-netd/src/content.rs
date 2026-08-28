@@ -135,6 +135,15 @@ pub struct Session {
     /// The cost, stated where it will be read: an object shared *during* a session is not
     /// visible to that session.
     shared_index: Option<Vec<SharedIndexEntry>>,
+    /// What this node is carrying and may pass on, taken once per session (ADR-0028 §9).
+    carried_index: Option<Vec<otwono_net::content::CarriedEntry>>,
+    /// What this node is carrying *for this peer*, taken once per session.
+    ///
+    /// A separate snapshot from `carried_index` and not a filter over it, because the two
+    /// answer different questions and sharing one cache would mean a bug in the scoping
+    /// could serve the wrong one. The cost is the same as every other index here: an
+    /// envelope taken into custody *during* a session is not visible to that session.
+    addressed_index: Option<Vec<otwono_net::content::CarriedEntry>>,
 }
 
 impl Session {
@@ -183,6 +192,12 @@ impl ContentResponder {
             // a "no such pointer" reply distinct from a refusal would tell a stranger which
             // names this node has -- the same leak `not_available` exists to close.
             Request::Pointer { .. } => Response::not_available(""),
+            // Both carriage questions refuse with an empty page of the matching kind. A
+            // carrier that refuses and one that holds nothing must be indistinguishable, or
+            // asking becomes a way to find out whether a node carries at all (ADR-0028 §9).
+            Request::Relayable { .. } | Request::AddressedToMe { .. } => {
+                Response::Carried(otwono_net::content::CarriedPage { entries: Vec::new() })
+            }
         };
         if request.validate().is_err() {
             return refuse();
@@ -195,6 +210,14 @@ impl ContentResponder {
         }
         if let Request::Pointer { service, name } = request {
             return self.pointer(service, name);
+        }
+        if let Request::Relayable { after, max_entries } = request {
+            return self.carried(after.as_deref(), *max_entries, session, None);
+        }
+        if let Request::AddressedToMe { after, max_entries } = request {
+            // The recipient is the NodeID the handshake authenticated, never a field the
+            // asker supplied. There is nothing to spoof because there is nothing to send.
+            return self.carried(after.as_deref(), *max_entries, session, Some(peer));
         }
         match self.ask_store(peer, request) {
             Some(reply) => self
@@ -309,6 +332,78 @@ impl ContentResponder {
         Response::Replicable(otwono_net::content::ReplicablePage { entries })
     }
 
+    /// Answer a carriage question, scoped or not (ADR-0028 §9).
+    ///
+    /// One function for both because the paging, the session discipline and the refusal are
+    /// identical; `scope` is the only difference and it is the whole difference. Passing
+    /// `Some(peer)` asks the store for that peer's mail only — the scoping happens in
+    /// `otwono-stored`, not here, so this daemon never holds the full bag while answering a
+    /// scoped question and cannot leak it by mistake.
+    fn carried(
+        &self,
+        after: Option<&str>,
+        max_entries: u32,
+        session: &mut Session,
+        scope: Option<&NodeId>,
+    ) -> Response {
+        let empty = || Response::Carried(otwono_net::content::CarriedPage { entries: Vec::new() });
+
+        let cached = if scope.is_some() {
+            &mut session.addressed_index
+        } else {
+            &mut session.carried_index
+        };
+        if cached.is_none() {
+            let Some(entries) = self.ask_carried_index(scope) else {
+                return empty();
+            };
+            *cached = Some(entries);
+        }
+        let all = cached.as_ref().expect("set just above");
+        let start = match after {
+            Some(after) => match all.iter().position(|e| e.envelope_id == after) {
+                Some(i) => i + 1,
+                None => return empty(),
+            },
+            None => 0,
+        };
+        let entries: Vec<_> = all
+            .iter()
+            .skip(start)
+            .take(max_entries as usize)
+            .cloned()
+            .collect();
+        Response::Carried(otwono_net::content::CarriedPage { entries })
+    }
+
+    fn ask_carried_index(&self, scope: Option<&NodeId>) -> Option<Vec<otwono_net::content::CarriedEntry>> {
+        let params = match scope {
+            Some(peer) => json!({ "recipient": peer.to_text() }),
+            None => json!({}),
+        };
+        let reply = self.call_store("envelope.held", params)?;
+        let entries = reply.get("entries")?.as_array()?;
+        entries
+            .iter()
+            .map(|e| {
+                let envelope_id = e.get("envelope_id")?.as_str()?.to_string();
+                // Checked here as well as at the store, for the reason the other indexes
+                // check it: this daemon is what puts it on a wire.
+                if !content::is_hex_digest(&envelope_id) {
+                    return None;
+                }
+                let recipient = e.get("recipient")?.as_str()?.to_string();
+                otwono_identity::NodeId::parse(&recipient).ok()?;
+                Some(otwono_net::content::CarriedEntry {
+                    envelope_id,
+                    recipient,
+                    size_bytes: e.get("size_bytes")?.as_u64()?,
+                    expires_at_ms: e.get("expires_at_ms")?.as_u64()?,
+                })
+            })
+            .collect()
+    }
+
     fn ask_replicable_index(&self) -> Option<Vec<otwono_net::content::ReplicableEntry>> {
         let reply = self.call_store(
             "store.replicable",
@@ -394,7 +489,11 @@ impl ContentResponder {
             // Never reaches translate: the index questions are answered from the session
             // snapshot in `answer`, and a pointer is answered before the store is asked for
             // an object at all.
-            Request::SharedWithMe { .. } | Request::Replicable { .. } | Request::Pointer { .. } => false,
+            Request::SharedWithMe { .. }
+            | Request::Replicable { .. }
+            | Request::Relayable { .. }
+            | Request::AddressedToMe { .. }
+            | Request::Pointer { .. } => false,
         };
         if !allowed {
             // Reachable only if otwono-stored regressed: it has already applied its own
@@ -440,7 +539,11 @@ impl ContentResponder {
             // before the store is asked for an object. Written out rather than caught by a
             // wildcard so a future request kind has to be considered here instead of
             // silently becoming a manifest.
-            Request::SharedWithMe { .. } | Request::Replicable { .. } | Request::Pointer { .. } => None,
+            Request::SharedWithMe { .. }
+            | Request::Replicable { .. }
+            | Request::Relayable { .. }
+            | Request::AddressedToMe { .. }
+            | Request::Pointer { .. } => None,
             Request::Chunk { digest, .. } => {
                 let served = reply.get("digest")?.as_str()?;
                 if served != digest {
@@ -492,7 +595,10 @@ impl ContentResponder {
             ),
             // Answered from a session snapshot, not per request (ADR-0020), so it never
             // reaches here.
-            Request::SharedWithMe { .. } | Request::Replicable { .. } => return None,
+            Request::SharedWithMe { .. }
+            | Request::Replicable { .. }
+            | Request::Relayable { .. }
+            | Request::AddressedToMe { .. } => return None,
         };
         self.call_store(method, params)
     }
@@ -814,7 +920,137 @@ impl otwono_pointer::SequenceMemory for BrokeredPointers {
     }
 }
 
-fn request_token(perm_socket: &Path, action: &str, reason: &str) -> Result<String, String> {
+/// This daemon's view of the carriage store, over the control plane (ADR-0026 §10's shape).
+///
+/// The envelopes belong to `otwono-stored` — that daemon opens the store, knows the budget
+/// from the capability profile, and sweeps lapsed custody. This daemon must not open the same
+/// directory: two processes sweeping one store would each drop what the other was holding.
+///
+/// A token per call rather than a cached one, as [`BrokeredCache`] does and for the same
+/// reason: a pass happens when this node meets a peer, so the extra local round trip costs
+/// nothing, and an operator who revokes `envelope.carry` stops carriage at the next peer.
+pub struct BrokeredCarrier {
+    store_socket: PathBuf,
+    perm_socket: PathBuf,
+    /// Whether the "not carrying" line has already been printed. A stock node grants no
+    /// `envelope.carry`, so without this the daemon would say the same thing on every
+    /// connection for the life of the machine.
+    quiet: std::sync::atomic::AtomicBool,
+}
+
+impl std::fmt::Debug for BrokeredCarrier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrokeredCarrier")
+            .field("store", &self.store_socket)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BrokeredCarrier {
+    pub fn new(store_socket: impl AsRef<Path>, perm_socket: impl AsRef<Path>) -> Self {
+        BrokeredCarrier {
+            store_socket: store_socket.as_ref().to_path_buf(),
+            perm_socket: perm_socket.as_ref().to_path_buf(),
+            quiet: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn call(&self, method: &str, params: Value, reason: &str) -> Result<Value, String> {
+        let token = request_token(&self.perm_socket, otwono_stored::CAPABILITY_CARRY, reason)?;
+        let mut client = Client::connect(&self.store_socket)
+            .map_err(|e| format!("{}: {e}", self.store_socket.display()))?;
+        client
+            .call_with_capability(method, params, &token)
+            .map_err(|e| format!("{method}: {e}"))?
+            .map_err(|e| e.message)
+    }
+
+    /// What this node holds for one recipient, or for everyone.
+    pub fn held(&self, recipient: Option<&str>) -> Result<Vec<Value>, String> {
+        let params = match recipient {
+            Some(r) => json!({ "recipient": r }),
+            None => json!({}),
+        };
+        let reply = self.call(
+            "envelope.held",
+            params,
+            "otwono-netd is answering a carriage question",
+        )?;
+        Ok(reply
+            .get("entries")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Give up custody of one envelope.
+    pub fn release(&self, envelope_id: &str) -> Result<(), String> {
+        self.call(
+            "envelope.release",
+            json!({ "envelope_id": envelope_id }),
+            "otwono-netd is giving up custody of a delivered envelope",
+        )
+        .map(|_| ())
+    }
+}
+
+impl otwono_store::Carrier for BrokeredCarrier {
+    /// A refusal reads as "this node carries no mail", and that is deliberate.
+    ///
+    /// The broker denying `envelope.carry`, the store being down, and a node whose profile
+    /// sets the budget to zero all mean the same thing to a pass: nothing will be held, so
+    /// ask nobody. The operator learns which it was from the log line, not from the network.
+    fn carriage_room(&self, candidates: &[String], _now_ms: u64) -> Option<otwono_store::CarriageRoom> {
+        let entries = match self.held(None) {
+            Ok(v) => v,
+            Err(e) => {
+                if !self.quiet.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("otwono-netd: not carrying mail: {e}");
+                }
+                return None;
+            }
+        };
+        let already_held: Vec<String> = entries
+            .iter()
+            .filter_map(|e| e.get("envelope_id").and_then(Value::as_str).map(str::to_string))
+            .filter(|id| candidates.is_empty() || candidates.contains(id))
+            .collect();
+        // The store applies the budget when it takes custody, and applies it against the
+        // number from the capability profile that this daemon does not have. Reporting a
+        // ceiling here rather than a computed figure keeps that decision in one place
+        // (CLAUDE.md §2.6); a pass that offered too much is refused at the take.
+        Some(otwono_store::CarriageRoom {
+            room_bytes: otwono_envelope::MAX_ENVELOPE_BYTES,
+            already_held,
+        })
+    }
+
+    fn take_custody(
+        &self,
+        envelope: &otwono_envelope::Envelope,
+        _now_ms: u64,
+    ) -> Result<Option<otwono_envelope::Custody>, String> {
+        let reply = self.call(
+            "envelope.take",
+            json!({ "envelope": envelope }),
+            "otwono-netd is taking custody of an envelope for a peer it may meet later",
+        )?;
+        if !reply.get("taken").and_then(Value::as_bool).unwrap_or(false) {
+            // A named refusal is not an error: a full node saying "not this one" is the
+            // normal answer on a small machine (ADR-0026 §8).
+            return Ok(None);
+        }
+        let until_ms = reply
+            .get("until_ms")
+            .and_then(Value::as_u64)
+            .ok_or("envelope.take said taken but named no deadline")?;
+        Ok(Some(otwono_envelope::Custody::taken(
+            envelope, until_ms, until_ms,
+        )))
+    }
+}
+
+pub(crate) fn request_token(perm_socket: &Path, action: &str, reason: &str) -> Result<String, String> {
     let mut broker = Client::connect(perm_socket).map_err(|e| format!("{}: {e}", perm_socket.display()))?;
     let value = broker
         .call("perm.request", json!({ "action": action, "reason": reason }))
@@ -905,6 +1141,11 @@ pub fn fetch_replicable_index<L: LinkAdapter>(
             &mut budget,
         )? {
             Response::Replicable(p) => p,
+            Response::Carried(_) => {
+                return Err(ProtocolError::Mismatched(
+                    "a carriage page in place of a replication offer".into(),
+                ))
+            }
             Response::NotAvailable { .. } => return Ok(all),
             Response::Manifest(_)
             | Response::Chunk(_)
@@ -1046,6 +1287,201 @@ pub fn replication_pass<L: LinkAdapter, H: otwono_store::ReplicaHolder + ?Sized>
     }
 }
 
+/// Ask a peer what it is carrying, in pages (ADR-0028 §9).
+///
+/// `scoped` picks the question: `false` asks `content.relayable` — everything the carrier
+/// holds and may pass on — and `true` asks `content.addressed_to_me`, which returns only what
+/// is addressed to this node. Bounded by the same page count as the replication offer, and
+/// for the same reason: this runs on the discovery thread.
+fn fetch_carried_index<L: LinkAdapter>(
+    channel: &mut SecureChannel<L>,
+    link: &LinkProperties,
+    scoped: bool,
+) -> Result<Vec<content::CarriedEntry>, ProtocolError> {
+    let window = content::max_shared_entries_per_page(link);
+    let mut all: Vec<content::CarriedEntry> = Vec::new();
+    let mut after: Option<String> = None;
+
+    for _ in 0..MAX_OFFER_PAGES_PER_PASS {
+        let mut budget = MAX_ROUND_TRIPS;
+        let request = if scoped {
+            Request::AddressedToMe {
+                after: after.clone(),
+                max_entries: window,
+            }
+        } else {
+            Request::Relayable {
+                after: after.clone(),
+                max_entries: window,
+            }
+        };
+        let page = match round_trip(channel, &request, &mut budget)? {
+            Response::Carried(p) => p,
+            Response::NotAvailable { .. } => break,
+            Response::Manifest(_)
+            | Response::Chunk(_)
+            | Response::SharedWithYou(_)
+            | Response::Replicable(_)
+            | Response::Pointer(_) => {
+                return Err(ProtocolError::Mismatched(
+                    "the wrong kind of reply in place of a carriage page".into(),
+                ))
+            }
+        };
+        if page.entries.is_empty() {
+            break;
+        }
+        after = page.entries.last().map(|e| e.envelope_id.clone());
+        all.extend(page.entries);
+    }
+    Ok(all)
+}
+
+/// What one carry pass did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CarryPass {
+    /// This node carries no mail, or has no room. Nothing was asked.
+    NotCarrying,
+    /// The peer offered nothing, or nothing this node would take.
+    NothingTaken { offered: usize },
+    /// One envelope was taken into custody until a deadline this node chose.
+    Took {
+        envelope_id: String,
+        size_bytes: u64,
+        until_ms: u64,
+    },
+}
+
+/// One carry pass against one peer (ADR-0028 §2).
+///
+/// Deliberately the same shape as [`replication_pass`], because it is the same problem: a
+/// node with room asks a peer what is on offer and takes at most one. Writing a second
+/// pattern for it would mean two places to get the budget arithmetic wrong.
+///
+/// **Pulled, never pushed.** The consent check happens before anything reaches the wire, so a
+/// node that carries no mail makes no carriage traffic at all rather than asking and
+/// discarding — ADR-0028 §2's rule kept structural rather than left to a check somebody could
+/// forget.
+///
+/// At most one envelope per pass, for [`replication_pass`]'s reason: a node that took
+/// everything could have its whole carriage budget filled by the first peer it meets. The
+/// choice among offers is **the one expiring soonest**, which differs from replication's
+/// smallest-first on purpose — a replica is about durability and any of them will do, while
+/// an envelope has a deadline and the one closest to missing it is the one worth moving.
+pub fn carry_pass<L: LinkAdapter, C: otwono_store::Carrier + ?Sized>(
+    channel: &mut SecureChannel<L>,
+    link: &LinkProperties,
+    carrier: &C,
+    now_ms: u64,
+) -> Result<CarryPass, ProtocolError> {
+    let Some(room) = carrier.carriage_room(&[], now_ms) else {
+        return Ok(CarryPass::NotCarrying);
+    };
+    if room.room_bytes == 0 {
+        return Ok(CarryPass::NotCarrying);
+    }
+
+    let mut offers = fetch_carried_index(channel, link, false)?;
+    let offered = offers.len();
+    if offers.is_empty() {
+        return Ok(CarryPass::NothingTaken { offered });
+    }
+
+    // Never take an envelope addressed to this node through the *carriage* path: that is
+    // collection, it belongs on the scoped question, and taking custody of one's own mail
+    // would leave it sitting in the carriage store instead of being opened.
+    let me = channel.local();
+    offers.retain(|o| o.recipient != me.to_text());
+    offers.retain(|o| o.size_bytes <= room.room_bytes && !o.expires_at_ms.eq(&0));
+
+    let ids: Vec<String> = offers.iter().map(|o| o.envelope_id.clone()).collect();
+    let held = match carrier.carriage_room(&ids, now_ms) {
+        Some(r) => r.already_held,
+        None => return Ok(CarryPass::NotCarrying),
+    };
+    offers.retain(|o| !held.contains(&o.envelope_id));
+
+    // Soonest deadline first, ties broken by id so the choice is total and deterministic.
+    offers.sort_by_key(|o| (o.expires_at_ms, o.envelope_id.clone()));
+    let Some(pick) = offers.first().cloned() else {
+        return Ok(CarryPass::NothingTaken { offered });
+    };
+
+    let envelope = otwono_envelope::Envelope {
+        schema_version: otwono_envelope::SCHEMA_VERSION.to_string(),
+        envelope_id: pick.envelope_id.clone(),
+        recipient: pick.recipient.clone(),
+        size_bytes: pick.size_bytes,
+        expires_at_ms: pick.expires_at_ms,
+    };
+    // Checked before the bytes are asked for: a descriptor that does not parse is a peer
+    // sending nonsense, and fetching first would mean paying for it.
+    envelope
+        .validate()
+        .map_err(|e| ProtocolError::Mismatched(format!("offered envelope: {e}")))?;
+
+    let fetched = fetch_object(channel, &pick.envelope_id, link)?;
+    // An envelope is a SHARED object: sealed to exactly one recipient (ADR-0019). A carrier
+    // offering one as anything else is contradicting itself, and the manifest is the half
+    // that carries the object.
+    if fetched.visibility != "shared" {
+        return Err(ProtocolError::Mismatched(format!(
+            "offered as an envelope but served as {}",
+            fetched.visibility
+        )));
+    }
+    if fetched.bytes.len() as u64 != pick.size_bytes {
+        return Err(ProtocolError::Mismatched(format!(
+            "offered {} bytes and served {}",
+            pick.size_bytes,
+            fetched.bytes.len()
+        )));
+    }
+
+    match carrier.take_custody(&envelope, now_ms) {
+        Ok(None) => Ok(CarryPass::NothingTaken { offered }),
+        Ok(Some(custody)) => Ok(CarryPass::Took {
+            envelope_id: custody.envelope.envelope_id,
+            size_bytes: custody.envelope.size_bytes,
+            until_ms: custody.until_ms,
+        }),
+        Err(e) => Err(ProtocolError::Mismatched(format!("could not take custody: {e}"))),
+    }
+}
+
+/// Ask a peer what it is holding for *this* node, and fetch it (ADR-0028 §9).
+///
+/// The collection half. Uses the scoped question, so this node never receives a list of who
+/// else the carrier serves — which is the reason §9 has two methods at all.
+///
+/// Returns what was fetched, for the caller to put where a recipient can open it. Nothing is
+/// stored here: this function moves bytes, and where they land is a decision with a capability
+/// attached to it.
+pub fn collect_addressed<L: LinkAdapter>(
+    channel: &mut SecureChannel<L>,
+    link: &LinkProperties,
+) -> Result<Vec<FetchedObject>, ProtocolError> {
+    let mut collected = Vec::new();
+    for entry in fetch_carried_index(channel, link, true)? {
+        // A carrier answering the scoped question with somebody else's mail is either
+        // confused or probing; either way this node did not ask for it.
+        if entry.recipient != channel.local().to_text() {
+            return Err(ProtocolError::Mismatched(
+                "a carrier offered mail addressed to somebody else".into(),
+            ));
+        }
+        let fetched = fetch_object(channel, &entry.envelope_id, link)?;
+        if fetched.visibility != "shared" {
+            return Err(ProtocolError::Mismatched(format!(
+                "an envelope served as {}",
+                fetched.visibility
+            )));
+        }
+        collected.push(fetched);
+    }
+    Ok(collected)
+}
+
 /// Ask a peer what one of its names points at, and verify the answer (ADR-0027).
 ///
 /// # The key comes from the handshake, not from the record
@@ -1088,7 +1524,11 @@ pub fn fetch_pointer<L: LinkAdapter, M: otwono_pointer::SequenceMemory + ?Sized>
     )? {
         Response::Pointer(p) => p,
         Response::NotAvailable { .. } => return Ok(None),
-        Response::Manifest(_) | Response::Chunk(_) | Response::SharedWithYou(_) | Response::Replicable(_) => {
+        Response::Manifest(_)
+        | Response::Chunk(_)
+        | Response::SharedWithYou(_)
+        | Response::Replicable(_)
+        | Response::Carried(_) => {
             return Err(ProtocolError::Mismatched(
                 "the wrong kind of reply in place of a pointer".into(),
             ))
@@ -1141,7 +1581,11 @@ pub fn fetch_shared_index<L: LinkAdapter>(
         )? {
             Response::SharedWithYou(p) => p,
             Response::NotAvailable { .. } => return Ok(all),
-            Response::Manifest(_) | Response::Chunk(_) | Response::Replicable(_) | Response::Pointer(_) => {
+            Response::Manifest(_)
+            | Response::Chunk(_)
+            | Response::Replicable(_)
+            | Response::Carried(_)
+            | Response::Pointer(_) => {
                 return Err(ProtocolError::Mismatched(
                     "the wrong kind of reply in place of a sharing index page".into(),
                 ))
@@ -1328,7 +1772,10 @@ fn fetch_manifest<L: LinkAdapter>(
             Response::Chunk(_) => {
                 return Err(ProtocolError::Mismatched("a chunk in place of a manifest".into()))
             }
-            Response::SharedWithYou(_) | Response::Replicable(_) | Response::Pointer(_) => {
+            Response::SharedWithYou(_)
+            | Response::Replicable(_)
+            | Response::Carried(_)
+            | Response::Pointer(_) => {
                 return Err(ProtocolError::Mismatched(
                     "an index page in place of a manifest".into(),
                 ))
@@ -1451,7 +1898,10 @@ fn fetch_chunk<L: LinkAdapter>(
             Response::Manifest(_) => {
                 return Err(ProtocolError::Mismatched("a manifest in place of a chunk".into()))
             }
-            Response::SharedWithYou(_) | Response::Replicable(_) | Response::Pointer(_) => {
+            Response::SharedWithYou(_)
+            | Response::Replicable(_)
+            | Response::Carried(_)
+            | Response::Pointer(_) => {
                 return Err(ProtocolError::Mismatched(
                     "an index page in place of a chunk".into(),
                 ))
