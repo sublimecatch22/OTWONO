@@ -2003,6 +2003,96 @@ fn a_carrier_offers_what_it_holds_after_serving_ordinary_content() {
 /// object, whose copy of the content key travels, what a scoped index question returns — is
 /// satisfied trivially. Three booted nodes found three separate defects that this blindness
 /// hid; each of them fails this test.
+/// A carrier standing on its own: its own store daemon, its own mesh identity, listening.
+///
+/// Everything a node needs to take custody from one peer and hand the envelope to the next.
+/// Extracted so a second hop costs a call rather than sixty lines, which is why no test
+/// exercised one before: building a carrier by hand was most of writing the test.
+///
+/// The store daemon gets a cache as well as an envelope store, because since ADR-0031 a
+/// carrier without one carries nothing — the ciphertext goes in the cache so that giving it
+/// up frees disk and not only a record.
+struct Carrier {
+    store_socket: PathBuf,
+    /// Where other nodes reach it, for `carry_from` and `collect_from`.
+    candidate: Candidate,
+}
+
+impl Carrier {
+    fn start(h: &Harness, tag: &str) -> Carrier {
+        let dir = h.dir.join(format!("carrier-{tag}"));
+        let store_socket = h.dir.join(format!("carrier-{tag}.sock"));
+        let store = otwono_store::Store::encrypted(dir.join("store"), otwono_store::StorageKey::generate());
+        store.ensure_layout().unwrap();
+        let service = Arc::new(
+            otwono_stored::StoreService::new(store, h.perm_socket.clone())
+                .with_identity(h.id_socket.clone())
+                .with_cache(
+                    otwono_store::Cache::at(dir.join("cache"), otwono_store::StorageKey::generate(), 8 << 20)
+                        .unwrap(),
+                )
+                .with_envelopes(
+                    otwono_store::EnvelopeStore::at(dir.join("envelopes")).unwrap(),
+                    8 << 20,
+                ),
+        );
+        let shutdown = h.shutdown.clone();
+        let server = Server::bind(&store_socket).unwrap();
+        std::thread::spawn(move || server.serve(service, shutdown));
+        Client::connect_waiting(&store_socket, Duration::from_secs(5))
+            .unwrap_or_else(|e| panic!("carrier {tag}'s store daemon never came up: {e}"));
+
+        let mesh = BrokeredSigner::bind(
+            AgreementKeystore::new(h.dir.join(format!("agreement-carrier-{tag}")))
+                .load_or_generate()
+                .unwrap()
+                .0,
+            &h.id_socket,
+            &h.perm_socket,
+        )
+        .expect("bind");
+        let claimed_node_id = mesh.node_id();
+        let listener = TcpLink::listen("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let serving = Arc::new(
+            NetState::new(Arc::new(mesh))
+                .with_responder(ContentResponder::new(&store_socket, &h.perm_socket)),
+        );
+        std::thread::spawn(move || otwono_netd::run_listener(serving, listener));
+
+        Carrier {
+            store_socket,
+            candidate: Candidate {
+                claimed_node_id,
+                address,
+            },
+        }
+    }
+
+    /// This carrier as a taker of other people's mail, for `carry_from`.
+    fn taking(&self, h: &Harness) -> Arc<NetState> {
+        Arc::new(
+            NetState::new(Arc::clone(&h.client).signer.clone()).with_carrier(Arc::new(
+                otwono_netd::content::BrokeredCarrier::new(&self.store_socket, &h.perm_socket),
+            )),
+        )
+    }
+
+    /// What it is holding, by envelope id.
+    fn holding(&self, h: &Harness) -> Vec<String> {
+        Client::connect(&self.store_socket)
+            .unwrap()
+            .call_with_capability("envelope.held", json!({}), &h.token("envelope.carry"))
+            .unwrap()
+            .expect("the carriage listing")["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["envelope_id"].as_str().unwrap().to_string())
+            .collect()
+    }
+}
+
 #[test]
 fn an_envelope_reaches_its_recipient_through_a_carrier_that_is_neither_party() {
     let h = Harness::start("brokered-carry");
@@ -2395,6 +2485,156 @@ fn a_carrier_that_lost_the_bytes_stops_offering_the_envelope() {
         scoped["entries"].as_array().unwrap().len(),
         0,
         "the scoped question still offers it: {scoped}"
+    );
+}
+
+/// An envelope crosses two carriers, and the first one never finds out it arrived.
+///
+/// ADR-0028 §7 concludes that a carrier may pass an envelope on, and says the record's shape
+/// makes that structural rather than a permission: what a carrier offers is what it holds,
+/// and a second carrier taking from a first is the same pass as taking from the sender. That
+/// had never been run. A conclusion nothing exercises is a guess.
+///
+/// It is also the one place drop on delivery does not reach, and this pins that rather than
+/// leaving it as prose. The recipient tells the carrier it collected *from*. Earlier hops
+/// hold their copies until they lapse, because telling them would need either gossip or the
+/// sender's involvement and §5 rules the second out.
+#[test]
+fn an_envelope_crosses_two_carriers_and_only_the_last_is_told_it_arrived() {
+    let h = Harness::start("two-hop");
+
+    // Sealed to a recipient that is neither carrier and is not the harness, so every scoping
+    // and key check on the way has something to get wrong.
+    let recipient_signing = otwono_identity::SigningIdentity::generate().unwrap();
+    let recipient_sharing = otwono_identity::SharingKey::generate().unwrap();
+    let binding = recipient_signing.bind_sharing(&recipient_sharing.public());
+    let recipient = *recipient_signing.node_id();
+
+    let sealed = Client::connect(&h.store_socket)
+        .unwrap()
+        .call_with_capability(
+            "store.share",
+            json!({
+                "data": data_encoding::BASE64.encode(b"mail that has to change hands twice"),
+                "recipients": [binding],
+            }),
+            &h.token("store.share"),
+        )
+        .unwrap()
+        .expect("sealing");
+    let sealed_id = sealed["content_id"].as_str().unwrap().to_string();
+    let envelope = otwono_envelope::Envelope::new(
+        &sealed_id,
+        &recipient,
+        sealed["size_bytes"].as_u64().unwrap(),
+        otwono_identity::now_unix_ms() + 2 * 60 * 60 * 1000,
+    );
+    Client::connect(&h.store_socket)
+        .unwrap()
+        .call_with_capability(
+            "envelope.take",
+            json!({ "envelope": envelope }),
+            &h.token("envelope.carry"),
+        )
+        .unwrap()
+        .expect("the sender holds its own outgoing envelope");
+
+    // --- hop one: the sender to A ------------------------------------------------------
+    let a = Carrier::start(&h, "a");
+    match a.taking(&h).carry_from(&h.candidate()).expect("a carry pass") {
+        otwono_netd::content::CarryPass::Took { envelope_id, .. } => assert_eq!(envelope_id, sealed_id),
+        other => panic!("the sender offered one envelope and A's pass said {other:?}"),
+    }
+    assert_eq!(a.holding(&h), vec![sealed_id.clone()]);
+
+    // --- hop two: A to B ---------------------------------------------------------------
+    //
+    // The step nothing had run. A is not the sender and not the recipient, so it is serving
+    // an object it cannot open, to a peer that is also not the recipient, on the strength of
+    // a custody record alone — and it has to hand over the recipient's copy of the content
+    // key, not its own, because it has none.
+    let b = Carrier::start(&h, "b");
+    match b
+        .taking(&h)
+        .carry_from(&a.candidate)
+        .expect("a second carry pass")
+    {
+        otwono_netd::content::CarryPass::Took { envelope_id, .. } => assert_eq!(envelope_id, sealed_id),
+        other => panic!("A offered one envelope and B's pass said {other:?}"),
+    }
+    assert_eq!(
+        b.holding(&h),
+        vec![sealed_id.clone()],
+        "B took the pass but is not holding the envelope"
+    );
+
+    // And what B holds is openable by the recipient, not by B. A relay that dropped the key
+    // on the way would leave the last hop with ciphertext nobody can read, and nothing
+    // before the recipient would notice.
+    let at_b = Client::connect(&b.store_socket)
+        .unwrap()
+        .call_with_capability(
+            "store.serve_manifest",
+            json!({ "content_id": sealed_id, "from_chunk": 0, "max_chunks": 64,
+                    "peer": recipient.to_text() }),
+            &h.token("store.serve"),
+        )
+        .unwrap()
+        .expect("B serves what it carries");
+    assert_eq!(
+        at_b["sharing"]["sealed_key"]["recipient"],
+        json!(recipient.to_text()),
+        "the key that survived two hops is not the recipient's: {at_b}"
+    );
+
+    // --- the recipient collects from B -------------------------------------------------
+    let inbox_dir = h.dir.join("two-hop-inbox");
+    let inbox_socket = h.dir.join("two-hop-inbox.sock");
+    let inbox = otwono_store::Store::encrypted(inbox_dir.join("store"), otwono_store::StorageKey::generate());
+    inbox.ensure_layout().unwrap();
+    let inbox_service = Arc::new(
+        otwono_stored::StoreService::new(inbox, h.perm_socket.clone()).with_identity(h.id_socket.clone()),
+    );
+    let sd = h.shutdown.clone();
+    let inbox_server = Server::bind(&inbox_socket).unwrap();
+    std::thread::spawn(move || inbox_server.serve(inbox_service, sd));
+    Client::connect_waiting(&inbox_socket, Duration::from_secs(5)).expect("the inbox never came up");
+
+    let collector = NetState::new(Arc::new(otwono_identity::NodeIdentity::from_parts(
+        recipient_signing,
+        otwono_identity::AgreementKey::generate().unwrap(),
+    )))
+    .with_inbox(Arc::new(otwono_netd::content::BrokeredInbox::new(
+        &inbox_socket,
+        &h.perm_socket,
+    )));
+    let collected = match collector.collect_from(&b.candidate).expect("collecting from B") {
+        otwono_netd::content::Collected::Fetched(v) => v,
+        other => panic!("a collector with an inbox reported {other:?}"),
+    };
+    assert_eq!(
+        collected.len(),
+        1,
+        "two hops and the recipient got {} objects",
+        collected.len()
+    );
+    assert_eq!(collected[0].content_id, sealed_id);
+
+    // --- and the asymmetry ADR-0028 §7 names -------------------------------------------
+    //
+    // B is told and lets go. A is not, and holds its copy until its own deadline. That is
+    // not a defect to be fixed here; it is the documented cost of a release that travels
+    // only between the two nodes that met.
+    assert!(
+        b.holding(&h).is_empty(),
+        "B was told the envelope arrived and is still holding it: {:?}",
+        b.holding(&h)
+    );
+    assert_eq!(
+        a.holding(&h),
+        vec![sealed_id],
+        "A was told about a delivery it was not party to, or dropped the envelope for some \
+         other reason — either way the release reached further than it should"
     );
 }
 

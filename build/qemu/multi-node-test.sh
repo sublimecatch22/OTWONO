@@ -406,3 +406,17 @@ if [ "${MESH_CONTENT_SMOKE:-0}" != 0 ]; then
 fi
 
 echo "PASS: $NODES nodes discovered and mutually authenticated"
+# And say plainly when that is *all* that was asserted.
+#
+# An image built without MESH_CONTENT_SMOKE=1 carries no content or envelope check, so the
+# harness boots three nodes, watches them find each other, and prints PASS. That is a true
+# statement about a real result and it is one line away from looking like the whole suite
+# passed — which is how a rebuild that dropped the flag went unnoticed until someone read the
+# manifest. A release image legitimately has no checks in it, so this is a warning and not a
+# failure; it just has to be impossible to miss.
+if [ "${MESH_CONTENT_SMOKE:-0}" = 0 ]; then
+    echo
+    echo "NOTE: this image carries no content or envelope check, so nothing above tested"
+    echo "      content, replication, pointers or store-and-forward. Rebuild with"
+    echo "      MESH_CONTENT_SMOKE=1 to assert those."
+fi
