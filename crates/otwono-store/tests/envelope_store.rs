@@ -136,6 +136,41 @@ fn a_lapsed_envelope_is_deleted_rather_than_hidden() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The sweep says which envelopes it dropped, so their ciphertext can go too (ADR-0031).
+///
+/// The record is one of two things a lapsed envelope leaves behind. `held` deleted it and
+/// discarded the id, so nothing downstream could free the bytes — a stranger's undecryptable
+/// mail stayed in the carrier's cache until budget pressure evicted it, displacing what the
+/// household had actually fetched. Right for a lapsed replica, which the cluster still wants;
+/// wrong for post nobody can open.
+#[test]
+fn the_sweep_reports_what_it_dropped_so_the_bytes_can_follow() {
+    let dir = tmp("sweep-reports");
+    let store = EnvelopeStore::at(&dir).unwrap();
+    store
+        .take(&for_node(1, 0x0a, NOW + 1000), &policy(), NOW)
+        .unwrap()
+        .unwrap();
+    store
+        .take(&for_node(1, 0x0b, NOW + 90_000), &policy(), NOW)
+        .unwrap()
+        .unwrap();
+
+    let (held, lapsed) = store.held_and_lapsed(NOW).unwrap();
+    assert_eq!(held.len(), 2);
+    assert!(lapsed.is_empty(), "nothing was due and {lapsed:?} was reported");
+
+    let (held, lapsed) = store.held_and_lapsed(NOW + 1000).unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!(lapsed, vec![cid(0x0a)], "the sweep did not name what it dropped");
+
+    // Reported once. A caller that freed the same bytes on every listing would be doing it
+    // for ever, and on a busy carrier that is every thirty seconds.
+    let (_, again) = store.held_and_lapsed(NOW + 1000).unwrap();
+    assert!(again.is_empty(), "the same lapse was reported twice: {again:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Releasing custody is idempotent, because delivery races a sweep.
 #[test]
 fn releasing_custody_twice_is_not_an_error() {

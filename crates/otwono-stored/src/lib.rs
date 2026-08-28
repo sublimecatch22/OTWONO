@@ -1647,15 +1647,35 @@ impl StoreService {
     fn handle_envelope_held(&self, params: Value) -> Result<Value, RpcError> {
         let (store, _) = self.envelopes()?;
         let now = otwono_store::cache::now_unix_ms();
+        let (all, lapsed) = store
+            .held_and_lapsed(now)
+            .map_err(|e| RpcError::internal(e.to_string()))?;
+
+        // An envelope that ran out its deadline leaves two things behind, and the sweep above
+        // only removes one. Since ADR-0031 the ciphertext is in the cache, and without this it
+        // would stay there as an ordinary entry until budget pressure evicted it — a
+        // stranger's undecryptable mail displacing what this household actually fetched.
+        //
+        // Right for a lapsed replica, whose bytes the cluster still wants; wrong for post
+        // nobody can open and nobody is waiting for.
+        for id in &lapsed {
+            let freed = match (self.cache.as_ref(), Self::parse_id(id)) {
+                (Some(cache), Ok(id)) => cache.release_carried(&id, now).unwrap_or(0),
+                _ => 0,
+            };
+            eprintln!("otwono-stored: custody of {id} ran out; freed {freed} bytes");
+        }
+
+        // Scoping happens after the sweep, not instead of it: a recipient asking what is
+        // waiting for it must not leave another recipient's lapsed mail on the disk.
         let held = match params.get("recipient").and_then(Value::as_str) {
             Some(text) => {
                 let node = otwono_identity::NodeId::parse(text)
                     .map_err(|e| RpcError::invalid_params(format!("recipient: {e}")))?;
-                store.held_for(&node, now)
+                all.into_iter().filter(|c| c.envelope.is_for(&node)).collect()
             }
-            None => store.held(now),
-        }
-        .map_err(|e| RpcError::internal(e.to_string()))?;
+            None => all,
+        };
 
         // Drop records whose bytes this node no longer has (ADR-0031).
         //

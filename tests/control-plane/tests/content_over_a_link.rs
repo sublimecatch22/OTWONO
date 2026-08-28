@@ -92,6 +92,15 @@ action = "envelope.carry"
 decision = "allow"
 ttl_seconds = 300
 
+# Reading the cache index: which objects are here, their sizes and holds. Not the objects
+# themselves — that is `store.read`, which stays denied below. A carriage test needs this to
+# tell "the bytes went" from "the custody record went", which every other question a carrier
+# answers conflates once custody is gone.
+[[rule]]
+action = "cache.read"
+decision = "allow"
+ttl_seconds = 300
+
 [[rule]]
 action = "store.read"
 decision = "deny"
@@ -2635,6 +2644,132 @@ fn an_envelope_crosses_two_carriers_and_only_the_last_is_told_it_arrived() {
         vec![sealed_id],
         "A was told about a delivery it was not party to, or dropped the envelope for some \
          other reason — either way the release reached further than it should"
+    );
+}
+
+/// An envelope that runs out its deadline takes its ciphertext with it (ADR-0031).
+///
+/// The other way a carrier lets go, and the one that happens when drop on delivery does not:
+/// the release is best effort, so a carrier whose recipient never comes back reaches its
+/// deadline still holding the envelope. Both endings have to free the same things.
+///
+/// Freeing only the record is what the permanent store forced before ADR-0031, and it is
+/// worse on this path than on delivery's — an undelivered envelope is exactly the one nobody
+/// will ever ask for again, so its bytes would sit in a stranger's cache displacing what that
+/// household actually fetched.
+///
+/// The one test here that sleeps. The sweep reads the wall clock and ADR-0026 §9 puts it in
+/// the listing rather than on a timer, so there is no seam to inject a clock through; a
+/// deadline a few seconds out and a real wait is the honest way to reach it.
+#[test]
+fn an_envelope_that_expires_frees_its_bytes_as_well_as_its_record() {
+    let h = Harness::start("carriage-expiry");
+
+    // Sealed to somebody who never turns up, and taken by a carrier the ordinary way — a
+    // real carry pass rather than the bytes being handed over in the test, because reaching
+    // into the sender's store for the ciphertext needs `store.read` and this daemon is right
+    // to refuse it.
+    let recipient_signing = otwono_identity::SigningIdentity::generate().unwrap();
+    let recipient_sharing = otwono_identity::SharingKey::generate().unwrap();
+    let binding = recipient_signing.bind_sharing(&recipient_sharing.public());
+    let recipient = *recipient_signing.node_id();
+
+    let sealed = Client::connect(&h.store_socket)
+        .unwrap()
+        .call_with_capability(
+            "store.share",
+            json!({
+                "data": data_encoding::BASE64.encode(b"mail whose recipient never came back"),
+                "recipients": [binding],
+            }),
+            &h.token("store.share"),
+        )
+        .unwrap()
+        .expect("sealing");
+    let sealed_id = sealed["content_id"].as_str().unwrap().to_string();
+
+    let deadline_ms = 4_000;
+    let envelope = otwono_envelope::Envelope::new(
+        &sealed_id,
+        &recipient,
+        sealed["size_bytes"].as_u64().unwrap(),
+        otwono_identity::now_unix_ms() + deadline_ms,
+    );
+    let took_at = std::time::Instant::now();
+    Client::connect(&h.store_socket)
+        .unwrap()
+        .call_with_capability(
+            "envelope.take",
+            json!({ "envelope": envelope }),
+            &h.token("envelope.carry"),
+        )
+        .unwrap()
+        .expect("the sender holds its own outgoing envelope");
+
+    let carrier = Carrier::start(&h, "expiring");
+    match carrier
+        .taking(&h)
+        .carry_from(&h.candidate())
+        .expect("a carry pass")
+    {
+        otwono_netd::content::CarryPass::Took { envelope_id, .. } => assert_eq!(envelope_id, sealed_id),
+        other => panic!("the sender offered one envelope and the pass said {other:?}"),
+    }
+
+    // Here and servable while the deadline stands. If the machine were slow enough that
+    // getting this far already spent the window, say so rather than passing for that reason.
+    // Whether the *bytes* are here, asked of the cache directly.
+    //
+    // Not `store.serve_manifest`: after the deadline that refuses because custody is gone,
+    // whether or not the ciphertext went with it, so it would pass for a carrier that freed
+    // the record and kept the bytes for ever — which is the whole defect. Found by inverting
+    // the free and watching the first version of this test pass anyway.
+    let cached = || -> bool {
+        Client::connect(&carrier.store_socket)
+            .unwrap()
+            .call_with_capability("cache.status", json!({}), &h.token("cache.read"))
+            .unwrap()
+            .expect("the carrier's cache status")["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["content_id"] == json!(sealed_id))
+    };
+    assert_eq!(carrier.holding(&h), vec![sealed_id.clone()]);
+    assert!(
+        cached(),
+        "the carrier took custody without keeping the ciphertext"
+    );
+    let servable = Client::connect(&carrier.store_socket)
+        .unwrap()
+        .call_with_capability(
+            "store.serve_manifest",
+            json!({ "content_id": sealed_id, "from_chunk": 0, "max_chunks": 64,
+                    "peer": recipient.to_text() }),
+            &h.token("store.serve"),
+        )
+        .unwrap();
+    assert!(
+        servable.is_ok(),
+        "the carrier cannot serve what it just took: {servable:?}"
+    );
+    let spent = took_at.elapsed();
+    assert!(
+        spent < Duration::from_millis(deadline_ms - 500),
+        "setup took {spent:?} of a {deadline_ms}ms window; the assertions below would pass \
+         for the wrong reason"
+    );
+
+    // Past the deadline. The listing is what sweeps, as ADR-0026 §9 has it.
+    std::thread::sleep(Duration::from_millis(deadline_ms + 400) - spent);
+    assert!(
+        carrier.holding(&h).is_empty(),
+        "the record outlived its deadline: {:?}",
+        carrier.holding(&h)
+    );
+    assert!(
+        !cached(),
+        "custody lapsed and the ciphertext stayed in the carrier's cache"
     );
 }
 

@@ -96,7 +96,29 @@ impl EnvelopeStore {
     /// that needs a timer needs a timer that runs, and every caller of this is already a
     /// moment when the node is doing carriage work.
     pub fn held(&self, now_ms: u64) -> Result<Vec<Custody>, EnvelopeStoreError> {
+        Ok(self.held_and_lapsed(now_ms)?.0)
+    }
+
+    /// The same sweep, and the ids it dropped on the way.
+    ///
+    /// The custody record is one of two things a lapsed envelope leaves behind; the other is
+    /// the ciphertext, which since ADR-0031 is in the cache and has to be told. [`Self::held`]
+    /// deleted the record and discarded which id it was, so nothing downstream could free the
+    /// bytes — an expired envelope became an ordinary cache entry and sat there until budget
+    /// pressure evicted it.
+    ///
+    /// That is the right answer for a lapsed *replica*, whose bytes the cluster still wants
+    /// and which this node may itself have use for. It is the wrong one for a stranger's
+    /// mail: nobody wants it, this node cannot open it, and leaving it there means a carrier's
+    /// cache slowly fills with undecryptable post at the expense of what the household
+    /// actually fetched.
+    ///
+    /// A record too damaged to parse is deleted without its id being knowable, so its bytes
+    /// cannot be freed here. They lapse out of their carriage hold on the cache's own
+    /// schedule and become evictable like anything else, which is the best available answer.
+    pub fn held_and_lapsed(&self, now_ms: u64) -> Result<(Vec<Custody>, Vec<String>), EnvelopeStoreError> {
         let mut out = Vec::new();
+        let mut lapsed = Vec::new();
         for entry in std::fs::read_dir(self.root.join("held"))? {
             let path = entry?.path();
             // A damaged record is dropped rather than failing the listing: one unreadable
@@ -105,13 +127,18 @@ impl EnvelopeStore {
             // it would leak the budget it occupies.
             match read_custody(&path) {
                 Ok(Some(held)) if !held.is_due(now_ms) => out.push(held),
-                Ok(Some(_)) | Ok(None) | Err(_) => {
+                Ok(Some(due)) => {
+                    lapsed.push(due.envelope.envelope_id);
+                    let _ = std::fs::remove_file(&path);
+                }
+                Ok(None) | Err(_) => {
                     let _ = std::fs::remove_file(&path);
                 }
             }
         }
         out.sort_by(|a, b| (a.until_ms, &a.envelope.envelope_id).cmp(&(b.until_ms, &b.envelope.envelope_id)));
-        Ok(out)
+        lapsed.sort();
+        Ok((out, lapsed))
     }
 
     /// What this carrier holds for one recipient, and nothing else (ADR-0028 §9).

@@ -25,9 +25,13 @@ custody store, which was already emptying before ADR-0031 moved the ciphertext t
 so it looked the same whether the bytes went or stayed. The release now reports what it freed
 and the carrier's check fails on zero: `released … (87 bytes freed)`, `DROPPED … freed=87`.
 
+Expiry — the other way a carrier lets go, and the one that happens when the release does not
+arrive — frees the same two things, and is covered by
+`an_envelope_that_expires_frees_its_bytes_as_well_as_its_record` over real daemons.
+
 That does not make every part of this document verified. No envelope has ever expired on a
-booted node, the release's failure paths have only unit tests, and the freed count is the
-daemon's own rather than an independent look at the disk. See §7 and
+booted node, the release's failure paths have only unit tests, and the freed count a booted
+run reports is the daemon's own rather than an independent look at the disk. See §7 and
 `docs/build/VERIFICATION-LOG.md` for what the runs have and have not demonstrated.
 
 This document describes the third of `DISTRIBUTED-SERVICES.md`'s three primitives. The
