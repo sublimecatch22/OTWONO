@@ -196,10 +196,17 @@ impl EncryptedFileSecretStore {
         };
 
         if key_bytes.len() != 32 {
-            bail!("vault key file is corrupt: expected 32 bytes, found {}", key_bytes.len());
+            bail!(
+                "vault key file is corrupt: expected 32 bytes, found {}",
+                key_bytes.len()
+            );
         }
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
-        Ok(Self { vault_path, cipher, lock: Mutex::new(()) })
+        Ok(Self {
+            vault_path,
+            cipher,
+            lock: Mutex::new(()),
+        })
     }
 
     fn read_vault(&self) -> Result<VaultFile> {
@@ -260,7 +267,9 @@ impl SecretStore for EncryptedFileSecretStore {
         let plaintext = self
             .cipher
             .decrypt(Nonce::from_slice(nonce), ciphertext)
-            .map_err(|_| anyhow!("could not decrypt secret {key:?}; the vault key may have changed"))?;
+            .map_err(|_| {
+                anyhow!("could not decrypt secret {key:?}; the vault key may have changed")
+            })?;
         Ok(Some(String::from_utf8(plaintext)?))
     }
 
@@ -387,13 +396,18 @@ mod tests {
     #[test]
     fn the_vault_file_never_contains_the_plaintext() {
         let (tmp, store) = file_store();
-        store.set("provider:conn_1", "sk-super-secret-abcdef").unwrap();
+        store
+            .set("provider:conn_1", "sk-super-secret-abcdef")
+            .unwrap();
         let raw = std::fs::read_to_string(tmp.path().join("vault.bin")).unwrap();
         assert!(
             !raw.contains("sk-super-secret-abcdef"),
             "plaintext leaked into the vault file"
         );
-        assert!(raw.contains("provider:conn_1"), "key names are stored in the clear by design");
+        assert!(
+            raw.contains("provider:conn_1"),
+            "key names are stored in the clear by design"
+        );
     }
 
     #[test]

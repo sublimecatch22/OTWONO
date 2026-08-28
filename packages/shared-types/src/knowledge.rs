@@ -90,7 +90,10 @@ impl IngestState {
             "failed" => Ok(Self::Failed),
             "removed" => Ok(Self::Removed),
             "skipped" => Ok(Self::Skipped),
-            other => Err(DomainError::validation("ingest_state", format!("unknown {other:?}"))),
+            other => Err(DomainError::validation(
+                "ingest_state",
+                format!("unknown {other:?}"),
+            )),
         }
     }
 }
@@ -164,12 +167,30 @@ mod tests {
 
     #[test]
     fn required_mvp_formats_are_recognised() {
-        assert_eq!(DocumentFormat::from_extension("txt"), Some(DocumentFormat::Text));
-        assert_eq!(DocumentFormat::from_extension(".MD"), Some(DocumentFormat::Markdown));
-        assert_eq!(DocumentFormat::from_extension("pdf"), Some(DocumentFormat::Pdf));
-        assert_eq!(DocumentFormat::from_extension("docx"), Some(DocumentFormat::Docx));
-        assert_eq!(DocumentFormat::from_extension("csv"), Some(DocumentFormat::Csv));
-        assert_eq!(DocumentFormat::from_extension("rs"), Some(DocumentFormat::SourceCode));
+        assert_eq!(
+            DocumentFormat::from_extension("txt"),
+            Some(DocumentFormat::Text)
+        );
+        assert_eq!(
+            DocumentFormat::from_extension(".MD"),
+            Some(DocumentFormat::Markdown)
+        );
+        assert_eq!(
+            DocumentFormat::from_extension("pdf"),
+            Some(DocumentFormat::Pdf)
+        );
+        assert_eq!(
+            DocumentFormat::from_extension("docx"),
+            Some(DocumentFormat::Docx)
+        );
+        assert_eq!(
+            DocumentFormat::from_extension("csv"),
+            Some(DocumentFormat::Csv)
+        );
+        assert_eq!(
+            DocumentFormat::from_extension("rs"),
+            Some(DocumentFormat::SourceCode)
+        );
     }
 
     #[test]

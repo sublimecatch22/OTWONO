@@ -92,7 +92,10 @@ impl ListingState {
                 return Ok(candidate);
             }
         }
-        Err(DomainError::validation("listing_state", format!("unknown {value:?}")))
+        Err(DomainError::validation(
+            "listing_state",
+            format!("unknown {value:?}"),
+        ))
     }
 }
 
@@ -162,36 +165,73 @@ impl ProhibitedCategory {
     }
 }
 
-/// Keyword table backing moderation. Kept small, explicit and testable; it is
-/// a floor, not a substitute for the human escalation path.
-const PROHIBITED_TERMS: &[(ProhibitedCategory, &[&str])] = &[
+/// Phrase table backing moderation. Kept small, explicit and testable; it is a
+/// floor, not a substitute for the human escalation path.
+///
+/// Each entry is a phrase of one or more words. Matching is word-based and
+/// tolerates ordinary English inflection (see `INFLECTIONS`), so
+/// "harvest logins" also catches "harvested logins" — while "forge" still does
+/// not catch "forget", because "t" is not an inflection.
+const PROHIBITED_PHRASES: &[(ProhibitedCategory, &[&str])] = &[
     (
         ProhibitedCategory::Illegal,
-        &["launder", "counterfeit", "smuggle", "burglary", "steal a", "traffick"],
+        &[
+            "launder",
+            "counterfeit",
+            "smuggle",
+            "burglary",
+            "traffick",
+            "fence stolen",
+        ],
     ),
     (
         ProhibitedCategory::PhysicalHarm,
-        &["hurt someone", "beat up", "assault", "poison", "kill "],
+        &["hurt someone", "beat up", "assault", "poison", "kill"],
     ),
     (
         ProhibitedCategory::Weapons,
-        &["firearm", "gun parts", "ghost gun", "silencer", "explosive", "ammunition"],
+        &[
+            "firearm",
+            "gun part",
+            "ghost gun",
+            "silencer",
+            "explosive",
+            "ammunition",
+        ],
     ),
     (
         ProhibitedCategory::Deception,
-        &["fake review", "impersonate", "forge", "pretend to be a real", "astroturf"],
+        &[
+            "fake review",
+            "impersonate",
+            "forge",
+            "astroturf",
+            "fake testimonial",
+        ],
     ),
     (
         ProhibitedCategory::Exploitation,
-        &["unpaid trial work", "under 16", "sweatshop", "debt bondage"],
+        &["unpaid trial work", "sweatshop", "debt bondage", "under 16"],
     ),
     (
         ProhibitedCategory::Surveillance,
-        &["follow my ex", "track a person", "covert camera", "stalk", "spy on"],
+        &[
+            "follow my ex",
+            "track a person",
+            "covert camera",
+            "stalk",
+            "spy on",
+        ],
     ),
     (
         ProhibitedCategory::CredentialHarvesting,
-        &["collect passwords", "phishing", "harvest logins", "credential dump", "otp code from"],
+        &[
+            "collect password",
+            "phishing",
+            "harvest login",
+            "harvest credential",
+            "credential dump",
+        ],
     ),
     (
         ProhibitedCategory::Harassment,
@@ -199,9 +239,61 @@ const PROHIBITED_TERMS: &[(ProhibitedCategory, &[&str])] = &[
     ),
     (
         ProhibitedCategory::PrivacyInvasion,
-        &["home address of", "private medical", "scrape personal data", "find where they live"],
+        &[
+            "home address of",
+            "private medical",
+            "scrape personal data",
+            "find where they live",
+        ],
     ),
 ];
+
+/// Suffixes a word may carry and still be the same word for moderation.
+/// Deliberately short: every entry is an inflection, never a different word.
+const INFLECTIONS: &[&str] = &["s", "es", "ed", "d", "ing", "er", "ers", "ings"];
+
+/// True when `text_word` is `term_word` possibly carrying an inflection.
+///
+/// A trailing `e` is also allowed to drop before a suffix, so "impersonate"
+/// matches "impersonating". This is still narrow enough that "forge" does not
+/// match "forget": "t" is not an inflection with or without the `e`.
+fn word_matches(term_word: &str, text_word: &str) -> bool {
+    if text_word == term_word {
+        return true;
+    }
+    let mut stems = vec![term_word];
+    if let Some(without_e) = term_word.strip_suffix('e') {
+        stems.push(without_e);
+    }
+    stems.iter().any(|stem| {
+        text_word
+            .strip_prefix(*stem)
+            .is_some_and(|suffix| INFLECTIONS.contains(&suffix))
+    })
+}
+
+/// Split into lowercase alphanumeric words, so punctuation, casing and spacing
+/// cannot be used to slip a phrase past the check.
+fn words(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_ascii_lowercase())
+        .collect()
+}
+
+/// True when the word sequence of `phrase` appears in `haystack`.
+fn phrase_present(haystack: &[String], phrase: &str) -> bool {
+    let needle = words(phrase);
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|window| {
+        window
+            .iter()
+            .zip(needle.iter())
+            .all(|(text_word, term_word)| word_matches(term_word, text_word))
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModerationFinding {
@@ -227,24 +319,20 @@ impl ModerationVerdict {
     }
 }
 
-/// Screen the free-text parts of a listing. Case-insensitive substring match on
-/// a normalised form so that spacing and capitalisation cannot evade it.
+/// Screen the free-text parts of a listing.
 pub fn moderate(text: &str) -> ModerationVerdict {
-    let normalised = text.to_ascii_lowercase().replace(['\n', '\t'], " ");
-    let collapsed = normalised.split_whitespace().collect::<Vec<_>>().join(" ");
-    let padded = format!(" {collapsed} ");
-
+    let haystack = words(text);
     let mut findings = Vec::new();
-    for (category, terms) in PROHIBITED_TERMS {
-        for term in *terms {
-            if padded.contains(term) {
-                findings.push(ModerationFinding {
-                    category: category.as_str().to_string(),
-                    explanation: category.explanation().to_string(),
-                    matched: (*term).to_string(),
-                });
-                break;
-            }
+    for (category, phrases) in PROHIBITED_PHRASES {
+        if let Some(matched) = phrases
+            .iter()
+            .find(|phrase| phrase_present(&haystack, phrase))
+        {
+            findings.push(ModerationFinding {
+                category: category.as_str().to_string(),
+                explanation: category.explanation().to_string(),
+                matched: (*matched).to_string(),
+            });
         }
     }
 
@@ -336,9 +424,8 @@ mod tests {
 
     #[test]
     fn a_normal_listing_passes_moderation() {
-        let verdict = moderate(
-            "Photograph a shopfront in Leeds and send five images with a short caption.",
-        );
+        let verdict =
+            moderate("Photograph a shopfront in Leeds and send five images with a short caption.");
         assert!(verdict.is_allowed(), "{verdict:?}");
     }
 
@@ -354,7 +441,10 @@ mod tests {
             "Harass this account until they delete it",
         ] {
             match moderate(text) {
-                ModerationVerdict::Refused { findings, escalation } => {
+                ModerationVerdict::Refused {
+                    findings,
+                    escalation,
+                } => {
                     assert!(!findings.is_empty(), "no finding for {text:?}");
                     assert!(findings[0].explanation.ends_with("not permitted."));
                     assert!(escalation.contains("human review"));
@@ -365,9 +455,38 @@ mod tests {
     }
 
     #[test]
-    fn moderation_ignores_case_and_spacing() {
+    fn moderation_ignores_case_spacing_and_punctuation() {
         assert!(!moderate("PHISHING   campaign\n setup").is_allowed());
         assert!(!moderate("Please\tIMPERSONATE the CEO").is_allowed());
+        assert!(!moderate("build a phishing-kit").is_allowed());
+    }
+
+    #[test]
+    fn moderation_catches_ordinary_inflections() {
+        for text in [
+            "Provide a list of harvested logins",
+            "Collecting passwords from staff",
+            "Impersonating the finance director",
+            "Stalking a former colleague",
+        ] {
+            assert!(!moderate(text).is_allowed(), "moderation missed: {text:?}");
+        }
+    }
+
+    #[test]
+    fn moderation_does_not_fire_on_words_that_merely_start_the_same() {
+        for text in [
+            "Do not forget to include the receipts",
+            "Killometers is not a word but kilometres are fine",
+            "Harvest apples from the orchard and photograph them",
+            "Assess the assortment of stock on the shelves",
+        ] {
+            assert!(
+                moderate(text).is_allowed(),
+                "moderation should have allowed: {text:?} -> {:?}",
+                moderate(text)
+            );
+        }
     }
 
     #[test]
@@ -385,7 +504,9 @@ mod tests {
 
     #[test]
     fn a_draft_cannot_be_published_without_passing_creator_approval() {
-        assert!(ListingState::Draft.transition(ListingState::Published).is_err());
+        assert!(ListingState::Draft
+            .transition(ListingState::Published)
+            .is_err());
         assert!(ListingState::Draft
             .transition(ListingState::AwaitingCreatorApproval)
             .is_ok());
@@ -396,7 +517,11 @@ mod tests {
 
     #[test]
     fn a_rejected_listing_is_final() {
-        for target in [ListingState::Published, ListingState::Draft, ListingState::Assigned] {
+        for target in [
+            ListingState::Published,
+            ListingState::Draft,
+            ListingState::Assigned,
+        ] {
             assert!(ListingState::Rejected.transition(target).is_err());
         }
     }

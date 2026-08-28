@@ -65,7 +65,9 @@ impl WorkspaceKind {
         Self::ALL
             .into_iter()
             .find(|k| k.as_str() == value)
-            .ok_or_else(|| DomainError::validation("workspace_kind", format!("unknown kind {value:?}")))
+            .ok_or_else(|| {
+                DomainError::validation("workspace_kind", format!("unknown kind {value:?}"))
+            })
     }
 }
 
@@ -144,7 +146,10 @@ impl SessionStage {
             "synthesis" => Ok(Self::Synthesis),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
-            other => Err(DomainError::validation("stage", format!("unknown stage {other:?}"))),
+            other => Err(DomainError::validation(
+                "stage",
+                format!("unknown stage {other:?}"),
+            )),
         }
     }
 }

@@ -53,19 +53,27 @@ impl Db {
         bootstrap.close().map_err(|(_, e)| e)?;
         crate::paths::restrict_to_owner(path).ok();
 
-        let manager = SqliteConnectionManager::file(path)
-            .with_init(|conn| configure(conn, false));
+        let manager = SqliteConnectionManager::file(path).with_init(|conn| configure(conn, false));
         let pool = Pool::builder()
             .max_size(8)
             .build(manager)
             .context("building the database connection pool")?;
 
-        Ok((Self { pool, path: Some(path.to_path_buf()) }, outcome))
+        Ok((
+            Self {
+                pool,
+                path: Some(path.to_path_buf()),
+            },
+            outcome,
+        ))
     }
 
     /// Open the database at the standard data-directory location.
     pub fn open_default() -> Result<(Self, MigrationOutcome)> {
-        Self::open(&crate::paths::database_path()?, &crate::paths::backups_dir()?)
+        Self::open(
+            &crate::paths::database_path()?,
+            &crate::paths::backups_dir()?,
+        )
     }
 
     /// A migrated, isolated in-memory database. Used by tests.
@@ -82,7 +90,9 @@ impl Db {
     }
 
     pub fn conn(&self) -> Result<Conn> {
-        self.pool.get().context("checking out a database connection")
+        self.pool
+            .get()
+            .context("checking out a database connection")
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -96,7 +106,10 @@ impl Db {
 
     /// Run `f` inside a transaction, committing on `Ok` and rolling back on
     /// `Err`. Every multi-row write in this crate goes through here.
-    pub fn transaction<T>(&self, f: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>) -> Result<T> {
+    pub fn transaction<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
         let mut conn = self.conn()?;
         let tx = conn.transaction()?;
         let value = f(&tx)?;
@@ -153,7 +166,10 @@ mod tests {
                 [],
             )
             .unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("foreign key"), "{err}");
+        assert!(
+            err.to_string().to_lowercase().contains("foreign key"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -170,7 +186,9 @@ mod tests {
         let count: i64 = db
             .conn()
             .unwrap()
-            .query_row("SELECT COUNT(*) FROM settings WHERE key='x'", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM settings WHERE key='x'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(count, 0);
     }
@@ -196,11 +214,16 @@ mod tests {
         }
 
         let (db, outcome) = Db::open(&db_path, &backups).unwrap();
-        assert!(outcome.applied.is_empty(), "reopening must not re-run migrations");
+        assert!(
+            outcome.applied.is_empty(),
+            "reopening must not re-run migrations"
+        );
         let accent: String = db
             .conn()
             .unwrap()
-            .query_row("SELECT value FROM settings WHERE key='accent'", [], |r| r.get(0))
+            .query_row("SELECT value FROM settings WHERE key='accent'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(accent, "amber");
     }

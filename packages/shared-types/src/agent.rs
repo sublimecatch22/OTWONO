@@ -227,7 +227,10 @@ impl AgentPackage {
             return Err(DomainError::validation("name", "must not be empty"));
         }
         if self.name.chars().count() > 120 {
-            return Err(DomainError::validation("name", "must be 120 characters or fewer"));
+            return Err(DomainError::validation(
+                "name",
+                "must be 120 characters or fewer",
+            ));
         }
         if self.system_instructions.len() > 32_768 {
             return Err(DomainError::validation(
@@ -236,7 +239,10 @@ impl AgentPackage {
             ));
         }
         if self.max_steps == 0 || self.max_steps > 200 {
-            return Err(DomainError::validation("max_steps", "must be between 1 and 200"));
+            return Err(DomainError::validation(
+                "max_steps",
+                "must be between 1 and 200",
+            ));
         }
         if self.timeout_seconds == 0 || self.timeout_seconds > 3_600 {
             return Err(DomainError::validation(

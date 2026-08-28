@@ -48,18 +48,21 @@ fn ensure_migrations_table(conn: &Connection) -> Result<()> {
 
 pub fn current_version(conn: &Connection) -> Result<i64> {
     ensure_migrations_table(conn)?;
-    let version: Option<i64> = conn.query_row(
-        "SELECT MAX(version) FROM schema_migrations",
-        [],
-        |row| row.get(0),
-    )?;
+    let version: Option<i64> =
+        conn.query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })?;
     Ok(version.unwrap_or(0))
 }
 
 /// Copy the database file next to itself under `backups/`, named for the
 /// schema version it is leaving. Returns `None` when there is nothing to back
 /// up (a database that has never been migrated).
-pub fn backup_before_migration(db_path: &Path, backups_dir: &Path, from: i64) -> Result<Option<PathBuf>> {
+pub fn backup_before_migration(
+    db_path: &Path,
+    backups_dir: &Path,
+    from: i64,
+) -> Result<Option<PathBuf>> {
     if from == 0 || !db_path.exists() {
         return Ok(None);
     }
@@ -90,7 +93,11 @@ pub struct MigrationOutcome {
 }
 
 /// Bring `conn` up to `target_version()`. Idempotent.
-pub fn migrate(conn: &mut Connection, db_path: Option<&Path>, backups_dir: Option<&Path>) -> Result<MigrationOutcome> {
+pub fn migrate(
+    conn: &mut Connection,
+    db_path: Option<&Path>,
+    backups_dir: Option<&Path>,
+) -> Result<MigrationOutcome> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
     let from = current_version(conn)?;
     let to = target_version();
@@ -105,7 +112,12 @@ pub fn migrate(conn: &mut Connection, db_path: Option<&Path>, backups_dir: Optio
 
     let pending: Vec<&Migration> = MIGRATIONS.iter().filter(|m| m.version > from).collect();
     if pending.is_empty() {
-        return Ok(MigrationOutcome { from, to, applied: Vec::new(), backup: None });
+        return Ok(MigrationOutcome {
+            from,
+            to,
+            applied: Vec::new(),
+            backup: None,
+        });
     }
 
     let backup = match (db_path, backups_dir) {
@@ -116,8 +128,12 @@ pub fn migrate(conn: &mut Connection, db_path: Option<&Path>, backups_dir: Optio
     let mut applied = Vec::new();
     for migration in pending {
         let tx = conn.transaction()?;
-        tx.execute_batch(migration.sql)
-            .with_context(|| format!("applying migration {:04}_{}", migration.version, migration.name))?;
+        tx.execute_batch(migration.sql).with_context(|| {
+            format!(
+                "applying migration {:04}_{}",
+                migration.version, migration.name
+            )
+        })?;
         tx.execute(
             "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
             rusqlite::params![
@@ -128,15 +144,26 @@ pub fn migrate(conn: &mut Connection, db_path: Option<&Path>, backups_dir: Optio
         )?;
         tx.commit()?;
         applied.push(migration.name);
-        tracing::info!(version = migration.version, name = migration.name, "applied migration");
+        tracing::info!(
+            version = migration.version,
+            name = migration.name,
+            "applied migration"
+        );
     }
 
     let reached = current_version(conn)?;
     if reached != to {
-        return Err(anyhow!("migration finished at version {reached}, expected {to}"));
+        return Err(anyhow!(
+            "migration finished at version {reached}, expected {to}"
+        ));
     }
 
-    Ok(MigrationOutcome { from, to, applied, backup })
+    Ok(MigrationOutcome {
+        from,
+        to,
+        applied,
+        backup,
+    })
 }
 
 #[cfg(test)]
@@ -200,7 +227,8 @@ mod tests {
 
         // Simulate a broken migration body applied through the same path.
         let tx = conn.transaction().unwrap();
-        let result = tx.execute_batch("CREATE TABLE ok_table (id TEXT); SELECT this_is_not_valid();");
+        let result =
+            tx.execute_batch("CREATE TABLE ok_table (id TEXT); SELECT this_is_not_valid();");
         assert!(result.is_err());
         drop(tx); // rolled back
 
@@ -250,14 +278,18 @@ mod tests {
         // The backup still holds the user's data at the pre-upgrade version.
         let restored = Connection::open(&backup).unwrap();
         let theme: String = restored
-            .query_row("SELECT value FROM settings WHERE key='theme'", [], |r| r.get(0))
+            .query_row("SELECT value FROM settings WHERE key='theme'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(theme, "dark");
         assert_eq!(current_version(&restored).unwrap(), 1);
 
         // And the live database kept the data through the upgrade.
         let theme: String = conn
-            .query_row("SELECT value FROM settings WHERE key='theme'", [], |r| r.get(0))
+            .query_row("SELECT value FROM settings WHERE key='theme'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(theme, "dark");
     }
@@ -288,6 +320,9 @@ mod tests {
                 [],
             )
             .unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("constraint"), "{err}");
+        assert!(
+            err.to_string().to_lowercase().contains("constraint"),
+            "{err}"
+        );
     }
 }

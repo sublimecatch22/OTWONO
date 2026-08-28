@@ -107,10 +107,7 @@ pub enum StreamEvent {
     /// Knowledge chunks used for this answer.
     Citations { citations: Vec<Citation> },
     /// The run paused for a human decision.
-    ApprovalRequired {
-        request_id: String,
-        summary: String,
-    },
+    ApprovalRequired { request_id: String, summary: String },
     /// Terminal success.
     Done {
         message_id: String,

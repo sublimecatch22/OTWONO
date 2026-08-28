@@ -99,10 +99,17 @@ impl NewActivity {
     }
 
     pub fn user(action: impl Into<String>) -> Self {
-        Self { actor_type: ActorType::User, ..Self::system(action) }
+        Self {
+            actor_type: ActorType::User,
+            ..Self::system(action)
+        }
     }
 
-    pub fn agent(agent_id: impl Into<String>, agent_name: impl Into<String>, action: impl Into<String>) -> Self {
+    pub fn agent(
+        agent_id: impl Into<String>,
+        agent_name: impl Into<String>,
+        action: impl Into<String>,
+    ) -> Self {
         Self {
             actor_type: ActorType::Agent,
             actor_id: Some(agent_id.into()),
@@ -116,7 +123,11 @@ impl NewActivity {
         self
     }
 
-    pub fn with_target(mut self, target_type: impl Into<String>, target_id: impl Into<String>) -> Self {
+    pub fn with_target(
+        mut self,
+        target_type: impl Into<String>,
+        target_id: impl Into<String>,
+    ) -> Self {
         self.target_type = Some(target_type.into());
         self.target_id = Some(target_id.into());
         self
@@ -141,12 +152,31 @@ impl NewActivity {
 /// Keys whose values are replaced before storage. Matching mirrors the agent
 /// package rule: normalised exact names plus high-signal fragments.
 const REDACT_EXACT: &[&str] = &[
-    "token", "secret", "password", "passphrase", "credential", "credentials", "auth",
-    "authorization", "bearer", "cookie", "key", "jwt",
+    "token",
+    "secret",
+    "password",
+    "passphrase",
+    "credential",
+    "credentials",
+    "auth",
+    "authorization",
+    "bearer",
+    "cookie",
+    "key",
+    "jwt",
 ];
 const REDACT_FRAGMENTS: &[&str] = &[
-    "apikey", "accesstoken", "refreshtoken", "idtoken", "authtoken", "bearertoken",
-    "sessiontoken", "privatekey", "secretkey", "clientsecret", "apisecret",
+    "apikey",
+    "accesstoken",
+    "refreshtoken",
+    "idtoken",
+    "authtoken",
+    "bearertoken",
+    "sessiontoken",
+    "privatekey",
+    "secretkey",
+    "clientsecret",
+    "apisecret",
 ];
 
 pub const REDACTED: &str = "[redacted]";
@@ -307,15 +337,13 @@ mod tests {
     fn secrets_are_redacted_before_they_reach_the_database() {
         let db = Db::open_in_memory().unwrap();
         let repo = ActivityRepo::new(&db);
-        repo.record(
-            NewActivity::system("provider.request").with_detail(json!({
-                "endpoint": "http://127.0.0.1:11434",
-                "api_key": "sk-live-should-not-appear",
-                "headers": { "Authorization": "Bearer secret-value" },
-                "nested": [{ "refresh_token": "rt-should-not-appear" }],
-                "max_output_tokens": 512
-            })),
-        )
+        repo.record(NewActivity::system("provider.request").with_detail(json!({
+            "endpoint": "http://127.0.0.1:11434",
+            "api_key": "sk-live-should-not-appear",
+            "headers": { "Authorization": "Bearer secret-value" },
+            "nested": [{ "refresh_token": "rt-should-not-appear" }],
+            "max_output_tokens": 512
+        })))
         .unwrap();
 
         let raw: String = db
@@ -326,7 +354,10 @@ mod tests {
         assert!(!raw.contains("sk-live-should-not-appear"), "{raw}");
         assert!(!raw.contains("secret-value"), "{raw}");
         assert!(!raw.contains("rt-should-not-appear"), "{raw}");
-        assert!(raw.contains("127.0.0.1:11434"), "non-sensitive detail must survive");
+        assert!(
+            raw.contains("127.0.0.1:11434"),
+            "non-sensitive detail must survive"
+        );
         assert!(raw.contains("512"), "model parameters must not be redacted");
     }
 
@@ -334,11 +365,19 @@ mod tests {
     fn entries_come_back_newest_first_and_filter_by_project() {
         let db = Db::open_in_memory().unwrap();
         let repo = ActivityRepo::new(&db);
-        repo.record(NewActivity::user("project.create").with_project("prj_1")).unwrap();
-        repo.record(NewActivity::user("task.run").with_project("prj_1")).unwrap();
-        repo.record(NewActivity::user("chat.send").with_project("prj_2")).unwrap();
+        repo.record(NewActivity::user("project.create").with_project("prj_1"))
+            .unwrap();
+        repo.record(NewActivity::user("task.run").with_project("prj_1"))
+            .unwrap();
+        repo.record(NewActivity::user("chat.send").with_project("prj_2"))
+            .unwrap();
 
-        let all = repo.list(&ActivityQuery { limit: 50, ..Default::default() }).unwrap();
+        let all = repo
+            .list(&ActivityQuery {
+                limit: 50,
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(all.len(), 3);
         assert_eq!(all[0].action, "chat.send", "newest first");
 
@@ -350,15 +389,23 @@ mod tests {
             })
             .unwrap();
         assert_eq!(scoped.len(), 2);
-        assert!(scoped.iter().all(|e| e.project_id.as_deref() == Some("prj_1")));
+        assert!(scoped
+            .iter()
+            .all(|e| e.project_id.as_deref() == Some("prj_1")));
     }
 
     #[test]
     fn queries_filter_by_actor_and_action_prefix() {
         let db = Db::open_in_memory().unwrap();
         let repo = ActivityRepo::new(&db);
-        repo.record(NewActivity::agent("agt_1", "Researcher", "tool.knowledge_search")).unwrap();
-        repo.record(NewActivity::agent("agt_1", "Researcher", "tool.http_fetch")).unwrap();
+        repo.record(NewActivity::agent(
+            "agt_1",
+            "Researcher",
+            "tool.knowledge_search",
+        ))
+        .unwrap();
+        repo.record(NewActivity::agent("agt_1", "Researcher", "tool.http_fetch"))
+            .unwrap();
         repo.record(NewActivity::user("settings.update")).unwrap();
 
         let tools = repo
@@ -390,7 +437,12 @@ mod tests {
                 .with_outcome(Outcome::Denied),
         )
         .unwrap();
-        let entries = repo.list(&ActivityQuery { limit: 10, ..Default::default() }).unwrap();
+        let entries = repo
+            .list(&ActivityQuery {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(entries[0].outcome, Outcome::Denied);
     }
 
@@ -401,9 +453,22 @@ mod tests {
         for _ in 0..5 {
             repo.record(NewActivity::system("tick")).unwrap();
         }
-        assert_eq!(repo.list(&ActivityQuery { limit: 0, ..Default::default() }).unwrap().len(), 1);
         assert_eq!(
-            repo.list(&ActivityQuery { limit: u32::MAX, ..Default::default() }).unwrap().len(),
+            repo.list(&ActivityQuery {
+                limit: 0,
+                ..Default::default()
+            })
+            .unwrap()
+            .len(),
+            1
+        );
+        assert_eq!(
+            repo.list(&ActivityQuery {
+                limit: u32::MAX,
+                ..Default::default()
+            })
+            .unwrap()
+            .len(),
             5
         );
     }

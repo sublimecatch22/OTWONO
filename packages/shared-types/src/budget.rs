@@ -45,7 +45,10 @@ impl ExpenseState {
             "rejected" => Ok(Self::Rejected),
             "settled" => Ok(Self::Settled),
             "cancelled" => Ok(Self::Cancelled),
-            other => Err(DomainError::validation("expense_state", format!("unknown {other:?}"))),
+            other => Err(DomainError::validation(
+                "expense_state",
+                format!("unknown {other:?}"),
+            )),
         }
     }
 }
@@ -96,7 +99,10 @@ pub struct BudgetSummary {
 /// Decide what a newly recorded expense needs before it can proceed.
 pub fn required_state_for(amount_minor: i64, budget: &Budget) -> DomainResult<ExpenseState> {
     if amount_minor < 0 {
-        return Err(DomainError::validation("amount_minor", "must not be negative"));
+        return Err(DomainError::validation(
+            "amount_minor",
+            "must not be negative",
+        ));
     }
     Ok(if amount_minor >= budget.approval_threshold_minor {
         ExpenseState::AwaitingApproval
@@ -172,7 +178,10 @@ mod tests {
     #[test]
     fn amounts_at_or_above_the_threshold_need_approval() {
         let b = budget(100_00, 50_00);
-        assert_eq!(required_state_for(49_99, &b).unwrap(), ExpenseState::Estimated);
+        assert_eq!(
+            required_state_for(49_99, &b).unwrap(),
+            ExpenseState::Estimated
+        );
         assert_eq!(
             required_state_for(50_00, &b).unwrap(),
             ExpenseState::AwaitingApproval

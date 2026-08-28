@@ -73,14 +73,19 @@ impl Capability {
     /// Capabilities that can move data off the device always need an explicit
     /// grant and can never be pre-approved by a template.
     pub const fn leaves_device(self) -> bool {
-        matches!(self, Self::HttpFetch | Self::RelaySync | Self::MarketplacePublish)
+        matches!(
+            self,
+            Self::HttpFetch | Self::RelaySync | Self::MarketplacePublish
+        )
     }
 
     pub fn parse(value: &str) -> DomainResult<Self> {
         Self::ALL
             .into_iter()
             .find(|c| c.as_str() == value)
-            .ok_or_else(|| DomainError::validation("capability", format!("unknown capability {value:?}")))
+            .ok_or_else(|| {
+                DomainError::validation("capability", format!("unknown capability {value:?}"))
+            })
     }
 }
 
@@ -97,14 +102,26 @@ pub enum Scope {
     /// Everything the user owns. Only ever created by the user, never requested
     /// by an agent.
     Global,
-    Project { project_id: String },
-    Workspace { workspace_id: String },
-    Agent { agent_id: String },
+    Project {
+        project_id: String,
+    },
+    Workspace {
+        workspace_id: String,
+    },
+    Agent {
+        agent_id: String,
+    },
     /// A filesystem prefix. Comparison is on canonicalised paths.
-    Path { path: String },
+    Path {
+        path: String,
+    },
     /// A single host, matched exactly (no wildcard subdomains).
-    Host { host: String },
-    Connector { connector_id: String },
+    Host {
+        host: String,
+    },
+    Connector {
+        connector_id: String,
+    },
 }
 
 impl Scope {
@@ -180,10 +197,16 @@ pub struct PermissionRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum CheckOutcome {
-    Allowed { grant_id: String },
+    Allowed {
+        grant_id: String,
+    },
     /// No matching grant: deny by default and ask.
-    NeedsApproval { reason: String },
-    Denied { reason: String },
+    NeedsApproval {
+        reason: String,
+    },
+    Denied {
+        reason: String,
+    },
     /// The global emergency stop is engaged; nothing runs.
     Stopped,
 }
@@ -216,7 +239,9 @@ mod tests {
     #[test]
     fn narrower_scopes_outrank_broader_ones() {
         let path = Scope::Path { path: "/a".into() };
-        let project = Scope::Project { project_id: "p".into() };
+        let project = Scope::Project {
+            project_id: "p".into(),
+        };
         assert!(path.precedence() > project.precedence());
         assert!(project.precedence() > Scope::Global.precedence());
     }

@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 description = "SQLite persistence, versioned migrations and secret storage for OTWONO AI."
 
+[lints]
+workspace = true
+
 [dependencies]
 otwono-types.workspace = true
 anyhow.workspace = true

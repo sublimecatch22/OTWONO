@@ -35,8 +35,7 @@ pub fn database_path() -> Result<PathBuf> {
 
 fn subdir(name: &str) -> Result<PathBuf> {
     let path = data_dir()?.join(name);
-    std::fs::create_dir_all(&path)
-        .with_context(|| format!("creating {}", path.display()))?;
+    std::fs::create_dir_all(&path).with_context(|| format!("creating {}", path.display()))?;
     Ok(path)
 }
 

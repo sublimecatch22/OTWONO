@@ -172,7 +172,8 @@ impl Preferences {
             self.background = "depth".into();
         }
 
-        self.visible_tabs.retain(|tab| KNOWN_TABS.contains(&tab.as_str()));
+        self.visible_tabs
+            .retain(|tab| KNOWN_TABS.contains(&tab.as_str()));
         self.visible_tabs.dedup();
         for required in REQUIRED_TABS {
             if !self.visible_tabs.iter().any(|t| t == required) {
@@ -219,7 +220,9 @@ impl<'a> SettingsRepo<'a> {
     }
 
     pub fn delete(&self, key: &str) -> Result<()> {
-        self.db.conn()?.execute("DELETE FROM settings WHERE key = ?1", [key])?;
+        self.db
+            .conn()?
+            .execute("DELETE FROM settings WHERE key = ?1", [key])?;
         Ok(())
     }
 

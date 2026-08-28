@@ -85,7 +85,10 @@ state_str!(TaskState,
 impl ProjectState {
     /// A terminal project can only be archived (or, for `Archived`, nothing).
     pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled | Self::Archived)
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::Archived
+        )
     }
 
     pub fn allows(self, to: Self) -> bool {
@@ -133,7 +136,9 @@ impl TaskState {
             (a, b) if a == b => false,
             (Queued, Ready | Blocked | Cancelled) => true,
             (Ready, Running | AwaitingApproval | Blocked | Cancelled) => true,
-            (Running, Verifying | AwaitingApproval | Blocked | Completed | Failed | Cancelled) => true,
+            (Running, Verifying | AwaitingApproval | Blocked | Completed | Failed | Cancelled) => {
+                true
+            }
             (AwaitingApproval, Running | Ready | Blocked | Failed | Cancelled) => true,
             (Blocked, Ready | Running | Failed | Cancelled) => true,
             (Verifying, Completed | Ready | Failed | Cancelled) => true,
@@ -288,7 +293,9 @@ mod tests {
 
     #[test]
     fn project_cannot_skip_from_draft_to_running() {
-        let err = ProjectState::Draft.transition(ProjectState::Running).unwrap_err();
+        let err = ProjectState::Draft
+            .transition(ProjectState::Running)
+            .unwrap_err();
         assert_eq!(
             err,
             DomainError::InvalidTransition {
@@ -318,7 +325,10 @@ mod tests {
 
     #[test]
     fn failed_task_may_be_requeued_for_rework() {
-        assert_eq!(TaskState::Failed.transition(TaskState::Ready).unwrap(), TaskState::Ready);
+        assert_eq!(
+            TaskState::Failed.transition(TaskState::Ready).unwrap(),
+            TaskState::Ready
+        );
     }
 
     #[test]
