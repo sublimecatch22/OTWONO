@@ -1,0 +1,33 @@
+{
+  "name": "otwono-ai",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OTWONO AI — local-first, user-controlled AI work platform.",
+  "license": "Apache-2.0",
+  "workspaces": [
+    "apps/web",
+    "packages/ui"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace @otwono/web",
+    "build": "npm run build --workspace @otwono/web",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "format": "prettier --write \"apps/web/src/**/*.{ts,tsx,css}\" \"packages/ui/src/**/*.{ts,tsx,css}\"",
+    "format:check": "prettier --check \"apps/web/src/**/*.{ts,tsx,css}\" \"packages/ui/src/**/*.{ts,tsx,css}\"",
+    "test": "npm run test --workspaces --if-present",
+    "test:e2e": "playwright test",
+    "rust:fmt": "cargo fmt --all",
+    "rust:lint": "cargo clippy --workspace --all-targets -- -D warnings",
+    "rust:test": "cargo test --workspace",
+    "verify": "npm run format:check && npm run typecheck && npm run test && npm run rust:lint && npm run rust:test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.49.1",
+    "prettier": "3.4.2",
+    "typescript": "5.7.2"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
