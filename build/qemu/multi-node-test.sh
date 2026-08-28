@@ -98,6 +98,36 @@ SMP="${OTWONO_MULTI_NODE_SMP:-$(( HOST_CORES / NODES ))}"
 echo "  vcpus      $SMP per guest ($NODES guests on $HOST_CORES host cores)"
 
 PIDS=()
+
+# Start one guest. Separated out so a node can be booted again after being powered off,
+# which is what the store-and-forward check needs: its whole property is that a recipient
+# absent at send time collects after the sender has gone (ADR-0028).
+#
+# The QMP socket is how the harness reaches the power button. `-no-reboot` means QEMU exits
+# on shutdown, so waiting for the process to end is waiting for the guest to be off.
+boot_guest() { # ordinal logfile
+    local i="$1" log="$2" n="n$1" mac
+    # The MAC carries how many nodes there are and which one this is: octet 5 is N, octet 6
+    # the 1-based ordinal. A guest has no other way to know -- every node boots the same
+    # image -- and it needs both to take a distinct share of an object's chunks, to know how
+    # many peers to wait for, and to know its role in the envelope check.
+    mac=$(segment_mac "$NODES" "$i")
+    "$QEMU" "${MACHINE[@]}" \
+        -m 2048 -smp "$SMP" \
+        -drive if=pflash,format=raw,unit=0,readonly=on,file="$OUT/code-$n.fd" \
+        -drive if=pflash,format=raw,unit=1,file="$OUT/vars-$n.fd" \
+        -drive if=virtio,format=raw,file="$OUT/node-$n.img" \
+        -netdev "socket,id=seg,mcast=$MCAST_GROUP:$MCAST_PORT" \
+        -device virtio-net-pci,netdev=seg,mac="$mac" \
+        -qmp "unix:$OUT/qmp-$n.sock,server=on,wait=off" \
+        -nographic -serial mon:stdio -no-reboot \
+        < /dev/null >> "$log" 2>&1 &
+    GUEST_PID[$i]=$!
+    PIDS+=($!)
+}
+
+# Every guest's current pid, by ordinal. A node booted a second time gets a new one.
+declare -A GUEST_PID
 cleanup() {
     for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
     wait 2>/dev/null || true
@@ -126,17 +156,7 @@ for i in $(seq 1 "$NODES"); do
     # is the 1-based ordinal. A guest has no other way to know -- every node boots the same
     # image -- and it needs both to take a distinct share of an object's chunks and to know
     # how many peers to wait for. Reading its own MAC costs nothing and adds no interface.
-    mac=$(segment_mac "$NODES" "$i")
-    "$QEMU" "${MACHINE[@]}" \
-        -m 2048 -smp "$SMP" \
-        -drive if=pflash,format=raw,unit=0,readonly=on,file="$OUT/code-$n.fd" \
-        -drive if=pflash,format=raw,unit=1,file="$OUT/vars-$n.fd" \
-        -drive if=virtio,format=raw,file="$OUT/node-$n.img" \
-        -netdev "socket,id=seg,mcast=$MCAST_GROUP:$MCAST_PORT" \
-        -device virtio-net-pci,netdev=seg,mac="$mac" \
-        -nographic -serial mon:stdio -no-reboot \
-        < /dev/null > "$OUT/node-$n.log" 2>&1 &
-    PIDS+=($!)
+    boot_guest "$i" "$OUT/node-$n.log"
     sleep 2
 done
 
@@ -247,6 +267,93 @@ if [ "${MESH_CONTENT_SMOKE:-0}" != 0 ]; then
             exit 1
         fi
         echo "fan-out: $spread of $NODES node(s) drew the large object from several peers"
+    fi
+
+    # --- store-and-forward: does a message survive its sender going away? (ADR-0028) -----
+    #
+    # The property that needs three machines. Node 1 seals an envelope to node 3 *while node
+    # 3 is off*, node 2 takes custody of it, node 1 is then shut down, and node 3 comes back
+    # and collects from node 2 with the sender gone for the whole collection.
+    #
+    # The order is what makes it a test rather than a demonstration. Each power-down is
+    # waited for — `powerdown_guest` returns only once the process is gone — so "node 1 was
+    # down when node 3 collected" is established by the sequence and not inferred from a log.
+    if [ "$NODES" -ge 3 ]; then
+        echo
+        echo "store-and-forward: powering off node 3, the recipient"
+        powerdown_guest "$OUT/qmp-n3.sock" "${GUEST_PID[3]}" "node n3" || exit 1
+
+        echo "waiting for node 1 to seal and node 2 to take custody (up to ${CONTENT_TIMEOUT}s)"
+        deadline=$(( $(date +%s) + CONTENT_TIMEOUT ))
+        envelope_result=timeout
+        while [ "$(date +%s)" -lt "$deadline" ]; do
+            if grep -qa "OTWONO-ENVELOPE-FAIL" "$OUT"/node-n*.log 2>/dev/null; then
+                envelope_result=fail; break
+            fi
+            if grep -qa "OTWONO-ENVELOPE-SEALED" "$OUT/node-n1.log" 2>/dev/null \
+                && grep -qa "OTWONO-ENVELOPE-CARRIED" "$OUT/node-n2.log" 2>/dev/null; then
+                envelope_result=pass; break
+            fi
+            sleep 5
+        done
+        if [ "$envelope_result" != pass ]; then
+            echo "FAIL: no envelope was sealed and taken into custody ($envelope_result)" >&2
+            grep -ha "OTWONO-ENVELOPE-" "$OUT"/node-n*.log >&2 || true
+            exit 1
+        fi
+        sealed=$(grep -hoa "OTWONO-ENVELOPE-SEALED.*" "$OUT/node-n1.log" | tail -1 | tr -d '\r')
+        carried=$(grep -hoa "OTWONO-ENVELOPE-CARRIED.*" "$OUT/node-n2.log" | tail -1 | tr -d '\r')
+        echo "  $sealed"
+        echo "  $carried"
+
+        # The same envelope, or the carrier took something else and the test proves nothing.
+        sealed_id=$(echo "$sealed" | grep -o 'envelope=[0-9a-f]*' | cut -d= -f2)
+        carried_id=$(echo "$carried" | grep -o 'envelope=[0-9a-f]*' | cut -d= -f2)
+        if [ -z "$sealed_id" ] || [ "$sealed_id" != "$carried_id" ]; then
+            echo "FAIL: node 2 took custody of $carried_id, not the sealed $sealed_id" >&2
+            exit 1
+        fi
+
+        echo "store-and-forward: powering off node 1, the sender"
+        powerdown_guest "$OUT/qmp-n1.sock" "${GUEST_PID[1]}" "node n1" || exit 1
+        echo "  node 1 is off; nothing it holds can serve node 3 from here on"
+
+        echo "store-and-forward: booting node 3 again to collect"
+        : > "$OUT/node-n3-boot2.log"
+        boot_guest 3 "$OUT/node-n3-boot2.log"
+
+        deadline=$(( $(date +%s) + CONTENT_TIMEOUT ))
+        collect_result=timeout
+        while [ "$(date +%s)" -lt "$deadline" ]; do
+            if grep -qa "OTWONO-ENVELOPE-FAIL\|Kernel panic" "$OUT/node-n3-boot2.log" 2>/dev/null; then
+                collect_result=fail; break
+            fi
+            if grep -qa "OTWONO-ENVELOPE-COLLECTED" "$OUT/node-n3-boot2.log" 2>/dev/null; then
+                collect_result=pass; break
+            fi
+            # If node 1 came back from the dead the test is void, so say so rather than
+            # passing on a technicality.
+            if kill -0 "${GUEST_PID[1]}" 2>/dev/null; then
+                echo "FAIL: node 1 is running again; the collection was not made with the sender absent" >&2
+                exit 1
+            fi
+            sleep 5
+        done
+        if [ "$collect_result" != pass ]; then
+            echo "FAIL: node 3 collected nothing with the sender absent ($collect_result)" >&2
+            grep -ha "OTWONO-ENVELOPE-" "$OUT/node-n3-boot2.log" >&2 || true
+            exit 1
+        fi
+        collected=$(grep -hoa "OTWONO-ENVELOPE-COLLECTED.*" "$OUT/node-n3-boot2.log" | tail -1 | tr -d '\r')
+        echo "  $collected"
+        collected_id=$(echo "$collected" | grep -o 'envelope=[0-9a-f]*' | cut -d= -f2)
+        if [ "$collected_id" != "$sealed_id" ]; then
+            echo "FAIL: node 3 collected $collected_id, not the sealed $sealed_id" >&2
+            exit 1
+        fi
+        kill -0 "${GUEST_PID[1]}" 2>/dev/null \
+            && { echo "FAIL: node 1 was running at the end of the collection" >&2; exit 1; }
+        echo "store-and-forward: node 3 collected and opened its envelope from node 2, with node 1 off"
     fi
 fi
 

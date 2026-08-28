@@ -1,0 +1,169 @@
+#!/bin/sh
+# OTWONO envelope check: does a message survive its sender going away? (ADR-0028)
+#
+# The property store-and-forward exists for, and the one two nodes structurally cannot test.
+# It needs three parties: a sender, a carrier that is neither party, and a recipient that is
+# absent when the message is sent and returns after the sender has gone.
+#
+# Roles come from the ordinal in the MAC, the same way the content check learns its share:
+#
+#   node 1  sender     seals an envelope to a peer that has gone away, and offers it
+#   node 2  carrier    takes custody of it through the carry pass, unprompted
+#   node 3  recipient  is powered off, then returns and collects from the carrier
+#
+# # Why the sender waits for a peer to disappear
+#
+# It seals to a peer it knows is *currently unreachable*, which is exactly the case
+# store-and-forward exists for. It can do that because it captured that peer's signed sharing
+# binding while the peer was still up (ADR-0019 -- a binding travels in the Hello after a
+# handshake), and a binding is a file that outlives the connection.
+#
+# It also means the sender needs no coordination channel: nothing tells node 1 which peer is
+# node 3, and nothing needs to. The peer that goes away is the recipient by construction,
+# because the harness is what powers it off.
+set -eu
+
+WORK=/var/lib/otwono/envelope-check
+STAMP=/var/lib/otwono/envelope-check.sealed
+
+fail() { echo "OTWONO-ENVELOPE-FAIL $*" >&2; exit 1; }
+step() { echo "OTWONO-ENVELOPE-STEP $*"; }
+
+node_total=1
+node_ordinal=1
+for dev in /sys/class/net/*/address; do
+    a=$(cat "$dev" 2>/dev/null) || continue
+    case "$a" in
+        52:54:00:07:*)
+            node_total=$(( 0x$(echo "$a" | cut -d: -f5) ))
+            node_ordinal=$(( 0x$(echo "$a" | cut -d: -f6) ))
+            break
+            ;;
+    esac
+done
+
+# Two nodes cannot hold a message for an absent sender: the carrier would have to be one of
+# the two parties. Say so and stop, rather than appearing to test something.
+[ "$node_total" -ge 3 ] || {
+    echo "OTWONO-ENVELOPE-SKIP store-and-forward needs three nodes; this segment has $node_total"
+    exit 0
+}
+
+mkdir -p "$WORK"; chmod 0700 "$WORK"
+
+connected_ids() {
+    otwono-netd --peers --socket /run/otwono/net.sock --perm-socket /run/otwono/perm.sock 2>/dev/null |
+        awk '$2 == "connected" { print $1 }'
+}
+
+case "$node_ordinal" in
+1)
+    # --- sender ------------------------------------------------------------------------
+    [ -f "$STAMP" ] && { echo "OTWONO-ENVELOPE-SKIP already sealed on an earlier boot"; exit 0; }
+
+    step "capturing both peers' sharing bindings while they are still up"
+    i=0
+    captured=0
+    while [ "$i" -lt 60 ]; do
+        captured=0
+        for id in $(connected_ids); do
+            if otwono-netd --peer-binding "$WORK/$id.binding" --peer "$id" \
+                    --socket /run/otwono/net.sock >/dev/null 2>&1; then
+                captured=$(( captured + 1 ))
+            fi
+        done
+        [ "$captured" -ge 2 ] && break
+        i=$((i + 1))
+        sleep 5
+    done
+    [ "$captured" -ge 2 ] || fail "captured $captured of 2 peer bindings"
+    step "captured $captured bindings"
+
+    # Now wait for one of them to go away. That peer is the recipient.
+    step "waiting for a peer to go away, so there is somebody to send to who cannot receive"
+    gone=""
+    i=0
+    while [ "$i" -lt 120 ]; do
+        here=$(connected_ids)
+        for f in "$WORK"/*.binding; do
+            [ -f "$f" ] || continue
+            id=$(basename "$f" .binding)
+            case " $here " in
+                *" $id "*) ;;
+                *) gone=$id; break ;;
+            esac
+        done
+        [ -n "$gone" ] && break
+        i=$((i + 1))
+        sleep 5
+    done
+    [ -n "$gone" ] || fail "no peer went away within the window; nothing to send to"
+    step "peer $gone is gone; sealing to it"
+
+    printf 'otwono envelope check: for a node that is not here %s\n' "$(date -u +%s%N)" \
+        > "$WORK/message.txt"
+    sent=$(otwono-storectl envelope-send --file "$WORK/message.txt" \
+        --recipient "$WORK/$gone.binding" --hold-hours 2 2>&1) \
+        || fail "sealing an envelope failed: $sent"
+    envelope=$(echo "$sent" | awk 'NR==1 {print $1}')
+    [ -n "$envelope" ] || fail "envelope-send returned no id: $sent"
+    echo "$envelope" > "$STAMP"
+    echo "OTWONO-ENVELOPE-SEALED envelope=$envelope recipient=$gone"
+    ;;
+2)
+    # --- carrier -----------------------------------------------------------------------
+    # Nothing here drives the carry pass on purpose for the first while: the daemon's own
+    # carriage sweep should take custody unprompted, exactly as replication does, and a check
+    # that reached for the manual path first would never find out whether it does.
+    step "waiting to be offered somebody else's mail"
+    carried=""
+    i=0
+    while [ "$i" -lt 120 ]; do
+        carried=$(otwono-storectl envelope-held 2>/dev/null | awk 'NR==1 {print $1}') || carried=""
+        case "$carried" in
+            [0-9a-f]*) break ;;
+            *) carried="" ;;
+        esac
+        # After the first minute, ask directly as well. If the sweep is what delivered it the
+        # marker is already printed; if it is not, this says so and the difference is visible
+        # in the timing rather than hidden.
+        [ "$i" -gt 12 ] && otwono-netd --carry --socket /run/otwono/net.sock >/dev/null 2>&1
+        i=$((i + 1))
+        sleep 5
+    done
+    [ -n "$carried" ] || fail "took custody of nothing within the window"
+    echo "OTWONO-ENVELOPE-CARRIED envelope=$carried"
+    ;;
+3)
+    # --- recipient ---------------------------------------------------------------------
+    # On the first boot there is nothing to collect: the sender has not sealed yet, and will
+    # not until this node is gone. The stamp is what tells the two boots apart.
+    if [ ! -f "$STAMP" ]; then
+        : > "$STAMP"
+        echo "OTWONO-ENVELOPE-SKIP first boot; the sender seals once this node is away"
+        exit 0
+    fi
+    step "collecting what a carrier is holding for this node"
+    collected=""
+    i=0
+    while [ "$i" -lt 120 ]; do
+        out=$(otwono-netd --collect --socket /run/otwono/net.sock 2>&1)
+        collected=$(echo "$out" | awk '$2 == "collected" { print $3; exit }')
+        [ -n "$collected" ] && break
+        i=$((i + 1))
+        sleep 5
+    done
+    [ -n "$collected" ] || fail "collected nothing within the window; last reply: $out"
+
+    # Collected is not enough: the point is that the recipient can *read* it, which needs the
+    # key that was sealed to this node and nobody else (ADR-0019).
+    otwono-storectl open "$collected" --out "$WORK/opened" >/dev/null 2>&1 \
+        || fail "collected $collected but could not open it"
+    grep -q "otwono envelope check" "$WORK/opened" \
+        || fail "opened $collected and it was not the message that was sent"
+    echo "OTWONO-ENVELOPE-COLLECTED envelope=$collected bytes=$(wc -c < "$WORK/opened")"
+    ;;
+*)
+    echo "OTWONO-ENVELOPE-SKIP node $node_ordinal has no role in this check"
+    ;;
+esac

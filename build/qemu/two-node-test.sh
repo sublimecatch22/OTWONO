@@ -162,30 +162,6 @@ start_node() { # node netdev-spec logfile mac
     echo $!
 }
 
-# Shut a node down the way its own power button would.
-#
-# A clean shutdown and not a kill, deliberately. What is under test is whether state written
-# on one boot is there on the next; killing the VM would *also* be testing whether every
-# daemon's writes are durable against losing power, which is a different question and one
-# this repo has audited for exactly one file (the pointer store's). Conflating them would
-# mean a failure here could be either, and the log would say neither.
-powerdown_node() { # node pid
-    local n="$1" pid="$2" waited=0
-    printf '%s\n%s\n' \
-        '{"execute":"qmp_capabilities"}' \
-        '{"execute":"system_powerdown"}' \
-        | socat -t 5 - "UNIX-CONNECT:$OUT/qmp-$n.sock" > /dev/null 2>&1 || true
-    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 240 ]; do
-        sleep 2; waited=$(( waited + 2 ))
-    done
-    if kill -0 "$pid" 2>/dev/null; then
-        echo "FAIL: node $n did not shut down within ${waited}s of the power button" >&2
-        return 1
-    fi
-    rm -f "$OUT/qmp-$n.sock"
-    return 0
-}
-
 : > "$OUT/node-a.log"; : > "$OUT/node-b.log"
 # Locally-administered unicast addresses (the 0x02 bit set in the first octet), distinct
 # per node.
@@ -398,8 +374,8 @@ if [ "${MESH_CONTENT_SMOKE:-0}" != 0 ]; then
     # that can refuse it is what came back off the disk.
     echo
     echo "shutting both nodes down and booting them again from the same disks"
-    powerdown_node a "$PID_A" || exit 1
-    powerdown_node b "$PID_B" || exit 1
+    powerdown_guest "$OUT/qmp-a.sock" "$PID_A" "node a" || exit 1
+    powerdown_guest "$OUT/qmp-b.sock" "$PID_B" "node b" || exit 1
     echo "  both nodes powered off cleanly"
 
     # Separate logs. Overwriting the first boot's would destroy the evidence for everything

@@ -56,6 +56,31 @@ assert_data_filesystem() { # image-path
     return 0
 }
 
+# Shut a guest down the way its own power button would, and wait for it to stop.
+#
+# A clean shutdown and not a kill. Where a test is about state written on one boot being
+# there on the next, killing the VM would *also* be testing whether every daemon's writes
+# survive losing power — a different question, and one this repo has audited for two files.
+# Conflating them would mean a failure could be either and the log would say neither.
+#
+# Needs the guest to have been started with a QMP socket at $OUT/qmp-<node>.sock.
+powerdown_guest() { # qmp-socket pid label
+    local sock="$1" pid="$2" label="$3" waited=0
+    printf '%s\n%s\n' \
+        '{"execute":"qmp_capabilities"}' \
+        '{"execute":"system_powerdown"}' \
+        | socat -t 5 - "UNIX-CONNECT:$sock" > /dev/null 2>&1 || true
+    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 240 ]; do
+        sleep 2; waited=$(( waited + 2 ))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "FAIL: $label did not shut down within ${waited}s of the power button" >&2
+        return 1
+    fi
+    rm -f "$sock"
+    return 0
+}
+
 run_boot_test() { # log-file timeout qemu-binary args...
     local log="$1" timeout_s="$2" qemu="$3"; shift 3
     local settle="${OTWONO_BOOT_SETTLE:-15}"

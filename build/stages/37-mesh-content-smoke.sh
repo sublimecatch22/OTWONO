@@ -106,6 +106,16 @@ action = "pointer.write"
 subjects = ["uid:0"]
 decision = "allow"
 ttl_seconds = 300
+
+# Carrying other people's mail (ADR-0028 §8). Deliberately NOT implied by cache.replicate:
+# holding neighbourhood content an operator can inspect and purge is a different thing to
+# agree to than holding opaque ciphertext addressed to a stranger, and a release image grants
+# neither. An image that hands this to uid:0 is a test image.
+[[rule]]
+action = "envelope.carry"
+subjects = ["uid:0"]
+decision = "allow"
+ttl_seconds = 300
 POLICY
 chmod 0644 "$ROOTFS/etc/otwono/policy.d/91-mesh-content-smoke.toml"
 
@@ -213,7 +223,45 @@ UNIT
 chroot "$ROOTFS" systemctl enable otwono-pointer-reboot-check.service 2>/dev/null \
     || warn "could not enable otwono-pointer-reboot-check.service"
 
-log "NOTE: this image grants store.serve, net.content, cache.replicate, id.sign and the pointer capabilities. It is a test image."
+# The store-and-forward check. Three nodes minimum: the property is "the sender is absent
+# when the recipient collects", which needs a carrier that is neither party (ADR-0028). On
+# fewer nodes the script says so and stops rather than appearing to test something.
+log "installing the envelope check"
+install -m 0755 "$BUILD_DIR/files/otwono-envelope-check" \
+    "$ROOTFS/usr/lib/otwono/envelope-check"
+cat > "$ROOTFS/etc/systemd/system/otwono-envelope-check.service" <<'UNIT'
+[Unit]
+Description=OTWONO envelope check (TEST IMAGES ONLY)
+Documentation=file:/usr/share/doc/otwono/DISTRIBUTED-SERVICES.md
+After=otwono-netd.service otwono-stored.service otwono-mesh-content-check.service
+Requires=otwono-netd.service otwono-stored.service
+RequiresMountsFor=/var/lib/otwono
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# It waits for a peer to go away, which is a thing the harness does on its own schedule, so
+# it must not hold up the boot. Deliberately not Before=.
+ExecStart=/usr/lib/otwono/envelope-check
+StandardOutput=journal+console
+StandardError=journal+console
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/otwono
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+chroot "$ROOTFS" systemctl enable otwono-envelope-check.service 2>/dev/null \
+    || warn "could not enable otwono-envelope-check.service"
+
+log "NOTE: this image grants store.serve, net.content, cache.replicate, id.sign, the pointer capabilities and envelope.carry. It is a test image."
 manifest_add "mesh-content-smoke" "policy drop-in and boot check installed"
 stage_mark_complete 37-mesh-content-smoke
 stage_done

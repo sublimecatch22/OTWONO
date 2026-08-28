@@ -32,7 +32,10 @@ OPTIONS:
     --no-discovery         Do not announce or browse on the LAN
     --status               Query a running daemon and print its overlay status, then exit
     --peers                Query a running daemon and print its peer table, then exit
-    --peer-binding <PATH>  Write the first connected peer's sharing binding to PATH, so
+    --peer-binding <PATH>  Write a connected peer's sharing binding to PATH, so
+    --peer <NODE_ID>       Which peer --peer-binding should write; the first, if omitted
+    --carry                Take at most one envelope into custody from each connected peer
+    --collect              Collect what connected peers are holding for this node, then exit
                            something can seal to it (ADR-0019). Exits non-zero if no
                            connected peer has published one.
     --shared-with-me       Ask every connected peer what it has sealed to this node
@@ -101,6 +104,9 @@ fn run(args: &[String]) -> Result<String, Error> {
     let mut shared_with_me = false;
     let mut pointer: Option<String> = None;
     let mut peer_binding: Option<PathBuf> = None;
+    let mut peer_wanted: Option<String> = None;
+    let mut carry = false;
+    let mut collect = false;
     let mut fetch_id: Option<String> = None;
     let mut fetch_to_file = false;
     let mut fetch_cache = false;
@@ -123,6 +129,9 @@ fn run(args: &[String]) -> Result<String, Error> {
             "--shared-with-me" => shared_with_me = true,
             "--pointer" => pointer = Some(next(&mut it, "--pointer")?),
             "--peer-binding" => peer_binding = Some(next(&mut it, "--peer-binding")?.into()),
+            "--peer" => peer_wanted = Some(next(&mut it, "--peer")?.to_string()),
+            "--carry" => carry = true,
+            "--collect" => collect = true,
             "--fetch" => fetch_id = Some(next(&mut it, "--fetch")?),
             "--to-file" => fetch_to_file = true,
             "--cache" => fetch_cache = true,
@@ -193,7 +202,13 @@ fn run(args: &[String]) -> Result<String, Error> {
     if let Some(path) = peer_binding {
         let socket = socket.unwrap_or_else(|| otwono_proto::socket_path("net"));
         let perm_socket = perm_socket.unwrap_or_else(|| otwono_proto::socket_path("perm"));
-        return write_peer_binding(&socket, &perm_socket, &path);
+        return write_peer_binding(&socket, &perm_socket, &path, peer_wanted.as_deref());
+    }
+    if carry || collect {
+        let method = if carry { "net.carry" } else { "net.collect" };
+        let socket = socket.unwrap_or_else(|| otwono_proto::socket_path("net"));
+        let perm_socket = perm_socket.unwrap_or_else(|| otwono_proto::socket_path("perm"));
+        return carriage_report(&socket, &perm_socket, method);
     }
 
     // Only the agreement half. This daemon has no way to open node.key and no code path
@@ -605,16 +620,91 @@ fn shared_index_report(socket: &std::path::Path, perm_socket: &std::path::Path) 
 /// What is written is the *signed* binding, verbatim. Whatever seals to it verifies it
 /// again for itself — this daemon checked it when the peer offered it, and a second check
 /// costs nothing next to sealing somebody's data to a key nobody vouched for.
+/// Drive one carriage method against every connected peer (ADR-0028).
+///
+/// Every peer, not the first: a carrier holds what it happens to have met, so a recipient
+/// asking only one peer would collect only what that peer happens to carry. One unreachable
+/// peer must not lose the answers from the others, and a refusal is printed rather than
+/// dropped — a carriage question that fails silently is indistinguishable from one that found
+/// nothing, and those are very different things to an operator.
+fn carriage_report(
+    socket: &std::path::Path,
+    perm_socket: &std::path::Path,
+    method: &str,
+) -> Result<String, Error> {
+    let peers = peer_table(socket, perm_socket, method)?;
+    let connected: Vec<&serde_json::Value> = peers
+        .iter()
+        .filter(|p| p.get("state").and_then(|s| s.as_str()) == Some("connected"))
+        .collect();
+    if connected.is_empty() {
+        return Ok("no connected peers\n".to_string());
+    }
+    let token = request_token(perm_socket, "net.content", method)?;
+    let mut client = otwono_proto::Client::connect_waiting(socket, std::time::Duration::from_secs(5))
+        .map_err(|e| Error::Startup(format!("cannot reach otwono-netd at {}: {e}", socket.display())))?;
+
+    let mut out = String::new();
+    for peer in connected {
+        let Some(node_id) = peer.get("node_id").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        let Some(address) = peer
+            .get("addresses")
+            .and_then(|a| a.as_array())
+            .and_then(|a| a.first())
+            .and_then(|a| a.as_str())
+        else {
+            continue;
+        };
+        let reply = client
+            .call_with_capability(
+                method,
+                serde_json::json!({ "node_id": node_id, "address": address }),
+                &token,
+            )
+            .map_err(|e| Error::Startup(format!("{method} transport failure: {e}")))?;
+        match reply {
+            Ok(v) => {
+                if let Some(taken) = v.get("taken").and_then(|t| t.as_str()) {
+                    out.push_str(&format!("{node_id} took {taken}\n"));
+                } else if let Some(list) = v.get("collected").and_then(|c| c.as_array()) {
+                    for id in list.iter().filter_map(|i| i.as_str()) {
+                        out.push_str(&format!("{node_id} collected {id}\n"));
+                    }
+                } else if v.get("carrying").and_then(|c| c.as_bool()) == Some(false) {
+                    out.push_str(&format!("{node_id} this node carries no mail\n"));
+                } else {
+                    out.push_str(&format!("{node_id} nothing\n"));
+                }
+            }
+            Err(e) => out.push_str(&format!("{node_id} refused: {}\n", e.message)),
+        }
+    }
+    if out.is_empty() {
+        out.push_str("nothing to report\n");
+    }
+    Ok(out)
+}
+
 fn write_peer_binding(
     socket: &std::path::Path,
     perm_socket: &std::path::Path,
     out: &std::path::Path,
+    want: Option<&str>,
 ) -> Result<String, Error> {
     let peers = peer_table(socket, perm_socket, "otwono-netd --peer-binding")?;
     let chosen = peers
         .iter()
         .find(|p| {
-            p.get("state").and_then(|s| s.as_str()) == Some("connected") && p.get("sharing_binding").is_some()
+            p.get("state").and_then(|s| s.as_str()) == Some("connected")
+                && p.get("sharing_binding").is_some()
+                // With more than one peer, "the first connected" is whichever the table
+                // happened to order first, and a caller that wants a *particular* peer's
+                // binding has no way to say so. On two nodes that never mattered; on three it
+                // is the difference between sealing to the node you meant and sealing to the
+                // other one.
+                && want.is_none_or(|w| p.get("node_id").and_then(|n| n.as_str()) == Some(w))
         })
         .ok_or_else(|| {
             Error::Startup(

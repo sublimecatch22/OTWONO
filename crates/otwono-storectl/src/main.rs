@@ -56,6 +56,8 @@ COMMANDS:
     grant <CONTENT_ID>        Add recipients to an object this node can open
     revoke <CONTENT_ID>       Delete recipients' copies of the key. Recalls nothing.
     pointer-publish           Publish a signed pointer under this node's name (ADR-0027).
+    envelope-send             Seal a file to one recipient and offer it for carriage (ADR-0028).
+    envelope-held             What this node is carrying for other people.
                               Needs --service and --name; a CONTENT_ID names what it points
                               at, and omitting one publishes a tombstone.
     cache-status              The cluster cache's budget, usage and contents
@@ -138,6 +140,8 @@ struct Options {
     /// Pointer namespace and path, for `pointer-publish` (ADR-0027).
     service: Option<String>,
     name: Option<String>,
+    /// How long the sender asks a carrier to hold an envelope, for `envelope-send`.
+    hold_hours: Option<u64>,
     json: bool,
 }
 
@@ -161,6 +165,9 @@ fn run(args: &[String]) -> Result<String, Error> {
     // record on a command line between them.
     if opts.command == "pointer-publish" {
         return publish_pointer(&opts, &store_socket, &perm_socket);
+    }
+    if opts.command == "envelope-send" {
+        return send_envelope(&opts, &store_socket, &perm_socket);
     }
 
     let recipients = resolve_recipients(&opts)?;
@@ -247,6 +254,103 @@ fn resolve_recipients(opts: &Options) -> Result<Vec<Value>, Error> {
 ///
 /// Separated from the socket work so every command's request shape is unit-testable without
 /// a daemon anywhere.
+/// Seal a file to one recipient and record it as an envelope awaiting delivery (ADR-0028).
+///
+/// Two calls, because it is two things: `store.share` seals the bytes to the recipient's
+/// signed sharing binding (ADR-0019), and `envelope.take` records that this node is holding
+/// the result for somebody. The second is the same call a *carrier* makes, and that is not a
+/// coincidence — a sender is simply the first carrier, and giving it its own path would mean
+/// two ways for an envelope to enter the world.
+///
+/// The recipient comes from the binding file, never from a flag: the binding is signed, the
+/// store verifies it again for itself, and a NodeID typed separately could disagree with the
+/// key the bytes were actually sealed to.
+fn send_envelope(opts: &Options, store_socket: &Path, perm_socket: &Path) -> Result<String, Error> {
+    let path = opts
+        .file
+        .clone()
+        .ok_or_else(|| Error::Usage("envelope-send needs --file".into()))?;
+    let recipient_file = opts
+        .recipients
+        .first()
+        .ok_or_else(|| Error::Usage("envelope-send needs one --recipient binding".into()))?;
+    if opts.recipients.len() > 1 {
+        return Err(Error::Usage(
+            "envelope-send takes exactly one --recipient: an envelope is addressed to one node, \
+             and sealing to several would make the carrier's job ambiguous"
+                .into(),
+        ));
+    }
+    let binding_text = std::fs::read_to_string(recipient_file)
+        .map_err(|e| Error::Runtime(format!("{recipient_file}: {e}")))?;
+    let binding: serde_json::Value = serde_json::from_str(&binding_text)
+        .map_err(|e| Error::Runtime(format!("{recipient_file} is not a binding: {e}")))?;
+    let recipient = binding
+        .get("node_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::Runtime(format!("{recipient_file} names no node_id")))?
+        .to_string();
+
+    let bytes = std::fs::read(&path).map_err(|e| Error::Runtime(format!("{}: {e}", path.display())))?;
+    let sealed = call(
+        store_socket,
+        perm_socket,
+        "store.share",
+        json!({
+            "data": data_encoding::BASE64.encode(&bytes),
+            "recipients": [binding],
+        }),
+        Some("store.share"),
+    )?;
+    let envelope_id = sealed
+        .get("content_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::Runtime("store.share returned no content id".into()))?
+        .to_string();
+    let size_bytes = sealed
+        .get("size_bytes")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| Error::Runtime("store.share returned no size".into()))?;
+
+    // A default of one day. Long enough for a laptop shut overnight, short enough that a
+    // sender who does not think about it has not asked the network to keep something for a
+    // week. A carrier may shorten it and never lengthen it (ADR-0028 §3).
+    let hold_ms = opts.hold_hours.unwrap_or(24) * 60 * 60 * 1000;
+    let expires_at_ms = otwono_identity::now_unix_ms().saturating_add(hold_ms);
+
+    let taken = call(
+        store_socket,
+        perm_socket,
+        "envelope.take",
+        json!({
+            "envelope": {
+                "schema_version": otwono_envelope::SCHEMA_VERSION,
+                "envelope_id": envelope_id,
+                "recipient": recipient,
+                "size_bytes": size_bytes,
+                "expires_at_ms": expires_at_ms,
+            }
+        }),
+        Some("envelope.carry"),
+    )?;
+    if !taken.get("taken").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return Err(Error::Runtime(format!(
+            "sealed {envelope_id} but this node would not hold it: {}",
+            taken
+                .get("declined")
+                .and_then(|v| v.as_str())
+                .unwrap_or("no reason given")
+        )));
+    }
+    if opts.json {
+        return Ok(taken.to_string());
+    }
+    Ok(format!(
+        "{envelope_id} {size_bytes} for {recipient} until {}\n",
+        taken.get("until_ms").and_then(|v| v.as_u64()).unwrap_or(0)
+    ))
+}
+
 /// Publish one of this node's own signed pointers (ADR-0027).
 ///
 /// Three capabilities, and each is doing different work: `pointer.read` to learn the next
@@ -504,6 +608,7 @@ fn build_call(opts: &Options, recipients: &[Value]) -> Result<(String, Value, Op
         }
         "cache-status" => ("cache.status".into(), json!({}), Some("cache.read")),
         "cache-purge" => ("cache.purge".into(), json!({}), Some("cache.write")),
+        "envelope-held" => ("envelope.held".into(), json!({}), Some("envelope.carry")),
         other => return Err(Error::Usage(format!("unknown command {other:?}"))),
     })
 }
@@ -649,6 +754,26 @@ fn render(command: &str, v: &Value) -> String {
             s("visibility"),
             s("note")
         ),
+        "envelope-held" => {
+            // One line per envelope: id, recipient, size, the sender's expiry. Not this
+            // node's own committed deadline, which is on its own clock and is nobody else's
+            // business (ADR-0028 §10) -- an operator asking what a node carries is asking
+            // about the mail, not about the carrier's bookkeeping.
+            let mut out = String::new();
+            for e in v["entries"].as_array().cloned().unwrap_or_default() {
+                out.push_str(&format!(
+                    "{} {} {} {}\n",
+                    e["envelope_id"].as_str().unwrap_or("?"),
+                    e["recipient"].as_str().unwrap_or("?"),
+                    e["size_bytes"].as_u64().unwrap_or(0),
+                    e["expires_at_ms"].as_u64().unwrap_or(0),
+                ));
+            }
+            if out.is_empty() {
+                out.push_str("this node carries nothing for anyone\n");
+            }
+            out
+        }
         "cache-status" => {
             let mut out = format!(
                 "budget {} bytes, used {}, {} object(s), {} replica(s) held\n",
@@ -699,6 +824,15 @@ fn parse_args(args: &[String]) -> Result<Options, Error> {
             "--file" => opts.file = Some(next(&mut it, "--file")?.into()),
             "--out" => opts.out = Some(next(&mut it, "--out")?.into()),
             "--visibility" => opts.visibility = Some(next(&mut it, "--visibility")?),
+            "--hold-hours" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| Error::Usage("--hold-hours needs a number".into()))?;
+                opts.hold_hours = Some(
+                    v.parse()
+                        .map_err(|_| Error::Usage(format!("--hold-hours wants a number, got {v:?}")))?,
+                );
+            }
             "--service" => opts.service = Some(next(&mut it, "--service")?),
             "--name" => opts.name = Some(next(&mut it, "--name")?),
             "--derived-from" => opts.derived_from.push(next(&mut it, "--derived-from")?),
