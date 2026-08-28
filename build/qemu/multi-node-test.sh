@@ -443,7 +443,14 @@ if [ "${MESH_CONTENT_SMOKE:-0}" != 0 ] && [ "$NODES" -ge 3 ] \
         local n; n=$(grep -ca "inbound peer authenticated" "$1" 2>/dev/null || true)
         printf '%s' "${n:-0}"
     }
-    lost_before=$(unreachable "$OUT/node-n3.log")
+    # Node 3's *current* log, which is its second boot's. It was powered off and booted again
+    # for the collection, so `node-n3.log` stopped changing when it shut down — counting
+    # against that file is counting a number that can never move, and the first run of this
+    # phase timed out waiting for exactly that while node 3 was logging
+    # `Network is unreachable` twice a minute into the other file.
+    n3_log="$OUT/node-n3-boot2.log"
+    [ -f "$n3_log" ] || n3_log="$OUT/node-n3.log"
+    lost_before=$(unreachable "$n3_log")
 
     echo "partition: taking node 3's link down"
     set_guest_link "$OUT/qmp-n3.sock" down "node n3" || exit 1
@@ -454,7 +461,7 @@ if [ "${MESH_CONTENT_SMOKE:-0}" != 0 ] && [ "$NODES" -ge 3 ] \
     deadline=$(( $(date +%s) + 240 ))
     parted=timeout
     while [ "$(date +%s)" -lt "$deadline" ]; do
-        if [ "$(unreachable "$OUT/node-n3.log")" -gt "$lost_before" ]; then parted=pass; break; fi
+        if [ "$(unreachable "$n3_log")" -gt "$lost_before" ]; then parted=pass; break; fi
         sleep 5
     done
     if [ "$parted" != pass ]; then
@@ -462,6 +469,25 @@ if [ "${MESH_CONTENT_SMOKE:-0}" != 0 ] && [ "$NODES" -ge 3 ] \
         exit 1
     fi
     echo "  node 3 noticed the break"
+
+    # Node 2 writes only once it has no peers at all, which is this moment — so what it
+    # publishes cannot have reached node 3 before the break. Waiting for it *here*, before
+    # healing, is what makes that an assertion instead of a hope: heal first and the write
+    # could cross on an unbroken link and the convergence below would prove nothing.
+    echo "partition: waiting for node 2 to write while it is alone"
+    deadline=$(( $(date +%s) + 600 ))
+    wrote=timeout
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if grep -qa "OTWONO-PARTITION-FAIL" "$OUT/node-n2.log" 2>/dev/null; then wrote=fail; break; fi
+        if grep -qa "OTWONO-PARTITION-WROTE" "$OUT/node-n2.log" 2>/dev/null; then wrote=pass; break; fi
+        sleep 5
+    done
+    if [ "$wrote" != pass ]; then
+        echo "FAIL: node 2 did not write during the partition ($wrote)" >&2
+        grep -ha "OTWONO-PARTITION-" "$OUT/node-n2.log" >&2 || true
+        exit 1
+    fi
+    echo "  $(grep -hoa "OTWONO-PARTITION-WROTE.*" "$OUT/node-n2.log" | tail -1 | tr -d "\r")"
 
     # Counted now rather than before the partition: node 3 is provably cut off at this point,
     # so any inbound handshake node 2 logs from here can only have followed the heal. Taken
@@ -484,6 +510,35 @@ if [ "${MESH_CONTENT_SMOKE:-0}" != 0 ] && [ "$NODES" -ge 3 ] \
         exit 1
     fi
     echo "  the mesh healed: node 2 authenticated an inbound peer again"
+
+    # And the point of the whole phase: what was written on the other side of the break is
+    # here. Node 3 resolves the name and fetches what it points at — a name that crosses
+    # without its content is not convergence, and they are separate mechanisms.
+    echo "partition: waiting for node 3 to converge on what it missed"
+    deadline=$(( $(date +%s) + 900 ))
+    converged=timeout
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if grep -qa "OTWONO-PARTITION-FAIL" "$n3_log" 2>/dev/null; then converged=fail; break; fi
+        if grep -qa "OTWONO-PARTITION-CONVERGED" "$n3_log" 2>/dev/null; then converged=pass; break; fi
+        sleep 5
+    done
+    if [ "$converged" != pass ]; then
+        echo "FAIL: node 3 did not converge after the partition healed ($converged)" >&2
+        grep -ha "OTWONO-PARTITION-" "$n3_log" >&2 || true
+        exit 1
+    fi
+    echo "  $(grep -hoa "OTWONO-PARTITION-CONVERGED.*" "$n3_log" | tail -1 | tr -d "\r")"
+
+    # The id node 2 published and the id node 3 fetched are the same object, compared rather
+    # than each being asserted to exist. Two nodes each succeeding at something is not the
+    # same as them agreeing, and this phase is about agreement.
+    wrote_id=$(grep -hoa "OTWONO-PARTITION-WROTE id=[0-9a-f]*" "$OUT/node-n2.log" | tail -1 | cut -d= -f2)
+    got_id=$(grep -hoa "OTWONO-PARTITION-CONVERGED id=[0-9a-f]*" "$n3_log" | tail -1 | cut -d= -f2)
+    if [ -z "$wrote_id" ] || [ "$wrote_id" != "$got_id" ]; then
+        echo "FAIL: node 2 wrote '$wrote_id' and node 3 converged on '$got_id'" >&2
+        exit 1
+    fi
+    echo "  both nodes name the same object after the heal"
 fi
 
 echo "PASS: $NODES nodes discovered and mutually authenticated"
