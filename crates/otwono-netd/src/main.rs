@@ -34,6 +34,7 @@ OPTIONS:
     --peers                Query a running daemon and print its peer table, then exit
     --peer-binding <PATH>  Write a connected peer's sharing binding to PATH, so
     --peer <NODE_ID>       Which peer --peer-binding should write; the first, if omitted
+    --peer-ids             Print connected peers' full NodeIDs, one per line, for scripts
     --carry                Take at most one envelope into custody from each connected peer
     --collect              Collect what connected peers are holding for this node, then exit
                            something can seal to it (ADR-0019). Exits non-zero if no
@@ -105,6 +106,7 @@ fn run(args: &[String]) -> Result<String, Error> {
     let mut pointer: Option<String> = None;
     let mut peer_binding: Option<PathBuf> = None;
     let mut peer_wanted: Option<String> = None;
+    let mut peer_ids = false;
     let mut carry = false;
     let mut collect = false;
     let mut fetch_id: Option<String> = None;
@@ -130,6 +132,7 @@ fn run(args: &[String]) -> Result<String, Error> {
             "--pointer" => pointer = Some(next(&mut it, "--pointer")?),
             "--peer-binding" => peer_binding = Some(next(&mut it, "--peer-binding")?.into()),
             "--peer" => peer_wanted = Some(next(&mut it, "--peer")?.to_string()),
+            "--peer-ids" => peer_ids = true,
             "--carry" => carry = true,
             "--collect" => collect = true,
             "--fetch" => fetch_id = Some(next(&mut it, "--fetch")?),
@@ -203,6 +206,11 @@ fn run(args: &[String]) -> Result<String, Error> {
         let socket = socket.unwrap_or_else(|| otwono_proto::socket_path("net"));
         let perm_socket = perm_socket.unwrap_or_else(|| otwono_proto::socket_path("perm"));
         return write_peer_binding(&socket, &perm_socket, &path, peer_wanted.as_deref());
+    }
+    if peer_ids {
+        let socket = socket.unwrap_or_else(|| otwono_proto::socket_path("net"));
+        let perm_socket = perm_socket.unwrap_or_else(|| otwono_proto::socket_path("perm"));
+        return connected_peer_ids(&socket, &perm_socket);
     }
     if carry || collect {
         let method = if carry { "net.carry" } else { "net.collect" };
@@ -620,6 +628,31 @@ fn shared_index_report(socket: &std::path::Path, perm_socket: &std::path::Path) 
 /// What is written is the *signed* binding, verbatim. Whatever seals to it verifies it
 /// again for itself — this daemon checked it when the peer offered it, and a second check
 /// costs nothing next to sealing somebody's data to a key nobody vouched for.
+/// Connected peers' full NodeIDs, one per line.
+///
+/// `--peers` prints the **fingerprint**, which is right for it: that list is for a person to
+/// read, and a 59-character id on every line would make it unreadable. But a fingerprint is
+/// truncated and is documented throughout this system as never being what a decision is made
+/// against, so a script that needs to *name* a peer — to ask for its sharing binding, say, and
+/// then seal data to that key — must not be reading it from there.
+///
+/// Its own flag rather than an extra column, so the human-readable list stays readable and
+/// the machine-readable one is unambiguous about what it is.
+fn connected_peer_ids(socket: &std::path::Path, perm_socket: &std::path::Path) -> Result<String, Error> {
+    let peers = peer_table(socket, perm_socket, "otwono-netd --peer-ids")?;
+    let mut out = String::new();
+    for peer in peers {
+        if peer.get("state").and_then(|s| s.as_str()) != Some("connected") {
+            continue;
+        }
+        if let Some(id) = peer.get("node_id").and_then(|n| n.as_str()) {
+            out.push_str(id);
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
+
 /// Drive one carriage method against every connected peer (ADR-0028).
 ///
 /// Every peer, not the first: a carrier holds what it happens to have met, so a recipient

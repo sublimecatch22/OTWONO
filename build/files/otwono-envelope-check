@@ -51,9 +51,13 @@ done
 
 mkdir -p "$WORK"; chmod 0700 "$WORK"
 
+# Full NodeIDs, not fingerprints. `--peers` prints the fingerprint because that list is for
+# a person to read, and the first version of this check parsed it and got nothing: a
+# fingerprint is truncated, and `--peer-binding --peer` matches on the full id precisely
+# because choosing whose key to seal data to is a decision, and this system does not make
+# decisions against truncated identifiers.
 connected_ids() {
-    otwono-netd --peers --socket /run/otwono/net.sock --perm-socket /run/otwono/perm.sock 2>/dev/null |
-        awk '$2 == "connected" { print $1 }'
+    otwono-netd --peer-ids --socket /run/otwono/net.sock --perm-socket /run/otwono/perm.sock 2>/dev/null
 }
 
 case "$node_ordinal" in
