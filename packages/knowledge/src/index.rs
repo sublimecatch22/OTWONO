@@ -42,7 +42,7 @@ pub const ALWAYS_EXCLUDED: &[&str] = &[
 /// pointing OTWONO at a home directory does not lock the application up.
 pub const MAX_FILES_PER_RUN: usize = 5_000;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IngestReport {
     pub scanned: usize,
     pub indexed: usize,

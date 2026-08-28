@@ -115,7 +115,7 @@ impl Default for NewAgent {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentVersion {
     pub id: String,
     pub agent_id: String,

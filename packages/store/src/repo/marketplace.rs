@@ -80,7 +80,7 @@ pub struct NewListing {
     pub safety_class: Option<SafetyClass>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LedgerEntry {
     pub id: String,
     pub listing_id: String,

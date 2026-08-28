@@ -86,7 +86,7 @@ pub struct NewTask {
     pub max_attempts: Option<u32>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Artifact {
     pub id: String,
     pub project_id: String,
