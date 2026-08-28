@@ -299,15 +299,25 @@ custody question and keeps it **pulled** rather than pushed, so a relay's consen
 the way a replica holder's is. Its rules are implemented and unit-tested in
 `otwono-envelope`.
 
-**Primitive 3 is now `IMPLEMENTED`** (2026-08-27): a persistent carrier's store, both wire
-methods, a carry pass mirroring replication's, and collection — described in
-`docs/network/CARRIAGE.md`. Whether an envelope survives its sender going away is not yet
-shown on booted nodes, which is what the three-node absence test exists for. None of the three
-services is built.
+**Primitive 3 is now `VERIFIED`** (2026-08-28): a persistent carrier's store, both wire
+methods, a carry pass mirroring replication's, collection, and drop on delivery — described in
+`docs/network/CARRIAGE.md`. A three-node QEMU run asserts the whole round trip with the sender
+powered off for the collection, both daemons doing their own work, and the carrier freeing the
+ciphertext as well as the custody record.
+
+That settles **the second of the three clauses** in the exit criterion below: an offline
+message to a node that is away is delivered when it returns. The other two are untouched —
+none of the three services is built, and nothing partitions the network.
 
 **Exit criterion:** a three-node QEMU network where node A's wiki page is readable on node
 B, an offline message to node C is delivered when C returns, and a network partition heals
 with convergence asserted.
+
+| Clause | State |
+|---|---|
+| A's wiki page readable on B | not started; no service is built |
+| an offline message to C delivered when C returns | `VERIFIED` 2026-08-28, see `CARRIAGE.md` |
+| a partition heals with convergence asserted | not started |
 
 ---
 
