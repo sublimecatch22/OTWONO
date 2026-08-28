@@ -291,29 +291,6 @@ fn executor_for(state: &AppState, project: &Project) -> ApiResult<ProviderExecut
     Ok(ProviderExecutor::new(state.provider_for(&connection)))
 }
 
-/// Give every agent that has no model of its own the connection's default, so a
-/// project can run straight after setup.
-fn ensure_models(state: &AppState) -> ApiResult<()> {
-    let providers = ProviderRepo::new(&state.db);
-    let Some(connection) = providers.list()?.into_iter().find(|c| c.enabled) else {
-        return Ok(());
-    };
-    let Some(default_model) = connection.default_model.clone() else {
-        return Ok(());
-    };
-    let agents = AgentRepo::new(&state.db);
-    for mut agent in agents.list(None, false)? {
-        if agent.model.is_none() || agent.provider_connection_id.is_none() {
-            agent.model = agent.model.or_else(|| Some(default_model.clone()));
-            agent.provider_connection_id = Some(connection.id.clone());
-            agents
-                .update(&agent, Some("assigned the default connection"))
-                .ok();
-        }
-    }
-    Ok(())
-}
-
 pub async fn plan(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -321,7 +298,7 @@ pub async fn plan(
     let project = ProjectRepo::new(&state.db)
         .get(&id)?
         .ok_or_else(|| ApiError::not_found("That project"))?;
-    ensure_models(&state)?;
+    super::ensure_agent_models(&state)?;
     let executor = executor_for(&state, &project)?;
     Orchestrator::new(&state.db, &executor)
         .plan(&id)
@@ -337,7 +314,7 @@ pub async fn run(
     let project = ProjectRepo::new(&state.db)
         .get(&id)?
         .ok_or_else(|| ApiError::not_found("That project"))?;
-    ensure_models(&state)?;
+    super::ensure_agent_models(&state)?;
     let executor = executor_for(&state, &project)?;
     Orchestrator::new(&state.db, &executor)
         .run(&id)

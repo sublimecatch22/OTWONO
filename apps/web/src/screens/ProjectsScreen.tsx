@@ -5,7 +5,14 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate, useParams } from 'react-router-dom';
 
 import { api, ApiError } from '../api/client';
-import type { Agent, ProjectDetail, ProjectSummary, RunReport, Task } from '../api/types';
+import type {
+  Agent,
+  ProjectDetail,
+  ProjectSummary,
+  RunReport,
+  Task,
+  WorkspaceSummary,
+} from '../api/types';
 import { Markdown } from '../components/Markdown';
 import {
   Button,
@@ -26,10 +33,15 @@ export function ProjectsScreen() {
   const [title, setTitle] = useState('');
   const [objective, setObjective] = useState('');
   const [criteria, setCriteria] = useState('');
+  const [workspaceId, setWorkspaceId] = useState('');
 
   const projects = useQuery({
     queryKey: ['projects'],
     queryFn: () => api.get<ProjectSummary[]>('/api/projects'),
+  });
+  const workspaces = useQuery({
+    queryKey: ['workspaces'],
+    queryFn: () => api.get<WorkspaceSummary[]>('/api/workspaces'),
   });
 
   const create = useMutation({
@@ -41,6 +53,7 @@ export function ProjectsScreen() {
           .split('\n')
           .map((line) => line.trim())
           .filter(Boolean),
+        workspace_id: workspaceId || null,
       }),
     onSuccess: (project) => {
       client.invalidateQueries({ queryKey: ['projects'] });
@@ -108,6 +121,27 @@ export function ProjectsScreen() {
               />
             )}
           </Field>
+          <Field
+            label="Where this belongs"
+            hint="An office or lab whose team should own the work. Optional."
+          >
+            {({ id, describedBy }) => (
+              <select
+                id={id}
+                aria-describedby={describedBy}
+                className="select"
+                value={workspaceId}
+                onChange={(event) => setWorkspaceId(event.target.value)}
+              >
+                <option value="">Nowhere in particular</option>
+                {(workspaces.data ?? []).map((workspace) => (
+                  <option key={workspace.id} value={workspace.id}>
+                    {workspace.name}
+                  </option>
+                ))}
+              </select>
+            )}
+          </Field>
           <Button type="submit" variant="primary" busy={create.isPending} disabled={!title.trim()}>
             Create project
           </Button>
@@ -160,6 +194,10 @@ export function ProjectDetailScreen() {
     enabled: Boolean(projectId),
   });
   const agents = useQuery({ queryKey: ['agents'], queryFn: () => api.get<Agent[]>('/api/agents') });
+  const workspaces = useQuery({
+    queryKey: ['workspaces'],
+    queryFn: () => api.get<WorkspaceSummary[]>('/api/workspaces'),
+  });
 
   const invalidate = () => {
     client.invalidateQueries({ queryKey: ['project', projectId] });
@@ -335,6 +373,26 @@ export function ProjectDetailScreen() {
                 {(agents.data ?? []).map((agent) => (
                   <option key={agent.id} value={agent.id}>
                     {agent.name}
+                  </option>
+                ))}
+              </select>
+            )}
+          </Field>
+          <Field label="Workspace" hint="The office or lab this project belongs to.">
+            {({ id, describedBy }) => (
+              <select
+                id={id}
+                aria-describedby={describedBy}
+                className="select"
+                value={data.workspace_id ?? ''}
+                onChange={(event) =>
+                  updateProject.mutate({ workspace_id: event.target.value || null })
+                }
+              >
+                <option value="">Nowhere in particular</option>
+                {(workspaces.data ?? []).map((workspace) => (
+                  <option key={workspace.id} value={workspace.id}>
+                    {workspace.name}
                   </option>
                 ))}
               </select>

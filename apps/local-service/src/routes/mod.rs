@@ -17,7 +17,39 @@ pub mod workspaces;
 use axum::routing::{delete, get, post, put};
 use axum::Router;
 
+use otwono_store::repo::agents::AgentRepo;
+use otwono_store::repo::providers::ProviderRepo;
+
+use crate::error::ApiResult;
 use crate::state::AppState;
+
+/// Give every agent that has no model of its own the enabled connection's
+/// default, so work can be run straight after setup.
+///
+/// This lives here rather than in one route module because every way of
+/// running an agent needs it: a project, a workspace session and a lab
+/// experiment all fail the same way without it, and a user who has connected
+/// a runtime and chosen a model has done everything that should be asked.
+pub(crate) fn ensure_agent_models(state: &AppState) -> ApiResult<()> {
+    let providers = ProviderRepo::new(&state.db);
+    let Some(connection) = providers.list()?.into_iter().find(|c| c.enabled) else {
+        return Ok(());
+    };
+    let Some(default_model) = connection.default_model.clone() else {
+        return Ok(());
+    };
+    let agents = AgentRepo::new(&state.db);
+    for mut agent in agents.list(None, false)? {
+        if agent.model.is_none() || agent.provider_connection_id.is_none() {
+            agent.model = agent.model.or_else(|| Some(default_model.clone()));
+            agent.provider_connection_id = Some(connection.id.clone());
+            agents
+                .update(&agent, Some("assigned the default connection"))
+                .ok();
+        }
+    }
+    Ok(())
+}
 
 /// Everything behind the authentication guard.
 pub fn api_router() -> Router<AppState> {

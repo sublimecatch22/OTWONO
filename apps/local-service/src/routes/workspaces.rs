@@ -353,6 +353,7 @@ pub async fn run_session(
     State(state): State<AppState>,
     Path((_workspace_id, session_id)): Path<(String, String)>,
 ) -> ApiResult<Json<SessionDetail>> {
+    super::ensure_agent_models(&state)?;
     let executor = executor(&state)?;
     let session = SessionRunner::new(&state.db, &executor)
         .run(&session_id)
@@ -401,6 +402,7 @@ pub async fn run_experiment(
     State(state): State<AppState>,
     Path((_workspace_id, experiment_id)): Path<(String, String)>,
 ) -> ApiResult<Json<Vec<LabResult>>> {
+    super::ensure_agent_models(&state)?;
     let executor = executor(&state)?;
     LabRunner::new(&state.db, &executor)
         .run(&experiment_id)

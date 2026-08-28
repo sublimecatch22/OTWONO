@@ -190,8 +190,12 @@ export function WorkspaceDetailScreen() {
   const runSession = useMutation({
     mutationFn: (sessionId: string) =>
       api.post<SessionDetail>(`/api/workspaces/${workspaceId}/sessions/${sessionId}/run`),
-    onSuccess: () => {
+    onSuccess: (_result, sessionId) => {
       invalidate();
+      // The open transcript is a query of its own, so without this the message
+      // says the synthesis is below while the panel still shows the old state.
+      client.invalidateQueries({ queryKey: ['session', sessionId] });
+      setOpenSession(sessionId);
       toast({ tone: 'positive', body: 'The session finished. The synthesis is below.' });
     },
     onError: (error) =>

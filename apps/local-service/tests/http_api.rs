@@ -525,3 +525,74 @@ async fn the_state_used_by_tests_is_isolated_per_service() {
     assert_ne!(first.service.token, second.service.token);
     let _ = (&first.state, &second.state);
 }
+
+/// A regression test for a real gap: projects assigned the enabled
+/// connection's default model to agents that had none, but workspace sessions
+/// did not, so a boardroom refused to run on a machine where chat and projects
+/// both worked. Nothing here chooses a model for an agent by hand.
+#[tokio::test]
+async fn a_boardroom_session_runs_after_only_connecting_a_runtime() {
+    let runtime = FakeRuntime::start(Behaviour::ollama_default()).await;
+    let harness = Harness::start().await;
+
+    harness
+        .post_json(
+            "/api/connections",
+            json!({
+                "kind": "ollama",
+                "label": "Ollama",
+                "endpoint": runtime.base_url,
+                "default_model": "llama3.1:8b",
+                "enabled": true
+            }),
+        )
+        .await;
+
+    // The shipped agents have no model of their own at this point.
+    let agents = harness.get_json("/api/agents").await;
+    let agents = agents.as_array().unwrap();
+    assert!(
+        agents.iter().all(|agent| agent["model"].is_null()),
+        "the test is meaningless if an agent already has a model"
+    );
+
+    let workspace = harness
+        .post_json(
+            "/api/workspaces",
+            json!({ "kind": "boardroom", "name": "Release Board" }),
+        )
+        .await;
+    let workspace_id = workspace["id"].as_str().unwrap().to_string();
+
+    for (position, agent) in agents.iter().take(3).enumerate() {
+        harness
+            .post_json(
+                &format!("/api/workspaces/{workspace_id}/members"),
+                json!({ "agent_id": agent["id"], "is_coordinator": position == 0 }),
+            )
+            .await;
+    }
+
+    let session = harness
+        .post_json(
+            &format!("/api/workspaces/{workspace_id}/sessions"),
+            json!({ "question": "Should we ship on Friday?" }),
+        )
+        .await;
+    let session_id = session["id"].as_str().unwrap().to_string();
+
+    let response = harness
+        .post(
+            &format!("/api/workspaces/{workspace_id}/sessions/{session_id}/run"),
+            json!({}),
+        )
+        .await;
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(status.is_success(), "the session should run: {body}");
+    assert_eq!(body["stage"], "completed");
+    assert!(
+        !body["contributions"].as_array().unwrap().is_empty(),
+        "every member should have spoken"
+    );
+}
