@@ -47,11 +47,20 @@ carrier                                     holder of undelivered mail
    |   not addressed to me? soonest deadline?               |
    |                                                        |
    |-- manifest + chunks (ADR-0017, unchanged) ------------>|
-   |<-- the sealed ciphertext ------------------------------|
+   |<-- the sealed ciphertext, and the content key sealed --|
+   |    to the *recipient* (§4)                             |
    |                                                        |
+   |   store.accept_shared -> keeps the ciphertext          |
    |   envelope.take -> custody until min(sender's expiry,   |
    |                    now + this carrier's max hold)      |
 ```
+
+**The bytes are kept before custody is claimed**, and the order is load-bearing: custody of
+bytes a node does not hold is a promise it cannot keep. A carrier that recorded custody and
+dropped the ciphertext would count the envelope against its budget, offer it onward, and have
+nothing to serve when the recipient finally came. The first implementation did exactly that,
+and it took three booted nodes to notice, because a carrier holding nothing is
+indistinguishable from a carrier holding something until somebody asks for the object.
 
 **Pulled, never pushed** (ADR-0028 §2). The consent check happens before anything reaches the
 wire: a node that carries no mail makes no carriage traffic at all, rather than asking and
@@ -93,6 +102,11 @@ recipient — `may_go_to_peer` compares the sealed key's recipient against the a
 Taken together those two rules make carriage impossible: a carrier could never obtain the
 ciphertext it is meant to carry.
 
+The exception lives in **both** daemons, and it has to. `otwono-stored` applies its own copy
+of ADR-0019 §4 before `otwono-netd` ever sees the object, so an exception in the mesh daemon
+alone changes nothing — the store has already answered "not available". The first
+implementation had it in `otwono-netd` only, and the sender refused every carrier.
+
 So a node may serve a shared object to any peer **when it holds a custody record for it**.
 Carrying is exactly the act of holding another party's sealed bytes in order to pass them on,
 and every hop sees only ciphertext plus a sealed key it cannot use.
@@ -104,6 +118,23 @@ This does not widen ADR-0019:
 - An attacker cannot manufacture custody of somebody else's object to make a node serve it:
   the carry pass fetches the bytes *before* recording custody and verifies them against the
   content id, so anyone able to complete that already possessed the bytes.
+- The exception applies **inside** the `SHARED`-and-own-store check, never beside it. A
+  custody record is keyed by content id and `envelope.take` needs only a local capability, so
+  an exception applied first would have made a `PRIVATE` object servable to anyone by taking
+  custody of its id. It can only widen the audience of an object that was already going to
+  leave the node sealed.
+
+### Whose key travels
+
+When a node serves an object it is *carrying*, the copy of the content key in the manifest is
+the one sealed to **the recipient named in the custody record**, not to the peer asking. A
+carrier is not on the recipient list and has no copy of its own; an envelope that reached it
+without a key would be ciphertext nobody could ever open.
+
+The carrier is correspondingly the one caller that fetches an object expecting a key sealed to
+somebody else. Every other fetch requires the key to name *this* node, because a shared object
+this node cannot open is a download thrown away — which is why the carry pass says so
+explicitly rather than the check being relaxed for everyone.
 
 ## 5. Whose clock, and for how long
 
