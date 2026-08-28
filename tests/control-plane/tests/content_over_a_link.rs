@@ -1975,20 +1975,24 @@ fn a_carrier_offers_what_it_holds_after_serving_ordinary_content() {
     );
 }
 
-/// The same pass, but through the carrier a real node uses.
+/// Store-and-forward end to end: a message survives its sender being absent (ADR-0028).
 ///
-/// The test above runs the pass against an in-process [`otwono_store::EnvelopeStore`], which
-/// is not what `otwono-netd` does: on a node the carrier is a [`BrokeredCarrier`], and every
-/// decision — the budget, the expiry, the size ceiling — is made in `otwono-stored` on the
-/// other side of a socket and comes back as a reply.
+/// Three parties with three distinct identities, over real Noise links, through real daemons:
 ///
-/// Written because a three-node run reported `offered 1 envelope(s), took none` while the
-/// in-process test passed, and the only difference between them was this seam. A second store
-/// daemon, with its own directories and its own budget, is what makes the two ends distinct:
-/// one store cannot both send an envelope and be the stranger that agrees to carry it, because
-/// it would already be holding it.
+/// 1. a **sender** seals an object to a recipient's sharing key and takes custody of it,
+/// 2. a **carrier** — neither party, its own store daemon, its own budget — runs a carry pass,
+///    is served the ciphertext with the key sealed to the recipient, keeps it and records
+///    custody,
+/// 3. the **recipient** dials the carrier and collects it, with the key intact.
+///
+/// Every identity here is separate on purpose. The harness fronts both ends of its own link
+/// with one signing key, so a test written on that alone has the asking peer *be* the
+/// recipient, and every rule store-and-forward depends on — who may be served a sealed
+/// object, whose copy of the content key travels, what a scoped index question returns — is
+/// satisfied trivially. Three booted nodes found three separate defects that this blindness
+/// hid; each of them fails this test.
 #[test]
-fn a_brokered_carrier_takes_custody_through_its_own_store_daemon() {
+fn an_envelope_reaches_its_recipient_through_a_carrier_that_is_neither_party() {
     let h = Harness::start("brokered-carry");
 
     // A recipient that is nowhere near this test's identities, and the envelope is sealed to
@@ -2099,6 +2103,61 @@ fn a_brokered_carrier_takes_custody_through_its_own_store_daemon() {
         json!(recipient.to_text()),
         "the carrier holds the ciphertext but not the recipient's key: {kept}"
     );
+
+    // --- and the recipient collects it, over a link, from the carrier -------------------
+    //
+    // The delivery half. Everything above proves a carrier can be *given* an envelope; this
+    // proves it can hand one over. The recipient here is a NetState fronted by the identity
+    // the envelope was sealed to — not the harness's — because a collector that is also the
+    // sender is a collector for which every scoping and key check is trivially satisfied.
+    let carrier_mesh = BrokeredSigner::bind(
+        AgreementKeystore::new(h.dir.join("agreement-carrier-mesh"))
+            .load_or_generate()
+            .unwrap()
+            .0,
+        &h.id_socket,
+        &h.perm_socket,
+    )
+    .expect("bind");
+    let carrier_node = carrier_mesh.node_id();
+    let listener = TcpLink::listen("127.0.0.1:0").unwrap();
+    let carrier_addr = listener.local_addr().unwrap();
+    let serving = Arc::new(
+        NetState::new(Arc::new(carrier_mesh))
+            .with_responder(ContentResponder::new(&carrier_socket, &h.perm_socket)),
+    );
+    std::thread::spawn(move || otwono_netd::run_listener(serving, listener));
+
+    let recipient_node = Arc::new(otwono_identity::NodeIdentity::from_parts(
+        recipient_signing,
+        otwono_identity::AgreementKey::generate().unwrap(),
+    ));
+    let collector = NetState::new(recipient_node);
+    let collected = collector
+        .collect_from(&Candidate {
+            claimed_node_id: carrier_node,
+            address: carrier_addr,
+        })
+        .expect("collecting from the carrier");
+
+    assert_eq!(
+        collected.len(),
+        1,
+        "the carrier is holding one envelope for this node and served {}",
+        collected.len()
+    );
+    assert_eq!(collected[0].content_id, sealed_id);
+    assert_eq!(
+        collected[0]
+            .sharing
+            .as_ref()
+            .expect("an envelope with no key could never be opened")
+            .sealed_key
+            .recipient,
+        recipient.to_text(),
+        "the key that arrived is not the one sealed to this node"
+    );
+    assert_eq!(collected[0].bytes.len() as u64, size_bytes);
 }
 
 /// A node whose broker refuses `envelope.carry` carries nobody's mail and asks nobody.
