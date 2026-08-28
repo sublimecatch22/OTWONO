@@ -167,20 +167,27 @@ case "$node_ordinal" in
             [0-9a-f]*) break ;;
             *) carried="" ;;
         esac
-        # After the first minute, ask directly as well. If the sweep is what delivered it the
-        # marker is already printed; if it is not, this says so and the difference is visible
-        # in the timing rather than hidden.
+        # After four minutes, ask directly as well — and not before, because the sweep is the
+        # mechanism under test and the fallback silently substitutes for it. At one minute the
+        # two were racing: the sender does not seal until a peer has stayed away for a minute,
+        # so the envelope appears long after this loop starts, and whichever of the two
+        # happened to be due first took it. One run had the manual call win by half a second.
+        # Four minutes, then every two, gives the thirty-second sweep at least eight turns
+        # before this one interferes.
+        #
+        # Which of them took it is recorded on the marker below rather than left to be
+        # inferred, since `OTWONO-ENVELOPE-CARRIED` looks identical either way.
         #
         # The reply is printed, not discarded. A carry pass now names why it took nothing —
         # a peer with an empty bag, an envelope already held, a store refusing on budget —
         # and throwing that away is what made the previous failure cost a run to diagnose.
-        # Every twelfth poll, not every one. Each `--carry` opens a Noise channel to every
+        # Every twenty-fourth poll, not every one. Each `--carry` opens a Noise channel to every
         # connected peer, and on a segment of single-vCPU TCG guests that is real load on
         # the machines this one is waiting for — the other nodes are still running their own
         # content checks, and slowing them down is slowing down the thing being waited for.
         # The daemon's own sweep is the mechanism under test anyway; this is the fallback
         # that says so when the sweep is not doing its job.
-        if [ "$i" -gt 12 ] && [ $(( i % 12 )) -eq 0 ]; then
+        if [ "$i" -gt 36 ] && [ $(( i % 24 )) -eq 0 ]; then
             carry_out=$(otwono-netd --carry --socket /run/otwono/net.sock 2>&1) || carry_out="carry pass failed: $carry_out"
             [ -n "$carry_out" ] && echo "OTWONO-ENVELOPE-STEP carry: $(echo "$carry_out" | tr '\n' ';')"
         fi
@@ -188,7 +195,19 @@ case "$node_ordinal" in
         sleep 5
     done
     [ -n "$carried" ] || fail "took custody of nothing within the window"
-    echo "OTWONO-ENVELOPE-CARRIED envelope=$carried"
+
+    # Say which one carried it. `otwono-netd` logs `carrying <id>…` from the carriage sweep
+    # and from nowhere else — the manual `--carry` path does not print it — so its presence
+    # is the difference between the daemon doing this on its own and this script doing it for
+    # the daemon. Not a failure when it is `hand`: the sweep can legitimately be slow on a
+    # single TCG vCPU, and failing the run for that would trade one silent result for a
+    # flaky one. It just must not be invisible.
+    by=hand
+    if journalctl -u otwono-netd --no-pager 2>/dev/null \
+        | grep -qa "otwono-netd: carrying $(printf '%s' "$carried" | cut -c1-16)"; then
+        by=sweep
+    fi
+    echo "OTWONO-ENVELOPE-CARRIED envelope=$carried by=$by"
 
     # And then watch it go (ADR-0028 §7). The recipient reports delivery once the bytes are
     # on its own disk, and this node gives up custody in response — so this marker is the
