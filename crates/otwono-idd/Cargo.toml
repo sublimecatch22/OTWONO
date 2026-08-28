@@ -1,0 +1,19 @@
+[package]
+name = "otwono-idd"
+description = "OTWONO identity daemon: publishes the node identity and signs on behalf of authorized callers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "otwono-idd"
+path = "src/main.rs"
+
+[dependencies]
+otwono-proto = { workspace = true }
+otwono-identity = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+data-encoding = "2"

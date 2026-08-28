@@ -1,0 +1,240 @@
+#!/bin/sh
+# OTWONO control-plane self check, run once at boot.
+#
+# Proves the whole authorization path works on the running system: ask the permission
+# broker for a capability, call the hardware daemon with it, and confirm the broker
+# recorded the exchange. Probing hardware locally proves the prober works; only this
+# proves the daemons, sockets, policy, tokens and audit log work together.
+#
+# This is a file, not an inline ExecStart. A previous attempt inlined it and shipped a
+# quoting bug that only surfaced as a boot failure minutes into a QEMU run; as a file it
+# is linted by shellcheck in CI like every other script in this repository.
+set -eu
+
+PROFILE=/var/lib/otwono/control-plane-profile.json
+AUDIT=/var/log/otwono/audit.jsonl
+
+/usr/bin/otwono-hwctl remote --json > "$PROFILE"
+
+# No jq in the base image, so pull the tier out with grep. The profile is machine-written
+# JSON, so the field appears exactly once at the top level.
+tier=$(grep -o '"tier"[[:space:]]*:[[:space:]]*"[^"]*"' "$PROFILE" | head -1 | cut -d'"' -f4)
+[ -n "$tier" ] || { echo "OTWONO-CONTROL-PLANE-FAIL no tier in $PROFILE" >&2; exit 1; }
+
+if [ -r "$AUDIT" ]; then
+    records=$(wc -l < "$AUDIT" | tr -d ' ')
+else
+    echo "OTWONO-CONTROL-PLANE-FAIL broker wrote no audit log at $AUDIT" >&2
+    exit 1
+fi
+
+# The broker must have recorded the request and the token verification; a profile served
+# with an empty audit trail would mean enforcement ran without leaving evidence.
+[ "$records" -ge 2 ] || {
+    echo "OTWONO-CONTROL-PLANE-FAIL only $records audit record(s)" >&2
+    exit 1
+}
+
+# --- the confirmation socket (ADR-0024) ----------------------------------------------
+# otwono-permd binds two sockets: the control plane every daemon reaches, and the one a
+# person answers confirmations on. Their separation is the whole basis of the rule that a
+# subject may not confirm its own request, so a node where only one of them exists has a
+# permission model with a hole in it.
+#
+# permd exits non-zero if either bind fails, so "the service started" already implies this.
+# Asserted anyway: an inference from a unit's state is not an observation of the socket, and
+# this is the file that gets read when somebody wants to know what was actually true.
+[ -S /run/otwono/confirm.sock ] || {
+    echo "OTWONO-CONTROL-PLANE-FAIL otwono-permd bound no confirmation socket at" \
+         "/run/otwono/confirm.sock; nothing could approve an always_confirm action" >&2
+    exit 1
+}
+confirm_socket=present
+
+# A confirmation, end to end, when this image designates somebody to answer.
+#
+# Everything above proves the socket exists. This proves the mechanism completes: ask for an
+# always_confirm action, see it refused with a confirmation id, answer it, and collect the
+# token that answering authorised. Without this the channel is a set of parts that have
+# never been put together on a machine.
+#
+# Skipped, and reported as skipped, on an image with no confirmer -- which is every release
+# image. A check that silently passed here would be reporting a working confirmation on a
+# node that cannot make one.
+confirmed=no-confirmer
+wallet_created=skipped
+if [ -f /etc/systemd/system/otwono-permd.service.d/90-confirmer.conf ]; then
+    confirmed=failed
+    # fs.delete is always_confirm, so policy alone cannot authorise it however it is written.
+    out=$(otwono-permctl request fs.delete --resource /var/lib/otwono/confirm-check 2>&1 || true)
+    cid=$(echo "$out" | tr ' ' '\n' | grep -E '^[0-9a-f]{64}$' | head -1)
+    [ -n "$cid" ] || {
+        echo "OTWONO-CONTROL-PLANE-FAIL asking for fs.delete produced no confirmation id: $out" >&2
+        exit 1
+    }
+
+    # It must be waiting, and the listing must name what it would actually do.
+    listed=$(otwono-permctl list 2>&1) || {
+        echo "OTWONO-CONTROL-PLANE-FAIL cannot list confirmations: $listed" >&2
+        exit 1
+    }
+    echo "$listed" | grep -q "$cid" \
+        || { echo "OTWONO-CONTROL-PLANE-FAIL $cid is not in the waiting list" >&2; exit 1; }
+    echo "$listed" | grep -q "/var/lib/otwono/confirm-check" \
+        || { echo "OTWONO-CONTROL-PLANE-FAIL the listing does not name the resource" >&2; exit 1; }
+
+    # Nothing is authorised before somebody answers.
+    if otwono-permctl claim "$cid" >/dev/null 2>&1; then
+        echo "OTWONO-CONTROL-PLANE-FAIL a token was issued before anybody confirmed" >&2
+        exit 1
+    fi
+
+    otwono-permctl approve "$cid" >/dev/null 2>&1 \
+        || { echo "OTWONO-CONTROL-PLANE-FAIL the designated confirmer could not approve" >&2; exit 1; }
+
+    claimed=$(otwono-permctl claim "$cid" 2>&1) || {
+        echo "OTWONO-CONTROL-PLANE-FAIL an approved confirmation yielded no token: $claimed" >&2
+        exit 1
+    }
+    echo "$claimed" | grep -q '^token ' \
+        || { echo "OTWONO-CONTROL-PLANE-FAIL claim returned no token: $claimed" >&2; exit 1; }
+
+    # One approval, one request. A second claim must find nothing.
+    if otwono-permctl claim "$cid" >/dev/null 2>&1; then
+        echo "OTWONO-CONTROL-PLANE-FAIL the same approval was spent twice" >&2
+        exit 1
+    fi
+    confirmed=yes
+
+    # And now the thing all of this was for: create a wallet, the way a person would.
+    #
+    # Until this ran, otwono-walletd was a daemon whose main method had never executed. The
+    # sequence is the one a household follows -- ask, be told somebody must confirm, have
+    # them confirm, resume -- and it is worth walking on a machine because every step of it
+    # crosses a process boundary that a host-side test replaces with a function call.
+    wallet_created=failed
+    # Through stdin, not an argument. otwono-walletctl refuses --passphrase outright: an
+    # argument lands in shell history and in /proc/<pid>/cmdline, and this check should use
+    # the same door a person does.
+    pass_in() { printf '%s\n' "boot-check-passphrase"; }
+    ask=$(pass_in | otwono-walletctl create --passphrase-stdin 2>&1 || true)
+    wcid=$(echo "$ask" | tr ' ' '\n' | grep -E '^[0-9a-f]{64}$' | head -1)
+    [ -n "$wcid" ] || {
+        echo "OTWONO-CONTROL-PLANE-FAIL creating a wallet did not ask for confirmation: $ask" >&2
+        exit 1
+    }
+    # It must have stopped rather than proceeded: no vault yet.
+    otwono-walletctl status 2>&1 | grep -q "no wallet" \
+        || { echo "OTWONO-CONTROL-PLANE-FAIL a wallet appeared before anybody confirmed" >&2; exit 1; }
+
+    otwono-permctl approve "$wcid" >/dev/null 2>&1 \
+        || { echo "OTWONO-CONTROL-PLANE-FAIL could not approve the wallet creation" >&2; exit 1; }
+    made=$(pass_in | otwono-walletctl create --passphrase-stdin --confirmation "$wcid" 2>&1) || {
+        echo "OTWONO-CONTROL-PLANE-FAIL creating the wallet after approval failed: $made" >&2
+        exit 1
+    }
+    # The phrase is shown once, with the warning attached. A creation that printed neither
+    # would leave somebody with a wallet and no way back into it.
+    echo "$made" | grep -q "Write these 24 words down" \
+        || { echo "OTWONO-CONTROL-PLANE-FAIL creation did not show the recovery phrase" >&2; exit 1; }
+    words=$(echo "$made" | sed -n 's/^  \([a-z].*\)$/\1/p' | head -1 | wc -w)
+    [ "$words" -eq 24 ] \
+        || { echo "OTWONO-CONTROL-PLANE-FAIL the recovery phrase is $words words, not 24" >&2; exit 1; }
+
+    otwono-walletctl status 2>&1 | grep -q "argon2id" \
+        || { echo "OTWONO-CONTROL-PLANE-FAIL the wallet is not readable after creation" >&2; exit 1; }
+
+    # Derive from it, which is the only way to know the vault actually opens.
+    keys=$(pass_in | otwono-walletctl address --passphrase-stdin --index 0 --index 1 2>&1) || {
+        echo "OTWONO-CONTROL-PLANE-FAIL cannot derive from the new wallet: $keys" >&2
+        exit 1
+    }
+    derived=$(echo "$keys" | grep -c "^m/44'")
+    [ "$derived" -eq 2 ] \
+        || { echo "OTWONO-CONTROL-PLANE-FAIL derived $derived keys, expected 2" >&2; exit 1; }
+
+    # Every family renders, and every index differs in every family (ADR-0025). Two indices
+    # that produced the same address would make "a fresh address per purpose" a promise the
+    # UI cannot keep.
+    for fam in ethereum bitcoin cosmos; do
+        n=$(echo "$keys" | awk -v f="$fam" '$1 == f {print $2}' | sort -u | wc -l)
+        [ "$n" -eq 2 ] || {
+            echo "OTWONO-CONTROL-PLANE-FAIL $fam gave $n distinct addresses for 2 indices" >&2
+            exit 1
+        }
+    done
+    echo "$keys" | grep -q '^  ethereum  0x' \
+        || { echo "OTWONO-CONTROL-PLANE-FAIL no ethereum address rendered" >&2; exit 1; }
+    echo "$keys" | grep -q '^  bitcoin   bc1' \
+        || { echo "OTWONO-CONTROL-PLANE-FAIL no bitcoin address rendered" >&2; exit 1; }
+    echo "$keys" | grep -q '^  cosmos    otwono1' \
+        || { echo "OTWONO-CONTROL-PLANE-FAIL no cosmos address rendered" >&2; exit 1; }
+
+    # And the wrong passphrase opens nothing.
+    if printf 'wrong\n' | otwono-walletctl address --passphrase-stdin >/dev/null 2>&1; then
+        echo "OTWONO-CONTROL-PLANE-FAIL the wrong passphrase derived a key" >&2
+        exit 1
+    fi
+    wallet_created=yes
+fi
+
+# --- the wallet daemon (ADR-0022 §2, ADR-0023 §4) ------------------------------------
+# Three things, and the first is the one a document cannot establish on its own.
+#
+# 1. It really has no network. PrivateNetwork=yes is a line in a unit file until something
+#    observes its effect, so this compares the daemon's network namespace against PID 1's.
+#    They differ only if the isolation actually took hold. A unit that lost the line, or a
+#    systemd that ignored it, shows up here and nowhere else.
+# 2. It started and bound its socket. That is what the socket's existence shows, and it is
+#    all it shows -- this is not a brokered call, because there is no wallet CLI to make
+#    one with. Said plainly rather than dressed up: the daemon's own methods are covered by
+#    integration tests against a real broker, and what a boot adds here is that the unit,
+#    the sandbox and the socket path work on a real system.
+# 3. It reports no wallet -- the correct state for a node nobody has set one up on, and the
+#    only thing it *can* report, because wallet.create needs a confirmation channel that
+#    does not exist yet.
+#
+# The unit requires otwono-walletd and is ordered after it, so none of these can pass by
+# running before the daemon exists.
+# Fails closed at every step. A check that reported "unchecked" and carried on would be a
+# green result proving nothing, which is precisely how an isolation regression would reach
+# an image unnoticed.
+wallet_status=none
+wpid=$(systemctl show -p MainPID --value otwono-walletd.service 2>/dev/null || echo 0)
+[ -n "$wpid" ] && [ "$wpid" != 0 ] || {
+    echo "OTWONO-CONTROL-PLANE-FAIL otwono-walletd has no running process to check" >&2
+    exit 1
+}
+mine=$(readlink "/proc/$wpid/ns/net" 2>/dev/null || echo unknown)
+init=$(readlink /proc/1/ns/net 2>/dev/null || echo unknown)
+[ "$mine" != unknown ] && [ "$init" != unknown ] || {
+    echo "OTWONO-CONTROL-PLANE-FAIL cannot read the network namespaces to compare" >&2
+    exit 1
+}
+[ "$mine" != "$init" ] || {
+    echo "OTWONO-CONTROL-PLANE-FAIL otwono-walletd shares PID 1's network namespace;" \
+         "PrivateNetwork did not take effect and the money key is on the network" >&2
+    exit 1
+}
+wallet_ns=isolated
+
+[ -S /run/otwono/wallet.sock ] || {
+    echo "OTWONO-CONTROL-PLANE-FAIL otwono-walletd bound no socket at /run/otwono/wallet.sock" >&2
+    exit 1
+}
+# --status reads the vault path directly; it is not a control-plane call.
+out=$(/usr/bin/otwono-walletd --status 2>&1) || {
+    echo "OTWONO-CONTROL-PLANE-FAIL otwono-walletd --status failed: $out" >&2
+    exit 1
+}
+case "$out" in
+    *"exists  false"*) wallet_status=no-wallet ;;
+    *"exists  true"*)  wallet_status=present ;;
+    *)
+        echo "OTWONO-CONTROL-PLANE-FAIL otwono-walletd --status said something this check" \
+             "does not recognise: $out" >&2
+        exit 1
+        ;;
+esac
+
+echo "OTWONO-CONTROL-PLANE-OK tier=$tier audit_records=$records wallet_ns=$wallet_ns wallet_status=$wallet_status confirm_socket=$confirm_socket confirmed=$confirmed wallet_created=$wallet_created"

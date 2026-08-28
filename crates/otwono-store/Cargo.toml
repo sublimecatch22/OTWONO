@@ -1,0 +1,35 @@
+[package]
+name = "otwono-store"
+description = "OTWONO content store contracts: chunking, content addressing, visibility labels, and the on-disk chunk store."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# For SealedKey and seal_to (ADR-0019). The store wraps a content key per recipient; the
+# sealing itself lives with the identity types because that is where the key formats are.
+# One direction only: otwono-identity knows nothing about storage.
+otwono-identity = { workspace = true }
+otwono-pointer = { workspace = true }
+# statvfs, for the reserve floor that stops the cache filling the disk.
+rustix = { version = "0.38", features = ["fs", "process"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The hash used everywhere else in this system: the audit chain, the model store, the
+# fetch spool. One hash function, not four (CLAUDE.md Section 2.3).
+blake3 = "1"
+otwono-envelope = { workspace = true }
+# Content-defined chunking at the parameters ADR-0016 measured. Seven crates, no async
+# runtime, and it provides the streaming chunker a 4 GB model on a 4 GB board requires.
+fastcdc = "5"
+# XChaCha20-Poly1305 for encryption at rest. A 24-byte nonce means a random nonce per
+# chunk is safe without tracking a counter across restarts, which a counter-based AEAD
+# would require and would get wrong exactly once.
+chacha20poly1305 = { version = "0.10", features = ["stream"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+zeroize = "1"
+# Base64 for the nonce prefix in a sharing envelope, matching how every other key and
+# digest crosses a JSON boundary in this system.
+data-encoding = "2"

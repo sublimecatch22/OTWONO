@@ -1,0 +1,21 @@
+[package]
+name = "otwono-net"
+description = "OTWONO Node Mesh transport: link adapters, Noise XX secure channels, and identity-bound peer authentication."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+otwono-identity = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+snow = "0.9"
+data-encoding = "2"
+mdns-sd = "0.11"
+
+[dev-dependencies]
+data-encoding = "2"
+# The handshake tests hand-roll a hostile peer, so they need the Noise library directly.
+snow = "0.9"

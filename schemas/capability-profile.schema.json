@@ -1,0 +1,226 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://otwono.org/schemas/capability-profile-2.2.0.json",
+  "title": "OTWONO Capability Profile",
+  "description": "The machine-readable statement of what an OTWONO node can do. Produced by otwono-hwd (and by `otwono-hwctl profile --json`) and consumed by every other subsystem. No subsystem may re-derive hardware capability for itself.",
+  "type": "object",
+  "required": ["schema_version", "tier", "axes", "features", "overridden", "hardware", "warnings"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "tier": { "$ref": "#/$defs/tier" },
+    "limiting_factor": {
+      "type": ["string", "null"],
+      "description": "Which axis prevents the next tier up. Null at the top tier."
+    },
+    "axes": { "$ref": "#/$defs/axes" },
+    "features": { "$ref": "#/$defs/features" },
+    "overridden": { "type": "boolean" },
+    "detected": {
+      "type": "object",
+      "description": "Pre-override classification. Present only when `overridden` is true.",
+      "required": ["tier", "axes"],
+      "additionalProperties": false,
+      "properties": {
+        "tier": { "$ref": "#/$defs/tier" },
+        "axes": { "$ref": "#/$defs/axes" }
+      }
+    },
+    "hardware": { "$ref": "#/$defs/hardwareReport" },
+    "warnings": { "type": "array", "items": { "type": "string" } }
+  },
+  "$defs": {
+    "tier": {
+      "type": "string",
+      "enum": ["T0_MICRO", "T1_EDGE", "T2_BALANCED", "T3_CAPABLE", "T4_WORKSTATION"]
+    },
+    "axes": {
+      "type": "object",
+      "required": ["compute", "memory", "accelerator", "storage", "network", "power"],
+      "additionalProperties": false,
+      "properties": {
+        "compute": { "enum": ["minimal", "low", "medium", "high", "extreme"] },
+        "memory": { "enum": ["minimal", "low", "medium", "high", "extreme"] },
+        "accelerator": { "enum": ["none", "npu_small", "igpu", "gpu_small", "gpu_large", "gpu_multi"] },
+        "storage": { "enum": ["constrained", "standard", "fast", "bulk"] },
+        "network": { "enum": ["offline", "intermittent", "lan", "broadband", "gateway"] },
+        "power": { "enum": ["constrained", "managed", "unconstrained"] }
+      }
+    },
+    "features": {
+      "type": "object",
+      "required": [
+        "assistant_shape",
+        "local_llm", "max_model_parameters", "recommended_quantization", "local_rag",
+        "speech_to_text", "text_to_speech", "image_generation", "max_concurrent_agents",
+        "eligible_node_roles", "background_services", "desktop", "serve_ai_to_peers",
+        "content_replication", "cluster_cache_bytes", "envelope_carry_bytes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "assistant_shape": {
+          "type": "string",
+          "enum": ["command_grammar", "single_step_tool_calling", "planning_with_retrieval", "parallel_agents"],
+          "description": "What shape the assistant takes here (AI-RUNTIME.md \u00a76). Distinct from local_llm: command_grammar is a real assistant with no model in it, not the absence of one, and a UI that treats it as absence hides a feature the machine has."
+        },
+        "local_llm": { "type": "boolean" },
+        "max_model_parameters": { "type": ["integer", "null"], "minimum": 0 },
+        "recommended_quantization": { "type": ["string", "null"] },
+        "local_rag": { "type": "boolean" },
+        "speech_to_text": { "type": "boolean" },
+        "text_to_speech": { "type": "boolean" },
+        "image_generation": { "type": "boolean" },
+        "max_concurrent_agents": { "type": "integer", "minimum": 0 },
+        "eligible_node_roles": {
+          "type": "array",
+          "description": "Roles the hardware could sustain. Eligibility only: every role still requires explicit user opt-in.",
+          "items": { "enum": ["leaf", "relay", "cache", "gateway", "ai-provider", "archive"] }
+        },
+        "background_services": { "type": "array", "items": { "type": "string" } },
+        "desktop": { "enum": ["headless", "light", "full"] },
+        "serve_ai_to_peers": { "type": "boolean" },
+        "content_replication": { "type": "boolean" },
+        "cluster_cache_bytes": {
+          "type": "integer",
+          "description": "Bytes this machine may contribute to the cluster cache (ADR-0015). A default the operator may raise or lower; no subsystem infers its own. Zero means the machine caches nothing for peers, which is what a storage-constrained machine gets whatever its tier says.",
+          "minimum": 0
+        },
+        "envelope_carry_bytes": {
+          "type": "integer",
+          "description": "Bytes this machine may spend carrying other people's addressed envelopes for offline recipients (ADR-0028 §8). SEPARATE from cluster_cache_bytes and deliberately so: a cache entry is a convenience copy of content the operator can inspect and purge, while an envelope is opaque ciphertext for a stranger whose eviction may mean a message is never delivered with nobody told, and whose lifetime rule is the opposite of a replica's. Sized smaller and on a flatter curve than the cache, because mail is small and transient and because delivery comes from meeting peers rather than from having a big disk. Zero on a storage-constrained machine, for a sharper reason than the cache's: carrying mail you cannot promise to hold is worse than not carrying it, since the sender believes it is on its way. This is what the machine can afford; the broker's envelope.carry capability is what its operator permits, and both must pass.",
+          "minimum": 0
+        }
+      }
+    },
+    "hardwareReport": {
+      "type": "object",
+      "required": ["schema_version", "machine", "cpu", "memory", "accelerators", "storage", "network", "power", "warnings"],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+        "machine": {
+          "type": "object",
+          "required": ["model", "chassis", "architecture"],
+          "additionalProperties": false,
+          "properties": {
+            "model": { "type": ["string", "null"] },
+            "chassis": { "type": ["string", "null"] },
+            "architecture": { "type": "string" }
+          }
+        },
+        "cpu": {
+          "type": "object",
+          "required": ["architecture", "logical_cpus", "physical_cores", "vendor", "model_name", "max_frequency_mhz", "heterogeneous", "features", "flags"],
+          "additionalProperties": false,
+          "properties": {
+            "architecture": { "type": "string" },
+            "logical_cpus": { "type": "integer", "minimum": 0 },
+            "physical_cores": { "type": "integer", "minimum": 0 },
+            "vendor": { "type": ["string", "null"] },
+            "model_name": { "type": ["string", "null"] },
+            "max_frequency_mhz": { "type": ["integer", "null"], "minimum": 0 },
+            "heterogeneous": { "type": "boolean" },
+            "features": {
+              "type": "object",
+              "additionalProperties": { "type": "boolean" }
+            },
+            "flags": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "memory": {
+          "type": "object",
+          "required": ["total_bytes", "available_bytes", "swap_total_bytes"],
+          "additionalProperties": false,
+          "properties": {
+            "total_bytes": { "type": "integer", "minimum": 0 },
+            "available_bytes": { "type": "integer", "minimum": 0 },
+            "swap_total_bytes": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "accelerators": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["kind", "vendor", "name", "driver", "discrete", "vram_bytes", "compute_apis", "source"],
+            "additionalProperties": false,
+            "properties": {
+              "kind": { "enum": ["gpu", "npu"] },
+              "vendor": { "type": "string" },
+              "name": { "type": ["string", "null"] },
+              "driver": { "type": ["string", "null"] },
+              "discrete": { "type": "boolean" },
+              "vram_bytes": {
+                "type": ["integer", "null"],
+                "minimum": 0,
+                "description": "Null means undetectable, never zero. Consumers must not round an unknown upward."
+              },
+              "compute_apis": { "type": "array", "items": { "type": "string" } },
+              "source": { "type": "string" }
+            }
+          }
+        },
+        "storage": {
+          "type": "object",
+          "required": ["devices", "data_path", "data_total_bytes", "data_free_bytes", "rotational_only"],
+          "additionalProperties": false,
+          "properties": {
+            "devices": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["name", "size_bytes", "rotational", "removable"],
+                "additionalProperties": false,
+                "properties": {
+                  "name": { "type": "string" },
+                  "size_bytes": { "type": "integer", "minimum": 0 },
+                  "rotational": { "type": "boolean" },
+                  "removable": { "type": "boolean" }
+                }
+              }
+            },
+            "data_path": { "type": "string" },
+            "data_total_bytes": { "type": "integer", "minimum": 0 },
+            "data_free_bytes": { "type": "integer", "minimum": 0 },
+            "rotational_only": { "type": "boolean" }
+          }
+        },
+        "network": {
+          "type": "object",
+          "required": ["interfaces", "has_default_route", "has_link", "mesh_radio_present"],
+          "additionalProperties": false,
+          "properties": {
+            "interfaces": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["name", "kind", "operstate", "speed_mbps"],
+                "additionalProperties": false,
+                "properties": {
+                  "name": { "type": "string" },
+                  "kind": { "enum": ["loopback", "ethernet", "wireless", "bluetooth", "ieee802154", "point_to_point", "other"] },
+                  "operstate": { "type": "string" },
+                  "speed_mbps": { "type": ["integer", "null"], "minimum": 0 }
+                }
+              }
+            },
+            "has_default_route": { "type": "boolean" },
+            "has_link": { "type": "boolean" },
+            "mesh_radio_present": { "type": "boolean" }
+          }
+        },
+        "power": {
+          "type": "object",
+          "required": ["has_battery", "on_battery", "mains_online", "thermal_zones"],
+          "additionalProperties": false,
+          "properties": {
+            "has_battery": { "type": "boolean" },
+            "on_battery": { "type": "boolean" },
+            "mains_online": { "type": ["boolean", "null"] },
+            "thermal_zones": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "warnings": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}

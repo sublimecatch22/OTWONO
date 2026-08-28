@@ -1,0 +1,174 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://otwono.org/schemas/content-object-1.1.0.json",
+  "title": "OTWONO Content Object",
+  "description": "What the content store records about one object: the chunks it is made of, how large it is, and how visible it may be. The content_id is derived from the chunk list alone and from nothing else \u2014 not the label, not the filename, not who stored it \u2014 so two nodes holding the same bytes agree on its name even if they label it differently. That is what lets any holder of a chunk serve any other node (ADR-0015). Chunking parameters are a network-wide constant (ADR-0016) and are recorded here so an object split under other rules can be detected, which is all that can be done about it.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "content_id",
+    "chunking",
+    "chunks",
+    "size_bytes"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$"
+    },
+    "content_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "BLAKE3 over the domain separator, the chunking version, the chunk count, and each chunk's digest and length in order. Order is part of the name: the same chunks rearranged are a different object."
+    },
+    "chunking": {
+      "type": "string",
+      "const": "fastcdc-v2020-16k-64k-256k",
+      "description": "The parameters that produced this split, fixed by ADR-0016. A different value means the object's chunks cannot be shared with this node \u2014 not that it is corrupt."
+    },
+    "chunks": {
+      "type": "array",
+      "description": "In order. An empty array is a zero-length object, which is valid and stores nothing.",
+      "items": {
+        "type": "object",
+        "required": [
+          "blake3",
+          "length"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "blake3": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "length": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 262144
+          }
+        }
+      }
+    },
+    "size_bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Must equal the sum of the chunk lengths. Checked before a record is written and again when one is read."
+    },
+    "visibility": {
+      "enum": [
+        "private",
+        "shared",
+        "public",
+        "replicated"
+      ],
+      "default": "private",
+      "description": "Absent means private, and so does any value not in this list. A reader must never fail on an unrecognised label \u2014 it must treat it as private, so that damaging a record cannot make its contents more available (CLAUDE.md Section 8). An object labelled shared MUST carry a sharing envelope: a shared label over plaintext chunks would claim a protection the bytes do not have. The converse does not hold \u2014 a demoted object keeps its envelope, because its bytes are still sealed and dropping it would leave the owner unable to read their own object."
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Never part of the identity. A media type, an original filename, a service's own key \u2014 all things that legitimately differ between two nodes holding the same bytes."
+    },
+    "sharing": {
+      "type": "object",
+      "description": "Present when this object's chunks are ciphertext (ADR-0019). A shared object is encrypted as a whole before it is chunked, so its chunk digests and its content_id are over ciphertext: a holder cannot confirm a guess at the plaintext, and the object does not share an id with the same file stored public. The envelope is NOT part of the content_id, so substituting a nonce prefix or a recipient's copy yields an object that still verifies as the right bytes and then fails to open \u2014 a denial, never different plaintext.",
+      "required": [
+        "encryption",
+        "nonce_prefix",
+        "plaintext_size_bytes",
+        "sealed_keys"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "encryption": {
+          "type": "string",
+          "const": "xchacha20poly1305-stream-be32-1MiB",
+          "description": "The plaintext sealed in 1 MiB frames with the STREAM construction, the frames concatenated, and the result chunked. Framed rather than one AEAD call so an object larger than memory can be sealed and opened; STREAM rather than independent frames so truncation and reordering fail to decrypt instead of yielding a plausible shorter object. A value this build does not recognise must be refused, never guessed at."
+        },
+        "nonce_prefix": {
+          "type": "string",
+          "description": "Base64, 19 bytes. STREAM spends the remaining five bytes of the 24-byte XChaCha20 nonce on a big-endian frame counter and a last-frame flag. Fresh per object: the same content key with two prefixes produces unrelated ciphertext."
+        },
+        "plaintext_size_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "What the object was before sealing. size_bytes measures the ciphertext, which is larger by 16 bytes per frame."
+        },
+        "sealed_keys": {
+          "type": "array",
+          "minItems": 1,
+          "description": "The per-object content key, sealed once per recipient. This list IS the authorized set \u2014 a separate authorized.nodes alongside it would be a second fact that could disagree, and the disagreement would be a security bug whichever way it went. An empty list is not a shared object, it is an object nobody including its owner can open. A recipient appearing twice is refused: there is no way to tell which copy is meant. That this list names who a node shares with is an unsolved leak (OQ-28).",
+          "items": {
+            "type": "object",
+            "required": [
+              "recipient",
+              "ephemeral_public_key",
+              "sealed"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "recipient": {
+                "type": "string",
+                "description": "The recipient's NodeID in text form, bound as AEAD additional data so a copy addressed to one node cannot be presented as another's."
+              },
+              "ephemeral_public_key": {
+                "type": "string",
+                "description": "Base64 X25519 public key of the sender's per-seal keypair, discarded immediately after sealing. Ephemeral so the sealing node needs no long-term key of its own, and so two seals of one key to one node are unlinkable."
+              },
+              "sealed": {
+                "type": "string",
+                "description": "Base64 ChaCha20-Poly1305 ciphertext of the 32-byte content key."
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "schema_version": "1.0.0",
+      "content_id": "0000000000000000000000000000000000000000000000000000000000000000",
+      "chunking": "fastcdc-v2020-16k-64k-256k",
+      "chunks": [
+        {
+          "blake3": "1111111111111111111111111111111111111111111111111111111111111111",
+          "length": 65536
+        }
+      ],
+      "size_bytes": 65536,
+      "visibility": "public",
+      "metadata": {
+        "media_type": "text/markdown"
+      }
+    },
+    {
+      "schema_version": "1.0.0",
+      "content_id": "2222222222222222222222222222222222222222222222222222222222222222",
+      "chunking": "fastcdc-v2020-16k-64k-256k",
+      "chunks": [
+        {
+          "blake3": "3333333333333333333333333333333333333333333333333333333333333333",
+          "length": 65552
+        }
+      ],
+      "size_bytes": 65552,
+      "visibility": "shared",
+      "sharing": {
+        "encryption": "xchacha20poly1305-stream-be32-1MiB",
+        "nonce_prefix": "AAAAAAAAAAAAAAAAAAAAAAAAAA==",
+        "plaintext_size_bytes": 65536,
+        "sealed_keys": [
+          {
+            "recipient": "otw1exampleneighbour",
+            "ephemeral_public_key": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA=",
+            "sealed": "Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M="
+          }
+        ]
+      }
+    }
+  ]
+}

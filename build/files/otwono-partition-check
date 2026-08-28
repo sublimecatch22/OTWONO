@@ -1,0 +1,179 @@
+#!/bin/sh
+# OTWONO partition check — does content written on one side of a break arrive after it heals?
+#
+# BUILT FOR TESTING. Installed only by build stage 37 (MESH_CONTENT_SMOKE=1).
+#
+# The third clause of Phase 6's exit criterion. The harness takes node 3's link down with
+# QMP `set_link`, so the guest keeps running and keeps its state and simply cannot reach the
+# segment — a partition, not a restart, which is what makes this a different question from
+# the store-and-forward phase before it.
+#
+# Roles, by the ordinal encoded in the MAC (see otwono-envelope-check):
+#
+#   node 2  writer  waits until it is alone, publishes something new, says so
+#   node 3  reader  waits to be cut off, waits to come back, resolves what node 2 wrote
+#   node 1          nothing; it is powered off long before this matters
+#
+# Neither side is signalled by the harness. Each detects the partition itself, from its own
+# peer count — which is the honest version, because a check told when to look would pass
+# against a node that never noticed anything.
+#
+# What makes the result mean something is *when* node 2 publishes. It publishes only once it
+# has no peers at all, so the name cannot have reached node 3 before the break; a pointer is
+# pulled from its owner on demand, never pushed. Node 3 resolving it afterwards therefore
+# says the break healed and that what was written during it crossed. The harness waits for
+# the writer's marker before healing, so the ordering is asserted rather than assumed.
+set -eu
+
+SOCK=/run/otwono/net.sock
+STAMP=/var/lib/otwono/envelope-check.sealed
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+
+fail() { echo "OTWONO-PARTITION-FAIL $*" >&2; exit 1; }
+step() { echo "OTWONO-PARTITION-STEP $*"; }
+
+connected() {
+    otwono-netd --status --socket "$SOCK" 2>/dev/null | awk '/^connected/ {print $2}' || true
+}
+
+# Wait until this node is alone, or until it has somebody again. Prints nothing; the caller
+# says why it was waiting.
+#
+# `connected` can come back empty if the daemon is mid-restart, and empty is not zero — read
+# as zero it would look exactly like a partition, and this phase would declare one that never
+# happened.
+#
+# Two named modes rather than a comparison operator passed in a variable. That parses at
+# runtime and no static checker can follow it, which is a poor trade for one line, and
+# `wait_for_peers 240 alone` says what it is waiting for where `0 240 -eq` did not.
+wait_for_peers() { # attempts alone|connected
+    _attempts=$1; _mode=$2; _i=0
+    while [ "$_i" -lt "$_attempts" ]; do
+        _n=$(connected)
+        case "$_n" in
+            ''|*[!0-9]*) ;;
+            *)
+                case "$_mode" in
+                    alone)     [ "$_n" -eq 0 ] && return 0 ;;
+                    connected) [ "$_n" -ge 1 ] && return 0 ;;
+                    *) fail "wait_for_peers: unknown mode $_mode" ;;
+                esac
+                ;;
+        esac
+        _i=$(( _i + 1 ))
+        sleep 5
+    done
+    return 1
+}
+
+node_total=1
+node_ordinal=1
+for dev in /sys/class/net/*/address; do
+    a=$(cat "$dev" 2>/dev/null) || continue
+    case "$a" in
+        52:54:00:07:*)
+            node_total=$(( 0x$(echo "$a" | cut -d: -f5) ))
+            node_ordinal=$(( 0x$(echo "$a" | cut -d: -f6) ))
+            break
+            ;;
+    esac
+done
+
+[ "$node_total" -ge 3 ] || {
+    echo "OTWONO-PARTITION-SKIP this phase needs three nodes; this segment has $node_total"
+    exit 0
+}
+
+case "$node_ordinal" in
+1)
+    # The sender in the phase before this one, powered off by the harness before the link is
+    # ever touched. Nothing to do, and saying so beats an unexplained silent unit.
+    echo "OTWONO-PARTITION-SKIP node 1 is powered off before the partition"
+    exit 0
+    ;;
+2)
+    # --- writer ------------------------------------------------------------------------
+    # Alone means node 1 is off *and* node 3's link is down, which together is the harness
+    # having partitioned the segment. Waiting for zero rather than for a drop by one: a
+    # count that fell because node 1 shut down is not a partition, and this phase runs after
+    # that has already happened.
+    step "waiting to be cut off from every peer"
+    wait_for_peers 240 alone \
+        || fail "still has $(connected) peer(s) after 20 minutes; the link never went down"
+
+    # Something that exists only on this side of the break. A fresh object under a name
+    # nothing has published before, so node 3 resolving it cannot be resolving a stale
+    # answer it already had.
+    printf 'written during the partition on node %s at %s\n' \
+        "$node_ordinal" "$(date -u +%s%N)" > "$WORK/during-partition.txt"
+    put=$(otwono-storectl put --file "$WORK/during-partition.txt" --visibility public 2>&1) \
+        || fail "storing the object failed: $put"
+    target=$(echo "$put" | awk 'NR==1 {print $1}')
+    case "$target" in
+        [0-9a-f]*) ;;
+        *) fail "storing the object returned no content id: $put" ;;
+    esac
+    otwono-storectl pointer-publish --service partition --name Healed "$target" >/dev/null 2>&1 \
+        || fail "publishing partition/Healed failed"
+    echo "OTWONO-PARTITION-WROTE id=$target"
+    exit 0
+    ;;
+3)
+    # --- reader ------------------------------------------------------------------------
+    # Only on the boot that collected an envelope. On the first boot this node is powered off
+    # partway through the phase before this one, and a partition that never comes would make
+    # this unit sit out its whole window and then report a failure that is nothing to do with
+    # partitions.
+    [ -f "$STAMP" ] || {
+        echo "OTWONO-PARTITION-SKIP first boot; the partition happens after this node returns"
+        exit 0
+    }
+
+    step "waiting for the link to go down"
+    wait_for_peers 240 alone \
+        || fail "still has $(connected) peer(s) after 20 minutes; the link never went down"
+    step "cut off; waiting to come back"
+    wait_for_peers 240 connected \
+        || fail "the link came back and this node reconnected to nobody"
+
+    # Resolve what node 2 published while this node could not hear it. `--pointer` asks the
+    # peers this node is connected to; a pointer is only ever served by its owner, so an
+    # answer here is node 2's record and nobody else's.
+    step "resolving what the other side wrote while this node was away"
+    resolved=""
+    i=0
+    while [ "$i" -lt 120 ]; do
+        out=$(otwono-netd --pointer partition/Healed --socket "$SOCK" 2>&1) || out=""
+        resolved=$(echo "$out" | grep -o '[0-9a-f]\{64\}' | head -1) || resolved=""
+        [ -n "$resolved" ] && break
+        i=$(( i + 1 ))
+        sleep 5
+    done
+    [ -n "$resolved" ] || fail "the link healed and partition/Healed never resolved"
+
+    # And fetch it. A name that crosses and content that does not is not convergence, and
+    # the two are separate mechanisms — the pointer is a signed record, the object is chunks
+    # over the fetch path.
+    #
+    # `--to-file` names no path: it is a flag, and the daemon writes the object where it
+    # chooses and prints where that was (ADR-0018's handoff). Taking the path from the reply
+    # rather than choosing one is the whole point of that handoff.
+    got=$(otwono-netd --fetch "$resolved" --to-file --socket "$SOCK" 2>&1) \
+        || fail "resolved $resolved and could not fetch it: $got"
+    path=$(echo "$got" | grep -o "path=[^ ]*" | cut -d= -f2)
+    case "$path" in
+        /*) ;;
+        *) fail "a to-file fetch named no path: $got" ;;
+    esac
+    [ -f "$path" ] || fail "the fetched file is not there: $path"
+    grep -q "written during the partition" "$path" \
+        || fail "fetched $resolved and it was not what the other side wrote"
+    echo "OTWONO-PARTITION-CONVERGED id=$resolved bytes=$(wc -c < "$path")"
+    exit 0
+    ;;
+*)
+    echo "OTWONO-PARTITION-SKIP node $node_ordinal has no role in this phase"
+    exit 0
+    ;;
+esac

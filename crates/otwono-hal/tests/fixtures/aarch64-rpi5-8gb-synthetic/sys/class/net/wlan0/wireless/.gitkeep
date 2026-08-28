@@ -1,0 +1,1 @@
+# Marker directory. Its presence is what the probe checks; git cannot track an empty directory.

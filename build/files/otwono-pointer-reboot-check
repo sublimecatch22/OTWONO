@@ -1,0 +1,87 @@
+#!/bin/sh
+# OTWONO pointer reboot check: does the rollback defence survive losing the machine?
+#
+# ADR-0027's whole design rests on one sentence: the reader remembers the highest sequence it
+# has seen. A signature cannot tell a current record from an old one, so that memory is the
+# only thing standing between a reader and a replay -- and a memory that does not survive a
+# reboot is protection an attacker gets by waiting.
+#
+# That durability was tested in-process only: open a `PointerStore`, close it, open it again.
+# Same kernel, same page cache, same machine. This runs on a node that has actually been shut
+# down and brought back, and asks a peer for a name it has already read.
+#
+# # Why nothing here publishes anything
+#
+# The state this needs was left behind by the previous boot. `otwono-mesh-content-check`
+# finished with each node's own pointer regressed to sequence 1 and each node's memory of its
+# peer at sequence 2, and both halves are on disk. So on this boot the peer is *still serving
+# its sequence-1 record* and this node must *still* refuse it -- with nothing in memory but
+# what it read off the disk, because nothing on this boot has fetched that pointer before.
+#
+# The refusal names the sequence it remembers. Matching on that number rather than on the
+# word "refused" is the difference between proving the log survived and proving something
+# said no.
+set -eu
+
+STAMP=/var/lib/otwono/mesh-content-check.done
+POINTER=wiki/Getting-Started
+
+fail() { echo "OTWONO-POINTER-REBOOT-FAIL $*" >&2; exit 1; }
+step() { echo "OTWONO-POINTER-REBOOT-STEP $*"; }
+
+# The unit is conditioned on this too. Checked here as well because a script that silently
+# does nothing when its input is missing is a script that passes for the wrong reason.
+[ -f "$STAMP" ] || fail "no $STAMP; this boot has nothing to compare against"
+
+before=$(awk -F= '/^fingerprint=/ {print $2}' "$STAMP")
+[ -n "$before" ] || fail "$STAMP records no fingerprint"
+
+step "waiting for the mesh to come back"
+i=0
+connected=0
+while [ "$i" -lt 150 ]; do
+    connected=$(otwono-netd --status --socket /run/otwono/net.sock 2>/dev/null \
+        | awk '/^connected/ {print $2}')
+    case "$connected" in ''|*[!0-9]*) connected=0 ;; esac
+    [ "$connected" -ge 1 ] && break
+    i=$((i + 1))
+    sleep 5
+done
+[ "$connected" -ge 1 ] || fail "no peer reconnected after the reboot"
+
+# The identity is the other thing that has to survive, and until now this was asserted only
+# as "the key files are on disk" -- which is a proxy, not the property. Two boots of the same
+# disk reporting the same fingerprint is the property.
+now=$(otwono-netd --status --socket /run/otwono/net.sock | awk '/^fingerprint/ {print $2}')
+[ -n "$now" ] || fail "net.status reported no fingerprint after the reboot"
+[ "$now" = "$before" ] \
+    || fail "the identity did not survive the reboot: was $before, now $now"
+step "the node came back as the same identity"
+
+# The peer is still publishing the record it regressed to before the shutdown. Refusing it
+# now can only come from the sequence log on disk.
+step "asking the peer for a name this node read on a previous boot"
+refused=""
+i=0
+while [ "$i" -lt 60 ]; do
+    out=$(otwono-netd --pointer "$POINTER" --socket /run/otwono/net.sock 2>&1)
+    case "$out" in
+        *"refused a rollback"*)
+            # The remembered number, taken from the refusal itself: "sequence 1 is not newer
+            # than 2 already seen". A refusal that named 0, or named nothing, would mean the
+            # log came back empty and something else did the refusing.
+            refused=$(echo "$out" | sed -n 's/.*is not newer than \([0-9][0-9]*\) already seen.*/\1/p')
+            break
+            ;;
+    esac
+    i=$((i + 1))
+    sleep 5
+done
+
+[ -n "$refused" ] \
+    || fail "the peer's rolled-back pointer was not refused after the reboot; last reply: $out"
+[ "$refused" -ge 2 ] \
+    || fail "the refusal names sequence $refused; the log came back without what it had seen"
+step "refused the peer's rolled-back pointer from the sequence log on disk"
+
+echo "OTWONO-POINTER-REBOOT-OK fingerprint=$now remembered=$refused"

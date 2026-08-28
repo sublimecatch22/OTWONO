@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://otwono.org/schemas/envelope-1.0.0.json",
+  "title": "OTWONO Addressed Envelope Descriptor",
+  "description": "What a carrier is told about an envelope it has not opened (ADR-0028). This is the third of the three primitives every OTWONO service is composed from, and it is deliberately small: the payload is an ADR-0019 sealed object -- encrypted under a fresh per-object key, that key wrapped by X25519 to the recipient's sharing key -- and none of that appears here. A relay sees exactly these fields, which is the least it can see and still decide whether to carry the envelope and whom to hand it to. Note what is ABSENT: there is no sender field, because a relay has no use for one and the sender belongs inside the ciphertext where only the recipient can read it (ADR-0028 §4).",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "envelope_id",
+    "recipient",
+    "size_bytes",
+    "expires_at_ms"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$"
+    },
+    "envelope_id": {
+      "type": "string",
+      "description": "The content id of the ciphertext, as for any object: 64 lowercase hex characters over BLAKE3. Validated rather than assumed, because this string reaches a filesystem lookup and a fetch request and it arrives from whoever offered the envelope.",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "recipient": {
+      "type": "string",
+      "description": "The NodeID this is for, as NodeId::to_text produces it: the prefix otw1 followed by 55 characters of lowercase Crockford base32. The FULL form, never the otw1:xxxx-xxxx-xxxx-xxxx fingerprint, which is truncated for people to read aloud and is documented as never being what a decision is made against. A carrier compares this as a parsed NodeID rather than as a string, so a form differing only in case is the same node and not a message it would silently never deliver.",
+      "pattern": "^otw1[0-9abcdefghjkmnpqrstvwxyz]{55}$"
+    },
+    "size_bytes": {
+      "type": "integer",
+      "description": "Ciphertext size, so a carrier can decide before fetching. Larger than the plaintext, as it is for any sealed object.",
+      "minimum": 1
+    },
+    "expires_at_ms": {
+      "type": "integer",
+      "description": "When this stops existing -- ABSOLUTE, not a duration, and not a TTL. A replica's TTL restarts when the object is offered again because replication is about durability (ADR-0026 §5); a message is the opposite, and an envelope that inherited that behaviour would live as long as any relay kept meeting a peer that re-offered it. A carrier may commit to an earlier moment than this one and MUST NOT commit to a later one, so re-offering an envelope never buys it more time (ADR-0028 §3).",
+      "minimum": 0
+    }
+  }
+}

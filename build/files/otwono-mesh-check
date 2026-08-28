@@ -1,0 +1,59 @@
+#!/bin/sh
+# OTWONO mesh self check, run once at boot.
+#
+# Confirms the identity and mesh daemons are up and reports what the node can see. On a
+# lone node the peer counts are zero and that is a pass: having no neighbours is a normal
+# state for a local-first OS, not a fault. The two-VM test in build/qemu/ is what asserts
+# that peers are actually found.
+set -eu
+
+STATUS=$(/usr/bin/otwono-netd --status --socket /run/otwono/net.sock)
+
+fingerprint=$(echo "$STATUS" | awk '/^fingerprint/ {print $2}')
+known=$(echo "$STATUS" | awk '/^known/ {print $2}')
+connected=$(echo "$STATUS" | awk '/^connected/ {print $2}')
+
+[ -n "$fingerprint" ] || { echo "OTWONO-MESH-FAIL no fingerprint in net.status" >&2; exit 1; }
+
+# Both halves must be on disk, or the identity did not survive and will not survive a
+# reboot. They are separate files because they belong to separate daemons (ADR-0010):
+# node.key is otwono-idd's, agreement.key is otwono-netd's.
+[ -s /var/lib/otwono/identity/node.key ] || {
+    echo "OTWONO-MESH-FAIL no node key persisted" >&2
+    exit 1
+}
+[ -s /var/lib/otwono/identity/agreement.key ] || {
+    echo "OTWONO-MESH-FAIL no agreement key persisted" >&2
+    exit 1
+}
+
+# The split is only real if node.key stayed out of the agreement file. Cheap to check here
+# and it runs on every boot of every node, which a unit test does not.
+if grep -q '"signing_seed"' /var/lib/otwono/identity/agreement.key 2>/dev/null; then
+    echo "OTWONO-MESH-FAIL agreement.key contains signing material" >&2
+    exit 1
+fi
+if grep -q '"agreement_seed"' /var/lib/otwono/identity/node.key 2>/dev/null; then
+    echo "OTWONO-MESH-FAIL node.key still contains an agreement secret" >&2
+    exit 1
+fi
+
+# The interface address is on the line because a mesh that cannot form is almost always a
+# node with no address, and on a headless box that is invisible otherwise. "none" here
+# means link-local never came up, which is a different problem from "no peers found".
+addr=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | head -1)
+[ -n "$addr" ] || addr=$(ip -4 -o addr show scope link 2>/dev/null | awk '{print $4}' | head -1)
+[ -n "$addr" ] || addr=none
+
+echo "OTWONO-MESH-OK node=$fingerprint addr=$addr known=$known connected=$connected"
+
+# A node that has *found* peers but connected to none has a specific problem, and the
+# reason is otherwise only in the journal — invisible on a headless box and on a serial
+# console. Print it. Peers known and zero connected is the failure worth explaining;
+# zero known is just a node on its own, which is normal.
+if [ "$known" != "0" ] && [ "$connected" = "0" ]; then
+    /usr/bin/otwono-netd --peers --socket /run/otwono/net.sock --perm-socket /run/otwono/perm.sock 2>&1 |
+        while IFS= read -r line; do
+            echo "OTWONO-MESH-PEER $line"
+        done
+fi

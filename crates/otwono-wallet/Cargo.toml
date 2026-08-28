@@ -1,0 +1,29 @@
+[package]
+name = "otwono-wallet"
+description = "OTWONO wallet keys: BIP-39 mnemonic, BIP-32/44 derivation on secp256k1, and the passphrase-encrypted seed vault."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# secp256k1 in pure Rust (ADR-0022): cross-compiles to aarch64 with no C toolchain, which
+# CLAUDE.md §5 requires of every crate. A wallet signs a few times a day, so libsecp256k1's
+# speed advantage buys nothing here.
+k256 = { version = "0.13", features = ["ecdsa"] }
+bip32 = { version = "0.5", default-features = false, features = ["alloc", "secp256k1", "bip39"] }
+# Argon2id for the passphrase-derived vault key, matching FINANCE.md §3.
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+data-encoding = "2"
+rand_core = { version = "0.6", features = ["getrandom"] }
+# Address encoding (ADR-0025). Keccak for the Ethereum family, bech32 for the Bitcoin and
+# Cosmos families; ripemd and sha2 arrive with bip32 already.
+sha3 = "0.10"
+ripemd = "0.1"
+sha2 = "0.10"
+bech32 = "0.11"
+zeroize = { version = "1", features = ["derive"] }

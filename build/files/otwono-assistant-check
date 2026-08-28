@@ -1,0 +1,117 @@
+#!/bin/sh
+# OTWONO assistant self check, run once at boot.
+#
+# `otwono do …` has until now been proven by tests that spawn the binary against daemons a
+# test harness built. This runs it on the booted node: the real binary, the real sockets,
+# the real units, and — the part no host test can reproduce — **the shipped policy**.
+#
+# That last point is why this check needs no drop-in of its own, and why that matters. Every
+# capability the eight verbs name (hw.read, store.read, store.write, net.read, cache.read)
+# is granted by `10-default.toml` to uid:0 already. So this asserts that the assistant works
+# on a *release* image, with no test-only grants, which is a claim about the product rather
+# than about a harness. If a future policy change breaks that, this check is what says so.
+#
+# It is a file, not an inline ExecStart, for the reason the others are: a quoting bug in an
+# inline script surfaces as a boot failure minutes into a QEMU run, where as a file it is
+# linted by shellcheck in CI like every other script here.
+set -eu
+
+WORK=/var/lib/otwono/assistant-check
+rm -rf "$WORK"
+mkdir -p "$WORK"
+chmod 0700 "$WORK"
+
+fail() { echo "OTWONO-ASSISTANT-FAIL $*" >&2; exit 1; }
+
+# `do` is a shell keyword, so `otwono do help` makes shellcheck warn (SC1010) on every line
+# that calls it — it cannot tell a subcommand from a malformed loop. The quotes settle it.
+#
+# Worth recording rather than just working around: this is a real cost of the subcommand
+# name that AI-RUNTIME.md §6 chose. Every shell script that drives the assistant pays it,
+# and a helper is the cheapest place to pay it once.
+assistant() { otwono 'do' "$@"; }
+
+# --- 1. The assistant knows what shape it is, and says so before being asked -------------
+# A T0 node's help text has to name the limit up front. A user who learns it by being
+# refused three times has learned the same fact at three times the cost.
+help=$(assistant help) || fail "otwono do help failed"
+echo "$help" | grep -q "command-grammar assistant" \
+    || fail "help does not say what kind of assistant this is: $help"
+for verb in save fetch tier hardware peers cache; do
+    echo "$help" | grep -q "^  *$verb " || fail "help does not list \"$verb\""
+done
+# The verbs that write are marked as such, so a caller can confirm before acting.
+echo "$help" | grep -q "save .*\[changes something\]" \
+    || fail "help does not mark save as changing something"
+
+# --- 2. A verb reaches a daemon and agrees with it ---------------------------------------
+# Cross-checked against otwono-hwctl rather than asserted against a constant: what matters
+# is that the assistant and the hardware daemon give the *same* answer on this machine, not
+# that either matches a value baked into this script.
+tier_direct=$(otwono-hwctl tier) || fail "otwono-hwctl tier failed"
+tier_assistant=$(assistant tier) || fail "otwono do tier failed"
+echo "$tier_assistant" | grep -q "$tier_direct" \
+    || fail "the assistant says [$tier_assistant], hwctl says [$tier_direct]"
+
+# --- 3. A file goes in through the assistant and comes back byte for byte ----------------
+# The whole path: words to intent, a token from the broker, base64 over the control plane,
+# content-addressed back out. A base64 bug shows up here as corruption and nowhere else.
+printf 'otwono assistant check %s\n' "$(date -u +%s)" > "$WORK/note.txt"
+saved=$(assistant save "$WORK/note.txt") || fail "otwono do save failed"
+id=$(echo "$saved" | tr ' ' '\n' | grep -E '^[0-9a-f]{64}$' | head -1)
+[ -n "$id" ] || fail "save returned no content id: $saved"
+
+otwono-storectl get "$id" --out "$WORK/note.back" >/dev/null \
+    || fail "the object the assistant saved cannot be read back"
+cmp -s "$WORK/note.txt" "$WORK/note.back" \
+    || fail "the file came back different from how the assistant put it in"
+
+# --- 4. It is PRIVATE, because nobody said otherwise -------------------------------------
+# CLAUDE.md §8, asserted through the assistant specifically. A convenience layer that
+# widened a default would be the easiest place in the system to leak from, and the user
+# typed nothing about visibility at all.
+stat_out=$(otwono-storectl stat "$id") || fail "store.stat refused"
+echo "$stat_out" | grep -qi "private" \
+    || fail "the assistant saved a file as something other than private: $stat_out"
+
+# --- 5. An open-ended request is declined honestly, not misunderstood ---------------------
+# AI-RUNTIME.md §6. The message must name the *machine's* limit rather than the user's
+# phrasing, and the exit code must distinguish "I will not" from "it broke" so a script can
+# tell them apart. Both were wrong once and neither was caught by a unit test.
+set +e
+declined=$(assistant summarise my week 2>&1)
+code=$?
+set -e
+[ "$code" -eq 3 ] || fail "an open-ended request exited $code, expected 3"
+echo "$declined" | grep -q "on this machine" \
+    || fail "the refusal blames the request rather than the machine: $declined"
+echo "$declined" | grep -q "command-grammar" \
+    || fail "the refusal does not say what shape this machine is: $declined"
+echo "$declined" | grep -q "Did you mean" \
+    && fail "an open-ended request was treated as a misspelling: $declined"
+
+# --- 6. ...and a near miss is still treated as one ----------------------------------------
+# The pair. If everything became "this machine cannot", a user one letter out would be told
+# their hardware is too small, which is both wrong and unactionable.
+set +e
+typo=$(assistant fetc "$id" 2>&1)
+code=$?
+set -e
+[ "$code" -eq 3 ] || fail "a typo exited $code, expected 3"
+echo "$typo" | grep -q "Did you mean" || fail "a one-letter miss was not offered the verb: $typo"
+
+# --- 7. The assistant is not a way around the permission model ----------------------------
+# The shipped policy grants no store.serve and no net.content (stage 30 says so at length).
+# There is no verb that reaches either, so this asserts the vocabulary is bounded — an
+# assistant that could serve the street because it could reach the store would be the
+# permission model undone.
+for reach in serve publish connect replicate; do
+    set +e
+    assistant "$reach" something >/dev/null 2>&1
+    code=$?
+    set -e
+    [ "$code" -eq 3 ] || fail "\"otwono do $reach\" exited $code rather than declining"
+done
+
+rm -rf "$WORK"
+echo "OTWONO-ASSISTANT-OK tier=$tier_direct saved=$id verbs=$(echo "$help" | grep -c '^  [a-z]') declined=honestly"

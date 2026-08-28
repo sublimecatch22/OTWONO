@@ -1,0 +1,752 @@
+#!/bin/sh
+# OTWONO mesh content check: does content cross a link, and does PRIVATE content not?
+#
+# Phase 5's exit criterion, raised from a host-side assertion to something observed between
+# two booted nodes. Until now "a PRIVATE object never appears on any link" was proven by a
+# test that constructed daemons inside one process. This proves it over a real Noise channel
+# between two machines that authenticated each other.
+#
+# It runs on both nodes, because they run the same image. Each stores the same two fixed
+# objects and then asks its peer for both by content id.
+#
+# Why the same bytes on both sides: a content id is the hash of the content, so both nodes
+# derive the same id for the same fixed string with no coordination and no channel to pass
+# an id over. That is the one property of content addressing that makes this test possible.
+# A node fetching from a peer does not consult its own store, so holding a copy does not
+# make the fetch trivially succeed.
+#
+# It needs store.serve and net.content, which the shipped policy grants to nobody. Stage 37
+# installs the drop-in that grants them, and only when explicitly asked for.
+set -eu
+
+PUBLIC_TEXT='otwono mesh content check: this object is public and may cross a link'
+PRIVATE_TEXT='otwono mesh content check: this object is private and must never cross a link'
+ABSENT=0000000000000000000000000000000000000000000000000000000000000000
+WORK=/var/lib/otwono/mesh-content-check
+
+fail() { echo "OTWONO-MESH-CONTENT-FAIL $*" >&2; exit 1; }
+
+# Say where we are as we go.
+#
+# This check prints one marker at the end and can legitimately run for many minutes: it
+# waits for a mesh to form, then fetches several objects with generous retries. When it does
+# not finish, a log with nothing in it says only "somewhere in there" -- which is exactly the
+# position a run left me in, with no way to tell a hang from a slow boot without another
+# ten-minute cycle. A line per section costs nothing and turns that into a reading.
+step() { echo "OTWONO-MESH-CONTENT-STEP $*"; }
+
+# How many nodes are on this segment, and which one this is. The harness encodes both in the
+# MAC -- octet 5 is the count, octet 6 the 1-based ordinal -- because every node boots the
+# same image and has no other way to know. A node booted outside the multi-node harness sees
+# neither and falls back to "one of one", which disables the disjoint-share behaviour below.
+node_total=1
+node_ordinal=1
+for dev in /sys/class/net/*/address; do
+    a=$(cat "$dev" 2>/dev/null) || continue
+    case "$a" in
+        52:54:00:07:*)
+            node_total=$(( 0x$(echo "$a" | cut -d: -f5) ))
+            node_ordinal=$(( 0x$(echo "$a" | cut -d: -f6) ))
+            break
+            ;;
+    esac
+done
+[ "$node_total" -ge 1 ] || node_total=1
+[ "$node_ordinal" -ge 1 ] || node_ordinal=1
+
+rm -rf "$WORK"; mkdir -p "$WORK"; chmod 0700 "$WORK"
+printf '%s' "$PUBLIC_TEXT" > "$WORK/public.txt"
+printf '%s' "$PRIVATE_TEXT" > "$WORK/private.txt"
+
+# A second public object, big enough to be several chunks. The 68-byte one above fits in a
+# single chunk and a single range, so on its own it proves the protocol only at its smallest
+# -- ADR-0017's manifest pagination and ranged chunk fetch never get exercised on a wire.
+# 300 KiB is roughly five chunks at ADR-0016's 64 KiB average, and each chunk is larger than
+# one reply can carry, so at least one takes several round trips.
+#
+# Deterministic bytes, not /dev/urandom: both nodes must derive the same content id, and
+# they cannot if the contents differ.
+# Deliberately above the control plane's 640 KiB inline cap, so it can only cross as a file
+# (ADR-0018). Deterministic bytes, not /dev/urandom: both nodes must derive the same content
+# id, and they cannot if the contents differ.
+awk 'BEGIN { s = ""; for (i = 0; i < 20000; i++) s = s "otwono-mesh-large-object-fixture-" i "\n"; printf "%s", s }' \
+    > "$WORK/large.bin"
+
+pub_id=$(otwono-storectl put --file "$WORK/public.txt" --visibility public | awk '{print $1}') \
+    || fail "could not store the public object"
+# Over the inline cap, so `put` must refuse it and `import` must not -- the same boundary
+# ADR-0018 draws, checked here on a booted node.
+if otwono-storectl put --file "$WORK/large.bin" --visibility public >/dev/null 2>&1; then
+    fail "store.put accepted an object larger than the control plane can carry"
+fi
+big_id=$(otwono-storectl import --file "$WORK/large.bin" --visibility public | awk '{print $1}') \
+    || fail "could not import the large public object"
+[ -n "$big_id" ] || fail "the large put returned no content id"
+
+# Asserted, not assumed: if the fixture ever shrinks below one chunk this test quietly stops
+# proving the thing it exists for.
+big_chunks=$(otwono-storectl stat "$big_id" | awk '{print $4}')
+[ -n "$big_chunks" ] || fail "store.stat did not report a chunk count"
+[ "$big_chunks" -gt 1 ] \
+    || fail "the large fixture is $big_chunks chunk(s); it must span several to test ranging"
+
+# --- disjoint shares, on three nodes or more -------------------------------------------
+#
+# CLUSTER-CACHE.md section 8 asks for "a fetch with three peers holding disjoint
+# pieces". With every node holding the whole object, a fetch that spreads across peers is
+# nice but not necessary -- any one of them could have served it alone. This makes it
+# necessary: node i deletes the chunks where index mod N == i, so no single peer can serve
+# the object and any two together can.
+#
+# Node i is missing share i. A fetcher's peers are every node but itself, so between them
+# they are missing nothing: share j is held by k and share k is held by j. That is why the
+# fetcher's own copy being irrelevant -- net.fetch never consults the local store -- does
+# not break it, and why two nodes cannot do this: one peer is always missing its own share.
+if [ "$node_total" -ge 3 ]; then
+    # objects/<first two hex chars>/<hex>.json, per Store::object_path.
+    record="/var/lib/otwono/store/objects/$(echo "$big_id" | cut -c1-2)/$big_id.json"
+    [ -f "$record" ] || fail "cannot find the object record at $record"
+
+    idx=0
+    dropped=0
+    # In array order, which is the object's chunk order.
+    for digest in $(grep -o '"blake3": *"[0-9a-f]*"' "$record" | grep -o '[0-9a-f]\{64\}'); do
+        if [ $(( idx % node_total )) -eq $(( node_ordinal - 1 )) ]; then
+            aa=$(echo "$digest" | cut -c1-2)
+            bb=$(echo "$digest" | cut -c3-4)
+            rm -f "/var/lib/otwono/store/chunks/$aa/$bb/$digest" || true
+            dropped=$(( dropped + 1 ))
+        fi
+        idx=$(( idx + 1 ))
+    done
+    [ "$dropped" -gt 0 ] \
+        || fail "node $node_ordinal of $node_total dropped no chunks; the share split did nothing"
+fi
+prv_id=$(otwono-storectl put --file "$WORK/private.txt" --visibility private | awk '{print $1}') \
+    || fail "could not store the private object"
+[ -n "$pub_id" ] && [ -n "$prv_id" ] || fail "a put returned no content id"
+
+# --- the positive case ------------------------------------------------------------------
+# A PUBLIC object crosses the link and the peer names it back. Retried, because discovery
+# and the Noise handshake take a while under TCG and there is no point asking before there
+# is anybody to ask; "no connected peer" is the expected answer for the first minute or two.
+# Every peer, not merely one. With disjoint shares a fetch needs all of them, and starting
+# before the last neighbour arrives would fail for a reason that is not a defect.
+step "waiting for $(( node_total - 1 )) peer(s)"
+i=0
+while [ "$i" -lt 150 ]; do
+    seen=$(otwono-netd --status --socket /run/otwono/net.sock 2>/dev/null \
+        | awk '/^connected/ {print $2}')
+    case "$seen" in ''|*[!0-9]*) seen=0 ;; esac
+    [ "$seen" -ge $(( node_total - 1 )) ] && break
+    i=$((i + 1))
+    sleep 5
+done
+
+step "fetching the small public object"
+got=""
+i=0
+while [ "$i" -lt 120 ]; do
+    if got=$(otwono-netd --fetch "$pub_id" --socket /run/otwono/net.sock 2>&1); then
+        break
+    fi
+    got=""
+    i=$((i + 1))
+    sleep 5
+done
+[ -n "$got" ] || fail "no peer served the public object within 600s"
+echo "$got" | grep -q "$pub_id" || fail "the peer served something else: $got"
+
+# The same, for an object that spans several chunks. This is what puts ADR-0017's manifest
+# pagination and ranged chunk fetch on a real wire rather than an in-memory link.
+# Retried, like the small fetch above, and for a reason the small one does not have.
+#
+# A peer being *connected* does not mean it has stored this object yet: every node runs this
+# script independently and there is no barrier between them. With disjoint shares that is
+# fatal rather than merely slow -- a peer that has stored nothing leaves its share uncovered,
+# and the fetch fails with "or does not have it". The first run of this test failed exactly
+# that way on two of three nodes, which is the assertion working.
+#
+# The last failure is kept, not discarded. Throwing it away is how the first three-node run
+# reported only "a multi-chunk object would not cross the link" -- true, and silent about
+# which peer would not serve it, which cost a disk-mounting session to answer. The pointer
+# step above already learned this; this one had not.
+big=""
+last_error=""
+i=0
+while [ "$i" -lt 60 ]; do
+    if big=$(otwono-netd --fetch "$big_id" --to-file --socket /run/otwono/net.sock 2>&1); then
+        break
+    fi
+    last_error=$big
+    big=""
+    i=$((i + 1))
+    sleep 5
+done
+# No number in the message. It used to say "within 300s" while the loop actually spends 60
+# attempts *plus* their fetch time -- 510s on the run that hit it -- and a message that
+# states a wrong duration sends the reader looking in the wrong place.
+[ -n "$big" ] \
+    || fail "a multi-chunk object would not cross the link after $i attempts: $last_error"
+echo "$big" | grep -q "$big_id" || fail "the peer served the wrong large object: $big"
+step "large object fetched"
+big_size=$(wc -c < "$WORK/large.bin")
+echo "$big" | grep -q " $big_size bytes " \
+    || fail "the large object arrived at the wrong size (wanted $big_size): $big"
+
+# It came as a file, and the file is the object. This is ADR-0018's handoff between two
+# machines rather than between a caller and a daemon on one.
+big_path=$(echo "$big" | grep -o "path=[^ ]*" | cut -d= -f2)
+case "$big_path" in
+    /*) : ;;
+    *) fail "a to-file fetch named no path: $big" ;;
+esac
+[ -f "$big_path" ] || fail "the fetched file is not there: $big_path"
+cmp -s "$WORK/large.bin" "$big_path" \
+    || fail "the file that crossed the link is not the object"
+rm -f "$big_path"
+
+# And the inline path must refuse it rather than truncate or hang, naming its own limit.
+if otwono-netd --fetch "$big_id" --socket /run/otwono/net.sock >/dev/null 2>&1; then
+    fail "an inline fetch accepted an object larger than a control-plane line"
+fi
+
+# How many peers actually served chunks of it. Reported rather than asserted here, because
+# on a two-node segment there is only ever one peer and which peer answers a given chunk
+# first is a race by design. The multi-node harness is what asserts a spread, across nodes.
+big_served=$(echo "$big" | grep -o "served=[0-9]*" | cut -d= -f2)
+case "$big_served" in ''|*[!0-9]*) big_served=0 ;; esac
+
+# With disjoint shares this is not a race and not a nicety: no single peer holds the whole
+# object, so a completed fetch *must* have drawn on at least two of them. Asserted here
+# rather than in the harness, because here it is forced rather than likely.
+if [ "$node_total" -ge 3 ]; then
+    [ "$big_served" -ge 2 ] || fail \
+        "the object completed from $big_served peer(s), but no peer holds all of it"
+fi
+
+# --- the negative case, which is the point ----------------------------------------------
+# A PRIVATE object must not cross. The peer holds it -- both nodes stored it -- and refuses.
+if otwono-netd --fetch "$prv_id" --socket /run/otwono/net.sock > "$WORK/leak" 2>&1; then
+    fail "a PRIVATE object crossed the link: $(cat "$WORK/leak")"
+fi
+
+# And the refusal must be the same one an object that is simply not there gets, or a peer
+# can learn what this node holds by asking.
+otwono-netd --fetch "$ABSENT" --socket /run/otwono/net.sock > "$WORK/absent" 2>&1 || true
+sed "s/$prv_id/<id>/g" "$WORK/leak" > "$WORK/leak.norm"
+sed "s/$ABSENT/<id>/g" "$WORK/absent" > "$WORK/absent.norm"
+if ! cmp -s "$WORK/leak.norm" "$WORK/absent.norm"; then
+    echo "refused: $(cat "$WORK/leak.norm")" >&2
+    echo "absent:  $(cat "$WORK/absent.norm")" >&2
+    fail "refused and absent differ, so a peer can tell what this node holds"
+fi
+
+# The cluster cache, which on these nodes exists only because the test image overrides
+# the storage axis. Reported rather than asserted beyond being answerable: what matters here
+# is that a node with a real budget opens a real cache and can be asked about it.
+step "checking the cluster cache"
+cache_state=none
+cache_held=0
+if cache=$(otwono-storectl cache-status 2>&1); then
+    cache_state=$(echo "$cache" | awk '/^budget/ {print $2}')
+    [ -n "$cache_state" ] || fail "cache.status answered without a budget: $cache"
+    [ "$cache_state" -gt 0 ] \
+        || fail "the override did not give this node a cache budget: $cache"
+
+    # Fetch the small object again, this time keeping it. Until now the cache has had a
+    # budget and held nothing on every booted node, because net.fetch caches only when asked
+    # and nothing asked.
+    kept=$(otwono-netd --fetch "$pub_id" --cache --socket /run/otwono/net.sock 2>&1) \
+        || fail "a caching fetch failed: $kept"
+    echo "$kept" | grep -q "cached=" || fail "a caching fetch said nothing about caching: $kept"
+    echo "$kept" | grep -q "cached=false" \
+        && fail "asked to cache and it did not: $kept"
+
+    cache_held=$(otwono-storectl cache-status | awk '/^budget/ {print $6}')
+    case "$cache_held" in ''|*[!0-9]*) cache_held=0 ;; esac
+    [ "$cache_held" -ge 1 ] \
+        || fail "the cache holds $cache_held object(s) after a caching fetch"
+fi
+
+# --- A pointer crosses a link and resolves to a name (ADR-0027) -------------------------
+# Phase 6's second primitive on a booted node. Each node publishes a pointer under the same
+# name, and each then asks its peer what *that peer's* copy of the name points at.
+#
+# The same name on both is the point: a pointer is fetched only from its owner, so two nodes
+# publishing `wiki/Getting-Started` are two different pointers, and the record each receives
+# must carry the *peer's* NodeID and the peer's content id. A node that got its own back
+# would mean the request was being answered locally somewhere, which is the failure this
+# arrangement is shaped to catch.
+#
+# The content differs per node -- ordinal and nanoseconds -- so the ids are certainly
+# different and neither node can derive the other's.
+step "publishing a pointer and resolving the peer's"
+pointer_published=none
+pointer_resolved=none
+printf 'otwono pointer check node %s %s\n' "$node_ordinal" "$(date -u +%s%N)" \
+    > "$WORK/for-pointer.txt"
+if pt=$(otwono-storectl put --file "$WORK/for-pointer.txt" --visibility public 2>&1); then
+    pointer_target=$(echo "$pt" | awk 'NR==1 {print $1}')
+    [ -n "$pointer_target" ] || fail "storing the pointer's target returned no content id"
+
+    otwono-storectl pointer-publish --service wiki --name Getting-Started \
+        "$pointer_target" >/dev/null 2>&1 \
+        || fail "pointer-publish failed"
+    pointer_published=$pointer_target
+
+    # Retried: the peer may not have published yet, and unlike the offer index there is no
+    # per-session snapshot here -- each ask is a fresh channel and a fresh answer.
+    # Matched on the *shape* of the value, scanning every field, rather than on a field
+    # index. The first version of this tested $3 for a number -- but $3 is the literal word
+    # "sequence", so the condition was never true and the check could not have passed at
+    # all. The shared-with-me step above already used shape matching; departing from it here
+    # was the mistake.
+    #
+    # stderr is kept, not discarded. Discarding it is what made the failure unreadable: a
+    # resolve that errored and a resolve that returned nothing looked identical, and the
+    # retry loop hid both for six minutes.
+    # Which peer answered, its sequence, and its content id -- all three from the *same*
+    # line, and the peer is remembered.
+    #
+    # `--pointer` prints one line per connected peer. Taking the first 64-hex character run
+    # from anywhere in the output worked on two nodes, where there is only ever one line, and
+    # is a race on three: the id could come from one peer while the sequence checked later
+    # came from another. It passed two three-node runs and failed the third, which is the
+    # worst way for a test to be wrong.
+    pointer_peer=""
+    pointer_seq=0
+    i=0
+    while [ "$i" -lt 60 ]; do
+        pointer_out=$(otwono-netd --pointer wiki/Getting-Started --socket /run/otwono/net.sock 2>&1)
+        answer=$(echo "$pointer_out" | awk '
+            {
+                seq = ""; cid = ""; who = $1
+                for (f = 1; f <= NF; f++) {
+                    if ($f == "sequence") seq = $(f + 1)
+                    else if ($f ~ /^[0-9a-f]{64}$/) cid = $f
+                }
+                if (seq != "" && cid != "") { print who, seq, cid; exit }
+            }')
+        if [ -n "$answer" ]; then
+            pointer_peer=$(echo "$answer" | awk '{print $1}')
+            pointer_seq=$(echo "$answer" | awk '{print $2}')
+            pointer_resolved=$(echo "$answer" | awk '{print $3}')
+            break
+        fi
+        i=$((i + 1))
+        sleep 5
+    done
+
+    if [ "$pointer_resolved" != none ]; then
+        # It must be the peer's object, not this node's own. Getting our own back would mean
+        # the name resolved locally rather than over the link.
+        [ "$pointer_resolved" != "$pointer_published" ] \
+            || fail "the pointer resolved to this node's own object"
+        # And the object it names must be fetchable, which is what makes a pointer useful
+        # rather than merely verifiable.
+        got=$(otwono-netd --fetch "$pointer_resolved" --socket /run/otwono/net.sock 2>&1) \
+            || fail "the object a resolved pointer names could not be fetched: $got"
+        step "resolved the peer's pointer and fetched what it names"
+    else
+        # Not a failure on its own: a peer that has not published yet has nothing to
+        # resolve, and one node cannot tell that from a broken path. The harness asserts
+        # across both. What the last attempt actually said is printed, because "nothing
+        # resolved" with no other information is what made this take two runs to diagnose.
+        step "no peer pointer resolved within the retry window; last reply: $pointer_out"
+    fi
+fi
+
+# --- A pointer advances, and a regressed one is refused (ADR-0027 §1) -------------------
+# The property the whole design exists for, and the one that had only ever fired in a unit
+# test. Two things happen here, in order, and each needs the one before it.
+#
+# First the name moves: this node republishes at sequence 2 pointing somewhere else, and
+# waits until the peer reports *its* name at sequence 2. That proves an advance crossed a
+# link and that the reader took it -- which nothing had shown before.
+#
+# Then this node **regresses its own pointer**, and the peer must refuse it. That is the
+# rollback case with no synthetic actor in it: the record is genuinely the owner's, genuinely
+# signed, genuinely current for that owner, and refused only because the reader remembers a
+# higher number. ADR-0027's consequences name this exactly -- "an owner can roll itself
+# back" -- and the reader is the thing that stops it mattering.
+#
+# A node cannot publish backwards while it still holds its own record, and should not be able
+# to: `pointer.publish` refuses it. So the store is made to forget, which is not a trick but
+# the real way this happens -- a node that lost its pointer directory and started over. This
+# node publishes exactly one pointer, so `mine` holds exactly that one.
+pointer_advanced=none
+pointer_rollback_refused=no
+if [ "$pointer_resolved" != none ]; then
+    step "republishing the pointer and waiting for the peer's to advance"
+    printf 'otwono pointer check node %s update %s\n' "$node_ordinal" "$(date -u +%s%N)" \
+        > "$WORK/for-pointer-2.txt"
+    pt2=$(otwono-storectl put --file "$WORK/for-pointer-2.txt" --visibility public 2>&1) \
+        || fail "storing the pointer's second target failed: $pt2"
+    pointer_target2=$(echo "$pt2" | awk 'NR==1 {print $1}')
+    [ -n "$pointer_target2" ] || fail "storing the pointer's second target returned no content id"
+    otwono-storectl pointer-publish --service wiki --name Getting-Started \
+        "$pointer_target2" >/dev/null 2>&1 \
+        || fail "republishing the pointer failed"
+
+    # The sequence is read by field *name*, not position: the reply is
+    # "<node_id> wiki/Getting-Started sequence <n> <content_id>", and a check that counted
+    # fields is how the first version of the step above managed to be unpassable.
+    #
+    # Sequence and content id are taken from the *same line*, because `--pointer` prints one
+    # line per connected peer. On two nodes there is only ever one; on three there are two,
+    # at different sequences while the republish propagates, and reading the number from one
+    # line and the id from another would report a pairing that never existed.
+    # The *same peer* that answered above, and a sequence strictly past what it said then.
+    # Comparing against whichever peer happens to be listed first is what made this a race.
+    i=0
+    while [ "$i" -lt 60 ]; do
+        pointer_out=$(otwono-netd --pointer wiki/Getting-Started --socket /run/otwono/net.sock 2>&1)
+        pointer_advanced=$(echo "$pointer_out" | awk -v want="$pointer_peer" -v was="$pointer_seq" '
+            $1 == want {
+                seq = ""; cid = ""
+                for (f = 1; f <= NF; f++) {
+                    if ($f == "sequence") seq = $(f + 1)
+                    else if ($f ~ /^[0-9a-f]{64}$/) cid = $f
+                }
+                if (seq != "" && seq + 0 > was + 0 && cid != "") { print cid; exit }
+            }')
+        [ -n "$pointer_advanced" ] && break
+        pointer_advanced=none
+        i=$((i + 1))
+        sleep 5
+    done
+    [ "$pointer_advanced" != none ] \
+        || fail "peer $pointer_peer never moved past sequence $pointer_seq; last reply: $pointer_out"
+    [ "$pointer_advanced" != "$pointer_resolved" ] \
+        || fail "peer $pointer_peer advanced past sequence $pointer_seq without changing what the name points at"
+    step "the peer's pointer advanced to sequence 2 over the link"
+
+    # A settle window before regressing. Both nodes run this same script from the same boot
+    # and reach here within seconds of each other, but "seconds" is not a guarantee -- and a
+    # node that regressed while its peer was still looking for sequence 2 would fail the
+    # assertion above for the right reason at the wrong time. Nothing coordinates the two
+    # VMs, so the margin is the coordination.
+    sleep 90
+
+    step "regressing this node's own pointer, and expecting to refuse the peer's"
+    printf 'otwono pointer check node %s rolled back %s\n' "$node_ordinal" "$(date -u +%s%N)" \
+        > "$WORK/for-pointer-3.txt"
+    pt3=$(otwono-storectl put --file "$WORK/for-pointer-3.txt" --visibility public 2>&1) \
+        || fail "storing the regressed pointer's target failed: $pt3"
+    pointer_target3=$(echo "$pt3" | awk 'NR==1 {print $1}')
+    [ -n "$pointer_target3" ] || fail "storing the regressed target returned no content id"
+    rm -f /var/lib/otwono/pointers/mine/*.json
+    otwono-storectl pointer-publish --service wiki --name Getting-Started \
+        "$pointer_target3" >/dev/null 2>&1 \
+        || fail "republishing at sequence 1 failed after clearing this node's own records"
+
+    # Matched on the refusal text rather than on exit status: `--pointer` asks every
+    # connected peer and one peer's refusal must not be reported as the command failing.
+    i=0
+    while [ "$i" -lt 60 ]; do
+        pointer_out=$(otwono-netd --pointer wiki/Getting-Started --socket /run/otwono/net.sock 2>&1)
+        case "$pointer_out" in
+            *"refused a rollback"*)
+                pointer_rollback_refused=yes
+                break
+                ;;
+        esac
+        i=$((i + 1))
+        sleep 5
+    done
+    [ "$pointer_rollback_refused" = yes ] \
+        || fail "a regressed pointer was not refused; last reply: $pointer_out"
+    step "refused the peer's regressed pointer"
+fi
+
+# --- REPLICATED replicates itself, with nothing driving it (ADR-0026) -------------------
+# The claim this step exists for: a node that meets a peer takes a copy of what that peer
+# offers, without anyone asking it to. Every other replication test drives the pass by
+# calling it; here nothing does. Both nodes publish one REPLICATED object, both nodes dial,
+# and if the wiring is right each ends up holding the other's.
+#
+# Nothing passes an id between the VMs, and this node cannot derive the peer's: the object
+# carries a per-node timestamp so the two are certainly different bytes. So a replica showing
+# up here is one the peer offered and this node chose to take.
+#
+# Retried for the same reason the sharing index is: the offer list is taken once per session,
+# so an object marked REPLICATED after this node's last connection is only visible on a
+# later one (ADR-0026 §7). That is the design's stated cost, and here it is as a retry.
+step "publishing a REPLICATED object and waiting for the peer's"
+replicated_id=none
+replica_taken=none
+printf 'otwono replication check node %s %s\n' "$node_ordinal" "$(date -u +%s%N)" \
+    > "$WORK/for-replication.txt"
+if mine=$(otwono-storectl put --file "$WORK/for-replication.txt" --visibility replicated 2>&1); then
+    replicated_id=$(echo "$mine" | awk 'NR==1 {print $1}')
+    [ -n "$replicated_id" ] || fail "putting a REPLICATED object returned no content id"
+
+    i=0
+    while [ "$i" -lt 60 ]; do
+        # Any held replica that is not this node's own object came from the peer. The status
+        # marks a hold separately from a pin, so this cannot be satisfied by a pinned entry.
+        replica_taken=$(otwono-storectl cache-status 2>/dev/null \
+            | awk -v mine="$replicated_id" '$3 == "bytes" && /replica/ && $1 != mine { print $1; exit }')
+        [ -n "$replica_taken" ] && break
+        replica_taken=none
+        i=$((i + 1))
+        sleep 5
+    done
+
+    if [ "$replica_taken" != none ]; then
+        # It must be the peer's object and not this node's own, or "replication happened"
+        # would be satisfied by a node talking to itself.
+        [ "$replica_taken" != "$replicated_id" ] \
+            || fail "the only replica held is this node's own object"
+        held=$(otwono-storectl cache-status | awk '/^budget/ {print $8}')
+        case "$held" in ''|*[!0-9]*) held=0 ;; esac
+        [ "$held" -ge 1 ] \
+            || fail "a replica is marked held but the count says $held"
+        step "holding a replica taken from the peer with nothing driving it"
+    else
+        # Not a failure: a node whose peer never got as far as publishing has nothing to
+        # take, and this check has no way to tell that from a broken pass. The summary line
+        # records which happened, and the harness asserts across both nodes.
+        step "no replica taken from the peer within the retry window"
+    fi
+fi
+
+# --- A peer learned over the mesh can be sealed to (ADR-0019) ---------------------------
+# Until now a node could only be shared with by somebody who already held its binding out of
+# band. The binding now travels in the hello after every Noise handshake, so this asserts
+# what that makes possible on two machines: this node takes a *connected peer's* signed
+# sharing binding off the wire and encrypts an object to it.
+#
+# What this does NOT prove, and the marker says so by naming only an id: the peer cannot
+# fetch it. A recipient has no way to discover what has been shared with it (OQ-29), so
+# there is no id to hand the other side without a channel outside the mesh.
+step "sealing to a peer learned over the mesh"
+shared_to_peer=none
+if otwono-netd --peer-binding "$WORK/peer.binding" --socket /run/otwono/net.sock \
+        >/dev/null 2>&1; then
+    # The binding is signed, and otwono-stored verifies it again for itself -- so a garbled
+    # or substituted file is refused rather than sealed to.
+    grep -q '"sharing_public_key"' "$WORK/peer.binding" \
+        || fail "--peer-binding wrote something that is not a binding"
+
+    printf 'otwono shared-to-peer check %s\n' "$(date -u +%s)" > "$WORK/for-peer.txt"
+    to_peer=$(otwono-storectl share --file "$WORK/for-peer.txt" \
+        --recipient "$WORK/peer.binding") || fail "sharing to a mesh-learned peer refused"
+    shared_to_peer=$(echo "$to_peer" | awk 'NR==1 {print $1}')
+    [ -n "$shared_to_peer" ] || fail "sharing to a peer returned no content id"
+
+    # Sealed to the peer *and* to this node, which keeps a key to what it shares (ADR-0019
+    # §5a) -- an owner who cannot read what they shared has lost their own file. So this
+    # opens, and must come back byte for byte.
+    otwono-storectl open "$shared_to_peer" --out "$WORK/mine-back" >/dev/null \
+        || fail "this node cannot open an object it shared"
+    cmp -s "$WORK/for-peer.txt" "$WORK/mine-back" \
+        || fail "an object this node shared came back different"
+
+    # A tampered binding is refused rather than sealed to. Same file, one flipped character
+    # in the signature.
+    sed 's/"signature": "./"signature": "Z/' "$WORK/peer.binding" > "$WORK/bad.binding"
+    if otwono-storectl share --file "$WORK/for-peer.txt" \
+            --recipient "$WORK/bad.binding" >/dev/null 2>&1; then
+        fail "a binding whose signature does not check out was sealed to anyway"
+    fi
+fi
+
+# And then to *every* connected peer, not only the one `--peer-binding` happened to pick.
+#
+# The assertions above want one peer and are done. This is about the discovery step below: it
+# can only assert that a node finds what was sealed to it if something was. With one
+# arbitrarily-chosen recipient per node that is not guaranteed — on three nodes two of them
+# can pick the same third, leaving one node with nothing sealed to it, which then correctly
+# discovers nothing and spends the full six hundred seconds proving it. That happened on
+# three consecutive runs, and each time it looked like a failure worth investigating.
+#
+# Sealing to everyone makes "this node discovered nothing" mean something is wrong, which is
+# what an assertion is for.
+shared_to_peer_all="$shared_to_peer"
+for pid in $(otwono-netd --peer-ids --socket /run/otwono/net.sock \
+        --perm-socket /run/otwono/perm.sock 2>/dev/null); do
+    otwono-netd --peer-binding "$WORK/$pid.binding" --peer "$pid" \
+        --socket /run/otwono/net.sock >/dev/null 2>&1 || continue
+    printf 'otwono shared-to-%s %s\n' "$pid" "$(date -u +%s%N)" > "$WORK/for-$pid.txt"
+    each=$(otwono-storectl share --file "$WORK/for-$pid.txt" \
+        --recipient "$WORK/$pid.binding" 2>/dev/null) || continue
+    each_id=$(echo "$each" | awk 'NR==1 {print $1}')
+    case " $shared_to_peer_all " in
+        *" $each_id "*) ;;
+        *) shared_to_peer_all="$shared_to_peer_all $each_id" ;;
+    esac
+done
+step "sealed to every connected peer"
+
+# --- Adding and removing recipients, on a booted node (ADR-0019 §5) ---------------------
+# The host-side tests cover the logic. What only a boot can show is that the *shipped* image
+# permits it: the policy in stage 30 grants id.unwrap_shared for opening, and adding a
+# recipient needs the same capability for the same reason, so a policy written for one and
+# not the other would fail here and nowhere else.
+#
+# It also seals to a binding taken off the wire rather than a synthetic one, which is the
+# other thing a boot adds.
+#
+# Deliberately self-contained: the two nodes run this script with no barrier between them,
+# so nothing here waits on the peer. What is therefore NOT shown is a peer being refused
+# after a revoke -- that needs the other node to have reached a known point, and this check
+# has no way to know that.
+step "granting and revoking on a booted node"
+granted=none
+if [ -s "$WORK/peer.binding" ]; then
+    peer_node=$(tr -d '\n' < "$WORK/peer.binding" \
+        | sed -n 's/.*"node_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    [ -n "$peer_node" ] || fail "could not read the peer's node id out of its binding"
+
+    printf 'otwono grant-revoke check %s\n' "$(date -u +%s)" > "$WORK/for-grant.txt"
+    solo=$(otwono-storectl share --file "$WORK/for-grant.txt" --recipient self) \
+        || fail "sharing to self refused"
+    solo_id=$(echo "$solo" | awk 'NR==1 {print $1}')
+    [ -n "$solo_id" ] || fail "sharing to self returned no content id"
+
+    # The peer is not on it yet, so the peer's name must not appear.
+    echo "$solo" | grep -q "$peer_node" \
+        && fail "an object shared to self alone already names the peer"
+
+    # Widen it to the peer learned over the mesh. The id must not change: the ciphertext and
+    # the content key are the same, and only the set holding a wrapped copy of that key
+    # grows. An id that changed here would mean a second object, which is the bug this
+    # method exists not to be.
+    after=$(otwono-storectl grant "$solo_id" --recipient "$WORK/peer.binding") \
+        || fail "granting to a mesh-learned peer refused"
+    echo "$after" | grep -q "$solo_id" \
+        || fail "granting changed the content id; it must not"
+    echo "$after" | grep -q "$peer_node" \
+        || fail "granting did not put the peer on the recipient list"
+    granted=$solo_id
+
+    # Granting must not have cost this node its own access.
+    otwono-storectl open "$solo_id" --out "$WORK/granted-back" >/dev/null \
+        || fail "this node cannot open an object it granted"
+    cmp -s "$WORK/for-grant.txt" "$WORK/granted-back" \
+        || fail "an object came back different after granting"
+
+    # Now take it away. The reply has to name who was removed *and* say that nothing was
+    # recalled -- a revoke that printed only success would be the UI lie ADR-0019 §5 is
+    # about.
+    revoked=$(otwono-storectl revoke "$solo_id" --node "$peer_node") \
+        || fail "revoking a recipient refused"
+    echo "$revoked" | grep -q "removed $peer_node" \
+        || fail "revoking did not report removing the peer: $revoked"
+    echo "$revoked" | grep -qi 'ciphertext' \
+        || fail "revoking did not say that it recalls nothing: $revoked"
+
+    # And the owner still holds a key to their own file. Removing the *last* recipient --
+    # which after §5a is this node -- must be refused rather than performed.
+    otwono-storectl open "$solo_id" --out "$WORK/revoked-back" >/dev/null \
+        || fail "this node lost access to its own object after revoking somebody else"
+    cmp -s "$WORK/for-grant.txt" "$WORK/revoked-back" \
+        || fail "an object came back different after revoking"
+
+    again=$(otwono-storectl revoke "$solo_id" --node "$peer_node" 2>&1)
+    echo "$again" | grep -q 'unchanged' \
+        || fail "revoking somebody twice was not reported as changing nothing: $again"
+
+    # The one that protects a person from deleting their own file. After §5a this node is on
+    # every list it made, so "revoke everybody" would destroy the owner's access -- and the
+    # name to try it with comes out of the reply above rather than from any daemon, so this
+    # asserts against whatever the record actually says.
+    me=$(echo "$revoked" | sed -n 's/^still sealed to //p' | head -1)
+    [ -n "$me" ] || fail "revoking did not report who is still sealed to: $revoked"
+    if otwono-storectl revoke "$solo_id" --node "$me" >/dev/null 2>&1; then
+        fail "removing the last recipient was allowed; the owner just lost their own object"
+    fi
+    otwono-storectl open "$solo_id" --out "$WORK/last-back" >/dev/null \
+        || fail "the object is unopenable after a refused last-recipient revoke"
+    cmp -s "$WORK/for-grant.txt" "$WORK/last-back" \
+        || fail "a refused last-recipient revoke changed the object"
+fi
+
+# --- A recipient discovers what was shared with it, and fetches it (ADR-0020) -----------
+# The loop that could not be closed before. Every other object in this check has an id both
+# nodes derive independently, because a PUBLIC object's id is the hash of its content. A
+# SHARED object's is over ciphertext keyed by a fresh per-object key, so the recipient cannot
+# derive it, cannot guess it, and until now had no way to ask.
+#
+# Nothing here passes an id between the VMs. This node asks its peer what the peer has sealed
+# to *it*, and fetches whatever comes back.
+#
+# Both nodes ran the sealing step above, so each has sealed one object to the other. Retried,
+# because the peer may not have reached that step yet -- and because the peer's index is
+# taken once per session, so an object sealed after this node's last connection is only
+# visible on a later one. That is ADR-0020's stated cost, and here it is as a retry.
+# Now an assertion rather than an observation. Every node seals to every peer above, so every
+# node has something sealed to it by both, and finding nothing means something is wrong.
+#
+# It was tolerated before because it could not be: with one arbitrarily-chosen recipient per
+# node, a node with nothing sealed to it discovers nothing and is right to. That case cost
+# ten minutes a run and looked like a failure three runs running.
+#
+# The wait is still long, and for a reason that remains: the nodes run this script with no
+# barrier between them, so a node can reach this step before its peers have sealed. The
+# retry is for that, not for flakiness.
+step "asking the peer what it has sealed to this node"
+discovered=none
+i=0
+while [ "$i" -lt 60 ]; do
+    # Every id, not just the first. The peer seals more than one thing to this node during a
+    # run, and one of them -- the grant/revoke object above -- is revoked moments after it is
+    # granted. Taking only the first meant that whichever the index happened to list first
+    # decided whether the check passed.
+    all=$(otwono-netd --shared-with-me --socket /run/otwono/net.sock 2>&1 \
+        | awk '$1 ~ /^[0-9a-f]{64}$/ { print $1 }')
+    [ -n "$all" ] && break
+    i=$((i + 1))
+    sleep 5
+done
+
+if [ -n "$all" ]; then
+    for candidate in $all; do
+        # It must not be the object this node sealed: that one is sealed to the peer, and
+        # this node holds no copy of its key. Discovering it would mean the index answered
+        # with something it holds rather than something it was given.
+        case " $shared_to_peer_all " in
+            *" $candidate "*)
+                fail "the index offered back an object this node sealed to a peer" ;;
+        esac
+
+        # A discovered id that will not fetch is not a failure by itself. The index is a
+        # snapshot, and ADR-0019 §5 is explicit that a revoke stops future serving -- so an
+        # id discovered inside the peer's grant/revoke window is *correctly* unfetchable by
+        # the time it is asked for. Asserting otherwise would be asserting a guarantee the
+        # system does not make, which is what this step used to do: it took the first id and
+        # failed on it, and passed or failed on the order the index happened to return.
+        if got=$(otwono-netd --fetch "$candidate" --socket /run/otwono/net.sock 2>&1); then
+            echo "$got" | grep -q "$candidate" || fail "the fetch returned something else: $got"
+            discovered=$candidate
+            step "fetched an object discovered over the mesh"
+            break
+        fi
+    done
+    [ "$discovered" != none ] \
+        || fail "the peer sealed things to this node and would serve none of them: $all"
+else
+    fail "every peer sealed something to this node and none of it was discovered"
+fi
+
+rm -rf "$WORK"
+
+# What a second boot needs to know, written only on a run that got this far.
+#
+# Its existence is also what stops this check running twice: the unit is conditioned on the
+# file being absent, and `otwono-pointer-reboot-check` on it being present. A second run of
+# this script would republish under a name the peer has already seen at sequence 2, with
+# different bytes -- which is equivocation (ADR-0027 section 8), correctly refused, and
+# nothing to do with what either check is for.
+#
+# The fingerprint is recorded so the reboot check can say whether the identity survived. The
+# sequence is recorded for a reader of the file; the refusal proves it either way.
+cat > /var/lib/otwono/mesh-content-check.done <<STAMP
+fingerprint=$(otwono-netd --status --socket /run/otwono/net.sock 2>/dev/null | awk '/^fingerprint/ {print $2}')
+pointer=wiki/Getting-Started
+peer_sequence_seen=2
+STAMP
+
+echo "OTWONO-MESH-CONTENT-OK node=$node_ordinal/$node_total public=$pub_id large=$big_id large_served=$big_served private_refused=$prv_id cache_budget=$cache_state cache_held=$cache_held shared_to_peer=$shared_to_peer granted=$granted discovered=$discovered replicated=$replicated_id replica_taken=$replica_taken pointer_published=$pointer_published pointer_resolved=$pointer_resolved pointer_advanced=$pointer_advanced pointer_rollback_refused=$pointer_rollback_refused"

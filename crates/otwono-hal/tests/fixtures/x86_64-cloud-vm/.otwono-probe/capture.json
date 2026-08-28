@@ -1,0 +1,7 @@
+{
+  "synthetic": false,
+  "label": "OTWONO Cloud dev VM (Xeon 4c/16G, no GPU)",
+  "kernel": "6.18.44-fc-v21",
+  "arch": "x86_64",
+  "captured_by": "tools/capture-hw-fixture.sh"
+}

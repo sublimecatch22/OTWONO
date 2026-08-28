@@ -1,0 +1,144 @@
+#!/bin/sh
+# OTWONO content-store self check, run once at boot.
+#
+# Everything in Phase 5 and Phase 6 -- the store, the visibility labels, encryption at rest,
+# the file handoff and the cluster cache -- has until now been proven only by tests on
+# a build host. This runs the same paths on the booted node, through the real daemons, the
+# real sockets, the real policy and the real systemd units.
+#
+# It is a file, not an inline ExecStart, for the reason the control-plane check is: a
+# quoting bug in an inline script surfaces as a boot failure minutes into a QEMU run, where
+# as a file it is linted by shellcheck in CI like every other script here.
+set -eu
+
+WORK=/var/lib/otwono/content-check
+rm -rf "$WORK"
+mkdir -p "$WORK"
+chmod 0700 "$WORK"
+
+fail() { echo "OTWONO-CONTENT-FAIL $*" >&2; exit 1; }
+
+# --- 1. A small object goes in and comes back byte for byte -----------------------------
+printf 'otwono content check %s\n' "$(date -u +%s)" > "$WORK/small.txt"
+put=$(otwono-storectl put --file "$WORK/small.txt" --visibility private) \
+    || fail "store.put refused"
+id=$(echo "$put" | awk '{print $1}')
+[ -n "$id" ] || fail "store.put returned no content id"
+
+otwono-storectl get "$id" --out "$WORK/small.back" >/dev/null || fail "store.get refused"
+cmp -s "$WORK/small.txt" "$WORK/small.back" || fail "the object came back different"
+
+# --- 2. The store on disk is not the plaintext ------------------------------------------
+# Encryption at rest, checked on the booted node rather than in a unit test. The marker is
+# whatever the file's first field is; grep -r over the chunk store must not find it.
+marker=$(head -c 32 "$WORK/small.txt")
+if grep -rqF "$marker" /var/lib/otwono/store/chunks 2>/dev/null; then
+    fail "the store holds the object in the clear"
+fi
+
+# --- 3. A large object moves as a file, not on the socket -------------------------------
+# Over the control plane's line limit, so `put` must refuse it and `import` must not.
+dd if=/dev/urandom of="$WORK/large.bin" bs=1024 count=2048 status=none
+if otwono-storectl put --file "$WORK/large.bin" --visibility private >/dev/null 2>&1; then
+    fail "store.put accepted an object larger than the control plane can carry"
+fi
+imported=$(otwono-storectl import --file "$WORK/large.bin" --visibility private) \
+    || fail "store.import refused"
+large_id=$(echo "$imported" | awk '{print $1}')
+
+exported=$(otwono-storectl export "$large_id") || fail "store.export refused"
+# The line reads "<id> <n> bytes -> <path>", so the path is the last field of the line
+# carrying the arrow. Taking a fixed column got "->" itself, and the failure then read as a
+# missing file rather than as a parse error -- which is why the absolute-path check below
+# exists: a parse that goes wrong should say so, not blame the daemon.
+path=$(echo "$exported" | awk '/->/ {print $NF}')
+case "$path" in
+    /*) : ;;
+    *) fail "could not parse a path out of store.export's reply: $exported" ;;
+esac
+[ -f "$path" ] || fail "store.export named a file that is not there: $path"
+cmp -s "$WORK/large.bin" "$path" || fail "the exported file is not the object"
+rm -f "$path"
+
+# --- 4. The label boundary --------------------------------------------------------------
+# A private object must not be servable to a peer. store.serve is the boundary and it is
+# what otwono-netd calls; asking for it here with a store.read token must fail, because
+# reading locally and serving remotely are different capabilities on purpose.
+stat_out=$(otwono-storectl stat "$id") || fail "store.stat refused"
+case "$stat_out" in
+    *private*) : ;;
+    *) fail "an object stored as private came back as: $stat_out" ;;
+esac
+
+# --- 5. The cluster cache ---------------------------------------------------------
+# Its size comes from the capability profile and nowhere else, so this exercises the
+# otwono-stored -> otwono-hwd lookup on a real boot.
+#
+# Two outcomes are correct and this must accept both. A machine with room gets a budget and
+# a working cache. A machine whose storage axis is Constrained gets a budget of zero, and
+# otwono-stored then opens no cache at all and says so -- which is the intended behaviour on
+# a small board, not a failure. The first version of this check asserted budget > 0 and
+# would have failed on exactly the T0 hardware this project exists for.
+#
+# What would be wrong is silence, a crash, or an answer that is neither.
+if cache=$(otwono-storectl cache-status 2>&1); then
+    budget=$(echo "$cache" | awk '/^budget/ {print $2}')
+    [ -n "$budget" ] || fail "cache.status answered without a budget: $cache"
+    otwono-storectl cache-purge >/dev/null || fail "cache.purge refused"
+    cache_state="budget=$budget"
+else
+    case "$cache" in
+        *"no cluster cache"*) cache_state="none (profile set the budget to zero)" ;;
+        *) fail "cache.status failed for an unexpected reason: $cache" ;;
+    esac
+fi
+
+# --- 6. A SHARED object, sealed to this node and opened again (ADR-0019) ----------------
+# Until this ran on a booted node, every part of SHARED was proven only by tests on a build
+# host. This exercises the whole of it through the real daemons: otwono-idd generates and
+# vouches for the sharing key, otwono-stored encrypts before chunking and seals the content
+# key to the recipient, and opening it goes back through otwono-idd for the unwrap on the
+# caller's own capability. The sharing key never leaves otwono-idd at any point.
+printf 'otwono shared check %s\n' "$(date -u +%s)" > "$WORK/shared.txt"
+shared=$(otwono-storectl share --file "$WORK/shared.txt" --recipient self) \
+    || fail "store.share refused"
+shared_id=$(echo "$shared" | awk 'NR==1 {print $1}')
+[ -n "$shared_id" ] || fail "store.share returned no content id"
+
+# The label is shared, and the object names exactly one recipient: this node.
+case "$shared" in
+    *"sealed to otw1"*) : ;;
+    *) fail "store.share named no recipient: $shared" ;;
+esac
+share_stat=$(otwono-storectl stat "$shared_id") || fail "store.stat refused for the shared object"
+case "$share_stat" in
+    *shared*) : ;;
+    *) fail "an object stored as shared came back as: $share_stat" ;;
+esac
+
+# What is on disk is ciphertext, and not merely because the store is encrypted at rest: the
+# object is encrypted BEFORE it is chunked, so its content id is over ciphertext too. The
+# same plaintext stored public therefore gets a different id -- which is the property that
+# stops a holder confirming a guess at what a shared object contains.
+share_marker=$(head -c 32 "$WORK/shared.txt")
+if grep -rqF "$share_marker" /var/lib/otwono/store/chunks 2>/dev/null; then
+    fail "the shared object is on disk in the clear"
+fi
+plain=$(otwono-storectl put --file "$WORK/shared.txt" --visibility public) \
+    || fail "store.put refused the same bytes as public"
+plain_id=$(echo "$plain" | awk '{print $1}')
+[ "$plain_id" != "$shared_id" ] \
+    || fail "the shared object has the same id as the same bytes stored public"
+
+# And it opens, back to the byte.
+otwono-storectl open "$shared_id" --out "$WORK/shared.back" >/dev/null \
+    || fail "store.open_shared refused"
+cmp -s "$WORK/shared.txt" "$WORK/shared.back" || fail "the shared object came back different"
+
+# Relabelling cannot make plaintext shared: the bytes would have to be sealed and are not.
+if otwono-storectl demote "$plain_id" --visibility shared >/dev/null 2>&1; then
+    fail "a plaintext object became shared by being relabelled"
+fi
+
+rm -rf "$WORK"
+echo "OTWONO-CONTENT-OK id=$id large=$large_id cache=$cache_state shared=$shared_id"

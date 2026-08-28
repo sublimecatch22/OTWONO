@@ -1,0 +1,19 @@
+[package]
+name = "otwono-capability"
+description = "OTWONO capability classification: turns a hardware report into a capability profile and feature gates."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+otwono-hal = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+[features]
+# Exposes the hardware fixtures in `testing` to other crates' tests. Never enabled in a
+# shipped binary: it is dev-dependency surface, not product surface.
+testing = []

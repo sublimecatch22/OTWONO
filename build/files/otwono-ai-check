@@ -1,0 +1,83 @@
+#!/bin/sh
+# OTWONO AI self check, run once at boot.
+#
+# Confirms otwono-aid is up and reports what this node can run. Either answer is a PASS:
+# whether an inference backend is installed is a property of the image, and printing which
+# one it is at boot is the point — a node that quietly cannot do AI is worse than one that
+# says so, and a node that quietly *can* is one nobody knows to use.
+#
+# This is a file, not an inline ExecStart, for the reason recorded in
+# otwono-control-plane-check: an inline version shipped a quoting bug that only surfaced
+# minutes into a QEMU boot. As a file it is linted by shellcheck in CI.
+set -eu
+
+# Wait for the socket first. otwono-aid creates its catalog layout and *then* binds, so a
+# socket on disk means the layout is ready — Type=exec only tells systemd the binary was
+# exec'd, which is earlier than either. Without this the check races the daemon it checks.
+i=0
+while [ ! -S /run/otwono/ai.sock ] && [ "$i" -lt 60 ]; do
+    sleep 1
+    i=$((i + 1))
+done
+[ -S /run/otwono/ai.sock ] || { echo "OTWONO-AI-FAIL no socket at /run/otwono/ai.sock" >&2; exit 1; }
+
+STATUS=$(/usr/bin/otwono-aid --capabilities --model-dir /var/lib/otwono/models \
+    --publishers /etc/otwono/publishers.d)
+
+tier=$(echo "$STATUS" | awk '/^tier/ {print $2}')
+infer=$(echo "$STATUS" | awk '/^local infer/ {print $3}')
+models=$(echo "$STATUS" | awk '/^models/ {print $2}')
+publishers=$(echo "$STATUS" | awk '/^publishers/ {print $2}')
+# Everything after the "backends" label, since there may be several separated by commas.
+backends=$(echo "$STATUS" | sed -n 's/^backends *//p' | tr -d ' ')
+
+# Whether the inference engine will actually be confined (ADR-0012).
+#
+# Asked of the *running daemon* over the socket, not probed here. An earlier version ran
+# the adapter's --probe directly from this script and reported "full" on a node where the
+# real backend could not be confined at all: the landlock syscalls are not in systemd's
+# @system-service set, so otwono-aid's own filter denied them, while this unit -- which has
+# no SystemCallFilter -- was free to use them. The check was measuring its own environment
+# and calling it the daemon's. The daemon now measures at startup and reports it, and this
+# reads that.
+sandbox=$(/usr/bin/otwono-aictl capabilities --json 2>/dev/null     | grep -o '"backend_confinement"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | cut -d'"' -f4)
+[ -n "$sandbox" ] || sandbox=unknown
+
+[ -n "$tier" ] || { echo "OTWONO-AI-FAIL no tier from otwono-aid" >&2; exit 1; }
+[ -n "$infer" ] || { echo "OTWONO-AI-FAIL no inference status from otwono-aid" >&2; exit 1; }
+
+# The catalog directories must exist, or ai.models.list reports an empty catalog for the
+# wrong reason and a later model install has nowhere to land.
+for d in /var/lib/otwono/models/manifests /var/lib/otwono/models/blobs; do
+    [ -d "$d" ] || { echo "OTWONO-AI-FAIL missing catalog directory $d" >&2; exit 1; }
+done
+
+# The trust store must be readable. Empty is fine and is the shipped default; unreadable
+# is not, because it would silently become "trust nobody" for the wrong reason.
+[ -d /etc/otwono/publishers.d ] || {
+    echo "OTWONO-AI-FAIL missing publisher trust store /etc/otwono/publishers.d" >&2
+    exit 1
+}
+[ -n "$publishers" ] || { echo "OTWONO-AI-FAIL no publisher count from otwono-aid" >&2; exit 1; }
+[ -n "$backends" ] || { echo "OTWONO-AI-FAIL no backend list from otwono-aid" >&2; exit 1; }
+
+# The two must agree. Both come from the same probe, so a disagreement means the daemon is
+# advertising a backend it cannot use or hiding one it can -- either way the node is lying
+# about itself, which is exactly what a boot check is for.
+case "$backends" in
+    none) expected=unavailable ;;
+    *)    expected=available ;;
+esac
+[ "$infer" = "$expected" ] || {
+    echo "OTWONO-AI-FAIL backends=$backends implies $expected but inference reported $infer" >&2
+    exit 1
+}
+
+# A node with an engine installed but no confinement is reported, not failed: the operator
+# may have chosen that deliberately with --allow-unconfined, and a boot check is the wrong
+# place to overrule them. Printing it is what makes the choice visible.
+if [ "$backends" != "none" ] && [ "$sandbox" != "full" ]; then
+    echo "OTWONO-AI-WARN inference engine present but sandbox=$sandbox" >&2
+fi
+
+echo "OTWONO-AI-OK tier=$tier local_inference=$infer backends=$backends sandbox=$sandbox models=$models publishers=$publishers"

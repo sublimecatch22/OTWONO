@@ -1,0 +1,31 @@
+[package]
+name = "otwono-netd"
+description = "OTWONO node mesh daemon: identity-bound peer discovery and authenticated transport."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "otwono-netd"
+path = "src/main.rs"
+
+[dependencies]
+otwono-proto = { workspace = true }
+otwono-identity = { workspace = true }
+otwono-net = { workspace = true }
+# For ContentId's derivation and BLAKE3 chunk digests, so a fetched object is verified with
+# exactly the derivation the store uses. Note that the *label* check is deliberately NOT
+# shared with otwono-store: see content::may_leave_a_node.
+otwono-store = { workspace = true }
+otwono-envelope = { workspace = true }
+otwono-pointer = { workspace = true }
+# For the identity daemon's capability names. A dependency on the interface, not the
+# implementation: renaming a capability must be a compile error here, not a runtime denial.
+otwono-idd = { workspace = true }
+otwono-stored = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+data-encoding = "2"
+zeroize = "1"

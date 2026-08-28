@@ -1,0 +1,20 @@
+[package]
+name = "otwono-walletctl"
+description = "OTWONO wallet CLI: create a wallet, show its status, and derive addresses."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "otwono-walletctl"
+path = "src/main.rs"
+
+[dependencies]
+otwono-proto = { workspace = true }
+serde_json = { workspace = true }
+# Prompting without echo. Integrated rather than written (CLAUDE.md §2.3): reading a
+# passphrase from a terminal correctly means termios, and this crate does it in pure Rust so
+# it cross-compiles to aarch64 with no C toolchain.
+rpassword = "7"

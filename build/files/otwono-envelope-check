@@ -1,0 +1,344 @@
+#!/bin/sh
+# OTWONO envelope check: does a message survive its sender going away? (ADR-0028)
+#
+# The property store-and-forward exists for, and the one two nodes structurally cannot test.
+# It needs three parties: a sender, a carrier that is neither party, and a recipient that is
+# absent when the message is sent and returns after the sender has gone.
+#
+# Roles come from the ordinal in the MAC, the same way the content check learns its share:
+#
+#   node 1  sender     seals an envelope to a peer that has gone away, and offers it
+#   node 2  carrier    takes custody of it through the carry pass, unprompted
+#   node 3  recipient  is powered off, then returns and collects from the carrier
+#
+# # Why the sender waits for a peer to disappear
+#
+# It seals to a peer it knows is *currently unreachable*, which is exactly the case
+# store-and-forward exists for. It can do that because it captured that peer's signed sharing
+# binding while the peer was still up (ADR-0019 -- a binding travels in the Hello after a
+# handshake), and a binding is a file that outlives the connection.
+#
+# It also means the sender needs no coordination channel: nothing tells node 1 which peer is
+# node 3, and nothing needs to. The peer that goes away is the recipient by construction,
+# because the harness is what powers it off.
+set -eu
+
+WORK=/var/lib/otwono/envelope-check
+STAMP=/var/lib/otwono/envelope-check.sealed
+
+fail() { echo "OTWONO-ENVELOPE-FAIL $*" >&2; exit 1; }
+step() { echo "OTWONO-ENVELOPE-STEP $*"; }
+
+node_total=1
+node_ordinal=1
+for dev in /sys/class/net/*/address; do
+    a=$(cat "$dev" 2>/dev/null) || continue
+    case "$a" in
+        52:54:00:07:*)
+            node_total=$(( 0x$(echo "$a" | cut -d: -f5) ))
+            node_ordinal=$(( 0x$(echo "$a" | cut -d: -f6) ))
+            break
+            ;;
+    esac
+done
+
+# Two nodes cannot hold a message for an absent sender: the carrier would have to be one of
+# the two parties. Say so and stop, rather than appearing to test something.
+[ "$node_total" -ge 3 ] || {
+    echo "OTWONO-ENVELOPE-SKIP store-and-forward needs three nodes; this segment has $node_total"
+    exit 0
+}
+
+mkdir -p "$WORK"; chmod 0700 "$WORK"
+
+# Full NodeIDs, not fingerprints. `--peers` prints the fingerprint because that list is for
+# a person to read, and the first version of this check parsed it and got nothing: a
+# fingerprint is truncated, and `--peer-binding --peer` matches on the full id precisely
+# because choosing whose key to seal data to is a decision, and this system does not make
+# decisions against truncated identifiers.
+connected_ids() {
+    otwono-netd --peer-ids --socket /run/otwono/net.sock --perm-socket /run/otwono/perm.sock 2>/dev/null
+}
+
+case "$node_ordinal" in
+1)
+    # --- sender ------------------------------------------------------------------------
+    [ -f "$STAMP" ] && { echo "OTWONO-ENVELOPE-SKIP already sealed on an earlier boot"; exit 0; }
+
+    step "capturing both peers' sharing bindings while they are still up"
+    i=0
+    captured=0
+    while [ "$i" -lt 60 ]; do
+        captured=0
+        for id in $(connected_ids); do
+            if otwono-netd --peer-binding "$WORK/$id.binding" --peer "$id" \
+                    --socket /run/otwono/net.sock >/dev/null 2>&1; then
+                captured=$(( captured + 1 ))
+            fi
+        done
+        [ "$captured" -ge 2 ] && break
+        i=$((i + 1))
+        sleep 5
+    done
+    [ "$captured" -ge 2 ] || fail "captured $captured of 2 peer bindings"
+    step "captured $captured bindings"
+
+    # Now wait for one of them to go away. That peer is the recipient.
+    #
+    # "Gone" means *sustainedly* gone, and the distinction is the whole correctness of this
+    # check. A guest under TCG with one vCPU that is busy — running the content check, say —
+    # can miss enough heartbeats to drop out of `connected` for a poll or two and come
+    # straight back. The first version treated the first absence as departure and sealed to
+    # a node that was still running: on a three-node run it picked the *carrier*, which then
+    # correctly declined to carry its own mail ("1 addressed to this node") and the run hung
+    # waiting for a delivery that was never going to happen.
+    #
+    # So a peer must be missing for GONE_POLLS consecutive polls, and at least one other
+    # peer must still be present — a moment where everything vanishes is this node's network
+    # going quiet, not a peer departing, and picking a victim from it would be a guess.
+    step "waiting for a peer to stay away, so there is somebody to send to who cannot receive"
+    GONE_POLLS=12
+    gone=""
+    i=0
+    absent_id=""
+    absent_count=0
+    while [ "$i" -lt 240 ]; do
+        here=$(connected_ids)
+        missing=""
+        present=0
+        for f in "$WORK"/*.binding; do
+            [ -f "$f" ] || continue
+            id=$(basename "$f" .binding)
+            case " $here " in
+                *" $id "*) present=$(( present + 1 )) ;;
+                *) missing="$missing $id" ;;
+            esac
+        done
+
+        # One candidate at a time, and only while somebody else is still answering.
+        candidate=""
+        if [ "$present" -ge 1 ]; then
+            candidate=$(echo "$missing" | awk '{print $1}')
+        fi
+
+        if [ -n "$candidate" ] && [ "$candidate" = "$absent_id" ]; then
+            absent_count=$(( absent_count + 1 ))
+        else
+            absent_id="$candidate"
+            absent_count=$([ -n "$candidate" ] && echo 1 || echo 0)
+        fi
+
+        if [ "$absent_count" -ge "$GONE_POLLS" ]; then
+            gone="$absent_id"
+            break
+        fi
+        i=$((i + 1))
+        sleep 5
+    done
+    [ -n "$gone" ] || fail "no peer stayed away within the window; nothing to send to"
+    # The whole peer set at the moment of the decision, so a future misfire is one line to
+    # diagnose rather than three disk mounts.
+    step "peer $gone stayed away for $(( GONE_POLLS * 5 ))s; still connected: $(connected_ids | tr '\n' ' ')"
+    step "sealing to $gone"
+
+    printf 'otwono envelope check: for a node that is not here %s\n' "$(date -u +%s%N)" \
+        > "$WORK/message.txt"
+    sent=$(otwono-storectl envelope-send --file "$WORK/message.txt" \
+        --recipient "$WORK/$gone.binding" --hold-hours 2 2>&1) \
+        || fail "sealing an envelope failed: $sent"
+    envelope=$(echo "$sent" | awk 'NR==1 {print $1}')
+    [ -n "$envelope" ] || fail "envelope-send returned no id: $sent"
+    echo "$envelope" > "$STAMP"
+    echo "OTWONO-ENVELOPE-SEALED envelope=$envelope recipient=$gone"
+    ;;
+2)
+    # --- carrier -----------------------------------------------------------------------
+    # Nothing here drives the carry pass on purpose for the first while: the daemon's own
+    # carriage sweep should take custody unprompted, exactly as replication does, and a check
+    # that reached for the manual path first would never find out whether it does.
+    step "waiting to be offered somebody else's mail"
+    carried=""
+    i=0
+    # Wider than it looks it needs to be: the sender does not seal until a peer has stayed
+    # away for a full minute, and every step here is a subprocess on a single TCG vCPU.
+    while [ "$i" -lt 240 ]; do
+        carried=$(otwono-storectl envelope-held 2>/dev/null | awk 'NR==1 {print $1}') || carried=""
+        case "$carried" in
+            [0-9a-f]*) break ;;
+            *) carried="" ;;
+        esac
+        # After four minutes, ask directly as well — and not before, because the sweep is the
+        # mechanism under test and the fallback silently substitutes for it. At one minute the
+        # two were racing: the sender does not seal until a peer has stayed away for a minute,
+        # so the envelope appears long after this loop starts, and whichever of the two
+        # happened to be due first took it. One run had the manual call win by half a second.
+        # Four minutes, then every two, gives the thirty-second sweep at least eight turns
+        # before this one interferes.
+        #
+        # Which of them took it is recorded on the marker below rather than left to be
+        # inferred, since `OTWONO-ENVELOPE-CARRIED` looks identical either way.
+        #
+        # The reply is printed, not discarded. A carry pass now names why it took nothing —
+        # a peer with an empty bag, an envelope already held, a store refusing on budget —
+        # and throwing that away is what made the previous failure cost a run to diagnose.
+        # Every twenty-fourth poll, not every one. Each `--carry` opens a Noise channel to every
+        # connected peer, and on a segment of single-vCPU TCG guests that is real load on
+        # the machines this one is waiting for — the other nodes are still running their own
+        # content checks, and slowing them down is slowing down the thing being waited for.
+        # The daemon's own sweep is the mechanism under test anyway; this is the fallback
+        # that says so when the sweep is not doing its job.
+        if [ "$i" -gt 36 ] && [ $(( i % 24 )) -eq 0 ]; then
+            carry_out=$(otwono-netd --carry --socket /run/otwono/net.sock 2>&1) || carry_out="carry pass failed: $carry_out"
+            [ -n "$carry_out" ] && echo "OTWONO-ENVELOPE-STEP carry: $(echo "$carry_out" | tr '\n' ';')"
+        fi
+        i=$((i + 1))
+        sleep 5
+    done
+    [ -n "$carried" ] || fail "took custody of nothing within the window"
+
+    # Say which one carried it. `otwono-netd` logs `carrying <id>…` from the carriage sweep
+    # and from nowhere else — the manual `--carry` path does not print it — so its presence
+    # is the difference between the daemon doing this on its own and this script doing it for
+    # the daemon. Not a failure when it is `hand`: the sweep can legitimately be slow on a
+    # single TCG vCPU, and failing the run for that would trade one silent result for a
+    # flaky one. It just must not be invisible.
+    by=hand
+    if journalctl -u otwono-netd --no-pager 2>/dev/null \
+        | grep -qa "otwono-netd: carrying $(printf '%s' "$carried" | cut -c1-16)"; then
+        by=sweep
+    fi
+    echo "OTWONO-ENVELOPE-CARRIED envelope=$carried by=$by"
+
+    # And then watch it go (ADR-0028 §7). The recipient reports delivery once the bytes are
+    # on its own disk, and this node gives up custody in response — so this marker is the
+    # only place a *booted* node shows drop on delivery happening. Without it the feature
+    # would be unit-tested and unobserved.
+    #
+    # Nothing here drives it. If this never empties, the carrier is holding an envelope that
+    # was delivered, which is the thing being tested and a failure worth reporting.
+    step "waiting to be told the envelope arrived, so this node can stop holding it"
+    i=0
+    while [ "$i" -lt 240 ]; do
+        still=$(otwono-storectl envelope-held 2>/dev/null | awk 'NR==1 {print $1}') || still=""
+        case "$still" in
+            [0-9a-f]*) ;;
+            *)
+                # The custody record is gone. That alone has never been the interesting
+                # part: dropping the record emptied the carriage index before ADR-0031 too,
+                # when the ciphertext stayed on disk for ever afterwards. So also ask the
+                # daemon what it *freed*, which is the one place a running node says whether
+                # the bytes went with the record.
+                freed=$(journalctl -u otwono-netd --no-pager 2>/dev/null \
+                    | sed -n 's/.*released .*which says it arrived (\([0-9][0-9]*\) bytes freed).*/\1/p' \
+                    | tail -1)
+                [ -n "$freed" ] \
+                    || fail "custody of $carried ended without the daemon reporting a release"
+                [ "$freed" -gt 0 ] \
+                    || fail "released $carried and freed $freed bytes; the record went and the ciphertext stayed"
+                echo "OTWONO-ENVELOPE-DROPPED envelope=$carried freed=$freed"
+                exit 0
+                ;;
+        esac
+        i=$((i + 1))
+        sleep 5
+    done
+    fail "still carrying $carried after its recipient collected it"
+    ;;
+3)
+    # --- recipient ---------------------------------------------------------------------
+    # On the first boot there is nothing to collect: the sender has not sealed yet, and will
+    # not until this node is gone. The stamp records that this node has been here before.
+    #
+    # It is deliberately not *relied* on. This unit is ordered after the content check, and
+    # on the slowest node — which is this one, being last in the ordinal order — the harness
+    # can power the machine off in the seconds between that check finishing and this one
+    # starting. Then the second boot finds no stamp, reports "first boot", and the run fails
+    # for a reason that has nothing to do with store-and-forward.
+    #
+    # So what makes it the second boot is that a carrier is holding something, not that a
+    # file exists. Either way this node asks; the stamp only decides whether finding nothing
+    # is news. A first boot that has genuinely nothing to collect costs one short window and
+    # is powered off in the middle of it anyway.
+    was_here=1
+    if [ ! -f "$STAMP" ]; then
+        was_here=0
+        : > "$STAMP"
+    fi
+    attempts=240
+    [ "$was_here" -eq 0 ] && attempts=12
+
+    # Nothing here drives the collection on purpose for the first while, for the reason the
+    # carrier branch does not drive the carry pass: `otwono-netd` collects mail addressed to
+    # this node unprompted now, and a check that reached for `--collect` first would never
+    # find out whether it does. The previous run reached its recipient only because this
+    # script fetched the mail itself, which proves a command works and says nothing about
+    # the daemon.
+    #
+    # `--mail` is the read-only question: what is waiting, without fetching it. So the
+    # envelope id comes from the carrier, and whether it is *here* is a local fact — which
+    # makes "the sweep delivered it" and "this script delivered it" two different observable
+    # outcomes rather than one.
+    step "waiting for the collection sweep to bring this node its mail"
+    collected=""
+    out=""
+    i=0
+    while [ "$i" -lt "$attempts" ]; do
+        # Two ways to learn the envelope's id, because drop on delivery took the first one
+        # away. `--mail` asks the carriers what they are holding for this node, and that is
+        # empty both before the sender seals *and*, now, from the moment the sweep collects
+        # and the carrier lets go. Those two silences can be a second apart, so a five-second
+        # poll can miss the id entirely — which is exactly what happened on the run that
+        # first showed a carrier dropping: the envelope arrived, was opened, the carrier gave
+        # up custody, and this loop was still waiting for `--mail` to mention it.
+        #
+        # So also take the daemon at its word. It logs the full id of what it collected for
+        # this node, and unlike the carrier's offer list that line does not go away. It is
+        # better evidence anyway: the daemon saying what it did, rather than the test
+        # inferring it from what a peer still has.
+        waiting=$(otwono-netd --mail --socket /run/otwono/net.sock 2>&1 \
+            | awk '$2 == "waiting" { print $3; exit }')
+        if [ -z "$waiting" ]; then
+            waiting=$(journalctl -u otwono-netd --no-pager 2>/dev/null \
+                | sed -n 's/.*: collected \([0-9a-f][0-9a-f]*\) (.*addressed to this node.*/\1/p' \
+                | tail -1)
+        fi
+        if [ -n "$waiting" ]; then
+            if otwono-storectl open "$waiting" --out "$WORK/opened" >/dev/null 2>&1; then
+                collected="$waiting"
+                echo "OTWONO-ENVELOPE-SWEPT envelope=$collected"
+                break
+            fi
+            # After the first minute, ask by hand as well, and say so. If the sweep is what
+            # delivered it the marker above is already printed; if it is not, this is the
+            # line that says the daemon did not do its job.
+            if [ "$i" -gt 12 ] && [ $(( i % 12 )) -eq 0 ]; then
+                out=$(otwono-netd --collect --socket /run/otwono/net.sock 2>&1)
+                echo "OTWONO-ENVELOPE-STEP collect by hand: $(echo "$out" | tr '\n' ';')"
+                collected=$(echo "$out" | awk '$2 == "collected" { print $3; exit }')
+                [ -n "$collected" ] && break
+            fi
+        fi
+        i=$((i + 1))
+        sleep 5
+    done
+
+    if [ -z "$collected" ]; then
+        [ "$was_here" -eq 0 ] && {
+            echo "OTWONO-ENVELOPE-SKIP nothing held for this node yet; the sender seals once this node is away"
+            exit 0
+        }
+        fail "collected nothing within the window; last reply: $out"
+    fi
+
+    # Collected is not enough: the point is that the recipient can *read* it, which needs the
+    # key that was sealed to this node and nobody else (ADR-0019).
+    otwono-storectl open "$collected" --out "$WORK/opened" >/dev/null 2>&1 \
+        || fail "collected $collected but could not open it"
+    grep -q "otwono envelope check" "$WORK/opened" \
+        || fail "opened $collected and it was not the message that was sent"
+    echo "OTWONO-ENVELOPE-COLLECTED envelope=$collected bytes=$(wc -c < "$WORK/opened")"
+    ;;
+*)
+    echo "OTWONO-ENVELOPE-SKIP node $node_ordinal has no role in this check"
+    ;;
+esac

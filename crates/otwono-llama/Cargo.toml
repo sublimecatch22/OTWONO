@@ -1,0 +1,27 @@
+[package]
+name = "otwono-llama"
+description = "llama.cpp as an OTWONO AI backend: a supervised adapter process, not a linked engine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# For the hello frame and protocol version. Note the direction: the adapter depends on the
+# contracts crate, never the other way round, so otwono-ai stays buildable and testable on
+# a machine with no inference engine on it at all.
+otwono-ai = { workspace = true }
+otwono-proto = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# For killing the engine's whole process group without unsafe.
+rustix = { version = "0.38", features = ["process"] }
+# Kernel-enforced filesystem confinement for the engine (ADR-0012). Chosen partly because
+# it is applied by an ordinary syscall from safe Rust: the alternative, dropping privileges
+# in a pre_exec hook, would require unsafe in a process that handles untrusted model files.
+landlock = "0.4"
+
+[[bin]]
+name = "otwono-llama-backend"
+path = "src/main.rs"

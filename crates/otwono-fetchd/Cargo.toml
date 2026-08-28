@@ -1,0 +1,31 @@
+[package]
+name = "otwono-fetchd"
+description = "OTWONO fetch daemon: the only component that makes outbound client connections off the mesh."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "otwono-fetchd"
+path = "src/main.rs"
+
+[dependencies]
+otwono-proto = { workspace = true }
+otwono-fetch = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+http = "1"
+# Blocking HTTPS with rustls and no async runtime, chosen and measured in ADR-0014.
+# Redirects are disabled in the client on purpose: following one is a decision about the
+# allow-list, and that decision belongs to this daemon rather than to a library.
+# platform-verifier, not the bundled Mozilla roots: an OS must trust what the operator put
+# in /etc/ssl/certs. Without it a node could not fetch from a mirror behind a private CA,
+# and the ca-certificates package in every recipe would be decorative. Found by pointing
+# the daemon at a real host and watching it refuse a certificate the system trusts.
+# default-features = false drops `gzip`. Transparent decompression is exactly wrong here:
+# the bytes we spool would not be the bytes the server's Range header addresses, so a
+# resumed fetch would ask for the wrong offset -- and on a server that accepted it, would
+# silently assemble a corrupt file. We fetch opaque blobs and the caller hashes them.
+ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"] }

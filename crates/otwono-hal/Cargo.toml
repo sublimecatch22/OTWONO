@@ -1,0 +1,19 @@
+[package]
+name = "otwono-hal"
+description = "OTWONO hardware abstraction: injectable probes for CPU, memory, accelerators, storage, network and power."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# rustix gives us statvfs(2) without writing `unsafe` ourselves, which lets the whole
+# crate keep `#![forbid(unsafe_code)]` (CLAUDE.md §5).
+rustix = { version = "0.38", features = ["fs"], optional = true }
+
+[features]
+default = ["statvfs"]
+statvfs = ["dep:rustix"]

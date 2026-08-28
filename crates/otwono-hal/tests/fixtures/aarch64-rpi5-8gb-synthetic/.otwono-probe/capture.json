@@ -1,0 +1,6 @@
+{
+  "synthetic": true,
+  "label": "Raspberry Pi 5 Model B, 8 GiB (SYNTHETIC)",
+  "note": "Hand-written from published Pi 5 specs and Cortex-A76 feature flags. Replace with a real capture from tools/capture-hw-fixture.sh when hardware is available.",
+  "arch": "aarch64"
+}

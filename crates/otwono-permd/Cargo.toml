@@ -1,0 +1,21 @@
+[package]
+name = "otwono-permd"
+description = "OTWONO permission broker: typed actions, policy evaluation, capability tokens, hash-chained audit log."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "otwono-permd"
+path = "src/main.rs"
+
+[dependencies]
+otwono-proto = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+blake3 = "1"
+getrandom = "0.2"
+glob = "0.3"

@@ -1,0 +1,18 @@
+[package]
+name = "otwono-pointer"
+description = "Signed mutable pointers: the second OTWONO primitive, and the rollback rules that make it safe."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+otwono-identity = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+data-encoding = "2"
+
+[dev-dependencies]
+otwono-identity = { workspace = true }
+data-encoding = "2"

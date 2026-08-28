@@ -1,0 +1,19 @@
+[package]
+name = "otwono-aid"
+description = "OTWONO AI daemon: model catalog, admission control, and backend selection over the Local Control Plane."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "otwono-aid"
+path = "src/main.rs"
+
+[dependencies]
+otwono-proto = { workspace = true }
+otwono-ai = { workspace = true }
+otwono-capability = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

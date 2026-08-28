@@ -1,0 +1,294 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://otwono.org/schemas/ai-backend-protocol-1.0.0.json",
+  "title": "OTWONO AI Backend Protocol",
+  "description": "The contract between otwono-aid and an AI backend adapter process: newline-delimited JSON-RPC 2.0 on the adapter's stdin/stdout, framed and supervised by otwono-ai::supervisor. The first line the adapter writes is a hello; every line after that is a JSON-RPC response to a request the daemon sent. This is a process boundary and a language boundary \u2014 an adapter need not be written in Rust \u2014 so it is a schema and not a Rust trait.",
+  "$defs": {
+    "hello": {
+      "title": "Backend hello",
+      "description": "The adapter's first line, written before any model is loaded. Loading can take minutes on small hardware; saying hello first is what lets the supervisor's hello timeout stay short enough to distinguish a dead adapter from a slow one.",
+      "type": "object",
+      "required": [
+        "protocol",
+        "engine",
+        "version"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "description": "Protocol version the adapter implements. A mismatch is refused at spawn rather than at first inference.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "engine": {
+          "description": "Engine name, e.g. \"llama.cpp\".",
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "description": "Engine version, for ai.capabilities and for bug reports. \"unknown\" when the adapter could not determine it, which is not a failure.",
+          "type": "string"
+        }
+      }
+    },
+    "load_params": {
+      "title": "backend.load params",
+      "description": "Load a model, replacing whatever was loaded before. One model at a time: holding several would mean the adapter dividing memory between them, and that decision belongs to admission control, which sits above and sees the whole node's budget.",
+      "type": "object",
+      "required": [
+        "model_path",
+        "context_tokens"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "model_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "context_tokens": {
+          "description": "Context window to reserve. Admission control already charged the node's memory budget for exactly this number, so it is not a hint the engine may round up.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "sequences": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1
+        },
+        "threads": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "gpu_layers": {
+          "description": "Layers to offload to an accelerator. Null leaves the engine's default.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "load_result": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "model_path",
+        "context_tokens",
+        "sequences",
+        "load_ms",
+        "engine_pid"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "pattern": "^\\d+\\.\\d+\\.\\d+$"
+        },
+        "model_path": {
+          "type": "string"
+        },
+        "context_tokens": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sequences": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "load_ms": {
+          "description": "Spawn to healthy, in milliseconds. Reported rather than inferred: load time is the number users notice on small hardware.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "engine_pid": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "infer_params": {
+      "title": "backend.infer params",
+      "type": "object",
+      "required": [
+        "prompt",
+        "max_tokens"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "prompt": {
+          "type": "string"
+        },
+        "max_tokens": {
+          "description": "Required, not defaulted: an unbounded generation occupies the node's only engine for as long as the model keeps talking.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "temperature": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "top_p": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "top_k": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "seed": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "stop": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        }
+      }
+    },
+    "infer_result": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "text",
+        "tokens_predicted",
+        "tokens_evaluated",
+        "stop_reason",
+        "prompt_truncated",
+        "timings"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "pattern": "^\\d+\\.\\d+\\.\\d+$"
+        },
+        "text": {
+          "type": "string"
+        },
+        "tokens_predicted": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tokens_evaluated": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "stop_reason": {
+          "description": "Why generation stopped. token_limit means the answer is cut off, and a caller that renders it without saying so is lying to the user by omission.",
+          "enum": [
+            "end_of_sequence",
+            "token_limit",
+            "stop_string",
+            "other"
+          ]
+        },
+        "prompt_truncated": {
+          "description": "Whether the engine dropped part of the prompt to fit the context window.",
+          "type": "boolean"
+        },
+        "timings": {
+          "type": "object",
+          "required": [
+            "prompt_ms",
+            "predicted_ms"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "prompt_ms": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "predicted_ms": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    },
+    "status_result": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "engine",
+        "engine_version",
+        "model_path",
+        "context_tokens",
+        "sequences"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "pattern": "^\\d+\\.\\d+\\.\\d+$"
+        },
+        "engine": {
+          "type": "string"
+        },
+        "engine_version": {
+          "type": "string"
+        },
+        "model_path": {
+          "description": "Null when no model is loaded, which is the state the adapter starts in. Null, not an empty string: a caller must not have to guess which of the two means \"nothing\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "context_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "sequences": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        }
+      }
+    },
+    "unload_result": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "unloaded"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "pattern": "^\\d+\\.\\d+\\.\\d+$"
+        },
+        "unloaded": {
+          "description": "False when nothing was loaded. Unloading nothing succeeds; it is not an error to ask for a state you are already in.",
+          "type": "boolean"
+        }
+      }
+    }
+  },
+  "$comment": "A library of message definitions, not a single-instance schema: each frame is validated against the $defs entry for its method. The Rust types are in otwono-llama's protocol module and the hello in otwono-ai's supervisor; tests/schema/tests/ai_backend_protocol_schema.rs checks that what those types actually serialize matches what is written here."
+}

@@ -1,0 +1,16 @@
+[package]
+name = "otwono-agent"
+description = "OTWONO assistant: the tier-shaped command grammar and its honest refusals."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+otwono-capability = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+otwono-capability = { workspace = true, features = ["testing"] }

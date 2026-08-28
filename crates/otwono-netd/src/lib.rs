@@ -1,0 +1,1473 @@
+//! OTWONO node mesh daemon.
+//!
+//! Brings up the overlay: announce on the LAN, browse for others, authenticate whatever
+//! answers, and publish the result on the control plane.
+//!
+//! # What this daemon is not trusted with
+//!
+//! This is the Z3 process — the one that parses input from the network
+//! (docs/security/SECURITY-MODEL.md). It holds the node's X25519 agreement secret, because
+//! Noise needs it in-process, and **nothing else**. The Ed25519 signing key that a NodeID
+//! names lives in `otwono-idd`, and this daemon asks for each session signature over the
+//! control plane ([`signer::BrokeredSigner`], ADR-0010).
+//!
+//! Compromising this daemon costs the node its sessions and its agreement key. Both are
+//! replaceable. It does not cost the node its name.
+
+#![forbid(unsafe_code)]
+
+pub mod content;
+pub mod signer;
+
+pub use content::{
+    fetch_object, fetch_object_from_peers, fetch_object_to_file, fetch_pointer, fetch_shared_index,
+    serve_session, ContentResponder, FanOutReport, FetchedMeta, FetchedObject, PeerSource,
+};
+pub use otwono_net::content::SharedIndexEntry;
+pub use signer::{BindError, BrokeredSigner};
+
+use otwono_identity::{NodeId, SessionSigner};
+use otwono_net::{should_initiate, Candidate, LinkAdapter, PeerState, PeerTable, SecureChannel, TcpLink};
+use otwono_proto::{
+    unknown_method, CallContext, Client, MethodDescription, RpcError, Service, ServiceDescription,
+};
+use serde_json::{json, Value};
+use std::net::{SocketAddr, TcpListener};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+pub const SERVICE_NAME: &str = "otwono-netd";
+pub const DESCRIBE_SCHEMA_VERSION: &str = "1.0.0";
+pub const CAPABILITY_READ: &str = "net.read";
+pub const CAPABILITY_CONNECT: &str = "net.connect";
+/// Fetching content from a peer. Distinct from `net.connect`, and distinct from
+/// `otwono-fetchd`'s `net.fetch`, which is outbound HTTPS to the Internet (ADR-0014) and
+/// has nothing to do with the mesh.
+pub const CAPABILITY_CONTENT: &str = "net.content";
+pub const DEFAULT_PORT: u16 = 8443;
+
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The first message each side sends once authenticated.
+///
+/// Carrying the NodeID again is redundant — the handshake already proved it — and that is
+/// the point: a mismatch here would mean the session and the application disagree about
+/// who is on the other end, which is worth failing on rather than papering over.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct Hello {
+    pub node_id: String,
+    pub fingerprint: String,
+    pub software: String,
+    /// Where this node may be sealed to (ADR-0019), signed by its own Ed25519 key.
+    ///
+    /// Public information — it is what `node.pub` publishes — and carried here so a peer
+    /// that has completed a handshake knows where to seal without a second exchange. Absent
+    /// on a node that has no sharing key, which is a node nothing can be shared with rather
+    /// than a node that cannot mesh: Noise needs the agreement key and nothing else, and
+    /// tying the two together would mean a node that could not share also could not talk.
+    ///
+    /// `#[serde(default)]` so a peer running an older build still parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sharing_binding: Option<otwono_identity::SharingBinding>,
+}
+
+pub struct NetState {
+    /// Where objects too large to return inline are written for the caller (ADR-0018).
+    /// `None` on a daemon started without one, and then `net.fetch` says so rather than
+    /// silently capping at the inline size.
+    pub handoff: Option<otwono_store::Handoff>,
+    /// Answers peers' content requests, when this node has a store to answer from. `None`
+    /// on a node built without one: such a node meshes and authenticates, and refuses every
+    /// content request by never listening for one.
+    pub responder: Option<Arc<ContentResponder>>,
+    /// Where a replica goes, when this node holds any (ADR-0026 §10). `None` on a node that
+    /// does not replicate, and then no replication request ever reaches the wire — which is
+    /// §9's rule, kept structural rather than left to a check somebody could forget.
+    ///
+    /// Not a `Cache`: the cache belongs to `otwono-stored`, and this daemon reaches it over
+    /// the control plane precisely so there is only ever one writer to its index.
+    pub holder: Option<Arc<dyn otwono_store::ReplicaHolder + Send + Sync>>,
+    /// What this node remembers about pointer sequences it has already seen (ADR-0027 §1).
+    ///
+    /// Not an `Option`, because "no memory" is a security decision and not an absence: a
+    /// node that forgot to configure one would silently drop to first-use trust on every
+    /// read. The default is [`otwono_pointer::NoMemory`], which is explicit about accepting
+    /// whatever it is given; the daemon replaces it with a
+    /// [`content::BrokeredPointers`] that asks `otwono-stored`.
+    pub pointer_memory: Arc<dyn otwono_pointer::SequenceMemory + Send + Sync>,
+    /// Where envelopes taken into custody go (ADR-0028 §2). `None` is a node that carries no
+    /// mail for anyone, and it makes no carriage traffic at all rather than asking and
+    /// discarding — the same structural consent `holder` gives replication.
+    pub carrier: Option<Arc<dyn otwono_store::Carrier + Send + Sync>>,
+    /// Where mail addressed to *this* node goes (ADR-0028 §9). `None` is a node that never
+    /// asks a carrier whether anything is waiting for it, and makes no collection traffic at
+    /// all — the same structural consent `carrier` gives carriage.
+    pub inbox: Option<Arc<dyn otwono_store::Inbox + Send + Sync>>,
+    /// Whatever can sign for this node. In the daemon it is a [`BrokeredSigner`]; in a
+    /// test it is usually a whole `NodeIdentity`, which signs locally.
+    pub signer: Arc<dyn SessionSigner>,
+    node_id: NodeId,
+    pub peers: Mutex<PeerTable>,
+    pub listen_addr: Mutex<Option<SocketAddr>>,
+}
+
+/// A pointer resolved from a peer, with the key that peer proved in the handshake.
+#[derive(Debug, Clone)]
+pub struct Resolved {
+    /// `None` when the peer publishes no such name, or will not discuss it — one answer for
+    /// both, so asking cannot enumerate a node's names.
+    pub record: Option<otwono_pointer::Pointer>,
+    /// Ed25519, from the handshake and never from a payload.
+    pub public_key: [u8; 32],
+}
+
+impl NetState {
+    pub fn new(signer: Arc<dyn SessionSigner>) -> Self {
+        let node_id = signer.node_id();
+        NetState {
+            handoff: None,
+            responder: None,
+            holder: None,
+            pointer_memory: Arc::new(otwono_pointer::NoMemory),
+            carrier: None,
+            inbox: None,
+            signer,
+            node_id,
+            peers: Mutex::new(PeerTable::new()),
+            listen_addr: Mutex::new(None),
+        }
+    }
+
+    /// Give this node somewhere to write objects too large to return inline.
+    pub fn with_handoff(mut self, handoff: otwono_store::Handoff) -> Self {
+        self.handoff = Some(handoff);
+        self
+    }
+
+    /// Give this node a store to serve peers from.
+    pub fn with_responder(mut self, responder: ContentResponder) -> Self {
+        self.responder = Some(Arc::new(responder));
+        self
+    }
+
+    /// Give this node somewhere to put replicas it takes from peers.
+    ///
+    /// Takes the trait rather than a concrete cache so a test can drive a real
+    /// `otwono_store::Cache` in-process, while the daemon passes a [`content::BrokeredCache`]
+    /// that goes over the control plane. The pass cannot tell them apart, which is the point.
+    pub fn with_holder(mut self, holder: Arc<dyn otwono_store::ReplicaHolder + Send + Sync>) -> Self {
+        self.holder = Some(holder);
+        self
+    }
+
+    /// Give this node a memory of the pointer sequences it has seen.
+    ///
+    /// Without one, every pointer read is a first read: correctly signed, possibly ancient,
+    /// and accepted (ADR-0027 §1). A test that only cares whether a record crosses the wire
+    /// can leave the default; anything asserting the rollback rule must set this.
+    pub fn with_pointer_memory(
+        mut self,
+        memory: Arc<dyn otwono_pointer::SequenceMemory + Send + Sync>,
+    ) -> Self {
+        self.pointer_memory = memory;
+        self
+    }
+
+    /// Give this node somewhere to put envelopes it takes custody of.
+    ///
+    /// Takes the trait rather than a concrete store so a test can drive a real
+    /// `EnvelopeStore` in-process while the daemon passes a [`content::BrokeredCarrier`] that
+    /// goes over the control plane. The pass cannot tell them apart, which is the point.
+    pub fn with_carrier(mut self, carrier: Arc<dyn otwono_store::Carrier + Send + Sync>) -> Self {
+        self.carrier = Some(carrier);
+        self
+    }
+
+    /// Give this node somewhere to put mail addressed to itself.
+    ///
+    /// Without one it never asks. Collection used to be a command a person ran — the
+    /// carriage half swept unprompted while the receiving half waited to be told — so a
+    /// message "arriving" meant a message becoming fetchable by a node that thought to look.
+    pub fn with_inbox(mut self, inbox: Arc<dyn otwono_store::Inbox + Send + Sync>) -> Self {
+        self.inbox = Some(inbox);
+        self
+    }
+
+    /// Take at most one envelope into custody from one peer (ADR-0028 §2).
+    ///
+    /// A fresh channel, for the reason [`Self::replicate_from`] opens one, and the consent
+    /// check happens before the connect for the same reason: a node that dialled and then
+    /// discovered it carries nothing would still have told the peer it was interested.
+    pub fn carry_from(&self, candidate: &Candidate) -> Result<content::CarryPass, String> {
+        let Some(carrier) = self.carrier.clone() else {
+            return Ok(content::CarryPass::NotCarrying);
+        };
+        match carrier.carriage_room(&[], self.now()) {
+            Some(room) if room.room_bytes > 0 => {}
+            _ => return Ok(content::CarryPass::NotCarrying),
+        }
+        let source = self.open_content_channel(candidate)?;
+        let content::PeerSource {
+            mut channel, link, ..
+        } = source;
+        content::carry_pass(&mut channel, &link, carrier.as_ref(), self.now()).map_err(|e| e.to_string())
+    }
+
+    /// Ask one peer what it is holding for this node, and fetch nothing.
+    ///
+    /// The scoped index question on its own. Answers "is anything waiting for me?" without
+    /// paying for it, and without being the thing that collects — which is what makes it
+    /// usable for watching whether the *sweep* is doing its job. A person asking after their
+    /// mail gets the same answer.
+    ///
+    /// Needs no inbox: nothing is kept, so there is nothing to consent to beyond the
+    /// `net.content` the caller already holds.
+    pub fn mail_at(&self, candidate: &Candidate) -> Result<Vec<otwono_net::content::CarriedEntry>, String> {
+        let source = self.open_content_channel(candidate)?;
+        let content::PeerSource {
+            mut channel, link, ..
+        } = source;
+        let me = channel.local().to_text();
+        let entries = content::fetch_carried_index(&mut channel, &link, true).map_err(|e| e.to_string())?;
+        // The same refusal `collect_addressed` makes, for the same reason: a carrier
+        // answering the scoped question with somebody else's mail is confused or probing.
+        if entries.iter().any(|e| e.recipient != me) {
+            return Err("a carrier offered mail addressed to somebody else".into());
+        }
+        Ok(entries)
+    }
+
+    /// Ask one peer what it is holding for this node, and fetch it (ADR-0028 §9).
+    ///
+    /// The scoped question, so this node never learns who else the carrier serves. Returns
+    /// the sealed objects; putting them where the recipient can open them is the caller's
+    /// decision and carries its own capability.
+    pub fn collect_from(&self, candidate: &Candidate) -> Result<content::Collected, String> {
+        let Some(inbox) = self.inbox.clone() else {
+            return Ok(content::Collected::NoInbox);
+        };
+        // Before the connect, as carriage checks its budget before the connect: a node that
+        // dialled and then found it could not keep what it collected would still have told a
+        // carrier it was interested, and would have learned nothing it could act on.
+        if !inbox.accepting() {
+            return Ok(content::Collected::NoInbox);
+        }
+        let source = self.open_content_channel(candidate)?;
+        let content::PeerSource {
+            mut channel, link, ..
+        } = source;
+        let collected =
+            content::collect_addressed(&mut channel, &link, inbox.as_ref()).map_err(|e| e.to_string())?;
+        // Kept here rather than handed back unkept. A collection that returned objects and
+        // left storing them to the caller is what made this a command instead of a daemon.
+        for object in &collected {
+            let sharing = object
+                .sharing
+                .as_ref()
+                .ok_or("an envelope arrived without the key to open it")?;
+            inbox.keep(
+                &object.content_id,
+                &object.bytes,
+                &otwono_store::object::Sharing {
+                    encryption: sharing.encryption.clone(),
+                    nonce_prefix: sharing.nonce_prefix.clone(),
+                    plaintext_size_bytes: sharing.plaintext_size_bytes,
+                    sealed_keys: vec![sharing.sealed_key.clone()],
+                },
+            )?;
+
+            // Only now, and only for what was actually written. `keep` returning `Err` above
+            // takes this whole function with it, so there is no path where a carrier is told
+            // to drop an envelope this node failed to store — and the sender may be gone, so
+            // the carrier's copy can be the last one in existence (ADR-0028 §7).
+            //
+            // Best effort from here. A carrier that refuses, answers something else, or never
+            // hears this keeps the envelope until its deadline, which is exactly what every
+            // carrier did before drop on delivery existed.
+            match content::report_delivered(&mut channel, &object.content_id) {
+                Ok(true) => {}
+                Ok(false) => eprintln!(
+                    "otwono-netd: {} would not give up custody of {}…; it will lapse on its own",
+                    candidate.claimed_node_id.fingerprint(),
+                    &object.content_id[..object.content_id.len().min(16)]
+                ),
+                Err(e) => eprintln!(
+                    "otwono-netd: collected {}… but could not tell {} to drop it: {e}",
+                    &object.content_id[..object.content_id.len().min(16)],
+                    candidate.claimed_node_id.fingerprint()
+                ),
+            }
+        }
+        Ok(content::Collected::Fetched(collected))
+    }
+
+    pub fn node_id(&self) -> &NodeId {
+        &self.node_id
+    }
+
+    fn now(&self) -> u64 {
+        otwono_identity::now_unix_ms()
+    }
+
+    /// Handle one inbound connection: authenticate, exchange hello, record the peer.
+    pub fn serve_inbound(&self, link: TcpLink) {
+        let _ = link.set_timeout(Some(HANDSHAKE_TIMEOUT));
+        match SecureChannel::accept(link, self.signer.as_ref()) {
+            Ok(mut channel) => {
+                let node_id = channel.peer().node_id;
+                let sharing = match self.exchange_hello(&mut channel, false) {
+                    Ok(sharing) => sharing,
+                    Err(e) => {
+                        eprintln!("otwono-netd: hello with {} failed: {e}", node_id.fingerprint());
+                        self.peers.lock().unwrap().record_failure(&node_id, e, self.now());
+                        return;
+                    }
+                };
+                let now = self.now();
+                // Deliberately no address. An accepted socket's remote port is the
+                // *dialer's* ephemeral source port, not a port anything listens on, so
+                // recording it produces an entry that is guaranteed to be refused when
+                // dialled — and `addresses` is append-only, so an inbound connection seen
+                // before the peer's advertisement makes that dead entry the first one every
+                // outbound pass tries, permanently. Where a peer can be reached is what an
+                // advertisement says; that a peer is here is what this connection proves,
+                // and only the second is knowledge this side has.
+                self.peers
+                    .lock()
+                    .unwrap()
+                    .record_authenticated(node_id, None, now, sharing);
+                eprintln!(
+                    "otwono-netd: inbound peer authenticated: {}",
+                    node_id.fingerprint()
+                );
+
+                // The accepting side answers; the dialling side asks (ADR-0017). A node
+                // with no store simply drops the channel here, as it always did.
+                if let Some(responder) = self.responder.clone() {
+                    if let Err(e) = content::serve_session(&mut channel, responder.as_ref()) {
+                        eprintln!(
+                            "otwono-netd: content session with {} ended: {e}",
+                            node_id.fingerprint()
+                        );
+                    }
+                }
+            }
+            Err(e) => eprintln!("otwono-netd: inbound handshake refused: {e}"),
+        }
+    }
+
+    /// Dial a candidate and authenticate it.
+    ///
+    /// The candidate's claimed NodeID is checked against what the handshake proved. A
+    /// mismatch means something on the LAN advertised an identity it does not hold, which
+    /// is an incident, not a retry.
+    pub fn dial(&self, candidate: &otwono_net::Candidate) -> Result<otwono_identity::NodeId, String> {
+        let now = self.now();
+        {
+            let mut peers = self.peers.lock().unwrap();
+            peers.observe(candidate.claimed_node_id, candidate.address, now);
+            peers.set_state(&candidate.claimed_node_id, PeerState::Connecting, now);
+        }
+
+        // Every failure path must land here. An earlier version recorded only the
+        // identity-mismatch case, so a peer that simply would not connect sat in
+        // `Connecting` for ever, with no error to explain it.
+        let result = self.dial_inner(candidate);
+        if let Err(e) = &result {
+            let now = self.now();
+            self.peers
+                .lock()
+                .unwrap()
+                .record_failure(&candidate.claimed_node_id, e.clone(), now);
+        }
+        result
+    }
+
+    fn dial_inner(&self, candidate: &otwono_net::Candidate) -> Result<otwono_identity::NodeId, String> {
+        let link = TcpLink::connect(candidate.address, HANDSHAKE_TIMEOUT)
+            .map_err(|e| format!("connect to {}: {e}", candidate.address))?;
+        link.set_timeout(Some(HANDSHAKE_TIMEOUT))
+            .map_err(|e| e.to_string())?;
+
+        let mut channel = SecureChannel::initiate(link, self.signer.as_ref()).map_err(|e| e.to_string())?;
+        let proved = channel.peer().node_id;
+
+        if proved != candidate.claimed_node_id {
+            return Err(format!(
+                "{} advertised {} but authenticated as {}",
+                candidate.address,
+                candidate.claimed_node_id.fingerprint(),
+                proved.fingerprint()
+            ));
+        }
+
+        let sharing = self.exchange_hello(&mut channel, true)?;
+        let now = self.now();
+        self.peers
+            .lock()
+            .unwrap()
+            .record_authenticated(proved, Some(candidate.address), now, sharing);
+        Ok(proved)
+    }
+
+    /// Dial a peer and fetch one object from it.
+    ///
+    /// A fresh channel every time, because roles are fixed for a channel's life and this
+    /// node has to be the one that dialled in order to ask. It is also the reason this does
+    /// not reuse a connection the peer opened to us.
+    pub fn fetch_from(&self, candidate: &Candidate, content_id: &str) -> Result<FetchedObject, String> {
+        let link = TcpLink::connect(candidate.address, content::FETCH_TIMEOUT)
+            .map_err(|e| format!("connect to {}: {e}", candidate.address))?;
+        link.set_timeout(Some(content::FETCH_TIMEOUT))
+            .map_err(|e| e.to_string())?;
+        // Taken before the link is moved into the channel: it is what bounds every message,
+        // and a LoRa link and an Ethernet link get very different numbers from it.
+        let properties = link.properties();
+
+        let mut channel = SecureChannel::initiate(link, self.signer.as_ref()).map_err(|e| e.to_string())?;
+        let proved = channel.peer().node_id;
+        if proved != candidate.claimed_node_id {
+            return Err(format!(
+                "{} advertised {} but authenticated as {}",
+                candidate.address,
+                candidate.claimed_node_id.fingerprint(),
+                proved.fingerprint()
+            ));
+        }
+        self.exchange_hello(&mut channel, true)?;
+        content::fetch_object(&mut channel, content_id, &properties).map_err(|e| e.to_string())
+    }
+
+    /// Ask one peer what it has sealed to this node (ADR-0020).
+    ///
+    /// The one question a recipient cannot answer for itself: a `SHARED` object's id is over
+    /// ciphertext keyed by a fresh per-object key, so it cannot be derived from the content
+    /// the way a `PUBLIC` object's can.
+    pub fn shared_with_me(&self, candidate: &Candidate) -> Result<Vec<SharedIndexEntry>, String> {
+        let link = TcpLink::connect(candidate.address, content::FETCH_TIMEOUT)
+            .map_err(|e| format!("connect to {}: {e}", candidate.address))?;
+        link.set_timeout(Some(content::FETCH_TIMEOUT))
+            .map_err(|e| e.to_string())?;
+        let properties = link.properties();
+
+        let mut channel = SecureChannel::initiate(link, self.signer.as_ref()).map_err(|e| e.to_string())?;
+        let proved = channel.peer().node_id;
+        if proved != candidate.claimed_node_id {
+            return Err(format!(
+                "{} advertised {} but authenticated as {}",
+                candidate.address,
+                candidate.claimed_node_id.fingerprint(),
+                proved.fingerprint()
+            ));
+        }
+        self.exchange_hello(&mut channel, true)?;
+        content::fetch_shared_index(&mut channel, &properties).map_err(|e| e.to_string())
+    }
+
+    /// Ask one peer what it is offering for replication, and take at most one (ADR-0026 §9).
+    ///
+    /// A fresh channel, for the same reason [`Self::fetch_from`] opens one: roles are fixed
+    /// for a channel's life, and this node has to be the one that dialled in order to ask.
+    ///
+    /// A node with no holder does nothing and says so, without dialling. That is §9's
+    /// "a node that does not replicate makes no replication traffic at all" enforced before
+    /// the TCP connect rather than after it — a node that connected and then discovered it
+    /// had nowhere to put anything would still have told the peer it was interested.
+    pub fn replicate_from(&self, candidate: &Candidate) -> Result<content::ReplicationPass, String> {
+        let Some(holder) = self.holder.clone() else {
+            return Ok(content::ReplicationPass::NotReplicating);
+        };
+        // Asked before the connect, not after. A holder that will take nothing -- no cache,
+        // no budget left, or `cache.replicate` refused -- must not cause a connection at
+        // all: a node that dialled and then discovered it had nowhere to put anything would
+        // still have told the peer it was interested, which is exactly what §9 rules out.
+        // The pass asks again once the channel is up; it is a local socket call, and it
+        // keeps the pass correct on its own for the tests that drive it directly.
+        match holder.replica_room(&[], self.now()) {
+            Some(room) if room.room_bytes > 0 => {}
+            _ => return Ok(content::ReplicationPass::NotReplicating),
+        }
+        let source = self.open_content_channel(candidate)?;
+        let content::PeerSource {
+            mut channel, link, ..
+        } = source;
+        content::replication_pass(&mut channel, &link, holder.as_ref(), self.now()).map_err(|e| e.to_string())
+    }
+
+    /// Ask one peer what one of its names points at (ADR-0027).
+    ///
+    /// A fresh channel, for the reason [`Self::fetch_from`] opens one: roles are fixed for a
+    /// channel's life and this node has to be the one that dialled in order to ask.
+    ///
+    /// The answer is verified against the key the handshake proved, inside
+    /// [`content::fetch_pointer`], so a peer cannot serve a record for anyone but itself.
+    /// `Ok(None)` means it does not publish that name, or would not say — one answer, so
+    /// asking cannot enumerate a node's names.
+    pub fn pointer_from(
+        &self,
+        candidate: &Candidate,
+        service: &str,
+        name: &str,
+    ) -> Result<Option<otwono_pointer::Pointer>, String> {
+        Ok(self.resolve_pointer(candidate, service, name)?.record)
+    }
+
+    /// The same resolution, and the key the handshake proved the peer holds.
+    ///
+    /// A caller that resolved a pointer usually wants to check something *else* the same
+    /// author signed — a wiki page's revision chain, for one (ADR-0032) — and a NodeID is a
+    /// hash of the public key, so the key cannot be recovered from the record. It has to come
+    /// from the handshake, which is the only place it is proved rather than asserted: a key
+    /// taken from a payload would be whatever the peer put there.
+    ///
+    /// Returned even when there is no record. "This peer publishes no such name" and "this is
+    /// who I was talking to" are separate facts, and the caller may want the second to decide
+    /// whether the first is worth believing.
+    pub fn resolve_pointer(
+        &self,
+        candidate: &Candidate,
+        service: &str,
+        name: &str,
+    ) -> Result<Resolved, String> {
+        let source = self.open_content_channel(candidate)?;
+        let content::PeerSource {
+            mut channel, link, ..
+        } = source;
+        let public_key = channel.peer().public_key;
+        let record = content::fetch_pointer(&mut channel, service, name, &link, self.pointer_memory.as_ref())
+            .map_err(|e| e.to_string())?;
+        Ok(Resolved { record, public_key })
+    }
+
+    /// Fetch one object from several peers at once (ADR-0015).
+    ///
+    /// A candidate that cannot be dialled or cannot be authenticated is dropped here rather
+    /// than carried into the transfer: a peer this node cannot prove the identity of is not
+    /// a peer, whatever it is serving.
+    /// Say what a partly-reachable set of peers cost, when it costs something.
+    ///
+    /// A fetch that reaches *some* peers proceeds, which is right — ADR-0015's whole claim
+    /// is that any holder will do. But with disjoint shares "some" is not enough, and the
+    /// failure then reads "the peer will not serve it, or does not have it": true of the
+    /// peers that answered, and silent about the one that never did.
+    ///
+    /// That silence cost a three-node run and a disk-mounting session to resolve. So an
+    /// unreachable candidate is folded into the error when the fetch fails, and never
+    /// mentioned when it succeeds — a peer that was not needed is not a fault.
+    fn with_unreachable(e: String, unreachable: &[String]) -> String {
+        if unreachable.is_empty() {
+            return e;
+        }
+        format!(
+            "{e} (and {} peer(s) could not be reached at all: {})",
+            unreachable.len(),
+            unreachable.join("; ")
+        )
+    }
+
+    pub fn fetch_from_peers(
+        &self,
+        candidates: &[Candidate],
+        content_id: &str,
+    ) -> Result<(FetchedObject, FanOutReport), String> {
+        let mut sources = Vec::new();
+        let mut unreachable = Vec::new();
+        for candidate in candidates {
+            match self.open_content_channel(candidate) {
+                Ok(source) => sources.push(source),
+                Err(e) => unreachable.push(format!("{}: {e}", candidate.address)),
+            }
+        }
+        if sources.is_empty() {
+            return Err(format!(
+                "no candidate could be reached and authenticated: {}",
+                unreachable.join("; ")
+            ));
+        }
+        content::fetch_object_from_peers(sources, content_id)
+            .map_err(|e| Self::with_unreachable(e.to_string(), &unreachable))
+    }
+
+    /// Fetch one object from several peers straight into a file owned by `uid`.
+    ///
+    /// The whole point is that nothing here is ever the size of the object: the workers hold
+    /// one chunk each and the bytes go to disk as they are verified (OQ-25).
+    pub fn fetch_to_file(
+        &self,
+        candidates: &[Candidate],
+        content_id: &str,
+        uid: u32,
+    ) -> Result<(FetchedMeta, FanOutReport, std::path::PathBuf), String> {
+        let handoff = self
+            .handoff
+            .as_ref()
+            .ok_or("this daemon was started without an export directory")?;
+        let mut sources = Vec::new();
+        let mut unreachable = Vec::new();
+        for candidate in candidates {
+            match self.open_content_channel(candidate) {
+                Ok(source) => sources.push(source),
+                Err(e) => unreachable.push(format!("{}: {e}", candidate.address)),
+            }
+        }
+        if sources.is_empty() {
+            return Err(format!(
+                "no candidate could be reached and authenticated: {}",
+                unreachable.join("; ")
+            ));
+        }
+
+        // The size is not known until the manifest arrives, so the free-space check cannot
+        // be exact. Zero here means "check the floor only"; a fetch that runs out of room
+        // fails on a short write, and the file is truncated to nothing when it does.
+        let mut outcome = None;
+        let exported = handoff
+            .export(uid, 0, |file| {
+                let file = file
+                    .try_clone()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                match content::fetch_object_to_file(sources, content_id, file) {
+                    Ok(v) => {
+                        outcome = Some(v);
+                        Ok(())
+                    }
+                    Err(e) => Err(std::io::Error::other(Self::with_unreachable(
+                        e.to_string(),
+                        &unreachable,
+                    ))),
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        let (meta, report) = outcome.ok_or("the fetch reported neither success nor failure")?;
+        Ok((meta, report, exported.path))
+    }
+
+    /// Dial a peer and authenticate it, returning a channel ready for content requests.
+    ///
+    /// Public because it is the seam every method above sits on — `fetch_from`,
+    /// `pointer_from`, `replicate_from`, `carry_from` and `collect_from` are all this plus one
+    /// exchange — and a test that needs to send one request without a wrapper around it
+    /// should use the same dialling and the same authentication, not a second copy of them.
+    pub fn open_content_channel(
+        &self,
+        candidate: &Candidate,
+    ) -> Result<content::PeerSource<TcpLink>, String> {
+        // Every failure path records the failure, the same discipline `dial` already has and
+        // for a sharper reason. `retry_candidates` returns peers that are `Discovered` or
+        // `Failed`, never `Connected`, so a peer that dies while connected is dialled by the
+        // sweeps, fails every time, and is *never demoted* — it stays "connected" for the
+        // life of the process. `net.peers` then reports a machine that is switched off as
+        // connected, and every sweep works from that. Seen on a three-node run: node 3 was
+        // powered down, both survivors logged `No route to host` against it every cycle, and
+        // both kept printing `connected=2`.
+        let result = self.open_content_channel_inner(candidate);
+        if let Err(e) = &result {
+            let now = self.now();
+            self.peers
+                .lock()
+                .unwrap()
+                .record_failure(&candidate.claimed_node_id, e.clone(), now);
+        }
+        result
+    }
+
+    fn open_content_channel_inner(
+        &self,
+        candidate: &Candidate,
+    ) -> Result<content::PeerSource<TcpLink>, String> {
+        // The address, not just the error. "connect: Connection refused" says a peer is
+        // unreachable and nothing about *where* this node tried, which on a mesh where the
+        // address came from an advertisement is the only fact that matters -- a stale entry,
+        // the wrong address family, and a peer that is genuinely down all read identically
+        // without it. Diagnosing a three-node run without this meant mounting a VM disk.
+        let link = TcpLink::connect(candidate.address, content::FETCH_TIMEOUT)
+            .map_err(|e| format!("connect to {}: {e}", candidate.address))?;
+        link.set_timeout(Some(content::FETCH_TIMEOUT))
+            .map_err(|e| e.to_string())?;
+        let properties = link.properties();
+        let mut channel = SecureChannel::initiate(link, self.signer.as_ref()).map_err(|e| e.to_string())?;
+        let proved = channel.peer().node_id;
+        if proved != candidate.claimed_node_id {
+            return Err(format!(
+                "advertised {} but authenticated as {}",
+                candidate.claimed_node_id.fingerprint(),
+                proved.fingerprint()
+            ));
+        }
+        self.exchange_hello(&mut channel, true)?;
+        Ok(content::PeerSource {
+            name: proved.fingerprint(),
+            channel,
+            link: properties,
+        })
+    }
+
+    /// Exchange `Hello` and return where the peer says it may be sealed to, verified.
+    ///
+    /// Returned rather than recorded here, because at this point the peer is not yet in the
+    /// table — the caller inserts it — and a setter called before the insert would silently
+    /// do nothing. That is exactly what the first version of this did.
+    fn exchange_hello<L: LinkAdapter>(
+        &self,
+        channel: &mut SecureChannel<L>,
+        initiator: bool,
+    ) -> Result<Option<otwono_identity::SharingBinding>, String> {
+        let mine = Hello {
+            node_id: self.node_id.to_text(),
+            fingerprint: self.node_id.fingerprint(),
+            software: format!("otwono-netd/{}", env!("CARGO_PKG_VERSION")),
+            // Best effort: a node whose identity daemon cannot be reached still meshes, and
+            // simply cannot be sealed to until it can.
+            sharing_binding: self.signer.sharing_binding().ok(),
+        };
+        let encoded = serde_json::to_vec(&mine).map_err(|e| e.to_string())?;
+        let expected = channel.peer().node_id;
+
+        let theirs: Hello = if initiator {
+            channel.send(&encoded).map_err(|e| e.to_string())?;
+            let raw = channel.recv().map_err(|e| e.to_string())?;
+            serde_json::from_slice(&raw).map_err(|e| e.to_string())?
+        } else {
+            let raw = channel.recv().map_err(|e| e.to_string())?;
+            let theirs = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+            channel.send(&encoded).map_err(|e| e.to_string())?;
+            theirs
+        };
+
+        if theirs.node_id != expected.to_text() {
+            return Err(format!(
+                "hello claims {} but the handshake authenticated {}",
+                theirs.node_id,
+                expected.to_text()
+            ));
+        }
+
+        // A peer that sends no binding is one nothing can be shared with, which is fine. A
+        // peer that sends one that does not check out is making a signed claim that is
+        // false, and the session ends — treating a lie as an absence would teach this
+        // daemon to ignore lies, and the claim is about where somebody's data would go.
+        if let Some(binding) = &theirs.sharing_binding {
+            if binding.node_id != expected {
+                return Err(format!(
+                    "{} offered a sharing binding for {}",
+                    expected.to_text(),
+                    binding.node_id.to_text()
+                ));
+            }
+            binding
+                .verify()
+                .map_err(|e| format!("{}'s sharing binding does not verify: {e}", expected.to_text()))?;
+        }
+        Ok(theirs.sharing_binding)
+    }
+}
+
+/// Accept loop. Runs until the listener errors.
+pub fn run_listener(state: Arc<NetState>, listener: TcpListener) {
+    if let Ok(addr) = listener.local_addr() {
+        *state.listen_addr.lock().unwrap() = Some(addr);
+    }
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => match TcpLink::from_stream(stream) {
+                Ok(link) => {
+                    let state = Arc::clone(&state);
+                    std::thread::spawn(move || state.serve_inbound(link));
+                }
+                Err(e) => eprintln!("otwono-netd: rejecting connection: {e}"),
+            },
+            Err(e) => {
+                eprintln!("otwono-netd: accept failed: {e}");
+                return;
+            }
+        }
+    }
+}
+
+/// Take at most one replica from a peer that just authenticated (ADR-0026 §9).
+///
+/// Inline, on the discovery thread, and that is a deliberate cost rather than an oversight.
+/// §9 chose "on connection" over a timer, and a timer is what a background worker would
+/// become — it would need a queue, a bound on how many passes run at once, and a policy for
+/// what to do with a peer that disconnected while queued. Running here means the pass is
+/// naturally serialised, naturally rate-limited by how often this node meets peers, and has
+/// no state of its own.
+///
+/// What it costs: on a node that has enabled replication, discovering the next peer waits
+/// for this pass. The pass is bounded — one object, at most [`content::MAX_FETCH_BYTES`] —
+/// but on a slow link that is still a real delay, and it is worth naming. On a stock node no
+/// holder is configured and this returns without opening anything.
+///
+/// A failure is logged and swallowed: the peer is authenticated and connected either way,
+/// and a replication pass that did not work out is not a reason to forget a peer.
+fn replication_pass_after_dial(state: &Arc<NetState>, candidate: &Candidate) {
+    if state.holder.is_none() {
+        return;
+    }
+    match state.replicate_from(candidate) {
+        Ok(content::ReplicationPass::Took {
+            content_id,
+            size_bytes,
+        }) => eprintln!(
+            "otwono-netd: holding a replica of {} ({size_bytes} bytes) from {}",
+            &content_id[..content_id.len().min(16)],
+            candidate.claimed_node_id.fingerprint()
+        ),
+        Ok(content::ReplicationPass::NothingTaken { offered, why }) => eprintln!(
+            "otwono-netd: {} offered {offered} object(s) for replication, took none: {why}",
+            candidate.claimed_node_id.fingerprint()
+        ),
+        Ok(content::ReplicationPass::NotReplicating) => {}
+        Err(e) => eprintln!(
+            "otwono-netd: replication pass with {} failed: {e}",
+            candidate.claimed_node_id.fingerprint()
+        ),
+    }
+}
+
+/// How long the discovery loop waits for a new advertisement before retrying known peers.
+const DISCOVERY_SWEEP: Duration = Duration::from_secs(30);
+
+/// Take at most one replica from one already-connected peer, on the sweep tick.
+///
+/// The dial-time pass is not enough on its own, and finding out why corrected ADR-0026 §9.
+/// A peer is marked `Connected` once and `retry_candidates` then skips it forever, while
+/// `dial_inner` drops its channel as soon as the handshake is done. So a "connection" is a
+/// momentary event that happens **once per peer for the life of the daemon** — which would
+/// have made a dial-time-only pass replicate one object per peer, ever, and only content
+/// that already existed when the two nodes first met. Anything published afterwards would
+/// never be offered to anybody.
+///
+/// This rides the sweep the discovery loop already runs, so §9's reasons survive intact:
+/// no new timer and no interval to configure; nothing happens offline, because a node with
+/// no peers has nothing to iterate; and it is still rate-limited, now by the sweep rather
+/// than by chance meetings.
+///
+/// **It is self-limiting rather than bounded by a rule.** A node whose budget is full
+/// answers `NotReplicating` before the dial, so it makes no traffic at all. A node with room
+/// asks around until it has none. One peer per tick, rotating, so no single peer is asked
+/// repeatedly while another is never asked.
+fn replication_sweep(state: &Arc<NetState>, turn: &mut usize, last: &mut std::time::Instant) {
+    if state.holder.is_none() {
+        return;
+    }
+    // Elapsed time, not "the browse timed out". Tying this to the timeout branch would mean
+    // a segment whose peers re-announce briskly never sweeps at all: every iteration would
+    // take the `Some(candidate)` path and the sweep would starve exactly where there are
+    // most peers to ask.
+    if last.elapsed() < DISCOVERY_SWEEP {
+        return;
+    }
+    *last = std::time::Instant::now();
+    let connected = state.peers.lock().unwrap().connected();
+    if connected.is_empty() {
+        return;
+    }
+    let peer = &connected[*turn % connected.len()];
+    *turn = turn.wrapping_add(1);
+    let Some(address) = peer.addresses.first().and_then(|a| a.parse().ok()) else {
+        return;
+    };
+    replication_pass_after_dial(
+        state,
+        &Candidate {
+            claimed_node_id: peer.node_id,
+            address,
+        },
+    );
+}
+
+/// Take custody of an envelope from one peer, on the sweep tick (ADR-0028 §2).
+///
+/// The mirror of [`replication_sweep`] and separate from it on purpose: a node may carry
+/// mail without replicating content, or replicate without carrying, because §8 made those
+/// two different agreements. Sharing a sweep would tie them together in code after the ADR
+/// took care to keep them apart.
+fn carriage_sweep(state: &Arc<NetState>, turn: &mut usize, last: &mut std::time::Instant) {
+    if state.carrier.is_none() {
+        return;
+    }
+    if last.elapsed() < DISCOVERY_SWEEP {
+        return;
+    }
+    *last = std::time::Instant::now();
+    let connected = state.peers.lock().unwrap().connected();
+    if connected.is_empty() {
+        return;
+    }
+    let peer = &connected[*turn % connected.len()];
+    *turn = turn.wrapping_add(1);
+    let Some(address) = peer.addresses.first().and_then(|a| a.parse().ok()) else {
+        return;
+    };
+    let candidate = Candidate {
+        claimed_node_id: peer.node_id,
+        address,
+    };
+    match state.carry_from(&candidate) {
+        Ok(content::CarryPass::Took {
+            envelope_id,
+            size_bytes,
+            until_ms,
+        }) => eprintln!(
+            "otwono-netd: carrying {}… ({size_bytes} bytes) for somebody until {until_ms},              taken from {}",
+            &envelope_id[..envelope_id.len().min(16)],
+            candidate.claimed_node_id.fingerprint()
+        ),
+        Ok(content::CarryPass::NothingTaken { offered, why }) => eprintln!(
+            "otwono-netd: {} offered {offered} envelope(s), took none: {why}",
+            candidate.claimed_node_id.fingerprint()
+        ),
+        Ok(content::CarryPass::NotCarrying) => {}
+        Err(e) => eprintln!(
+            "otwono-netd: carry pass with {} failed: {e}",
+            candidate.claimed_node_id.fingerprint()
+        ),
+    }
+}
+
+/// Ask one peer whether it is holding anything for this node (ADR-0028 §9).
+///
+/// The receiving half made a daemon. Carriage has swept unprompted since it was written,
+/// while collection was a command somebody ran, so a message "arriving" meant a message
+/// becoming fetchable by a node that thought to look. A three-node run reached its recipient
+/// only because the test harness invoked `otwono-netd --collect`.
+///
+/// One peer per turn, like the other two sweeps, and for the same reason: this runs inline on
+/// the loop that finds peers.
+fn collection_sweep(state: &Arc<NetState>, turn: &mut usize, last: &mut std::time::Instant) {
+    if state.inbox.is_none() {
+        return;
+    }
+    if last.elapsed() < DISCOVERY_SWEEP {
+        return;
+    }
+    *last = std::time::Instant::now();
+    let connected = state.peers.lock().unwrap().connected();
+    if connected.is_empty() {
+        return;
+    }
+    let peer = &connected[*turn % connected.len()];
+    *turn = turn.wrapping_add(1);
+    let Some(address) = peer.addresses.first().and_then(|a| a.parse().ok()) else {
+        return;
+    };
+    let candidate = Candidate {
+        claimed_node_id: peer.node_id,
+        address,
+    };
+    match state.collect_from(&candidate) {
+        // Silence when this node keeps no mail, and when there was none waiting. Both are
+        // almost every pass on almost every node, and a console filled every thirty seconds
+        // with "still nothing" is a console nobody reads. `BrokeredInbox::accepting` says the
+        // first one once, when it is a refusal an operator can act on.
+        Ok(content::Collected::NoInbox) => {}
+        Ok(content::Collected::Fetched(collected)) => {
+            for object in &collected {
+                // Whole id, not the sixteen-character prefix the other carriage lines use.
+                // This is the one an operator does something with next — `otwono-storectl
+                // open <id>` — and a truncated id cannot be pasted into that.
+                eprintln!(
+                    "otwono-netd: collected {} ({} bytes) addressed to this node, from {}",
+                    object.content_id,
+                    object.bytes.len(),
+                    candidate.claimed_node_id.fingerprint()
+                );
+            }
+        }
+        Err(e) => eprintln!(
+            "otwono-netd: collection pass with {} failed: {e}",
+            candidate.claimed_node_id.fingerprint()
+        ),
+    }
+}
+
+/// Discovery loop: browse the LAN, dial whoever we are supposed to dial, and keep trying.
+///
+/// The retry sweep is not optional. mDNS delivers `ServiceResolved` once per resolution,
+/// so a dial that loses a startup race — the peer's listener not yet bound, an address
+/// still settling — would otherwise never be attempted again, and the two nodes would sit
+/// forever having discovered each other and connected to nothing.
+pub fn run_discovery(state: Arc<NetState>, discovery: otwono_net::Discovery) {
+    let local = *state.node_id();
+    let mut turn = 0usize;
+    let mut carriage_turn = 0usize;
+    let mut collection_turn = 0usize;
+    // Starts one interval in the past so the first sweep does not wait for one: a node that
+    // has just met its peers is a node with the most to ask them.
+    let mut last_sweep = std::time::Instant::now() - DISCOVERY_SWEEP;
+    let mut last_carriage = std::time::Instant::now() - DISCOVERY_SWEEP;
+    let mut last_collection = std::time::Instant::now() - DISCOVERY_SWEEP;
+    loop {
+        let Some(candidate) = discovery.next_candidate(DISCOVERY_SWEEP) else {
+            retry_known_peers(&state, &local);
+            replication_sweep(&state, &mut turn, &mut last_sweep);
+            carriage_sweep(&state, &mut carriage_turn, &mut last_carriage);
+            collection_sweep(&state, &mut collection_turn, &mut last_collection);
+            continue;
+        };
+        replication_sweep(&state, &mut turn, &mut last_sweep);
+        carriage_sweep(&state, &mut carriage_turn, &mut last_carriage);
+        collection_sweep(&state, &mut collection_turn, &mut last_collection);
+        if candidate.claimed_node_id == local {
+            continue; // our own advertisement
+        }
+
+        // Both nodes see each other at once. Without an election both dial, and each ends
+        // up holding a half-used channel while refusing the other's.
+        if !should_initiate(&local, &candidate.claimed_node_id) {
+            let now = otwono_identity::now_unix_ms();
+            state
+                .peers
+                .lock()
+                .unwrap()
+                .observe(candidate.claimed_node_id, candidate.address, now);
+            continue;
+        }
+
+        let already_connected = state
+            .peers
+            .lock()
+            .unwrap()
+            .get(&candidate.claimed_node_id)
+            .is_some_and(|p| p.state == PeerState::Connected);
+        if already_connected {
+            continue;
+        }
+
+        match state.dial(&candidate) {
+            Ok(id) => {
+                eprintln!("otwono-netd: outbound peer authenticated: {}", id.fingerprint());
+                replication_pass_after_dial(&state, &candidate);
+            }
+            Err(e) => eprintln!("otwono-netd: dial failed: {e}"),
+        }
+    }
+}
+
+/// Re-dial every known peer this node should be initiating to and is not connected to.
+fn retry_known_peers(state: &Arc<NetState>, local: &otwono_identity::NodeId) {
+    let candidates: Vec<_> = state
+        .peers
+        .lock()
+        .unwrap()
+        .retry_candidates()
+        .into_iter()
+        .filter(|(node_id, _)| should_initiate(local, node_id))
+        .collect();
+
+    for (claimed_node_id, address) in candidates {
+        let candidate = Candidate {
+            claimed_node_id,
+            address,
+        };
+        match state.dial(&candidate) {
+            Ok(id) => {
+                eprintln!("otwono-netd: peer authenticated on retry: {}", id.fingerprint());
+                replication_pass_after_dial(state, &candidate);
+            }
+            // Expected while the other side is still coming up. The reason is kept on the
+            // peer record either way, so `otwono-netd --peers` can explain a mesh that
+            // will not form.
+            Err(e) => eprintln!(
+                "otwono-netd: retry of {} failed: {e}",
+                claimed_node_id.fingerprint()
+            ),
+        }
+    }
+}
+
+pub struct NetService {
+    state: Arc<NetState>,
+    perm_socket: PathBuf,
+    /// Where collected mail is written. Configurable so the step that puts an envelope on
+    /// the recipient's disk can be tested somewhere other than a booted node.
+    store_socket: PathBuf,
+}
+
+impl NetService {
+    /// The store socket defaults to the well-known path, which is what a daemon uses.
+    /// [`NetService::with_store_socket`] is for a caller that has its own — a test, or a
+    /// second store on one machine — because a hardcoded path here meant the one step that
+    /// puts collected mail on disk could not be exercised anywhere but a booted node.
+    pub fn new(state: Arc<NetState>, perm_socket: PathBuf) -> Self {
+        NetService {
+            state,
+            perm_socket,
+            store_socket: otwono_proto::socket_path("store"),
+        }
+    }
+
+    pub fn with_store_socket(mut self, store_socket: PathBuf) -> Self {
+        self.store_socket = store_socket;
+        self
+    }
+
+    /// A peer to talk to: an address, and the NodeID the caller expects to find there.
+    ///
+    /// Both are required. Dialling an address without saying who should answer would make
+    /// this daemon connect to whatever is listening, which is exactly the check `dial`
+    /// exists to perform.
+    fn candidate(params: &Value) -> Result<Candidate, RpcError> {
+        let address = params
+            .get("address")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::invalid_params("an address is required"))?;
+        let node_id = params
+            .get("node_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::invalid_params("a node_id is required"))?;
+        Ok(Candidate {
+            claimed_node_id: otwono_identity::NodeId::parse(node_id)
+                .map_err(|e| RpcError::invalid_params(e.to_string()))?,
+            address: address
+                .parse()
+                .map_err(|e| RpcError::invalid_params(format!("bad address: {e}")))?,
+        })
+    }
+
+    fn authorize(&self, ctx: &CallContext, action: &str) -> Result<(), RpcError> {
+        let token = ctx
+            .capability
+            .as_deref()
+            .ok_or_else(|| RpcError::unauthorized(format!("{action} requires a capability token")))?;
+        let mut client = Client::connect(&self.perm_socket).map_err(|e| {
+            RpcError::unavailable(format!(
+                "cannot reach the permission broker at {}: {e}",
+                self.perm_socket.display()
+            ))
+        })?;
+        client
+            .call(
+                "perm.verify",
+                json!({ "token": token, "action": action, "subject": ctx.peer.subject() }),
+            )
+            .map_err(|e| RpcError::unavailable(format!("broker call failed: {e}")))?
+            .map(|_| ())
+    }
+}
+
+impl Service for NetService {
+    fn describe(&self) -> ServiceDescription {
+        ServiceDescription {
+            schema_version: DESCRIBE_SCHEMA_VERSION.to_string(),
+            service: SERVICE_NAME.to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            methods: vec![
+                MethodDescription::open("net.status", "This node's overlay identity and link state"),
+                MethodDescription::guarded(
+                    "net.peers",
+                    "Peers this node has met, and their authentication state",
+                    CAPABILITY_READ,
+                ),
+                MethodDescription::guarded(
+                    "net.connect",
+                    "Dial a peer at a given address and authenticate it",
+                    CAPABILITY_CONNECT,
+                ),
+                MethodDescription::guarded(
+                    "net.shared_with_me",
+                    "Ask one peer what it has sealed to this node (ADR-0020)",
+                    CAPABILITY_CONTENT,
+                ),
+                MethodDescription::guarded(
+                    "net.carry",
+                    "Take at most one envelope into custody from one peer (ADR-0028)",
+                    CAPABILITY_CONTENT,
+                ),
+                MethodDescription::guarded(
+                    "net.collect",
+                    "Ask one peer what it is holding for this node, and store it",
+                    CAPABILITY_CONTENT,
+                ),
+                MethodDescription::guarded(
+                    "net.mail",
+                    "Ask one peer what it is holding for this node, without fetching any of it",
+                    CAPABILITY_CONTENT,
+                ),
+                MethodDescription::guarded(
+                    "net.pointer",
+                    "Ask one peer what one of its names points at (ADR-0027)",
+                    CAPABILITY_CONTENT,
+                ),
+                MethodDescription::guarded(
+                    "net.fetch",
+                    "Fetch one content-addressed object from a peer, verified on arrival",
+                    CAPABILITY_CONTENT,
+                ),
+            ],
+        }
+    }
+
+    fn call(&self, ctx: &CallContext, method: &str, params: Value) -> Result<Value, RpcError> {
+        match method {
+            "net.status" => {
+                let peers = self.state.peers.lock().unwrap();
+                Ok(json!({
+                    "node_id": self.state.node_id().to_text(),
+                    "fingerprint": self.state.node_id().fingerprint(),
+                    "listen_addr": self.state.listen_addr.lock().unwrap().map(|a| a.to_string()),
+                    "discovery": otwono_net::SERVICE_TYPE,
+                    "peers_known": peers.len(),
+                    "peers_connected": peers.connected().len(),
+                }))
+            }
+            "net.peers" => {
+                // Who a node has met is privacy-relevant even though each NodeID is public.
+                self.authorize(ctx, CAPABILITY_READ)?;
+                let peers = self.state.peers.lock().unwrap().all();
+                serde_json::to_value(json!({ "peers": peers })).map_err(|e| RpcError::internal(e.to_string()))
+            }
+            "net.connect" => {
+                self.authorize(ctx, CAPABILITY_CONNECT)?;
+                let candidate = Self::candidate(&params)?;
+                let proved = self
+                    .state
+                    .dial(&candidate)
+                    .map_err(|e| RpcError::new(otwono_proto::code::UNAVAILABLE, e))?;
+                Ok(json!({ "node_id": proved.to_text(), "fingerprint": proved.fingerprint() }))
+            }
+            // net.content, the same capability a fetch needs: every id in the reply is one
+            // this node could then fetch, so being allowed to ask is being allowed to fetch.
+            // net.content, like the fetch it usually precedes: a pointer's answer is a
+            // content id this node could then ask for, so being allowed to resolve a name is
+            // being allowed to reach what it names.
+            "net.carry" => {
+                self.authorize(ctx, CAPABILITY_CONTENT)?;
+                let candidate = Self::candidate(&params)?;
+                let pass = self.state.carry_from(&candidate).map_err(RpcError::internal)?;
+                Ok(match pass {
+                    content::CarryPass::NotCarrying => json!({
+                        "schema_version": DESCRIBE_SCHEMA_VERSION,
+                        "carrying": false,
+                    }),
+                    content::CarryPass::NothingTaken { offered, why } => json!({
+                        "schema_version": DESCRIBE_SCHEMA_VERSION,
+                        "carrying": true,
+                        "offered": offered,
+                        "taken": Value::Null,
+                        "why": why,
+                    }),
+                    content::CarryPass::Took {
+                        envelope_id,
+                        size_bytes,
+                        until_ms,
+                    } => json!({
+                        "schema_version": DESCRIBE_SCHEMA_VERSION,
+                        "carrying": true,
+                        "taken": envelope_id,
+                        "size_bytes": size_bytes,
+                        "until_ms": until_ms,
+                    }),
+                })
+            }
+            "net.collect" => {
+                self.authorize(ctx, CAPABILITY_CONTENT)?;
+                let candidate = Self::candidate(&params)?;
+                // The storing happens inside `collect_from`, with the inbox the sweep uses.
+                // This method used to do it here instead, which meant the command and the
+                // daemon kept mail by two different paths — and only one of them was the one
+                // a node runs unattended.
+                let collected = self.state.collect_from(&candidate).map_err(RpcError::internal)?;
+                Ok(json!({
+                    "schema_version": DESCRIBE_SCHEMA_VERSION,
+                    // Said explicitly, because a node that will not keep mail and a node with
+                    // no mail waiting otherwise answer identically — and a caller staring at
+                    // an empty list has no way to tell which it is looking at.
+                    "collecting": !matches!(collected, content::Collected::NoInbox),
+                    "collected": collected
+                        .objects()
+                        .iter()
+                        .map(|o| o.content_id.clone())
+                        .collect::<Vec<_>>(),
+                }))
+            }
+            "net.mail" => {
+                self.authorize(ctx, CAPABILITY_CONTENT)?;
+                let candidate = Self::candidate(&params)?;
+                let waiting = self.state.mail_at(&candidate).map_err(RpcError::internal)?;
+                Ok(json!({
+                    "schema_version": DESCRIBE_SCHEMA_VERSION,
+                    "waiting": waiting.iter().map(|e| json!({
+                        "envelope_id": e.envelope_id,
+                        "size_bytes": e.size_bytes,
+                        "expires_at_ms": e.expires_at_ms,
+                    })).collect::<Vec<_>>(),
+                }))
+            }
+            "net.pointer" => {
+                self.authorize(ctx, CAPABILITY_CONTENT)?;
+                let candidate = Self::candidate(&params)?;
+                let service = params
+                    .get("service")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| RpcError::invalid_params("net.pointer needs a service"))?;
+                let name = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| RpcError::invalid_params("net.pointer needs a name"))?;
+                let found = self
+                    .state
+                    .resolve_pointer(&candidate, service, name)
+                    .map_err(RpcError::internal)?;
+                Ok(json!({
+                    "schema_version": DESCRIBE_SCHEMA_VERSION,
+                    "node_id": candidate.claimed_node_id.to_text(),
+                    "service": service,
+                    "name": name,
+                    // The key the handshake proved this peer holds, so a caller can check
+                    // something else the same author signed — a wiki revision chain, say.
+                    // A NodeID is a hash of it and a payload's copy would be the peer's
+                    // word for it, so this is the only honest source.
+                    "public_key": data_encoding::BASE64.encode(&found.public_key),
+                    // null for a name the peer does not publish or will not discuss. One
+                    // answer for both, so asking cannot enumerate a node's names.
+                    "record": found.record.map(|p| serde_json::to_value(p).unwrap_or(Value::Null)),
+                }))
+            }
+            "net.shared_with_me" => {
+                self.authorize(ctx, CAPABILITY_CONTENT)?;
+                let candidate = Self::candidate(&params)?;
+                let entries = self
+                    .state
+                    .shared_with_me(&candidate)
+                    .map_err(|e| RpcError::new(otwono_proto::code::UNAVAILABLE, e))?;
+                Ok(json!({
+                    "schema_version": DESCRIBE_SCHEMA_VERSION,
+                    "peer": candidate.claimed_node_id.to_text(),
+                    "entries": entries
+                        .iter()
+                        .map(|e| json!({
+                            "content_id": e.content_id,
+                            "plaintext_size_bytes": e.plaintext_size_bytes,
+                        }))
+                        .collect::<Vec<_>>(),
+                }))
+            }
+            "net.fetch" => {
+                self.authorize(ctx, CAPABILITY_CONTENT)?;
+                let content_id = params
+                    .get("content_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| RpcError::invalid_params("net.fetch needs a content_id"))?;
+                // One peer or several. Several is the point of ADR-0015 — every holder of a
+                // chunk is as good as any other, so a dense cluster transfers faster —
+                // and one peer is just the degenerate case of it.
+                let candidates: Vec<Candidate> = match params.get("peers").and_then(Value::as_array) {
+                    Some(list) => list.iter().map(Self::candidate).collect::<Result<_, _>>()?,
+                    None => vec![Self::candidate(&params)?],
+                };
+                if candidates.is_empty() {
+                    return Err(RpcError::invalid_params("net.fetch needs at least one peer"));
+                }
+                let names: Vec<String> = candidates.iter().map(|c| c.claimed_node_id.to_text()).collect();
+                // Explicit, not guessed. A caller that does not know an object's size asks
+                // for a file; one that knows it is small saves itself a file to clean up.
+                let to_file = params.get("to_file").and_then(Value::as_bool).unwrap_or(false);
+                if to_file {
+                    let (meta, report, path) = self
+                        .state
+                        .fetch_to_file(&candidates, content_id, ctx.peer.uid)
+                        .map_err(|e| RpcError::new(otwono_proto::code::UNAVAILABLE, e))?;
+                    return Ok(json!({
+                        "schema_version": DESCRIBE_SCHEMA_VERSION,
+                        "content_id": meta.content_id,
+                        "visibility": meta.visibility,
+                        "chunking": meta.chunking,
+                        "size_bytes": meta.size_bytes,
+                        // Present when the object is shared: the file on disk is ciphertext
+                        // until this is used, so leaving it behind would hand the caller a
+                        // file they cannot read and no way to find out why.
+                        "sharing": meta.sharing,
+                        "path": path.display().to_string(),
+                        "owner_uid": ctx.peer.uid,
+                        "asked": names,
+                        "manifest_from": report.manifest_from,
+                        "chunks_from": report.chunks_from,
+                        "peers_that_served": report.peers_that_served(),
+                        "dropped": report.dropped,
+                        // Caching a file-delivered object would need a cache.import that
+                        // does not exist; cache.put is inline and inherits the 640 KiB cap.
+                        "cached": false,
+                        "note": "this file is plaintext and yours; read it and unlink it",
+                    }));
+                }
+                let (fetched, report) = self
+                    .state
+                    .fetch_from_peers(&candidates, content_id)
+                    .map_err(|e| RpcError::new(otwono_proto::code::UNAVAILABLE, e))?;
+
+                // Never by default. Caching a peer's content is storing bytes the operator
+                // did not choose one at a time, so it is asked for or it does not happen
+                // (CLUSTER-CACHE.md §5).
+                let wanted_cache = params.get("cache").and_then(Value::as_bool).unwrap_or(false);
+                let cached = match (wanted_cache, self.state.responder.as_ref()) {
+                    (false, _) => json!(false),
+                    (true, None) => json!({ "error": "this daemon has no store to cache into" }),
+                    (true, Some(responder)) => match responder.cache(&fetched) {
+                        Ok(v) => v,
+                        // A cache miss is not a fetch failure. The bytes are verified and in
+                        // the caller's hands either way, and saying so beats discarding them.
+                        Err(e) => json!({ "error": e }),
+                    },
+                };
+                Ok(json!({
+                    "schema_version": DESCRIBE_SCHEMA_VERSION,
+                    "content_id": fetched.content_id,
+                    "visibility": fetched.visibility,
+                    "chunking": fetched.chunking,
+                    "size_bytes": fetched.bytes.len(),
+                    "sharing": fetched.sharing,
+                    "asked": names,
+                    "manifest_from": report.manifest_from,
+                    "chunks_from": report.chunks_from,
+                    "peers_that_served": report.peers_that_served(),
+                    "dropped": report.dropped,
+                    "cached": cached,
+                    "data": data_encoding::BASE64.encode(&fetched.bytes),
+                }))
+            }
+            other => Err(unknown_method(other)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A peer that was never reached is named when the fetch fails, and not otherwise.
+    ///
+    /// The silent version of this cost a three-node run: with disjoint shares a fetch needs
+    /// every peer, and "the peer will not serve it, or does not have it" was true of the
+    /// peers that answered while saying nothing about the one that never did.
+    #[test]
+    fn a_failed_fetch_names_the_peers_it_could_not_reach() {
+        let unreachable = vec![
+            "169.254.251.233:8443: connect to 169.254.251.233:8443: link I/O failed: Connection refused"
+                .to_string(),
+        ];
+        let reported = NetState::with_unreachable("the peer will not serve it".into(), &unreachable);
+        assert!(reported.starts_with("the peer will not serve it"), "{reported}");
+        assert!(
+            reported.contains("169.254.251.233:8443"),
+            "the address is the fact a reader needs: {reported}"
+        );
+        assert!(reported.contains("1 peer(s) could not be reached"), "{reported}");
+    }
+
+    /// A fetch that succeeded says nothing about peers it did not need.
+    ///
+    /// ADR-0015's claim is that any holder will do, so an unreachable peer is only a fault
+    /// when the object could not be assembled without it. Mentioning it on success would
+    /// teach an operator to ignore the line.
+    #[test]
+    fn an_unreachable_peer_is_not_mentioned_when_nothing_went_wrong() {
+        assert_eq!(
+            NetState::with_unreachable("some other failure".into(), &[]),
+            "some other failure",
+            "an empty unreachable list must not decorate the error"
+        );
+    }
+}

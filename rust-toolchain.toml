@@ -1,0 +1,13 @@
+# Pin the toolchain so a local run and a CI run see the same compiler and the same lints.
+#
+# Why this file exists: PR #1's first CI run failed on a clippy lint
+# (`collapsible_match`) that exists in 1.97 and not in the 1.94 the work was developed
+# against. `-D warnings` is worth keeping, but only a pinned toolchain makes it stable —
+# otherwise every new Rust release can turn a green branch red with no code change.
+#
+# Bumping this is a deliberate act: raise the version, run `cargo clippy --workspace
+# --all-targets -- -D warnings`, and fix what the new release found in the same commit.
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]

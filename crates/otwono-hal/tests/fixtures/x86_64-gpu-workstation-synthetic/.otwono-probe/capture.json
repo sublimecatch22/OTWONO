@@ -1,0 +1,6 @@
+{
+  "synthetic": true,
+  "label": "Ryzen 9 7950X + Radeon RX 7900 XTX 24 GiB (SYNTHETIC)",
+  "note": "Hand-written from published specs. Replace with a real capture when hardware is available.",
+  "arch": "x86_64"
+}
