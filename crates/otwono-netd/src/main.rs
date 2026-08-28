@@ -346,7 +346,10 @@ fn run(args: &[String]) -> Result<String, Error> {
     );
 
     server
-        .serve(Arc::new(NetService::new(state, perm_socket)), Shutdown::new())
+        .serve(
+            Arc::new(NetService::new(state, perm_socket).with_store_socket(store_socket)),
+            Shutdown::new(),
+        )
         .map_err(|e| Error::Startup(format!("serve failed: {e}")))?;
     Ok(String::new())
 }

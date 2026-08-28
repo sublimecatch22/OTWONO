@@ -2156,6 +2156,64 @@ fn an_envelope_reaches_its_recipient_through_a_carrier_that_is_neither_party() {
         "the key that arrived is not the one sealed to this node"
     );
     assert_eq!(collected[0].bytes.len() as u64, size_bytes);
+
+    // And `net.collect` puts it on the recipient's disk, which is the step that makes the
+    // envelope openable rather than merely fetched. It was hardcoded to the well-known store
+    // socket until now, so this was the one part of the chain that could only run on a
+    // booted node.
+    let inbox_dir = h.dir.join("recipient-store");
+    let inbox_socket = h.dir.join("recipient-store.sock");
+    let inbox = otwono_store::Store::encrypted(inbox_dir.join("store"), otwono_store::StorageKey::generate());
+    inbox.ensure_layout().unwrap();
+    let inbox_service = Arc::new(
+        otwono_stored::StoreService::new(inbox, h.perm_socket.clone()).with_identity(h.id_socket.clone()),
+    );
+    let sd = h.shutdown.clone();
+    let inbox_server = Server::bind(&inbox_socket).unwrap();
+    std::thread::spawn(move || inbox_server.serve(inbox_service, sd));
+    Client::connect_waiting(&inbox_socket, Duration::from_secs(5)).expect("the inbox never came up");
+
+    let net_socket = h.dir.join("recipient-net.sock");
+    let collecting_service = Arc::new(
+        otwono_netd::NetService::new(Arc::new(collector), h.perm_socket.clone())
+            .with_store_socket(inbox_socket.clone()),
+    );
+    let sd = h.shutdown.clone();
+    let net_server = Server::bind(&net_socket).unwrap();
+    std::thread::spawn(move || net_server.serve(collecting_service, sd));
+    Client::connect_waiting(&net_socket, Duration::from_secs(5)).expect("the collector never came up");
+
+    let reply = Client::connect(&net_socket)
+        .unwrap()
+        .call_with_capability(
+            "net.collect",
+            json!({ "node_id": carrier_node.to_text(), "address": carrier_addr.to_string() }),
+            &h.token("net.content"),
+        )
+        .unwrap()
+        .expect("net.collect");
+    assert_eq!(
+        reply["collected"],
+        json!([sealed_id]),
+        "net.collect did not report storing the envelope: {reply}"
+    );
+
+    let on_disk = Client::connect(&inbox_socket)
+        .unwrap()
+        .call_with_capability(
+            "store.serve_manifest",
+            json!({ "content_id": sealed_id, "from_chunk": 0, "max_chunks": 64,
+                    "peer": recipient.to_text() }),
+            &h.token("store.serve"),
+        )
+        .unwrap()
+        .expect("the collected envelope is in the recipient's own store");
+    assert_eq!(on_disk["visibility"], json!("shared"));
+    assert_eq!(
+        on_disk["sharing"]["sealed_key"]["recipient"],
+        json!(recipient.to_text()),
+        "the envelope is on disk without the key that opens it: {on_disk}"
+    );
 }
 
 /// A node whose broker refuses `envelope.carry` carries nobody's mail and asks nobody.

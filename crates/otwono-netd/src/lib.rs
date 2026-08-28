@@ -876,6 +876,9 @@ fn retry_known_peers(state: &Arc<NetState>, local: &otwono_identity::NodeId) {
 pub struct NetService {
     state: Arc<NetState>,
     perm_socket: PathBuf,
+    /// Where collected mail is written. Configurable so the step that puts an envelope on
+    /// the recipient's disk can be tested somewhere other than a booted node.
+    store_socket: PathBuf,
 }
 
 impl NetService {
@@ -895,8 +898,8 @@ impl NetService {
             otwono_stored::CAPABILITY_WRITE,
             "otwono-netd is storing an envelope collected for this node",
         )?;
-        let mut client = otwono_proto::Client::connect(otwono_proto::socket_path("store"))
-            .map_err(|e| format!("store socket: {e}"))?;
+        let mut client = otwono_proto::Client::connect(&self.store_socket)
+            .map_err(|e| format!("{}: {e}", self.store_socket.display()))?;
         client
             .call_with_capability(
                 "store.accept_shared",
@@ -915,8 +918,21 @@ impl NetService {
         Ok(object.content_id.clone())
     }
 
+    /// The store socket defaults to the well-known path, which is what a daemon uses.
+    /// [`NetService::with_store_socket`] is for a caller that has its own — a test, or a
+    /// second store on one machine — because a hardcoded path here meant the one step that
+    /// puts collected mail on disk could not be exercised anywhere but a booted node.
     pub fn new(state: Arc<NetState>, perm_socket: PathBuf) -> Self {
-        NetService { state, perm_socket }
+        NetService {
+            state,
+            perm_socket,
+            store_socket: otwono_proto::socket_path("store"),
+        }
+    }
+
+    pub fn with_store_socket(mut self, store_socket: PathBuf) -> Self {
+        self.store_socket = store_socket;
+        self
     }
 
     /// A peer to talk to: an address, and the NodeID the caller expects to find there.
