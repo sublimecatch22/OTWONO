@@ -144,8 +144,40 @@ ADR-0032 (the decisions), ADR-0027 (pointers, and the ordering rule this copies)
 otwono-wikictl write Getting-Started --file page.md
 otwono-wikictl read  Getting-Started --out page.md
 otwono-wikictl history Getting-Started
-otwono-wikictl read Getting-Started --from <NODEID> --at <ADDR> --out theirs.md
+otwono-wikictl read Getting-Started --from <NODEID> --out theirs.md
+otwono-wikictl delete Getting-Started
 ```
+
+`--from` needs no `--at`: a node already knows where the peers it is connected to are
+listening, so the tool asks it rather than making the caller join two commands' output.
+`--at` remains for naming an address the node does not have.
+
+### Deleting
+
+A delete publishes a **tombstone** — a signed, sequenced record saying "this no longer
+exists" (ADR-0027 §4), not a pointer that quietly stops being served. A name that goes silent
+is indistinguishable from a node that is unreachable, and a reader deserves to tell those
+apart.
+
+It removes nothing. The revisions and their bodies are content-addressed and stay readable to
+anyone holding an id, and any node that copied the page still has it. The reply says so,
+rather than letting the word "delete" imply a reach this system does not have.
+
+Deleting a name nobody used is refused: publishing a signed assertion about the absence of
+something that never existed would burn a sequence number to say nothing.
+
+A page therefore has three states, and the difference between the last two matters to whoever
+is holding the terminal:
+
+| State | What the pointer says | What a reader is told |
+|---|---|---|
+| never written | no record at all | "no page called X on this node" |
+| deleted | a tombstone, at some sequence | "X was deleted at sequence N; its revisions are still readable by id" |
+| present | a head revision | the page |
+
+Writing after a delete starts a **new chain**. Reattaching to what came before would make the
+deletion a thing that never quite happened; the old revisions stay readable by id, and this
+page's history begins again.
 
 Reading a peer's page checks three things before a byte is written, because a file on disk is
 what a person then reads and believes: the **pointer**, by `otwono-netd`, against the
