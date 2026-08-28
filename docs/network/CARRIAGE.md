@@ -7,9 +7,9 @@ carried by a second, and collected *and opened* by a third with the sender power
 whole collection.
 
 That does not make every part of this document verified. Drop on delivery is not implemented,
-nothing on the receiving side collects unprompted, and the run's take was driven by the CLI
-rather than by the daemon's own sweep — see §7 and `docs/build/VERIFICATION-LOG.md` for what
-the runs have and have not demonstrated.
+and on the run that demonstrated delivery both the take and the collection were driven by the
+CLI rather than by the daemons' own sweeps — see §7 and `docs/build/VERIFICATION-LOG.md` for
+what the runs have and have not demonstrated.
 
 This document describes the third of `DISTRIBUTED-SERVICES.md`'s three primitives. The
 decisions are ADR-0028's; this is how they are built.
@@ -100,6 +100,30 @@ own filtering.
 Neither question distinguishes "nothing for you" from "I will not say": both are an empty
 page, per ADR-0020's rule that asking must not reveal whether a node carries at all.
 
+## 3a. Both halves are daemons
+
+A node sweeps for mail addressed to it the way it sweeps for mail to carry: one peer per
+turn, on the same thirty-second cadence, on the same thread that finds peers. Nobody has to
+ask it to.
+
+That was not true at first, and the asymmetry was easy to miss. The carriage half swept
+unprompted from the day it was written while the receiving half waited to be told, so "the
+message arrives" meant "the message becomes fetchable by a node that thinks to look" — and
+the first three-node run reached its recipient only because the test harness ran
+`otwono-netd --collect` itself.
+
+Three things a sweep needs that a command does not:
+
+| | |
+|---|---|
+| **Not re-download** | A carrier holds an envelope until it expires even after handing it over — §7's drop on delivery is not built — so a sweep that did not check would refetch the same message every thirty seconds until the sender's expiry ran out. `Inbox::holds` is the check. |
+| **Not need `store.read`** | `otwono-netd` is the Z3 hostile-input daemon and does not hold it. So the check is `store.holds`, which answers one **named** content id with a bool and nothing else, guarded by `store.write`. That is the authority to avoid a redundant write, not the authority to read the store — see ADR-0030. |
+| **Not ask when it cannot keep** | `Inbox::accepting` is checked before the connect, as carriage checks its budget before the connect. A node that dialled and then found it had nowhere to put the mail would have told a carrier it was interested for nothing. |
+
+`otwono-netd --mail` asks what is waiting without fetching any of it. It is the read-only
+half of the same question, and it is what lets an operator — or a test — tell mail that
+arrived on its own apart from mail that was fetched by hand.
+
 ## 4. Custody is what authorises serving
 
 A carrier is by definition **not** the recipient, and ADR-0019's serving rule admits only the
@@ -185,11 +209,6 @@ flatter than the cache's.
   carrier currently holds until expiry even after the recipient has collected. Closing it
   needs either an explicit release from the recipient — a third wire method — or per-envelope
   chunk-serving state, and neither is written.
-- **Nothing collects automatically.** `content.addressed_to_me` exists and works, and the
-  carriage sweep runs unprompted, but nothing on the receiving side ever asks. A node learns
-  it has mail only when somebody runs `otwono-netd --collect`. The carriage half is a
-  daemon; the collection half is a command, and until that is fixed "the message arrives"
-  means "the message becomes fetchable".
 - **Re-relay in practice.** §7 concludes that a carrier may pass an envelope on, and the
   record's shape makes it structural rather than a permission. No test exercises a second hop.
 - **Forward secrecy.** The sharing key is long-lived, so compromising it opens every envelope

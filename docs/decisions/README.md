@@ -44,3 +44,4 @@ Rules:
 | 0027 | Signed mutable pointers: sequence numbers, not timestamps, and rollback is the threat | accepted |
 | 0028 | Addressed messages: the envelope already exists, so store-and-forward is about custody, and it is pulled | accepted |
 | 0029 | **DRAFT, for review** — a compact encoding for the ONM wire: measurements, four candidates, and a recommendation | draft |
+| 0030 | Asking whether an object is already here is a writer's question, not a reader's | accepted |

@@ -167,16 +167,43 @@ mod tests {
     fn a_transposition_is_caught_by_the_checksum() {
         // The failure BIP-39's checksum exists for, and the one most likely to happen off a
         // sheet of paper. Swapping two adjacent words keeps every word valid.
-        let m = Mnemonic::generate();
-        let mut words: Vec<&str> = m.phrase().split_whitespace().collect();
-        words.swap(3, 4);
-        if words[3] == words[4] {
-            return; // a repeated word makes the swap a no-op; nothing to assert
+        //
+        // A **fixed** phrase, and every adjacent swap in it, rather than one random swap in a
+        // freshly generated one. The checksum is eight bits for a twenty-four word phrase, so
+        // a transposition it does not catch is not a bug — it is the one time in 256 that the
+        // permuted entropy happens to check out. Written against a random phrase this test
+        // failed about one run in a hundred, measured over 300 runs, which is exactly often
+        // enough to be dismissed as noise and to be masking something one day.
+        //
+        // `debug_never_prints_the_words` below was fixed for the same reason. This one had
+        // the same defect and kept it.
+        const PINNED: &str = "medal calm festival valley panic escape garment cost sea abuse \
+                              salad ghost image fly cannon can invest sample dad tourist \
+                              reject page bleak dish";
+        let phrase = PINNED.split_whitespace().collect::<Vec<_>>().join(" ");
+        Mnemonic::parse(&phrase).expect("the pinned phrase must itself be valid");
+
+        let words: Vec<&str> = phrase.split_whitespace().collect();
+        let mut swapped = 0;
+        let mut caught = 0;
+        for i in 0..words.len() - 1 {
+            if words[i] == words[i + 1] {
+                continue; // a repeated word makes the swap a no-op; nothing to assert
+            }
+            swapped += 1;
+            let mut w = words.clone();
+            w.swap(i, i + 1);
+            if let Err(MnemonicError::BadChecksum) = Mnemonic::parse(&w.join(" ")) {
+                caught += 1;
+            }
         }
-        match Mnemonic::parse(&words.join(" ")) {
-            Err(MnemonicError::BadChecksum) => {}
-            other => panic!("expected a checksum error, got {other:?}"),
-        }
+        assert_eq!(swapped, 23, "the pinned phrase should have 23 adjacent swaps");
+        assert_eq!(
+            caught,
+            swapped,
+            "the checksum let {} of {swapped} adjacent transpositions through",
+            swapped - caught
+        );
     }
 
     #[test]
