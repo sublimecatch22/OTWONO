@@ -650,6 +650,19 @@ fi
 # because the peer may not have reached that step yet -- and because the peer's index is
 # taken once per session, so an object sealed after this node's last connection is only
 # visible on a later one. That is ADR-0020's stated cost, and here it is as a retry.
+# `discovered=none` here is usually not a failure, and it is worth saying so plainly because
+# the shape is misleading: this loop then runs its full six hundred seconds and the marker
+# reports `none` with nothing else wrong.
+#
+# The reason is above. Each node seals to **one** peer, chosen by `--peer-binding` with no
+# `--peer`, which takes whichever the peer table happened to order first. On three nodes that
+# is not a permutation: two nodes can both pick the third, and then one node has nothing
+# sealed to it at all and correctly discovers nothing. Roughly one node per three-node run
+# lands in that case, and spends ten minutes proving a negative.
+#
+# So this step asserts discovery *when something was sealed to this node* and tolerates the
+# case where nothing was. Making it unconditional means sealing to every connected peer
+# rather than one, which is a change to the step above and wants its own run to validate.
 step "asking the peer what it has sealed to this node"
 discovered=none
 i=0
