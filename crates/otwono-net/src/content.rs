@@ -158,6 +158,23 @@ pub enum Request {
         /// The path within it.
         name: String,
     },
+    /// I have this envelope now; you may stop holding it. (ADR-0028 §7)
+    ///
+    /// The third bound on amplification, and the only one that asks a node to be honest —
+    /// which is why it costs nothing to be lied to. There is no recipient field, for the
+    /// reason `AddressedToMe` has none: the only recipient a carrier will act on is the one
+    /// the handshake authenticated. A peer claiming delivery of somebody else's envelope is
+    /// naming an envelope it is not the recipient of, and the carrier refuses.
+    ///
+    /// So the worst a peer can do with this is tell a carrier to stop holding **its own**
+    /// mail, which is its own business. That is what makes an unauthenticated-in-content,
+    /// unacknowledged, best-effort message safe here.
+    ///
+    /// §5's refusal to acknowledge is not contradicted. That refusal protects the *sender*,
+    /// who learns nothing by being told; a carrier that just handed an envelope over already
+    /// knows the recipient is reachable, so this tells it nothing new.
+    #[serde(rename = "content.delivered")]
+    Delivered { envelope_id: String },
     /// One range of one chunk of one object.
     #[serde(rename = "content.chunk")]
     Chunk {
@@ -398,6 +415,14 @@ pub enum Response {
     /// proved, in `otwono-netd`.
     #[serde(rename = "pointer")]
     Pointer(PointerReply),
+    /// Whether a carrier gave up custody, in answer to `content.delivered`.
+    ///
+    /// `false` covers "I was not holding that", "I hold it for somebody else" and "I do not
+    /// carry mail at all", deliberately. Distinguishing them would make this a way to ask a
+    /// carrier whether it holds a given envelope for a given node, which is the enumeration
+    /// question ADR-0028 §9 split two methods apart to avoid.
+    #[serde(rename = "released")]
+    Released { envelope_id: String, released: bool },
     /// Absent, refused, damaged, or not part of that object. One answer for all of them.
     #[serde(rename = "not_available")]
     NotAvailable { content_id: String },
@@ -519,10 +544,16 @@ impl Request {
             // at, and the id is the answer rather than the question.
             // Neither carriage question names a content id: both ask *which* envelopes, and
             // the ids are the answer rather than the question.
+            //
+            // `Delivered` does name one, and still answers None. This method means "the
+            // request is asking for this object", which decides both the serving check and
+            // the shape of a refusal — and `Delivered` asks for nothing. Its id is validated
+            // below on its own.
             Request::SharedWithMe { .. }
             | Request::Replicable { .. }
             | Request::Relayable { .. }
             | Request::AddressedToMe { .. }
+            | Request::Delivered { .. }
             | Request::Pointer { .. } => None,
         }
     }
@@ -545,6 +576,11 @@ impl Request {
                         asked: *max_chunks as u64,
                         ceiling: MAX_CHUNKS_PER_REQUEST as u64,
                     });
+                }
+            }
+            Request::Delivered { envelope_id } => {
+                if !is_hex_digest(envelope_id) {
+                    return Err(ProtocolError::NotHex { field: "envelope_id" });
                 }
             }
             Request::Chunk {

@@ -266,6 +266,28 @@ impl NetState {
                     sealed_keys: vec![sharing.sealed_key.clone()],
                 },
             )?;
+
+            // Only now, and only for what was actually written. `keep` returning `Err` above
+            // takes this whole function with it, so there is no path where a carrier is told
+            // to drop an envelope this node failed to store — and the sender may be gone, so
+            // the carrier's copy can be the last one in existence (ADR-0028 §7).
+            //
+            // Best effort from here. A carrier that refuses, answers something else, or never
+            // hears this keeps the envelope until its deadline, which is exactly what every
+            // carrier did before drop on delivery existed.
+            match content::report_delivered(&mut channel, &object.content_id) {
+                Ok(true) => {}
+                Ok(false) => eprintln!(
+                    "otwono-netd: {} would not give up custody of {}…; it will lapse on its own",
+                    candidate.claimed_node_id.fingerprint(),
+                    &object.content_id[..object.content_id.len().min(16)]
+                ),
+                Err(e) => eprintln!(
+                    "otwono-netd: collected {}… but could not tell {} to drop it: {e}",
+                    &object.content_id[..object.content_id.len().min(16)],
+                    candidate.claimed_node_id.fingerprint()
+                ),
+            }
         }
         Ok(content::Collected::Fetched(collected))
     }

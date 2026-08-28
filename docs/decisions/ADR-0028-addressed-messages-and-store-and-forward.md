@@ -155,6 +155,10 @@ be honest:
   else can forge: a carrier holds what it agreed to hold and no more. No node can be harmed
   past the limit its own operator set, which is ADR-0026's consent argument unchanged.
 - **Drop on delivery.** A carrier that has handed an envelope to its recipient drops it.
+  **Built 2026-08-28** as `content.delivered`, reported by the recipient after the bytes are
+  on its own disk and never before — `CARRIAGE.md` §3b has the mechanism and the ordering
+  argument. It reaches only the carrier the recipient collected from; earlier hops keep their
+  copies until they lapse.
 
 That last one is free, and it is worth being precise about why, because §5 refuses an
 acknowledgement on privacy grounds and this looks like one. It is not. A carrier that hands

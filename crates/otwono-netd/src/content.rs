@@ -204,6 +204,15 @@ impl ContentResponder {
             Request::Relayable { .. } | Request::AddressedToMe { .. } => {
                 Response::Carried(otwono_net::content::CarriedPage { entries: Vec::new() })
             }
+            // `released: false` is the *only* negative answer this question has, so a refusal
+            // is shaped like every other no: "I was not holding that", "I hold it for
+            // somebody else", "I do not carry mail" and "I will not say" are one reply. A
+            // distinguishable refusal would turn this into a way to ask whether a carrier
+            // holds a given envelope for a given node.
+            Request::Delivered { envelope_id } => Response::Released {
+                envelope_id: envelope_id.clone(),
+                released: false,
+            },
         };
         if request.validate().is_err() {
             return refuse();
@@ -216,6 +225,9 @@ impl ContentResponder {
         }
         if let Request::Pointer { service, name } = request {
             return self.pointer(service, name);
+        }
+        if let Request::Delivered { envelope_id } = request {
+            return self.delivered(peer, envelope_id);
         }
         if let Request::Relayable { after, max_entries } = request {
             return self.carried(after.as_deref(), *max_entries, session, None);
@@ -382,6 +394,48 @@ impl ContentResponder {
         Response::Carried(otwono_net::content::CarriedPage { entries })
     }
 
+    /// A recipient says it has its envelope; give up custody (ADR-0028 §7).
+    ///
+    /// Everything that makes this safe is in one line below: the custody record is looked up
+    /// in the index **scoped to the peer the handshake authenticated**, so a node can only
+    /// ever release an envelope addressed to itself. A peer naming somebody else's envelope
+    /// finds nothing and is told `released: false`, which is also what it is told when this
+    /// node was not carrying it at all.
+    ///
+    /// Deliberately not cached the way the serving indexes are. Those are cached because a
+    /// peer could force a store round trip per *chunk*; this question is asked once per
+    /// envelope by the one node entitled to ask it, and a stale cache here would refuse a
+    /// release that should have happened — leaving the carrier holding delivered mail until
+    /// expiry, which is the thing this method exists to stop.
+    fn delivered(&self, peer: &NodeId, envelope_id: &str) -> Response {
+        let no = || Response::Released {
+            envelope_id: envelope_id.to_string(),
+            released: false,
+        };
+        let Some(mine) = self.ask_carried_index(Some(peer)) else {
+            return no();
+        };
+        if !mine.iter().any(|e| e.envelope_id == envelope_id) {
+            return no();
+        }
+        // Held, and held for this peer. Releasing is idempotent, so a repeated delivery
+        // report is not an error and does not need to be one.
+        match self.call_store_as(
+            otwono_stored::CAPABILITY_CARRY,
+            "envelope.release",
+            json!({ "envelope_id": envelope_id }),
+        ) {
+            Some(_) => Response::Released {
+                envelope_id: envelope_id.to_string(),
+                released: true,
+            },
+            // The store would not, so this node is still holding it. Saying `false` is the
+            // truth: the recipient learns nothing it can act on either way, and the envelope
+            // will lapse on its own deadline.
+            None => no(),
+        }
+    }
+
     /// Whether this node holds custody of an object, for the serving decision.
     ///
     /// Cached for the session like every other index here, and for the same reason: producing
@@ -534,6 +588,7 @@ impl ContentResponder {
             | Request::Replicable { .. }
             | Request::Relayable { .. }
             | Request::AddressedToMe { .. }
+            | Request::Delivered { .. }
             | Request::Pointer { .. } => false,
         };
         if !allowed {
@@ -556,6 +611,9 @@ impl ContentResponder {
             session.remember(&content_id);
         }
         match request {
+            // Answered in `answer` before the store is asked for an object, like the index
+            // questions above it. Reaching here would mean the dispatch missed one.
+            Request::Delivered { .. } => None,
             Request::Manifest { .. } => Some(Response::Manifest(ManifestPage {
                 content_id,
                 size_bytes: reply.get("size_bytes")?.as_u64()?,
@@ -606,6 +664,10 @@ impl ContentResponder {
             // A pointer is fetched by `pointer` above, not through the object path: it names
             // no content id, so there is no object for the store to authorize.
             Request::Pointer { .. } => return None,
+            // Names an envelope id but asks for no object: it reports that one has already
+            // been delivered, and is answered from the custody index rather than the store's
+            // serving path.
+            Request::Delivered { .. } => return None,
             Request::Manifest {
                 content_id,
                 from_chunk,
@@ -1385,7 +1447,8 @@ pub fn fetch_replicable_index<L: LinkAdapter>(
                 ))
             }
             Response::NotAvailable { .. } => return Ok(all),
-            Response::Manifest(_)
+            Response::Released { .. }
+            | Response::Manifest(_)
             | Response::Chunk(_)
             | Response::SharedWithYou(_)
             | Response::Pointer(_) => {
@@ -1577,6 +1640,7 @@ pub(crate) fn fetch_carried_index<L: LinkAdapter>(
             | Response::Chunk(_)
             | Response::SharedWithYou(_)
             | Response::Replicable(_)
+            | Response::Released { .. }
             | Response::Pointer(_) => {
                 return Err(ProtocolError::Mismatched(
                     "the wrong kind of reply in place of a carriage page".into(),
@@ -1785,6 +1849,37 @@ impl Collected {
 /// otherwise own that thread for as long as the fetches took.
 pub const MAX_COLLECTED_PER_PASS: usize = 1;
 
+/// Tell a carrier one of its envelopes has arrived, so it can stop holding it (ADR-0028 §7).
+///
+/// **Only ever called after the bytes are on this node's disk.** That ordering is the whole
+/// safety argument: the sender may be gone, so the carrier's copy can be the last one, and a
+/// release sent before the write succeeded would lose the message for good. Fetching,
+/// verifying and storing all happen first; this is the last step and it is the only one that
+/// may fail without consequence.
+///
+/// Best effort by design. A carrier that does not answer, answers `released: false`, or never
+/// receives this simply keeps the envelope until its deadline, which is what every carrier
+/// did before this existed. Nothing waits on it and nothing retries it.
+pub fn report_delivered<L: LinkAdapter>(
+    channel: &mut SecureChannel<L>,
+    envelope_id: &str,
+) -> Result<bool, ProtocolError> {
+    let mut budget = MAX_ROUND_TRIPS;
+    match round_trip(
+        channel,
+        &Request::Delivered {
+            envelope_id: envelope_id.to_string(),
+        },
+        &mut budget,
+    )? {
+        Response::Released { released, .. } => Ok(released),
+        // A carrier that answers something else is one this node will not argue with: the
+        // envelope is already delivered, and the only thing at stake is whether somebody
+        // else's disk frees up.
+        _ => Ok(false),
+    }
+}
+
 /// Ask a peer what it is holding for *this* node, and fetch it (ADR-0028 §9).
 ///
 /// The collection half. Uses the scoped question, so this node never receives a list of who
@@ -1880,7 +1975,8 @@ pub fn fetch_pointer<L: LinkAdapter, M: otwono_pointer::SequenceMemory + ?Sized>
         | Response::Chunk(_)
         | Response::SharedWithYou(_)
         | Response::Replicable(_)
-        | Response::Carried(_) => {
+        | Response::Carried(_)
+        | Response::Released { .. } => {
             return Err(ProtocolError::Mismatched(
                 "the wrong kind of reply in place of a pointer".into(),
             ))
@@ -1937,6 +2033,7 @@ pub fn fetch_shared_index<L: LinkAdapter>(
             | Response::Chunk(_)
             | Response::Replicable(_)
             | Response::Carried(_)
+            | Response::Released { .. }
             | Response::Pointer(_) => {
                 return Err(ProtocolError::Mismatched(
                     "the wrong kind of reply in place of a sharing index page".into(),
@@ -2149,6 +2246,7 @@ fn fetch_manifest<L: LinkAdapter>(
             Response::SharedWithYou(_)
             | Response::Replicable(_)
             | Response::Carried(_)
+            | Response::Released { .. }
             | Response::Pointer(_) => {
                 return Err(ProtocolError::Mismatched(
                     "an index page in place of a manifest".into(),
@@ -2275,6 +2373,7 @@ fn fetch_chunk<L: LinkAdapter>(
             Response::SharedWithYou(_)
             | Response::Replicable(_)
             | Response::Carried(_)
+            | Response::Released { .. }
             | Response::Pointer(_) => {
                 return Err(ProtocolError::Mismatched(
                     "an index page in place of a chunk".into(),

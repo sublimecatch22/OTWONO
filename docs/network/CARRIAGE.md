@@ -9,9 +9,10 @@ whole collection.
 A second run on 2026-08-28 showed both halves doing it **unprompted**: the carrier's sweep
 took custody and the recipient's sweep collected, with no command run by hand on either.
 
-That does not make every part of this document verified. Drop on delivery is not implemented,
-nothing has exercised a second hop, and no envelope has ever expired on a booted node — see
-§7 and `docs/build/VERIFICATION-LOG.md` for what the runs have and have not demonstrated.
+That does not make every part of this document verified. Drop on delivery (§3b) has tests but
+no booted-node run yet, nothing has exercised a second hop, and no envelope has ever expired
+on a booted node — see §7 and `docs/build/VERIFICATION-LOG.md` for what the runs have and have
+not demonstrated.
 
 This document describes the third of `DISTRIBUTED-SERVICES.md`'s three primitives. The
 decisions are ADR-0028's; this is how they are built.
@@ -126,6 +127,52 @@ Three things a sweep needs that a command does not:
 half of the same question, and it is what lets an operator — or a test — tell mail that
 arrived on its own apart from mail that was fetched by hand.
 
+## 3b. Drop on delivery
+
+ADR-0028 §7's third bound on amplification, and the only one that asks a node to be honest.
+A carrier used to hold every envelope it took until the sender's expiry whether or not it had
+been delivered, so a message with a week-long deadline sat on a stranger's disk for a week
+after arriving.
+
+`content.delivered { envelope_id }` is the release. It carries **no recipient field**, for the
+reason `content.addressed_to_me` has none: the only recipient a carrier acts on is the one the
+handshake authenticated, so a peer naming somebody else's envelope finds nothing in the scoped
+index and is told `released: false`. The worst a peer can do with this is tell a carrier to
+stop holding *its own* mail, which is its own business — and that is what makes an
+unacknowledged, best-effort, unverifiable message safe to act on here.
+
+`released: false` is also the answer for "I was not holding that", "I do not carry mail" and
+"I will not say". Distinguishing them would make this a way to ask whether a given carrier
+holds a given envelope for a given node, which is the enumeration question §3 split two
+methods apart to avoid.
+
+### The ordering is the safety argument
+
+A recipient reports delivery **after** the bytes are on its own disk, never after merely
+fetching them:
+
+```
+fetch  ->  verify against the content id  ->  store  ->  report delivered
+```
+
+The sender may be gone, so a carrier's copy can be the last one in existence. A release sent
+on the strength of a fetch would lose the message permanently and tell nobody — §5 refuses to
+acknowledge to the sender, so nothing anywhere would notice. `collect_from` therefore reports
+inside the loop that keeps each object, after the keep has returned `Ok`, and a keep that
+fails takes the whole call with it.
+`a_recipient_that_could_not_store_its_mail_does_not_release_the_carrier` asserts exactly that,
+and fails if the two are swapped.
+
+Everything after the store is best effort. A carrier that refuses, answers something else, or
+never hears the report keeps the envelope until its deadline — which is what every carrier did
+before this existed, so the failure mode is the old behaviour rather than a new one.
+
+### What it does not reach
+
+Only the carrier the recipient collected *from*. If A handed the envelope to B and B to C, and
+the recipient collects from C, then A and B hold their copies until they lapse. Telling them
+would need either gossip or the sender's involvement, and §5 rules the second out.
+
 ## 4. Custody is what authorises serving
 
 A carrier is by definition **not** the recipient, and ADR-0019's serving rule admits only the
@@ -207,10 +254,6 @@ flatter than the cache's.
 
 ## 7. What is not built
 
-- **Drop on delivery.** ADR-0028 §7 names it as one of three bounds on amplification. A
-  carrier currently holds until expiry even after the recipient has collected. Closing it
-  needs either an explicit release from the recipient — a third wire method — or per-envelope
-  chunk-serving state, and neither is written.
 - **Re-relay in practice.** §7 concludes that a carrier may pass an envelope on, and the
   record's shape makes it structural rather than a permission. No test exercises a second hop.
 - **Forward secrecy.** The sharing key is long-lived, so compromising it opens every envelope

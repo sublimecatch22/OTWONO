@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://otwono.org/schemas/onm-content-1.4.0.json",
+  "$id": "https://otwono.org/schemas/onm-content-1.5.0.json",
   "title": "OTWONO ONM Content-Fetch Protocol",
   "description": "The messages two nodes exchange to move content over an authenticated ONM channel (ADR-0017). Every message travels inside one Noise transport frame after the Hello exchange, so every one is bounded: a requester asks for a range, a responder may answer with less, and the requester loops. There is exactly one error shape — absent, private, shared, damaged, and not-part-of-that-object all produce not_available, because any finer answer tells a stranger what this node holds. A chunk request names the object the chunk belongs to; a bare digest would be a probe against a content-addressed store.",
   "oneOf": [
@@ -40,6 +40,9 @@
         },
         {
           "$ref": "#/$defs/addressed_to_me_request"
+        },
+        {
+          "$ref": "#/$defs/delivered_request"
         }
       ]
     },
@@ -132,6 +135,9 @@
         },
         {
           "$ref": "#/$defs/carried_response"
+        },
+        {
+          "$ref": "#/$defs/released_response"
         }
       ]
     },
@@ -484,6 +490,23 @@
         }
       }
     },
+    "delivered_request": {
+      "type": "object",
+      "description": "I have this envelope now; you may stop holding it (ADR-0028 §7). There is NO RECIPIENT FIELD, for the reason content.addressed_to_me has none: the only recipient a carrier acts on is the one the handshake authenticated, so a peer naming somebody else's envelope finds nothing. The worst a peer can do with this is tell a carrier to stop holding ITS OWN mail. This does not contradict ADR-0028 §5's refusal to acknowledge: that protects the SENDER, who learns nothing by being told, whereas a carrier that just handed an envelope over already knows the recipient is reachable.",
+      "required": [
+        "method",
+        "envelope_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "method": {
+          "const": "content.delivered"
+        },
+        "envelope_id": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
     "addressed_to_me_request": {
       "type": "object",
       "description": "What are you holding for ME? (ADR-0028 §9). Scoped to the NodeID the Noise handshake authenticated. There is NO RECIPIENT FIELD, for the same reason content.pointer has no owner field: the only recipient a peer will answer about is the one it just authenticated, so there is nothing to spoof and nothing for a filter to get wrong. An empty reply from a carrier holding nothing for the asker is identical to an empty reply from a node that carries nothing at all — asking must not reveal whether a node carries.",
@@ -504,6 +527,27 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 256
+        }
+      }
+    },
+    "released_response": {
+      "type": "object",
+      "description": "Whether the carrier gave up custody. `false` covers 'I was not holding that', 'I hold it for somebody else', 'I do not carry mail' and 'I will not say', deliberately: distinguishing them would make this a way to ask whether a carrier holds a given envelope for a given node, which is the enumeration question ADR-0028 §9 split two methods apart to avoid. A recipient does not act on the answer either way — an envelope it has already stored is delivered whatever the carrier does next.",
+      "required": [
+        "reply",
+        "envelope_id",
+        "released"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "reply": {
+          "const": "released"
+        },
+        "envelope_id": {
+          "$ref": "#/$defs/digest"
+        },
+        "released": {
+          "type": "boolean"
         }
       }
     },

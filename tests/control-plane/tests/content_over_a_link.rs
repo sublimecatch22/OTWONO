@@ -809,6 +809,11 @@ fn a_peer_that_serves_the_wrong_bytes_is_caught() {
                 }
                 // It publishes nothing either, so there is no pointer to lie about.
                 Request::Pointer { .. } => Response::not_available(""),
+                // It carries nothing, so it releases nothing.
+                Request::Delivered { envelope_id } => Response::Released {
+                    envelope_id,
+                    released: false,
+                },
                 Request::Manifest { content_id, .. } => {
                     Response::Manifest(otwono_net::content::ManifestPage {
                         content_id,
@@ -2211,6 +2216,20 @@ fn an_envelope_reaches_its_recipient_through_a_carrier_that_is_neither_party() {
         json!(recipient.to_text()),
         "the envelope is on disk without the key that opens it: {on_disk}"
     );
+
+    // And the carrier has let it go (ADR-0028 §7). The recipient reports delivery as the
+    // last step of collecting, *after* the write above succeeded, so this is the whole
+    // round trip: taken, carried, handed over, dropped.
+    let still_held = Client::connect(&carrier_socket)
+        .unwrap()
+        .call_with_capability("envelope.held", json!({}), &h.token("envelope.carry"))
+        .unwrap()
+        .expect("the carrier lists what it holds");
+    assert_eq!(
+        still_held["entries"].as_array().unwrap().len(),
+        0,
+        "the carrier is still holding an envelope it delivered: {still_held}"
+    );
 }
 
 /// A node whose broker refuses `envelope.carry` carries nobody's mail and asks nobody.
@@ -2631,5 +2650,193 @@ fn asking_what_is_waiting_does_not_fetch_it() {
             .expect("collect is not an error"),
         otwono_netd::content::Collected::NoInbox,
         "asking what is waiting must not have configured an inbox as a side effect"
+    );
+}
+
+/// A carrier drops an envelope once its recipient says it has it (ADR-0028 §7).
+///
+/// The third bound on amplification, and the only one that asks a node to be honest. Before
+/// this a carrier held every envelope it took until the sender's expiry, delivered or not, so
+/// a message with a week-long deadline occupied a stranger's disk for a week after arriving.
+#[test]
+fn a_carrier_gives_up_custody_when_its_recipient_says_it_arrived() {
+    let h = Harness::start("drop-on-delivery");
+
+    let recipient_signing = otwono_identity::SigningIdentity::generate().unwrap();
+    let recipient_sharing = otwono_identity::SharingKey::generate().unwrap();
+    let binding = recipient_signing.bind_sharing(&recipient_sharing.public());
+    let recipient = *recipient_signing.node_id();
+
+    let sealed = Client::connect(&h.store_socket)
+        .unwrap()
+        .call_with_capability(
+            "store.share",
+            json!({
+                "data": data_encoding::BASE64.encode(b"delivered, and then dropped"),
+                "recipients": [binding],
+            }),
+            &h.token("store.share"),
+        )
+        .unwrap()
+        .expect("sealing");
+    let sealed_id = sealed["content_id"].as_str().unwrap().to_string();
+
+    let envelope = otwono_envelope::Envelope::new(
+        &sealed_id,
+        &recipient,
+        sealed["size_bytes"].as_u64().unwrap(),
+        otwono_identity::now_unix_ms() + 60 * 60 * 1000,
+    );
+    Client::connect(&h.store_socket)
+        .unwrap()
+        .call_with_capability(
+            "envelope.take",
+            json!({ "envelope": envelope }),
+            &h.token("envelope.carry"),
+        )
+        .unwrap()
+        .expect("the harness node carries it");
+
+    let held = |what: &str| -> usize {
+        Client::connect(&h.store_socket)
+            .unwrap()
+            .call_with_capability("envelope.held", json!({}), &h.token("envelope.carry"))
+            .unwrap()
+            .unwrap_or_else(|e| panic!("{what}: {e:?}"))["entries"]
+            .as_array()
+            .unwrap()
+            .len()
+    };
+    assert_eq!(held("before"), 1, "the premise: it is being carried");
+
+    // Somebody who is not the recipient cannot make the carrier drop it. Asserted *first*,
+    // so a bug that released for anyone could not be hidden by the recipient's own release
+    // happening earlier in the test.
+    let stranger = Arc::new(otwono_identity::NodeIdentity::generate().unwrap());
+    let mut channel = NetState::new(stranger)
+        .open_content_channel(&h.candidate())
+        .expect("a stranger may still connect")
+        .channel;
+    assert!(
+        !otwono_netd::content::report_delivered(&mut channel, &sealed_id).unwrap(),
+        "a node that is not the recipient released somebody else's envelope"
+    );
+    assert_eq!(
+        held("after a stranger asked"),
+        1,
+        "the stranger's claim was acted on"
+    );
+
+    // The recipient can.
+    let node = Arc::new(otwono_identity::NodeIdentity::from_parts(
+        recipient_signing,
+        otwono_identity::AgreementKey::generate().unwrap(),
+    ));
+    let mut channel = NetState::new(node)
+        .open_content_channel(&h.candidate())
+        .expect("the recipient connects")
+        .channel;
+    assert!(
+        otwono_netd::content::report_delivered(&mut channel, &sealed_id).unwrap(),
+        "the recipient said it had the envelope and the carrier kept it anyway"
+    );
+    assert_eq!(held("after the recipient reported delivery"), 0);
+
+    // Saying it twice is not an error. A recipient that collects, reports, and is restarted
+    // before the reply lands will say it again.
+    assert!(
+        !otwono_netd::content::report_delivered(&mut channel, &sealed_id).unwrap(),
+        "a repeated report must not be an error, only a `false`"
+    );
+}
+
+/// An inbox that fetches happily and cannot write. The failure that must not lose a message.
+struct ButterFingers;
+
+impl otwono_store::Inbox for ButterFingers {
+    fn accepting(&self) -> bool {
+        true
+    }
+    fn holds(&self, _content_id: &str) -> bool {
+        false
+    }
+    fn keep(
+        &self,
+        _content_id: &str,
+        _bytes: &[u8],
+        _sharing: &otwono_store::object::Sharing,
+    ) -> Result<(), String> {
+        Err("the disk is full".into())
+    }
+}
+
+/// A recipient that could not store what it collected does not tell the carrier to drop it.
+///
+/// The failure this whole feature has to survive. The sender may be gone, so the carrier's
+/// copy can be the last one in existence; a release sent on the strength of a fetch rather
+/// than a write would lose the message permanently and tell nobody.
+///
+/// So the order in `collect_from` is: fetch, verify, **store**, and only then report. This
+/// asserts the middle step failing takes the report with it.
+#[test]
+fn a_recipient_that_could_not_store_its_mail_does_not_release_the_carrier() {
+    let h = Harness::start("butter-fingers");
+
+    let recipient_signing = otwono_identity::SigningIdentity::generate().unwrap();
+    let recipient_sharing = otwono_identity::SharingKey::generate().unwrap();
+    let binding = recipient_signing.bind_sharing(&recipient_sharing.public());
+    let recipient = *recipient_signing.node_id();
+
+    let sealed = Client::connect(&h.store_socket)
+        .unwrap()
+        .call_with_capability(
+            "store.share",
+            json!({
+                "data": data_encoding::BASE64.encode(b"must survive a clumsy recipient"),
+                "recipients": [binding],
+            }),
+            &h.token("store.share"),
+        )
+        .unwrap()
+        .expect("sealing");
+    let sealed_id = sealed["content_id"].as_str().unwrap().to_string();
+
+    let envelope = otwono_envelope::Envelope::new(
+        &sealed_id,
+        &recipient,
+        sealed["size_bytes"].as_u64().unwrap(),
+        otwono_identity::now_unix_ms() + 60 * 60 * 1000,
+    );
+    Client::connect(&h.store_socket)
+        .unwrap()
+        .call_with_capability(
+            "envelope.take",
+            json!({ "envelope": envelope }),
+            &h.token("envelope.carry"),
+        )
+        .unwrap()
+        .expect("the harness node carries it");
+
+    let collector = NetState::new(Arc::new(otwono_identity::NodeIdentity::from_parts(
+        recipient_signing,
+        otwono_identity::AgreementKey::generate().unwrap(),
+    )))
+    .with_inbox(Arc::new(ButterFingers));
+
+    let outcome = collector.collect_from(&h.candidate());
+    assert!(
+        outcome.is_err(),
+        "a collection that could not be stored reported success: {outcome:?}"
+    );
+
+    let still_held = Client::connect(&h.store_socket)
+        .unwrap()
+        .call_with_capability("envelope.held", json!({}), &h.token("envelope.carry"))
+        .unwrap()
+        .expect("the carrier lists what it holds");
+    assert_eq!(
+        still_held["entries"].as_array().unwrap().len(),
+        1,
+        "the carrier dropped an envelope the recipient never managed to store: {still_held}"
     );
 }
