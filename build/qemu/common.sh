@@ -81,6 +81,40 @@ powerdown_guest() { # qmp-socket pid label
     return 0
 }
 
+# Cut a guest off from the segment, or put it back, without touching the guest.
+#
+# The partition primitive. `set_link` takes the NIC down inside QEMU, so the guest sees
+# carrier loss on a link that is still configured — which is what a network partition looks
+# like to a node, and unlike powering it off it keeps running and keeps its state. A node that
+# was shut down and restarted would be testing restart, which the store-and-forward phase
+# already does and which answers a different question.
+#
+# Needs the NIC to have been given an id (`-device virtio-net-pci,id=net0,...`); `set_link`
+# names the device, not the netdev behind it.
+#
+# QMP reports an unknown device as an error inside the reply rather than as a failed
+# connection, so the reply is inspected rather than trusted. Silently doing nothing here would
+# mean a partition test that never partitions anything and passes.
+set_guest_link() { # qmp-socket up|down label
+    local sock="$1" want="$2" label="$3" reply
+    local up=true; [ "$want" = down ] && up=false
+    reply=$(printf '%s\n%s\n' \
+        '{"execute":"qmp_capabilities"}' \
+        "{\"execute\":\"set_link\",\"arguments\":{\"name\":\"net0\",\"up\":$up}}" \
+        | socat -t 5 - "UNIX-CONNECT:$sock" 2>&1) || true
+    case "$reply" in
+        *'"error"'*)
+            echo "FAIL: could not bring $label's link $want: $reply" >&2
+            return 1
+            ;;
+        *'"return"'*) return 0 ;;
+        *)
+            echo "FAIL: no answer from $label's monitor when bringing its link $want" >&2
+            return 1
+            ;;
+    esac
+}
+
 run_boot_test() { # log-file timeout qemu-binary args...
     local log="$1" timeout_s="$2" qemu="$3"; shift 3
     local settle="${OTWONO_BOOT_SETTLE:-15}"

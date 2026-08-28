@@ -143,7 +143,7 @@ boot_guest() { # ordinal logfile
         -drive if=pflash,format=raw,unit=1,file="$OUT/vars-$n.fd" \
         -drive if=virtio,format=raw,file="$OUT/node-$n.img" \
         -netdev "socket,id=seg,mcast=$MCAST_GROUP:$MCAST_PORT" \
-        -device virtio-net-pci,netdev=seg,mac="$mac" \
+        -device virtio-net-pci,id=net0,netdev=seg,mac="$mac" \
         -qmp "unix:$OUT/qmp-$n.sock,server=on,wait=off" \
         -nographic -serial mon:stdio -no-reboot \
         < /dev/null >> "$log" 2>&1 &
@@ -403,6 +403,87 @@ if [ "${MESH_CONTENT_SMOKE:-0}" != 0 ]; then
         fi
         echo "  $(grep -hoa "OTWONO-ENVELOPE-DROPPED.*" "$OUT/node-n2.log" | tail -1 | tr -d "\r")"
     fi
+fi
+
+# --- a partition, and the healing of it ------------------------------------------------
+#
+# The third clause of Phase 6's exit criterion, in the half that can be asserted without any
+# service being built: the segment breaks, the nodes notice, and they find each other again.
+# What *converges* across the break is content, and that needs a guest-side check to write
+# during the partition — this asserts the partition itself, which nothing did before and
+# which everything else about a partition depends on.
+#
+# Nodes 2 and 3 are the survivors of the store-and-forward phase, so this uses them. Only
+# node 3's link goes down; a partition is one-sided from each node's point of view and taking
+# both would be indistinguishable from stopping the segment.
+#
+# `set_link` and not a power-off. The guest keeps running and keeps its state, which is what
+# makes this a partition rather than the restart the phase above already tests.
+#
+# Gated on the drop marker rather than on a variable: this runs only when the store-and-forward
+# phase actually got to the end, and reading that off the log is one fact instead of two that
+# can disagree.
+if [ "${MESH_CONTENT_SMOKE:-0}" != 0 ] && [ "$NODES" -ge 3 ] \
+    && grep -qa "OTWONO-ENVELOPE-DROPPED" "$OUT/node-n2.log" 2>/dev/null; then
+
+    # Every count here is taken *before* the thing that should change it, and the assertion is
+    # that it went up. Both of these lines are already in the logs — node 2 spent the whole
+    # store-and-forward phase failing to reach the powered-off node 1, and the nodes
+    # re-authenticate constantly — so grepping for either would have passed before the link
+    # was ever touched.
+    #
+    # `grep -c` prints 0 and exits 1 with no matches, which is fine, but prints *nothing* and
+    # exits 2 if the file is missing — and an empty string in an arithmetic test is a fatal
+    # error under `set -e`, so the count is forced to a number.
+    unreachable() { # log
+        local n; n=$(grep -ca "failed: connect to\|No route to host\|Network is unreachable" "$1" 2>/dev/null || true)
+        printf '%s' "${n:-0}"
+    }
+    authenticated() { # log
+        local n; n=$(grep -ca "inbound peer authenticated" "$1" 2>/dev/null || true)
+        printf '%s' "${n:-0}"
+    }
+    lost_before=$(unreachable "$OUT/node-n3.log")
+
+    echo "partition: taking node 3's link down"
+    set_guest_link "$OUT/qmp-n3.sock" down "node n3" || exit 1
+
+    # Node 3 is the one whose link went, so node 3 is where the failures appear on its own
+    # discovery thread. Two sweeps plus room: the sweep is every thirty seconds and a connect
+    # has to time out inside it.
+    deadline=$(( $(date +%s) + 240 ))
+    parted=timeout
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if [ "$(unreachable "$OUT/node-n3.log")" -gt "$lost_before" ]; then parted=pass; break; fi
+        sleep 5
+    done
+    if [ "$parted" != pass ]; then
+        echo "FAIL: node 3's link went down and it did not notice within 240s ($parted)" >&2
+        exit 1
+    fi
+    echo "  node 3 noticed the break"
+
+    # Counted now rather than before the partition: node 3 is provably cut off at this point,
+    # so any inbound handshake node 2 logs from here can only have followed the heal. Taken
+    # earlier it would have raced the link actually going down, and a handshake from the
+    # moment before the break would have read as the mesh healing.
+    auth_before=$(authenticated "$OUT/node-n2.log")
+
+    echo "partition: putting node 3's link back"
+    set_guest_link "$OUT/qmp-n3.sock" up "node n3" || exit 1
+    deadline=$(( $(date +%s) + 300 ))
+    healed=timeout
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        # A *new* handshake after the heal. "They are still connected" and "they found each
+        # other again" look identical in a log that only appends, so this counts.
+        if [ "$(authenticated "$OUT/node-n2.log")" -gt "$auth_before" ]; then healed=pass; break; fi
+        sleep 5
+    done
+    if [ "$healed" != pass ]; then
+        echo "FAIL: node 3's link came back and the nodes did not re-authenticate ($healed)" >&2
+        exit 1
+    fi
+    echo "  the mesh healed: node 2 authenticated an inbound peer again"
 fi
 
 echo "PASS: $NODES nodes discovered and mutually authenticated"
