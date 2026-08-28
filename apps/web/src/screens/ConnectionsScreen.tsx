@@ -54,9 +54,31 @@ export function ConnectionsScreen() {
   const update = useMutation({
     mutationFn: (input: { id: string; patch: Record<string, unknown> }) =>
       api.put<ProviderConnection>(`/api/connections/${input.id}`, input.patch),
-    onSuccess: () => client.invalidateQueries({ queryKey: ['connections'] }),
-    onError: (error) =>
-      toast({ tone: 'negative', body: error instanceof ApiError ? error.message : String(error) }),
+    // The switches and dropdowns here are controlled by the query cache, so
+    // without this they snap back to their old value until the refetch lands.
+    // The change is shown at once and rolled back if the service refuses it.
+    onMutate: async (input) => {
+      await client.cancelQueries({ queryKey: ['connections'] });
+      const previous = client.getQueryData<ConnectionsResponse>(['connections']);
+      client.setQueryData<ConnectionsResponse>(['connections'], (current) =>
+        current
+          ? {
+              ...current,
+              connections: current.connections.map((connection) =>
+                connection.id === input.id
+                  ? { ...connection, ...displayableFields(input.patch) }
+                  : connection,
+              ),
+            }
+          : current,
+      );
+      return { previous };
+    },
+    onError: (error, _input, context) => {
+      if (context?.previous) client.setQueryData(['connections'], context.previous);
+      toast({ tone: 'negative', body: error instanceof ApiError ? error.message : String(error) });
+    },
+    onSettled: () => client.invalidateQueries({ queryKey: ['connections'] }),
   });
 
   const remove = useMutation({
@@ -266,7 +288,7 @@ export function ConnectionsScreen() {
 
       <Card
         title="Add a connection by hand"
-        description="Any OpenAI-compatible endpoint: llama.cpp's server, vLLM, LocalAI, or a hosted gateway."
+        description="A runtime on a port other than the usual one, or any OpenAI-compatible endpoint: llama.cpp's server, vLLM, LocalAI, or a hosted gateway."
         actions={
           <Button size="sm" onClick={() => setShowManual((open) => !open)}>
             {showManual ? 'Hide' : 'Show'}
@@ -277,6 +299,18 @@ export function ConnectionsScreen() {
       </Card>
     </div>
   );
+}
+
+/**
+ * The parts of a patch that are safe to show before the service has agreed.
+ * `api_key` is deliberately absent: the key itself is never held in the cache,
+ * and whether one is stored is the service's answer to give.
+ */
+function displayableFields(patch: Record<string, unknown>): Partial<ProviderConnection> {
+  const allowed = ['label', 'endpoint', 'default_model', 'default_embedding_model', 'enabled'];
+  return Object.fromEntries(
+    Object.entries(patch).filter(([key]) => allowed.includes(key)),
+  ) as Partial<ProviderConnection>;
 }
 
 function ApiKeyField({
@@ -371,19 +405,33 @@ function ModelTable({ models }: { models: ModelInfo[] }) {
   );
 }
 
+/**
+ * The kinds a person can add by hand, with the address each one usually
+ * listens on. Ollama and LM Studio are here because a runtime moved to a
+ * different port is invisible to detection but perfectly usable.
+ */
+const MANUAL_KINDS = [
+  { id: 'ollama', name: 'Ollama', endpoint: 'http://127.0.0.1:11434' },
+  { id: 'lmstudio', name: 'LM Studio', endpoint: 'http://127.0.0.1:1234' },
+  { id: 'openai_compatible', name: 'OpenAI-compatible endpoint', endpoint: 'http://127.0.0.1:8080' },
+] as const;
+
 function ManualConnectionForm() {
   const client = useQueryClient();
   const toast = useUi((state) => state.toast);
+  const [kind, setKind] = useState<string>('ollama');
   const [label, setLabel] = useState('');
-  const [endpoint, setEndpoint] = useState('http://127.0.0.1:8080');
+  const [endpoint, setEndpoint] = useState<string>(MANUAL_KINDS[0].endpoint);
   const [apiKey, setApiKey] = useState('');
   const [error, setError] = useState<string | null>(null);
+
+  const chosen = MANUAL_KINDS.find((entry) => entry.id === kind) ?? MANUAL_KINDS[2];
 
   const create = useMutation({
     mutationFn: () =>
       api.post<ProviderConnection>('/api/connections', {
-        kind: 'openai_compatible',
-        label: label || 'OpenAI-compatible endpoint',
+        kind,
+        label: label || chosen.name,
         endpoint,
         api_key: apiKey || null,
         enabled: false,
@@ -410,6 +458,35 @@ function ManualConnectionForm() {
         create.mutate();
       }}
     >
+      <Field
+        label="Runtime"
+        hint="Pick the software that is listening. The wrong choice will fail the connection test rather than misbehave later."
+      >
+        {({ id, describedBy }) => (
+          <select
+            id={id}
+            aria-describedby={describedBy}
+            className="select"
+            value={kind}
+            onChange={(event) => {
+              const next =
+                MANUAL_KINDS.find((entry) => entry.id === event.target.value) ?? MANUAL_KINDS[2];
+              setKind(next.id);
+              // Only move the address if it is still one of our suggestions,
+              // so a typed address is never thrown away.
+              setEndpoint((current) =>
+                MANUAL_KINDS.some((entry) => entry.endpoint === current) ? next.endpoint : current,
+              );
+            }}
+          >
+            {MANUAL_KINDS.map((entry) => (
+              <option key={entry.id} value={entry.id}>
+                {entry.name}
+              </option>
+            ))}
+          </select>
+        )}
+      </Field>
       <Field label="Name">
         {({ id }) => (
           <input

@@ -52,7 +52,7 @@ pub fn nothing_found_guidance() -> &'static str {
     "No local AI runtime was found. OTWONO works without one — you can still create agents, \
      organise projects and index knowledge — but chat needs a model. Install Ollama from \
      ollama.com or LM Studio from lmstudio.ai, start it, then run this test again. If your \
-     runtime uses a different port, add it as an OpenAI-compatible connection."
+     runtime uses a different port, add it by hand and choose which runtime it is."
 }
 
 #[cfg(test)]

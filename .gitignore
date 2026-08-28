@@ -16,3 +16,5 @@ coverage/
 *.tsbuildinfo
 wordpress/*.zip
 .otwono-dev-data/
+test-results/
+playwright-report/

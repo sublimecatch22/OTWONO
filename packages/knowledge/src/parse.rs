@@ -51,6 +51,15 @@ pub enum ParseError {
     Empty,
 }
 
+impl ParseError {
+    /// Whether this is "there is nothing here for us to index" rather than
+    /// "reading it went wrong". The first is a skip and carries no error
+    /// badge; the second is a failure the user may want to act on.
+    pub fn is_nothing_to_index(&self) -> bool {
+        matches!(self, Self::TooLarge { .. } | Self::NotText | Self::Empty)
+    }
+}
+
 /// Read a file into segments according to its format.
 pub fn parse(path: &Path, format: DocumentFormat) -> Result<Vec<Segment>> {
     let metadata =

@@ -265,8 +265,12 @@ impl<'a> Indexer<'a> {
                 Err(error) => {
                     let message = error.to_string();
                     // A file we cannot read is skipped, not failed, when the
-                    // reason is "we do not handle this" rather than "it broke".
-                    let state = if message.contains("larger than") {
+                    // reason is "there is nothing here to index" rather than
+                    // "reading it went wrong". An empty file is not a fault.
+                    let nothing_to_index = error
+                        .downcast_ref::<parse::ParseError>()
+                        .is_some_and(parse::ParseError::is_nothing_to_index);
+                    let state = if nothing_to_index {
                         report.skipped += 1;
                         IngestState::Skipped
                     } else {
@@ -453,9 +457,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_file_that_cannot_be_parsed_is_recorded_as_failed_with_a_reason() {
+    async fn a_file_with_nothing_to_index_is_skipped_with_a_reason_not_marked_broken() {
+        // Binary content and an empty file are both "nothing here for us",
+        // not "reading it went wrong". Calling them failures would put an
+        // error against files the user has done nothing wrong with.
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("broken.md"), [0x00, 0x01, 0x02, 0x00]).unwrap();
+        std::fs::write(tmp.path().join("binary.md"), [0x00, 0x01, 0x02, 0x00]).unwrap();
+        write(tmp.path(), "blank.md", "   \n\t ");
+        let db = Db::open_in_memory().unwrap();
+        let source_id = source(&db, tmp.path());
+        let embedder = Embedder::lexical();
+        let report = Indexer::new(&db, &embedder)
+            .ingest_source(&source_id)
+            .await
+            .unwrap();
+
+        assert_eq!(report.failed, 0, "neither file is broken");
+        assert_eq!(report.skipped, 2);
+        assert_eq!(report.indexed, 0);
+
+        let documents = KnowledgeRepo::new(&db).list_documents(&source_id).unwrap();
+        assert_eq!(documents.len(), 2);
+        for document in &documents {
+            assert_eq!(document.state, IngestState::Skipped, "{}", document.file_name);
+            // The user is still told why, rather than the file vanishing.
+            assert!(document.error.is_some(), "{}", document.file_name);
+            assert!(!document.state.is_searchable());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_that_breaks_while_being_read_is_recorded_as_failed_with_a_reason() {
+        // A PDF that is not a PDF did break while being read, and that is
+        // worth reporting as a failure rather than a quiet skip.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("broken.pdf"), b"%PDF-1.7 not really a pdf").unwrap();
         let db = Db::open_in_memory().unwrap();
         let source_id = source(&db, tmp.path());
         let embedder = Embedder::lexical();
@@ -466,7 +502,7 @@ mod tests {
 
         assert_eq!(report.failed, 1);
         assert_eq!(report.indexed, 0);
-        assert!(report.failures[0].contains("broken.md"));
+        assert!(report.failures[0].contains("broken.pdf"));
 
         let documents = KnowledgeRepo::new(&db).list_documents(&source_id).unwrap();
         assert_eq!(documents[0].state, IngestState::Failed);
