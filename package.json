@@ -2,10 +2,11 @@
   "name": "otwono-ai",
   "version": "0.1.0",
   "private": true,
-  "description": "OTWONO AI — local-first, user-controlled AI work platform.",
+  "description": "OTWONO AI \u2014 local-first, user-controlled AI work platform.",
   "license": "Apache-2.0",
   "workspaces": [
     "apps/web",
+    "apps/desktop",
     "packages/ui"
   ],
   "scripts": {
@@ -20,10 +21,14 @@
     "rust:fmt": "cargo fmt --all",
     "rust:lint": "cargo clippy --workspace --all-targets -- -D warnings",
     "rust:test": "cargo test --workspace",
-    "verify": "npm run format:check && npm run typecheck && npm run test && npm run rust:lint && npm run rust:test"
+    "verify": "npm run format:check && npm run typecheck && npm run test && npm run rust:lint && npm run rust:test",
+    "desktop:dev": "npm run dev --workspace @otwono/desktop",
+    "desktop:build": "npm run build --workspace @otwono/desktop",
+    "service": "cargo run -p otwono-local-service"
   },
   "devDependencies": {
     "@playwright/test": "1.49.1",
+    "@tauri-apps/cli": "^2.11.4",
     "prettier": "3.4.2",
     "typescript": "5.7.2"
   },

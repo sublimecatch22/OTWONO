@@ -1,0 +1,71 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "OTWONO AI",
+  "version": "0.1.0",
+  "identifier": "com.otwono.ai",
+  "build": {
+    "frontendDist": "../../web/dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev --workspace @otwono/web",
+    "beforeBuildCommand": "npm run build --workspace @otwono/web"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "OTWONO AI",
+        "width": 1280,
+        "height": 840,
+        "minWidth": 880,
+        "minHeight": 600,
+        "resizable": true,
+        "center": true,
+        "decorations": true,
+        "theme": null
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' http://127.0.0.1:* ipc: http://ipc.localhost; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'",
+      "assetProtocol": {
+        "enable": false
+      }
+    },
+    "trayIcon": {
+      "id": "otwono",
+      "iconPath": "icons/icon.png",
+      "iconAsTemplate": true,
+      "tooltip": "OTWONO AI"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "msi", "deb", "appimage", "dmg"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "category": "Productivity",
+    "shortDescription": "An AI that works for you.",
+    "longDescription": "OTWONO AI is a local-first AI work platform. It creates, manages and supervises AI agents, keeps your data on your own machine, and shows you exactly what it did.",
+    "copyright": "OTWONO AI",
+    "licenseFile": "../../../LICENSE",
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "languages": ["English"],
+        "displayLanguageSelector": false
+      },
+      "wix": {
+        "language": ["en-US"]
+      }
+    },
+    "linux": {
+      "deb": {
+        "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0"]
+      }
+    }
+  },
+  "plugins": {}
+}
