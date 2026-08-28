@@ -570,6 +570,14 @@ export interface Listing {
   updated_at: string;
 }
 
+/** The receipt from a synchronisation: exactly what left the machine. */
+export interface SyncResult {
+  synchronised: number;
+  titles: string[];
+  sent_at: string;
+  what_was_sent: string;
+}
+
 export interface ModerationFinding {
   category: string;
   explanation: string;

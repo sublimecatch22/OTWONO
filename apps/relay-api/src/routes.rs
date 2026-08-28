@@ -945,13 +945,16 @@ pub struct SyncRequest {
 
 /// The desktop application pushes the metadata of projects the user marked for
 /// synchronisation. Anything resembling content is refused rather than stored.
+///
+/// Pushing needs `projects.write`, which a paired site never asks for: a
+/// WordPress token can read this metadata but must not be able to invent it.
 pub async fn sync_projects(
     State(state): State<RelayState>,
     headers: HeaderMap,
     Json(body): Json<SyncRequest>,
 ) -> RelayResult<Json<serde_json::Value>> {
     let caller = authenticate(&state, &headers)?;
-    require_scope(&caller, "projects.read")?;
+    require_scope(&caller, "projects.write")?;
 
     if body.projects.len() > 500 {
         return Err(RelayError::bad_request("Too many projects in one request."));

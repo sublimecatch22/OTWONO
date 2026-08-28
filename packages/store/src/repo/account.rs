@@ -57,6 +57,7 @@ pub const ALLOWED_SCOPES: &[&str] = &[
     "profile.read",
     "profile.write",
     "projects.read",
+    "projects.write",
     "tasks.read",
     "marketplace.read",
     "marketplace.write",

@@ -241,6 +241,7 @@ pub fn api_router() -> Router<AppState> {
         // account
         .route("/account", get(account::status))
         .route("/account/link", post(account::link))
+        .route("/account/sync", post(account::sync))
         .route("/account/unlink", post(account::unlink))
         .route("/account/pairing-code", post(account::create_pairing_code))
         .route(

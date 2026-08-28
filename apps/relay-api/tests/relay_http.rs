@@ -419,11 +419,46 @@ async fn a_pairing_code_works_once_and_cannot_exceed_its_sessions_scopes() {
     assert_eq!(again.status(), 403);
 }
 
+/// A paired WordPress site asks for `projects.read` so its members can see
+/// what the owner chose to publish. That token must not be able to invent
+/// project metadata in the owner's account.
+#[tokio::test]
+async fn reading_project_metadata_does_not_allow_writing_it() {
+    let harness = Harness::start().await;
+    let (_, token) = harness
+        .account("reader@example.com", &["projects.read"])
+        .await;
+
+    let refused = harness
+        .post_as(
+            "/v1/projects",
+            &token,
+            json!({
+                "projects": [
+                    { "id": "prj_forged", "title": "Not mine to write", "state": "running" }
+                ]
+            }),
+        )
+        .await;
+    assert_eq!(refused.status(), 403);
+
+    let listed: serde_json::Value = harness
+        .get_as("/v1/projects", &token)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 0, "nothing was written");
+}
+
 #[tokio::test]
 async fn project_metadata_synchronises_but_content_sized_titles_are_refused() {
     let harness = Harness::start().await;
     let (_, token) = harness
-        .account("person@example.com", &["profile.read", "projects.read"])
+        .account(
+            "person@example.com",
+            &["profile.read", "projects.read", "projects.write"],
+        )
         .await;
 
     let synced = harness

@@ -8,6 +8,7 @@ use otwono_store::repo::account::{
     AccountRepo, RelayLink, ALLOWED_SCOPES, PAIRING_CODE_TTL_SECONDS,
 };
 use otwono_store::repo::activity::{ActivityRepo, NewActivity};
+use otwono_store::repo::projects::ProjectRepo;
 use otwono_store::secrets::relay_token_key;
 
 use crate::error::{ApiError, ApiResult};
@@ -183,6 +184,100 @@ pub async fn link(
     )?;
 
     status(State(state)).await
+}
+
+#[derive(Debug, Serialize)]
+pub struct SyncResponse {
+    pub synchronised: usize,
+    /// Named so the user can check that nothing unexpected left the machine.
+    pub titles: Vec<String>,
+    pub sent_at: String,
+    pub what_was_sent: &'static str,
+}
+
+/// What leaves the machine, in full. Anything not in this list is not sent.
+const SYNC_FIELDS: &str =
+    "Only the identifier, title, state and task counts of each project you marked for      synchronisation. No objective, no task instructions, no output, no files, no knowledge.";
+
+/// Push the metadata of projects the user marked for synchronisation.
+///
+/// Nothing is sent unless the user linked an account, stored a token for it,
+/// and ticked synchronisation on the project itself. The request carries the
+/// five fields named in `SYNC_FIELDS` and nothing else, and the response
+/// repeats what was sent so the user can check it.
+pub async fn sync(State(state): State<AppState>) -> ApiResult<Json<SyncResponse>> {
+    let link = AccountRepo::new(&state.db)
+        .link()?
+        .filter(|link| link.revoked_at.is_none())
+        .ok_or_else(|| {
+            ApiError::BadRequest("No account is linked, so there is nowhere to send this.".into())
+        })?;
+
+    if !link.scopes.iter().any(|scope| scope == "projects.write") {
+        return Err(ApiError::Forbidden(
+            "This link was not granted permission to send project metadata.".into(),
+        ));
+    }
+
+    let token = state
+        .secrets
+        .get(&relay_token_key(&link.id))
+        .map_err(ApiError::Internal)?
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| {
+            ApiError::BadRequest(
+                "There is no sign-in for the linked account. Sign in again first.".into(),
+            )
+        })?;
+
+    let repo = ProjectRepo::new(&state.db);
+    let mut payload = Vec::new();
+    let mut titles = Vec::new();
+    for project in repo.list(None)?.into_iter().filter(|p| p.sync_enabled) {
+        let tasks = repo.tasks(&project.id)?;
+        payload.push(serde_json::json!({
+            "id": project.id,
+            "title": project.title,
+            "state": project.state.as_str(),
+            "task_count": tasks.len(),
+            "completed_tasks": tasks
+                .iter()
+                .filter(|task| task.state == otwono_types::project::TaskState::Completed)
+                .count(),
+        }));
+        titles.push(project.title.clone());
+    }
+
+    let url = format!("{}/v1/projects", link.relay_base_url.trim_end_matches('/'));
+    let response = state
+        .http
+        .post(&url)
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "projects": payload }))
+        .send()
+        .await
+        .map_err(|error| {
+            ApiError::BadRequest(format!("The relay could not be reached: {error}"))
+        })?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        return Err(ApiError::BadRequest(format!(
+            "The relay refused the synchronisation ({status})."
+        )));
+    }
+
+    let sent_at = otwono_types::ids::format_ts(&chrono::Utc::now());
+    ActivityRepo::new(&state.db).record(NewActivity::user("account.sync").with_detail(
+        serde_json::json!({ "projects": titles.len(), "relay": link.relay_base_url }),
+    ))?;
+
+    Ok(Json(SyncResponse {
+        synchronised: titles.len(),
+        titles,
+        sent_at,
+        what_was_sent: SYNC_FIELDS,
+    }))
 }
 
 pub async fn unlink(State(state): State<AppState>) -> ApiResult<Json<AccountStatus>> {

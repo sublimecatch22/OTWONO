@@ -17,6 +17,9 @@ pub struct AppState {
     /// Schema version reached at start-up, reported by `/api/system/status`.
     pub schema_version: i64,
     pub started_at: String,
+    /// The only client that reaches off this machine, and only when the user
+    /// has linked an account and asked for something to be sent.
+    pub http: reqwest::Client,
 }
 
 impl AppState {
@@ -29,6 +32,10 @@ impl AppState {
             allowed_origins: Arc::new(crate::auth::default_allowed_origins()),
             schema_version,
             started_at: otwono_types::ids::format_ts(&otwono_types::now()),
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(20))
+                .user_agent(concat!("OTWONO/", env!("CARGO_PKG_VERSION")))
+                .build()?,
         })
     }
 

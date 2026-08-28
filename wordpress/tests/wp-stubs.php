@@ -25,6 +25,8 @@ final class WP_Test_State {
 	public static array $roles      = array();
 	public static array $requests   = array();
 	public static array $responses  = array();
+	/** When true, outbound HTTP really happens, against a running relay. */
+	public static bool $live_http   = false;
 	public static int $current_user = 1;
 	public static array $capabilities = array( 'otwono_use_connector' => true, 'manage_options' => true );
 
@@ -35,6 +37,7 @@ final class WP_Test_State {
 		self::$roles        = array();
 		self::$requests     = array();
 		self::$responses    = array();
+		self::$live_http    = false;
 		self::$current_user = 1;
 		self::$capabilities = array( 'otwono_use_connector' => true, 'manage_options' => true );
 	}
@@ -380,9 +383,19 @@ function add_query_arg( array $args, string $url ): string {
 	return $url . '?' . http_build_query( $args );
 }
 
-/** Outbound HTTP is stubbed: tests queue responses and assert on requests. */
+/**
+ * Outbound HTTP is stubbed: tests queue responses and assert on requests.
+ *
+ * The live integration suite flips `$live_http` so the same plugin code talks
+ * to a relay that is actually running, over the network, with no queue.
+ */
 function wp_remote_request( string $url, array $args = array() ): array|WP_Error {
 	WP_Test_State::$requests[] = array( 'url' => $url, 'args' => $args );
+
+	if ( WP_Test_State::$live_http ) {
+		return wp_test_real_request( $url, $args );
+	}
+
 	$next = array_shift( WP_Test_State::$responses );
 	if ( null === $next ) {
 		return array( 'response' => array( 'code' => 200 ), 'body' => '{}' );
@@ -391,6 +404,36 @@ function wp_remote_request( string $url, array $args = array() ): array|WP_Error
 		return $next;
 	}
 	return $next;
+}
+
+/** A real request, used only by the live integration suite. */
+function wp_test_real_request( string $url, array $args ): array|WP_Error {
+	$handle = curl_init( $url );
+	$headers = array();
+	foreach ( (array) ( $args['headers'] ?? array() ) as $name => $value ) {
+		$headers[] = $name . ': ' . $value;
+	}
+	curl_setopt_array(
+		$handle,
+		array(
+			CURLOPT_CUSTOMREQUEST  => (string) ( $args['method'] ?? 'GET' ),
+			CURLOPT_RETURNTRANSFER => true,
+			CURLOPT_HTTPHEADER     => $headers,
+			CURLOPT_TIMEOUT        => (int) ( $args['timeout'] ?? 15 ),
+		)
+	);
+	if ( isset( $args['body'] ) && '' !== $args['body'] ) {
+		curl_setopt( $handle, CURLOPT_POSTFIELDS, $args['body'] );
+	}
+	$body = curl_exec( $handle );
+	if ( false === $body ) {
+		$message = curl_error( $handle );
+		curl_close( $handle );
+		return new WP_Error( 'http_request_failed', $message );
+	}
+	$code = (int) curl_getinfo( $handle, CURLINFO_RESPONSE_CODE );
+	curl_close( $handle );
+	return array( 'response' => array( 'code' => $code ), 'body' => (string) $body );
 }
 
 function wp_remote_retrieve_response_code( array|WP_Error $response ): int {

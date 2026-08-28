@@ -101,3 +101,32 @@ repository would add a level with no benefit.
 **Decision:** Persistence is its own crate rather than being folded into
 `agent-core`, so that `knowledge`, `permissions` and the relay can depend on
 migrations and repositories without depending on the orchestrator.
+
+## D-013 — Synchronisation is a push the user asks for, not a background job
+**Spec reference:** §14 "Do not pretend public remote synchronization works
+when it has not been deployed and tested"; §11 privacy.
+**Decision:** The desktop sends project metadata only when the user presses
+*Send project metadata*, only for projects they ticked, and the response is a
+receipt naming every title that left the machine and the exact fields sent.
+**Why:** A background sync would be a claim the user cannot check. An explicit
+push with a receipt is one they can. The path is covered end to end by a test
+that runs the desktop service against a relay that is really listening, and
+asserts that the objective, instructions and output of a project never arrive.
+
+## D-014 — `projects.write` is a scope of its own
+**Spec reference:** §13 "scoped, revocable access tokens."
+**Decision:** Pushing project metadata requires `projects.write`. A paired
+WordPress site asks only for `projects.read`.
+**Why:** Under the previous arrangement one scope covered both, so a site token
+could invent project metadata in the owner's account. Reading what the owner
+published and writing to their account are different powers and now need
+different grants.
+
+## D-015 — A file with nothing in it is skipped, not failed
+**Spec reference:** §8 "report what could not be read."
+**Decision:** Empty, whitespace-only, binary and over-size files are recorded
+as *skipped* with the reason shown. Only a file that broke while being read —
+a PDF that is not a PDF, an embedding call that failed — is recorded as
+*failed*.
+**Why:** Both are reported, so nothing disappears silently, but an error badge
+against a blank file tells the user something is wrong when nothing is.

@@ -5,7 +5,13 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 
 import type { Preferences } from '@otwono/ui';
 import { api, ApiError } from '../api/client';
-import type { AccountStatus, Grant, PairingCode, PermissionsResponse } from '../api/types';
+import type {
+  AccountStatus,
+  Grant,
+  PairingCode,
+  PermissionsResponse,
+  SyncResult,
+} from '../api/types';
 import {
   Badge,
   Button,
@@ -471,15 +477,34 @@ function AccountSettings() {
     },
   });
 
+  const [sent, setSent] = useState<SyncResult | null>(null);
+  const sync = useMutation({
+    mutationFn: () => api.post<SyncResult>('/api/account/sync'),
+    onSuccess: (result) => {
+      setSent(result);
+      toast({
+        tone: 'positive',
+        body: `Sent the metadata of ${result.synchronised} project(s).`,
+      });
+    },
+    onError: (error) =>
+      toast({ tone: 'negative', body: error instanceof ApiError ? error.message : String(error) }),
+  });
+
   return (
     <Card
       title="OTWONO account"
       description="Optional. Everything works without one."
       actions={
         account.data?.linked ? (
-          <Button size="sm" variant="danger" onClick={() => unlink.mutate()}>
-            Unlink
-          </Button>
+          <>
+            <Button size="sm" busy={sync.isPending} onClick={() => sync.mutate()}>
+              Send project metadata
+            </Button>
+            <Button size="sm" variant="danger" onClick={() => unlink.mutate()}>
+              Unlink
+            </Button>
+          </>
         ) : (
           <Button size="sm" variant="primary" busy={pair.isPending} onClick={() => pair.mutate()}>
             Show a pairing code
@@ -508,6 +533,24 @@ function AccountSettings() {
             { label: 'Scopes', value: account.data.link.scopes.join(', ') || 'None' },
           ]}
         />
+      )}
+
+      {sent && (
+        <Notice tone="positive" title="What was sent">
+          <p>{sent.what_was_sent}</p>
+          {sent.titles.length === 0 ? (
+            <p>
+              No project is marked for synchronisation, so nothing left this machine. Tick the box
+              on a project to include it.
+            </p>
+          ) : (
+            <ul>
+              {sent.titles.map((title) => (
+                <li key={title}>{title}</li>
+              ))}
+            </ul>
+          )}
+        </Notice>
       )}
     </Card>
   );

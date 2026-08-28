@@ -596,3 +596,122 @@ async fn a_boardroom_session_runs_after_only_connecting_a_runtime() {
         "every member should have spoken"
     );
 }
+
+/// Synchronisation, end to end, against a relay that is really running.
+///
+/// The point of the test is what does *not* travel: the project's objective,
+/// its task instructions and its output must never reach the relay, and a
+/// project the user did not tick must not be sent at all.
+#[tokio::test]
+async fn only_the_metadata_of_projects_the_user_ticked_reaches_the_relay() {
+    let (relay, _relay_state) = otwono_relay::serve_for_tests().await.unwrap();
+    let harness = Harness::start().await;
+    let client = reqwest::Client::new();
+
+    // An account on the relay, as the user would make one.
+    client
+        .post(format!("{}/v1/accounts", relay.base_url()))
+        .json(&json!({
+            "email": "owner@example.test",
+            "password": "a-long-enough-passphrase",
+            "display_name": "Sam Owner"
+        }))
+        .send()
+        .await
+        .unwrap();
+    let signed: serde_json::Value = client
+        .post(format!("{}/v1/accounts/sign-in", relay.base_url()))
+        .json(&json!({
+            "email": "owner@example.test",
+            "password": "a-long-enough-passphrase",
+            "scopes": ["profile.read", "projects.read", "projects.write"]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let relay_token = signed["token"].as_str().unwrap().to_string();
+
+    // Two projects: one the user marked for synchronisation, one they did not.
+    let shared = harness
+        .post_json(
+            "/api/projects",
+            json!({
+                "title": "Quarterly report for Q3",
+                "objective": "A private objective that must never leave this machine.",
+                "acceptance_criteria": ["Under 800 words"]
+            }),
+        )
+        .await;
+    let private = harness
+        .post_json(
+            "/api/projects",
+            json!({ "title": "Something private", "objective": "Also private." }),
+        )
+        .await;
+
+    let shared_id = shared["id"].as_str().unwrap();
+    let response = harness
+        .authorised(
+            harness
+                .client
+                .put(harness.url(&format!("/api/projects/{shared_id}")))
+                .json(&json!({ "sync_enabled": true })),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+
+    // Nothing can be sent before an account is linked.
+    let refused = harness.post("/api/account/sync", json!({})).await;
+    assert_eq!(refused.status(), 400);
+
+    harness
+        .post_json(
+            "/api/account/link",
+            json!({
+                "relay_base_url": relay.base_url(),
+                "account_id": signed["account_id"],
+                "account_email": "owner@example.test",
+                "scopes": ["profile.read", "projects.read", "projects.write"],
+                "token": relay_token
+            }),
+        )
+        .await;
+
+    let receipt = harness.post_json("/api/account/sync", json!({})).await;
+    assert_eq!(receipt["synchronised"], 1, "only the ticked project");
+    assert_eq!(receipt["titles"][0], "Quarterly report for Q3");
+
+    // What the relay actually holds.
+    let listed: serde_json::Value = client
+        .get(format!("{}/v1/projects", relay.base_url()))
+        .bearer_auth(&relay_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let stored = serde_json::to_string(&listed).unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(listed[0]["title"], "Quarterly report for Q3");
+    assert!(
+        !stored.contains("must never leave this machine"),
+        "the objective must not be synchronised: {stored}"
+    );
+    assert!(
+        !stored.contains("Something private"),
+        "a project the user did not tick must not be synchronised: {stored}"
+    );
+    assert!(
+        private["id"].as_str().is_some(),
+        "the untouched project still exists locally"
+    );
+
+    relay.handle.abort();
+}

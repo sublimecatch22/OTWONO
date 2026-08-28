@@ -54,6 +54,9 @@ test-support = ["otwono-agent-core/test-support"]
 [dev-dependencies]
 otwono-local-service = { path = ".", features = ["test-support"] }
 otwono-agent-core = { path = "../../packages/agent-core", features = ["test-support"] }
+# The relay is a dev dependency only: the desktop service links nothing of it
+# at run time and reaches it over HTTP like any other remote service.
+otwono-relay = { path = "../relay-api", features = ["test-support"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
 axum = { workspace = true }
