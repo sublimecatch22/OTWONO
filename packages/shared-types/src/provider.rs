@@ -96,11 +96,35 @@ impl Default for Capabilities {
     }
 }
 
+/// How a capability was established. Shown in the UI so the user can tell a
+/// probed fact from an educated guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilitySource {
+    /// The runtime itself told us.
+    Reported,
+    /// We asked the runtime to do it and it worked.
+    Probed,
+    /// Inferred from the model's name or family. May be wrong.
+    Inferred,
+}
+
+impl CapabilitySource {
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::Reported => "reported by the runtime",
+            Self::Probed => "confirmed by a test request",
+            Self::Inferred => "inferred from the model name; may be inaccurate",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelInfo {
     pub id: String,
     pub display_name: String,
     pub capabilities: Capabilities,
+    pub capability_source: CapabilitySource,
     pub parameter_size: Option<String>,
     pub quantization: Option<String>,
 }
@@ -159,6 +183,20 @@ mod tests {
             assert_eq!(ProviderKind::parse(kind.as_str()).unwrap(), kind);
         }
         assert!(ProviderKind::parse("chatgpt").is_err());
+    }
+
+    #[test]
+    fn every_capability_source_explains_itself() {
+        for source in [
+            CapabilitySource::Reported,
+            CapabilitySource::Probed,
+            CapabilitySource::Inferred,
+        ] {
+            assert!(!source.describe().is_empty());
+        }
+        assert!(CapabilitySource::Inferred
+            .describe()
+            .contains("may be inaccurate"));
     }
 
     #[test]

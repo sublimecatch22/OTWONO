@@ -453,10 +453,7 @@ impl<'a> KnowledgeRepo<'a> {
 
     /// Every chunk of every authorised source in `source_ids`, with its vector,
     /// for scoring. Only documents that reached `indexed` are returned.
-    pub fn searchable_chunks(
-        &self,
-        source_ids: &[String],
-    ) -> Result<Vec<SearchableChunk>> {
+    pub fn searchable_chunks(&self, source_ids: &[String]) -> Result<Vec<SearchableChunk>> {
         if source_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -651,7 +648,9 @@ mod tests {
         let source = source(&db);
         index_one(&repo, &source.id, "a.md", "the answer is 42");
         assert_eq!(
-            repo.searchable_chunks(std::slice::from_ref(&source.id)).unwrap().len(),
+            repo.searchable_chunks(std::slice::from_ref(&source.id))
+                .unwrap()
+                .len(),
             1
         );
 
