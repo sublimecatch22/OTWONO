@@ -553,6 +553,33 @@ if otwono-netd --peer-binding "$WORK/peer.binding" --socket /run/otwono/net.sock
     fi
 fi
 
+# And then to *every* connected peer, not only the one `--peer-binding` happened to pick.
+#
+# The assertions above want one peer and are done. This is about the discovery step below: it
+# can only assert that a node finds what was sealed to it if something was. With one
+# arbitrarily-chosen recipient per node that is not guaranteed — on three nodes two of them
+# can pick the same third, leaving one node with nothing sealed to it, which then correctly
+# discovers nothing and spends the full six hundred seconds proving it. That happened on
+# three consecutive runs, and each time it looked like a failure worth investigating.
+#
+# Sealing to everyone makes "this node discovered nothing" mean something is wrong, which is
+# what an assertion is for.
+shared_to_peer_all="$shared_to_peer"
+for pid in $(otwono-netd --peer-ids --socket /run/otwono/net.sock \
+        --perm-socket /run/otwono/perm.sock 2>/dev/null); do
+    otwono-netd --peer-binding "$WORK/$pid.binding" --peer "$pid" \
+        --socket /run/otwono/net.sock >/dev/null 2>&1 || continue
+    printf 'otwono shared-to-%s %s\n' "$pid" "$(date -u +%s%N)" > "$WORK/for-$pid.txt"
+    each=$(otwono-storectl share --file "$WORK/for-$pid.txt" \
+        --recipient "$WORK/$pid.binding" 2>/dev/null) || continue
+    each_id=$(echo "$each" | awk 'NR==1 {print $1}')
+    case " $shared_to_peer_all " in
+        *" $each_id "*) ;;
+        *) shared_to_peer_all="$shared_to_peer_all $each_id" ;;
+    esac
+done
+step "sealed to every connected peer"
+
 # --- Adding and removing recipients, on a booted node (ADR-0019 §5) ---------------------
 # The host-side tests cover the logic. What only a boot can show is that the *shipped* image
 # permits it: the policy in stage 30 grants id.unwrap_shared for opening, and adding a
@@ -650,19 +677,16 @@ fi
 # because the peer may not have reached that step yet -- and because the peer's index is
 # taken once per session, so an object sealed after this node's last connection is only
 # visible on a later one. That is ADR-0020's stated cost, and here it is as a retry.
-# `discovered=none` here is usually not a failure, and it is worth saying so plainly because
-# the shape is misleading: this loop then runs its full six hundred seconds and the marker
-# reports `none` with nothing else wrong.
+# Now an assertion rather than an observation. Every node seals to every peer above, so every
+# node has something sealed to it by both, and finding nothing means something is wrong.
 #
-# The reason is above. Each node seals to **one** peer, chosen by `--peer-binding` with no
-# `--peer`, which takes whichever the peer table happened to order first. On three nodes that
-# is not a permutation: two nodes can both pick the third, and then one node has nothing
-# sealed to it at all and correctly discovers nothing. Roughly one node per three-node run
-# lands in that case, and spends ten minutes proving a negative.
+# It was tolerated before because it could not be: with one arbitrarily-chosen recipient per
+# node, a node with nothing sealed to it discovers nothing and is right to. That case cost
+# ten minutes a run and looked like a failure three runs running.
 #
-# So this step asserts discovery *when something was sealed to this node* and tolerates the
-# case where nothing was. Making it unconditional means sealing to every connected peer
-# rather than one, which is a change to the step above and wants its own run to validate.
+# The wait is still long, and for a reason that remains: the nodes run this script with no
+# barrier between them, so a node can reach this step before its peers have sealed. The
+# retry is for that, not for flakiness.
 step "asking the peer what it has sealed to this node"
 discovered=none
 i=0
@@ -683,8 +707,10 @@ if [ -n "$all" ]; then
         # It must not be the object this node sealed: that one is sealed to the peer, and
         # this node holds no copy of its key. Discovering it would mean the index answered
         # with something it holds rather than something it was given.
-        [ "$candidate" != "$shared_to_peer" ] \
-            || fail "the index offered back the object this node sealed to its peer"
+        case " $shared_to_peer_all " in
+            *" $candidate "*)
+                fail "the index offered back an object this node sealed to a peer" ;;
+        esac
 
         # A discovered id that will not fetch is not a failure by itself. The index is a
         # snapshot, and ADR-0019 §5 is explicit that a revoke stops future serving -- so an
@@ -701,6 +727,8 @@ if [ -n "$all" ]; then
     done
     [ "$discovered" != none ] \
         || fail "the peer sealed things to this node and would serve none of them: $all"
+else
+    fail "every peer sealed something to this node and none of it was discovered"
 fi
 
 rm -rf "$WORK"
