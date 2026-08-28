@@ -1734,7 +1734,9 @@ impl StoreService {
         // caller has been told the truth, and an entry the cache would not drop is evictable
         // like anything else once its hold lapses.
         let freed = match (self.cache.as_ref(), Self::parse_id(envelope_id)) {
-            (Some(cache), Ok(id)) => cache.remove(&id).unwrap_or(0),
+            (Some(cache), Ok(id)) => cache
+                .release_carried(&id, otwono_store::cache::now_unix_ms())
+                .unwrap_or(0),
             _ => 0,
         };
         Ok(json!({

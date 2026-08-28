@@ -489,6 +489,27 @@ impl Cache {
                 budget: self.budget_bytes,
             });
         }
+        // Never take carriage of bytes this node is holding for another reason.
+        //
+        // `put_object` overwrites: storing this would relabel an existing entry `SHARED`,
+        // and [`Self::release_carried`] would then be a remote peer's message that deletes
+        // a replica this node promised to hold. Content addressing makes the collision
+        // require the exact ciphertext, so it takes a peer that already had the bytes — a
+        // former carrier, say — but "unlikely" is not an access rule.
+        //
+        // Declining is the right answer rather than an error: this node already has the
+        // bytes and is already keeping them, which is what carriage was for.
+        if let Some(entry) = self
+            .index
+            .lock()
+            .expect("cache index poisoned")
+            .objects
+            .get(&expected.to_hex())
+        {
+            if entry.pinned || entry.holds_a_live_replica(now_ms) {
+                return Ok(None);
+            }
+        }
         self.ensure_disk_room(size)?;
         // Room first, bytes second. `evict_to_fit` refuses rather than overrunning the
         // budget when everything left is held, and a refusal here must leave the cache as
@@ -505,10 +526,10 @@ impl Cache {
         let mut index = self.index.lock().expect("cache index poisoned");
         let hex = object.content_id.to_hex();
         match index.objects.get_mut(&hex) {
-            // Already here — as a replica, as something this node fetched, or as an
-            // envelope taken from another carrier. Content addressing means the chunks are
-            // the same files, so this is a hold on what is already there. The later
-            // deadline wins: two custody records for one object both have to be honoured.
+            // Already here — as another carrier's envelope this node also took, or as
+            // something it fetched. Content addressing means the chunks are the same files,
+            // so this is a hold on what is already there. The later deadline wins: two
+            // custody records for one object both have to be honoured.
             Some(entry) => {
                 entry.last_access_ms = now_ms;
                 entry.carried_until_ms = Some(entry.carried_until_ms.unwrap_or(0).max(until_ms));
@@ -532,6 +553,32 @@ impl Cache {
         }
         Self::persist(&index, &self.index_path)?;
         Ok(Some(object))
+    }
+
+    /// Give up a carried envelope's bytes, and only a carried envelope's (ADR-0031).
+    ///
+    /// The counterpart of [`Self::take_carried`], and deliberately not [`Self::remove`]. This
+    /// is reached from `content.delivered` — a message from a peer — so what it can delete
+    /// has to be bounded by more than the id being right. An entry an operator pinned, or one
+    /// this node promised to hold as a replica, is not this peer's to drop even if the id
+    /// matches; `take_carried` refuses to take carriage over either, so an entry that is one
+    /// of those was never carriage in the first place.
+    ///
+    /// Returns the bytes freed, and zero when there was nothing here to free — releasing
+    /// twice, or releasing something taken before ADR-0031 whose bytes are in the permanent
+    /// store, are both normal and neither is an error.
+    pub fn release_carried(&self, id: &ContentId, now_ms: u64) -> Result<u64, CacheError> {
+        let hex = id.to_hex();
+        let mut index = self.index.lock().expect("cache index poisoned");
+        match index.objects.get(&hex) {
+            Some(entry) if entry.pinned || entry.holds_a_live_replica(now_ms) => Ok(0),
+            Some(_) => {
+                let freed = self.remove_locked(&mut index, &hex)?;
+                Self::persist(&index, &self.index_path)?;
+                Ok(freed)
+            }
+            None => Ok(0),
+        }
     }
 
     /// Extend the carriage hold on something already here, to a deadline decided later.
@@ -1041,6 +1088,71 @@ mod tests {
             .expect_err("a mismatched id must be refused");
         assert!(matches!(err, CacheError::Store(_)), "{err}");
         assert!(!c.contains(&other), "the cache kept bytes it had just refused");
+    }
+
+    #[test]
+    fn carriage_will_not_take_over_a_replica_or_a_pin() {
+        // `put_object` overwrites, so storing a carried envelope over an entry this node
+        // holds for another reason would relabel it SHARED — and `release_carried` would
+        // then be a remote peer's message that deletes a replica this node promised to keep.
+        // Content addressing makes the collision need the exact ciphertext, which a former
+        // carrier would have.
+        let c = cache("carried-vs-replica", 100_000);
+        let (bytes, sharing, id) = sealed(&data(300, 210), 13);
+
+        let replica = c
+            .take_replica(&bytes, &policy(u64::MAX, 30), 1_000)
+            .unwrap()
+            .expect("held as a replica first");
+        assert_eq!(replica.content_id, id, "the fixture is not the same bytes");
+        assert!(
+            c.take_carried(&bytes, &id, sharing.clone(), 5_000, 1_000)
+                .unwrap()
+                .is_none(),
+            "carriage took over a live replica"
+        );
+        assert_eq!(
+            c.stat(&id).unwrap().visibility,
+            Visibility::Replicated,
+            "the replica was relabelled by a refused take"
+        );
+
+        // And a pin, which is an operator's decision and outlives every promise.
+        let c = cache("carried-vs-pin", 100_000);
+        let (bytes, sharing, id) = sealed(&data(300, 211), 14);
+        c.insert(&bytes, Visibility::Public, 1_000).unwrap();
+        c.set_pinned(&id, true).unwrap();
+        assert!(
+            c.take_carried(&bytes, &id, sharing, 5_000, 1_000)
+                .unwrap()
+                .is_none(),
+            "carriage took over a pinned object"
+        );
+    }
+
+    #[test]
+    fn releasing_a_carried_envelope_frees_it_and_nothing_else() {
+        let c = cache("release-carried", 100_000);
+        let (bytes, sharing, id) = sealed(&data(400, 212), 15);
+        c.take_carried(&bytes, &id, sharing, 5_000, 1_000)
+            .unwrap()
+            .expect("taken");
+        assert!(c.release_carried(&id, 1_500).unwrap() > 0, "nothing was freed");
+        assert!(!c.contains(&id), "the bytes outlived the custody record");
+        // Releasing twice is not an error and frees nothing the second time. A recipient
+        // reporting delivery races the carrier's own sweep, so this happens.
+        assert_eq!(c.release_carried(&id, 1_500).unwrap(), 0);
+
+        // A replica with the same id is not this peer's to drop. Unreachable while
+        // `take_carried` refuses to take over one, and asserted anyway: the two guards are
+        // what keep `content.delivered` from being a remote delete.
+        let c = cache("release-vs-replica", 100_000);
+        let (bytes, _, id) = sealed(&data(400, 213), 16);
+        c.take_replica(&bytes, &policy(u64::MAX, 30), 1_000)
+            .unwrap()
+            .expect("held");
+        assert_eq!(c.release_carried(&id, 1_500).unwrap(), 0);
+        assert!(c.contains(&id), "a release deleted a live replica");
     }
 
     #[test]

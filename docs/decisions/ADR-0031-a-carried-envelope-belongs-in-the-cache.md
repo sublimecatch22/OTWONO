@@ -66,6 +66,14 @@ permanent store. Custody decides which, and nothing else does.**
    refuse and which stays refused.
 4. `envelope.release` removes the cached object as well as the custody record. Release,
    expiry and dropping for room then all free bytes, which is what §7 assumes they do.
+5. **Carriage neither takes over nor deletes bytes this node holds for another reason.**
+   `put_object` overwrites, so storing a carried envelope over an existing entry would
+   relabel it `SHARED`; a release — which is a message from a peer — would then delete a
+   replica this node promised to hold, or an object an operator pinned. Content addressing
+   means the collision needs the exact ciphertext, so it takes a peer that already had the
+   bytes, which a former carrier is. "Unlikely" is not an access rule. `take_carried`
+   declines over a pin or a live replica, and `release_carried` frees only an entry that is
+   neither.
 
 ## What this does not decide, and the hazards it creates
 

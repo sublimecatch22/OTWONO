@@ -85,6 +85,28 @@ make -C build TARGET=arm64-qemu image
 make -C build clean
 ```
 
+### Testing the mesh across several nodes
+
+```bash
+make -C build TARGET=amd64-qemu-ubuntu MESH_CONTENT_SMOKE=1 image
+make -C build TARGET=amd64-qemu-ubuntu NODES=3 multi-node-test
+```
+
+Two things about that pair are easy to get wrong, and both used to fail silently.
+
+**`MESH_CONTENT_SMOKE=1` belongs on the *build*, not the run.** Without it stage 37 installs
+no content or envelope check and grants no `store.serve` or `net.content`, which is right for
+anything shipped and useless for a mesh test. The harness then boots the nodes, watches them
+find each other and prints `PASS: 3 nodes discovered` — true, and one line away from reading
+as if content, replication, pointers and store-and-forward had all passed. It now prints a
+note saying so; the note is the only thing distinguishing a real pass from an empty one.
+
+**`multi-node-test` does not rebuild the image.** It has no `make` dependency on `image` and
+boots whatever is at the output path, so committing a fix and running the harness tests the
+*previous* build. Stage 30 stamps the source revision into the manifest and the harness
+refuses a mismatch before it starts a VM; `--allow-stale-image` overrides that for a
+deliberate re-run of an older build.
+
 ## 6. Environment constraints observed in OTWONO Cloud
 
 Recorded from a real probe (`tools/probe-env.sh`), 2026-08-22:
