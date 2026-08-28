@@ -2247,3 +2247,66 @@ fn the_carriage_methods_refuse_a_token_minted_for_another_action() {
         assert!(allowed.is_ok(), "{method} with envelope.carry: {allowed:?}");
     }
 }
+
+/// Being dialled teaches a node that a peer is here, not where to reach it.
+///
+/// An accepted socket's remote port is the *dialer's* ephemeral source port. Recording it as
+/// the peer's address produces an entry nothing listens on, and `PeerTable::observe` appends,
+/// so an inbound connection seen before the peer's advertisement leaves that dead entry first
+/// in the list — and every outbound pass reads `addresses.first()`. The symptom is a peer
+/// that authenticates inbound and is refused on every dial back, asymmetrically and for the
+/// life of the process:
+///
+/// ```text
+/// carry pass with otw1:30am-… failed: connect to 169.254.182.65:33814:
+///   link I/O failed: Connection refused (os error 111)
+/// ```
+///
+/// 33814 was never a listening port. This test is the assertion that would have caught it.
+#[test]
+fn an_inbound_connection_records_no_dialable_address() {
+    let h = Harness::start("inbound-address");
+
+    // A second serving node, kept rather than moved into the listener thread, so its peer
+    // table can be read after somebody dials it.
+    let (agreement, _) = AgreementKeystore::new(h.dir.join("agreement-listener"))
+        .load_or_generate()
+        .unwrap();
+    let signer = BrokeredSigner::bind(agreement, &h.id_socket, &h.perm_socket).expect("bind");
+    let listening_node = signer.node_id();
+    let listener = TcpLink::listen("127.0.0.1:0").unwrap();
+    let listen_addr = listener.local_addr().unwrap();
+    let inbound = Arc::new(NetState::new(Arc::new(signer)));
+    let serving = Arc::clone(&inbound);
+    std::thread::spawn(move || otwono_netd::run_listener(serving, listener));
+
+    h.client
+        .dial(&Candidate {
+            claimed_node_id: listening_node,
+            address: listen_addr,
+        })
+        .expect("the dial authenticates");
+
+    // Give the accepting side its moment: the dial returns once the handshake completes, and
+    // the record happens on the other thread.
+    let dialer = h.client.node_id();
+    let mut recorded = None;
+    for _ in 0..50 {
+        if let Some(p) = inbound.peers.lock().unwrap().get(dialer) {
+            recorded = Some(p.addresses.clone());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let addresses = recorded.expect("the accepting node never recorded the peer that dialled it");
+    assert!(
+        addresses.is_empty(),
+        "an inbound connection contributed a dial address: {addresses:?} — the port there is \
+         the dialer's ephemeral source port and nothing listens on it"
+    );
+    assert_eq!(
+        inbound.peers.lock().unwrap().connected().len(),
+        1,
+        "the peer is still connected; only its address is unknown"
+    );
+}

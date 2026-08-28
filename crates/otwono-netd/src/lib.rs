@@ -212,7 +212,6 @@ impl NetState {
 
     /// Handle one inbound connection: authenticate, exchange hello, record the peer.
     pub fn serve_inbound(&self, link: TcpLink) {
-        let address = link.peer_addr();
         let _ = link.set_timeout(Some(HANDSHAKE_TIMEOUT));
         match SecureChannel::accept(link, self.signer.as_ref()) {
             Ok(mut channel) => {
@@ -226,10 +225,18 @@ impl NetState {
                     }
                 };
                 let now = self.now();
+                // Deliberately no address. An accepted socket's remote port is the
+                // *dialer's* ephemeral source port, not a port anything listens on, so
+                // recording it produces an entry that is guaranteed to be refused when
+                // dialled — and `addresses` is append-only, so an inbound connection seen
+                // before the peer's advertisement makes that dead entry the first one every
+                // outbound pass tries, permanently. Where a peer can be reached is what an
+                // advertisement says; that a peer is here is what this connection proves,
+                // and only the second is knowledge this side has.
                 self.peers
                     .lock()
                     .unwrap()
-                    .record_authenticated(node_id, address, now, sharing);
+                    .record_authenticated(node_id, None, now, sharing);
                 eprintln!(
                     "otwono-netd: inbound peer authenticated: {}",
                     node_id.fingerprint()
