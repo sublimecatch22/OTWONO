@@ -174,7 +174,13 @@ case "$node_ordinal" in
         # The reply is printed, not discarded. A carry pass now names why it took nothing —
         # a peer with an empty bag, an envelope already held, a store refusing on budget —
         # and throwing that away is what made the previous failure cost a run to diagnose.
-        if [ "$i" -gt 12 ]; then
+        # Every twelfth poll, not every one. Each `--carry` opens a Noise channel to every
+        # connected peer, and on a segment of single-vCPU TCG guests that is real load on
+        # the machines this one is waiting for — the other nodes are still running their own
+        # content checks, and slowing them down is slowing down the thing being waited for.
+        # The daemon's own sweep is the mechanism under test anyway; this is the fallback
+        # that says so when the sweep is not doing its job.
+        if [ "$i" -gt 12 ] && [ $(( i % 12 )) -eq 0 ]; then
             carry_out=$(otwono-netd --carry --socket /run/otwono/net.sock 2>&1) || carry_out="carry pass failed: $carry_out"
             [ -n "$carry_out" ] && echo "OTWONO-ENVELOPE-STEP carry: $(echo "$carry_out" | tr '\n' ';')"
         fi
