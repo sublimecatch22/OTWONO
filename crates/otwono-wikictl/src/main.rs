@@ -53,7 +53,7 @@ otwono-wikictl — wiki pages as signed chains of revisions
 
   otwono-wikictl write <PAGE> --file <PATH> [--visibility public|private]
   otwono-wikictl read <PAGE> --out <PATH> [--from <NODEID>] [--at <ADDR>]
-  otwono-wikictl history <PAGE> [--limit N]
+  otwono-wikictl history <PAGE> [--from <NODEID>] [--limit N]
   otwono-wikictl delete <PAGE>
   otwono-wikictl list
 
@@ -181,7 +181,12 @@ fn run() -> Result<String, Error> {
             Some(peer) => read_from_peer(&opts, &perm, &peer),
             None => read_page(&opts, &store, &perm),
         },
-        "history" => show_history(&opts, &store, &perm),
+        // A page of this node's own, or a peer's walked over a link. Same rendering, and
+        // the same rules at every step; only where the revisions come from differs.
+        "history" => match opts.from.clone() {
+            Some(peer) => peer_history(&opts, &perm, &peer),
+            None => show_history(&opts, &store, &perm),
+        },
         "delete" => delete_page(&opts, &store, &perm),
         "list" => list_pages(&opts, &store, &perm),
         other => Err(Error::Usage(format!("unknown command {other}"))),
@@ -349,17 +354,39 @@ fn show_history(opts: &Options, store: &Path, perm: &Path) -> Result<String, Err
     )
     .map_err(|e| Error::Runtime(e.to_string()))?;
 
+    render_history(opts, &page, &history)
+}
+
+/// One rendering for a local history and a peer's, so the two cannot drift.
+///
+/// How the walk ended is part of the answer and not a footnote: a list of revisions on its
+/// own cannot tell a whole history from as much of one as the reader happens to hold, and
+/// after fetching from a peer the second is the ordinary case.
+fn render_history(opts: &Options, page: &str, history: &otwono_wiki::History) -> Result<String, Error> {
     if opts.json {
         let steps: Vec<Value> = history
             .steps
             .iter()
-            .map(|s| json!({ "revision": s.content_id, "body": s.revision.body, "written_at_ms": s.revision.written_at_ms }))
+            .map(|s| {
+                json!({
+                    "revision": s.content_id,
+                    "body": s.revision.body,
+                    "author": s.revision.author,
+                    "written_at_ms": s.revision.written_at_ms,
+                })
+            })
             .collect();
         return Ok(format!(
             "{}\n",
-            serde_json::to_string(
-                &json!({ "page": page, "steps": steps, "end": format!("{:?}", history.end) })
-            )
+            serde_json::to_string(&json!({
+                "page": page,
+                "steps": steps,
+                "end": match &history.end {
+                    otwono_wiki::WalkEnd::Complete => json!("complete"),
+                    otwono_wiki::WalkEnd::Truncated { missing } => json!({ "truncated": missing }),
+                    otwono_wiki::WalkEnd::Limited => json!("limited"),
+                },
+            }))
             .map_err(runtime)?
         ));
     }
@@ -370,8 +397,6 @@ fn show_history(opts: &Options, store: &Path, perm: &Path) -> Result<String, Err
             step.content_id, step.revision.body, step.revision.written_at_ms
         ));
     }
-    // How the walk ended is part of the answer, not a footnote: a list on its own cannot
-    // tell a whole history from as much of one as this node happens to hold.
     out.push_str(&match &history.end {
         otwono_wiki::WalkEnd::Complete => "end: complete\n".to_string(),
         otwono_wiki::WalkEnd::Truncated { missing } => {
@@ -871,4 +896,77 @@ fn list_pages(opts: &Options, store: &Path, perm: &Path) -> Result<String, Error
         }
     }
     Ok(out)
+}
+
+/// Walk a peer's page back through its history, verifying every step.
+///
+/// The other half of reading somebody else's page. `read --from` takes the head and the body;
+/// this follows the chain — and it is the case ADR-0032's rules were written for. The pointer
+/// vouches for the head alone, so every ancestor arrives from the same peer with nothing
+/// standing behind it but that peer's word, and content addressing stops the bytes being
+/// altered without saying which id belongs in the chain.
+///
+/// The key comes from `net.pointer`, the only place it is proved rather than asserted: a
+/// NodeID is a hash of it, so no record can carry its own answer to "was this really them".
+///
+/// A revision authored by somebody *else* — a page this peer copied from a third node, which
+/// keeps its original author — is refused rather than shown unverified. There is nowhere yet
+/// to look a third party's key up from a terminal, and "verify it later" is "never".
+fn peer_history(opts: &Options, perm: &Path, peer: &str) -> Result<String, Error> {
+    let page = page_of(opts)?;
+    let net = opts
+        .net_socket
+        .clone()
+        .unwrap_or_else(|| otwono_proto::socket_path("net"));
+    let address = match opts.at.clone() {
+        Some(at) => at,
+        None => address_of(&net, perm, peer)?,
+    };
+
+    let resolved = call(
+        &net,
+        perm,
+        "net.pointer",
+        json!({ "node_id": peer, "address": address, "service": SERVICE, "name": page }),
+        Some("net.content"),
+    )?;
+    let record = resolved
+        .get("record")
+        .filter(|r| !r.is_null())
+        .ok_or_else(|| Error::Runtime(format!("{peer} publishes no page called {page:?}")))?;
+    let pointer: otwono_pointer::Pointer = serde_json::from_value(record.clone())
+        .map_err(|e| Error::Runtime(format!("the peer's pointer does not parse: {e}")))?;
+    let head = pointer
+        .content_id
+        .clone()
+        .ok_or_else(|| Error::Runtime(format!("{peer} has deleted {page:?}")))?;
+    let key: [u8; 32] = data_encoding::BASE64
+        .decode(
+            resolved
+                .get("public_key")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::Runtime("net.pointer returned no public_key".into()))?
+                .as_bytes(),
+        )
+        .map_err(|e| Error::Runtime(format!("net.pointer's public_key is not base64: {e}")))?
+        .try_into()
+        .map_err(|_| Error::Runtime("net.pointer's public_key is not 32 bytes".into()))?;
+
+    // Each step is a fetch from that peer. A parent it will not serve ends the walk as
+    // `Truncated` rather than an error, which is the ordinary case: a reader has fetched only
+    // what it asked for, and a peer under no obligation to keep its own history for ever.
+    let shelf = |id: &str| -> Option<otwono_wiki::Revision> {
+        let bytes = fetch(&net, perm, peer, &address, id).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    };
+    let history = otwono_wiki::walk(
+        &shelf,
+        &head,
+        &page,
+        |author| (author == peer).then_some(key),
+        opts.limit.unwrap_or(DEFAULT_HISTORY),
+    )
+    .map_err(|e| Error::Runtime(format!("{page:?} from {peer}: {e}")))?;
+
+    render_history(opts, &page, &history)
 }

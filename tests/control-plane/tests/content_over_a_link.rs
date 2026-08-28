@@ -3437,6 +3437,128 @@ fn a_wiki_page_is_readable_from_another_node() {
     assert_eq!(arrived_body.bytes, text, "the page did not arrive byte for byte");
 }
 
+/// A peer's page is walked back through its history, every step verified (ADR-0032).
+///
+/// `read --from` takes the head and the body. This is the case the signing rule was written
+/// for: the pointer vouches for the head alone, so every ancestor arrives from the same peer
+/// with nothing behind it but that peer's word. Verifying only the head and then following
+/// the chain would show fabricated earlier versions as the author's words.
+#[test]
+fn a_peers_history_is_walked_and_every_step_is_verified() {
+    let h = Harness::start("wiki-history-link");
+
+    // Three revisions on the serving node, chained.
+    let mut parent: Option<String> = None;
+    let mut heads = Vec::new();
+    for text in ["one\n", "two\n", "three\n"] {
+        let body = h.put(text.as_bytes(), "public");
+        let mut revision = otwono_wiki::Revision::new(
+            h.node_signing.node_id(),
+            "Getting-Started",
+            &body,
+            parent.clone(),
+            1_000,
+        );
+        revision.signature =
+            data_encoding::BASE64.encode(&h.node_signing.sign(&revision.signing_bytes().unwrap()).to_bytes());
+        let id = h.put(&serde_json::to_vec(&revision).unwrap(), "public");
+        parent = Some(id.clone());
+        heads.push(id);
+    }
+    h.publish("wiki", "Getting-Started", Some(heads.last().unwrap()));
+
+    let resolved = h
+        .client
+        .resolve_pointer(&h.candidate(), "wiki", "Getting-Started")
+        .expect("resolving over a real link");
+    let head = resolved.record.unwrap().content_id.unwrap();
+    let key = resolved.public_key;
+    let peer = h.server_node.to_text();
+
+    // Every revision is fetched from the peer, exactly as the CLI does it.
+    let shelf = |id: &str| -> Option<otwono_wiki::Revision> {
+        let fetched = h.client.fetch_from(&h.candidate(), id).ok()?;
+        serde_json::from_slice(&fetched.bytes).ok()
+    };
+    let history = otwono_wiki::walk(
+        &shelf,
+        &head,
+        "Getting-Started",
+        |author| (author == peer).then_some(key),
+        64,
+    )
+    .expect("a peer's chain must verify against the key the handshake proved");
+
+    assert_eq!(history.end, otwono_wiki::WalkEnd::Complete);
+    assert_eq!(
+        history
+            .steps
+            .iter()
+            .map(|s| s.content_id.clone())
+            .collect::<Vec<_>>(),
+        heads.iter().rev().cloned().collect::<Vec<_>>(),
+        "history must come back head first, over the link"
+    );
+}
+
+/// One forged ancestor sinks a peer's whole history, not just itself.
+///
+/// The head is genuine and the pointer is genuine; an ancestor is not. A reader that verified
+/// the head and trusted the chain would display that ancestor as this peer's earlier words,
+/// which is precisely what signing every revision exists to stop.
+#[test]
+fn a_peers_history_with_one_forged_ancestor_is_refused() {
+    let h = Harness::start("wiki-history-forged");
+    let somebody_else = NodeIdentity::generate().unwrap();
+
+    // The ancestor: signed by a third party, wearing the serving node's page.
+    let old_body = h.put(b"words the serving node never wrote\n", "public");
+    let mut forged =
+        otwono_wiki::Revision::new(somebody_else.node_id(), "Getting-Started", &old_body, None, 1_000);
+    forged.signature =
+        data_encoding::BASE64.encode(&somebody_else.sign(&forged.signing_bytes().unwrap()).to_bytes());
+    let ancestor = h.put(&serde_json::to_vec(&forged).unwrap(), "public");
+
+    // The head: genuinely the serving node's, naming that ancestor as its parent.
+    let body = h.put(b"the current page\n", "public");
+    let mut head_revision = otwono_wiki::Revision::new(
+        h.node_signing.node_id(),
+        "Getting-Started",
+        &body,
+        Some(ancestor),
+        2_000,
+    );
+    head_revision.signature = data_encoding::BASE64.encode(
+        &h.node_signing
+            .sign(&head_revision.signing_bytes().unwrap())
+            .to_bytes(),
+    );
+    let head = h.put(&serde_json::to_vec(&head_revision).unwrap(), "public");
+    h.publish("wiki", "Getting-Started", Some(&head));
+
+    let resolved = h
+        .client
+        .resolve_pointer(&h.candidate(), "wiki", "Getting-Started")
+        .expect("resolving over a real link");
+    let key = resolved.public_key;
+    let peer = h.server_node.to_text();
+    let shelf = |id: &str| -> Option<otwono_wiki::Revision> {
+        let fetched = h.client.fetch_from(&h.candidate(), id).ok()?;
+        serde_json::from_slice(&fetched.bytes).ok()
+    };
+    let err = otwono_wiki::walk(
+        &shelf,
+        &resolved.record.unwrap().content_id.unwrap(),
+        "Getting-Started",
+        |author| (author == peer).then_some(key),
+        64,
+    )
+    .expect_err("a chain with a foreign-authored ancestor must not verify");
+    // Refused on the author, before the signature is considered: this reader has no key for
+    // that third party and showing the revision unverified is what "verify it later" means.
+    assert_eq!(err, otwono_wiki::WikiError::WrongKey, "{err}");
+}
+
 /// A revision signed by somebody other than the node serving it is refused.
 ///
 /// The check that makes the composition worth anything. `otwono-netd` verifies the *pointer*

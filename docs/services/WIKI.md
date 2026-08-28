@@ -202,7 +202,17 @@ the public key, so a record cannot carry its own answer to "was this really them
 handshake is the only place that key is proved rather than asserted.
 
 `history` verifies every step and prints how the walk ended, so a truncated history says so
-rather than looking like a short one. It answers for revisions authored by **this** node and
-refuses others: a page copied from a peer keeps its original author (ADR-0032), and there is
-nowhere yet to look a peer's key up from a terminal. Refusing is the right answer — "verify it
-later" is "never".
+rather than looking like a short one.
+
+`history --from <NODEID>` walks a **peer's** chain over a link, fetching each revision from
+that peer and verifying it against the key the handshake proved. This is the case the signing
+rule exists for: the pointer vouches for the head alone, so every ancestor arrives from the
+same peer with nothing behind it but that peer's word, and a reader that verified the head and
+then followed the chain would show fabricated earlier versions as the author's words.
+
+Either way, a revision authored by somebody the reader has no key for is **refused**, not
+skipped. A page copied from a third node keeps its original author (ADR-0032), so a chain can
+legitimately change hands — and there is nowhere yet to look that author's key up from a
+terminal. Skipping is the tempting implementation and it is wrong: "verify it later" is
+"never", and one unverifiable ancestor sinks the history rather than being quietly omitted
+from it.
