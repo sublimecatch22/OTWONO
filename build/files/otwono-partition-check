@@ -37,16 +37,29 @@ connected() {
     otwono-netd --status --socket "$SOCK" 2>/dev/null | awk '/^connected/ {print $2}' || true
 }
 
-# Wait for the peer count to reach a target, or give up. Prints nothing; the caller says why
-# it was waiting. `connected` can come back empty if the daemon is mid-restart, which is not
-# zero and must not be read as one.
-wait_for_peers() { # want-count attempts test
-    _want=$1; _attempts=$2; _test=$3; _i=0
+# Wait until this node is alone, or until it has somebody again. Prints nothing; the caller
+# says why it was waiting.
+#
+# `connected` can come back empty if the daemon is mid-restart, and empty is not zero — read
+# as zero it would look exactly like a partition, and this phase would declare one that never
+# happened.
+#
+# Two named modes rather than a comparison operator passed in a variable. That parses at
+# runtime and no static checker can follow it, which is a poor trade for one line, and
+# `wait_for_peers 240 alone` says what it is waiting for where `0 240 -eq` did not.
+wait_for_peers() { # attempts alone|connected
+    _attempts=$1; _mode=$2; _i=0
     while [ "$_i" -lt "$_attempts" ]; do
         _n=$(connected)
         case "$_n" in
             ''|*[!0-9]*) ;;
-            *) [ "$_n" "$_test" "$_want" ] && return 0 ;;
+            *)
+                case "$_mode" in
+                    alone)     [ "$_n" -eq 0 ] && return 0 ;;
+                    connected) [ "$_n" -ge 1 ] && return 0 ;;
+                    *) fail "wait_for_peers: unknown mode $_mode" ;;
+                esac
+                ;;
         esac
         _i=$(( _i + 1 ))
         sleep 5
@@ -86,7 +99,7 @@ case "$node_ordinal" in
     # count that fell because node 1 shut down is not a partition, and this phase runs after
     # that has already happened.
     step "waiting to be cut off from every peer"
-    wait_for_peers 0 240 -eq \
+    wait_for_peers 240 alone \
         || fail "still has $(connected) peer(s) after 20 minutes; the link never went down"
 
     # Something that exists only on this side of the break. A fresh object under a name
@@ -118,10 +131,10 @@ case "$node_ordinal" in
     }
 
     step "waiting for the link to go down"
-    wait_for_peers 0 240 -eq \
+    wait_for_peers 240 alone \
         || fail "still has $(connected) peer(s) after 20 minutes; the link never went down"
     step "cut off; waiting to come back"
-    wait_for_peers 1 240 -ge \
+    wait_for_peers 240 connected \
         || fail "the link came back and this node reconnected to nobody"
 
     # Resolve what node 2 published while this node could not hear it. `--pointer` asks the
