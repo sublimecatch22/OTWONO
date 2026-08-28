@@ -8,6 +8,7 @@
 //! otwono-wikictl write Getting-Started --file page.md
 //! otwono-wikictl read  Getting-Started --out page.md
 //! otwono-wikictl history Getting-Started
+//! otwono-wikictl delete Getting-Started
 //! ```
 //!
 //! # Writing is four calls, and cannot be three shell invocations
@@ -52,6 +53,7 @@ otwono-wikictl — wiki pages as signed chains of revisions
   otwono-wikictl write <PAGE> --file <PATH> [--visibility public|private]
   otwono-wikictl read <PAGE> --out <PATH> [--from <NODEID>] [--at <ADDR>]
   otwono-wikictl history <PAGE> [--limit N]
+  otwono-wikictl delete <PAGE>
 
 Options:
   --socket PATH        otwono-stored's socket
@@ -178,6 +180,7 @@ fn run() -> Result<String, Error> {
             None => read_page(&opts, &store, &perm),
         },
         "history" => show_history(&opts, &store, &perm),
+        "delete" => delete_page(&opts, &store, &perm),
         other => Err(Error::Usage(format!("unknown command {other}"))),
     }
 }
@@ -217,8 +220,14 @@ fn write_page(opts: &Options, store: &Path, perm: &Path) -> Result<String, Error
     // Refusing rather than starting a fresh chain: silently ignoring the existing head would
     // move a name somebody else is using and lose whatever they had under it.
     let parent = match current_head(opts, store, perm, &page)? {
-        None => None,
-        Some(head) => {
+        Page::Never => None,
+        // Writing after a delete starts a new chain. The owner said the page was gone, and
+        // silently reattaching to what came before would make the deletion a thing that never
+        // quite happened. The old revisions stay content-addressed and reachable to anyone who
+        // kept an id — ADR-0027 §4 requires that be said rather than implied — but this page's
+        // history begins here.
+        Page::Deleted { .. } => None,
+        Page::At(head) => {
             // `otwono_wiki::may_extend` and not a check written here: it is a rule about what
             // a page is, so it belongs with the rest of them where it can be tested without a
             // store. This is one caller of it.
@@ -271,8 +280,16 @@ fn read_page(opts: &Options, store: &Path, perm: &Path) -> Result<String, Error>
         .out
         .clone()
         .ok_or_else(|| Error::Usage("read needs --out".into()))?;
-    let head = current_head(opts, store, perm, &page)?
-        .ok_or_else(|| Error::Runtime(format!("no page called {page:?} on this node")))?;
+    let head = match current_head(opts, store, perm, &page)? {
+        Page::At(head) => head,
+        Page::Never => return Err(Error::Runtime(format!("no page called {page:?} on this node"))),
+        Page::Deleted { sequence } => {
+            return Err(Error::Runtime(format!(
+                "{page:?} was deleted at sequence {sequence}; its revisions are still \
+                 content-addressed and readable by id, and anyone who copied it still has it"
+            )))
+        }
+    };
     let revision = revision_at(store, perm, &head)?;
     if revision.page != page {
         return Err(Error::Runtime(format!(
@@ -302,8 +319,15 @@ fn read_page(opts: &Options, store: &Path, perm: &Path) -> Result<String, Error>
 /// Walk the chain from the head, verifying every step.
 fn show_history(opts: &Options, store: &Path, perm: &Path) -> Result<String, Error> {
     let page = page_of(opts)?;
-    let head = current_head(opts, store, perm, &page)?
-        .ok_or_else(|| Error::Runtime(format!("no page called {page:?} on this node")))?;
+    let head = match current_head(opts, store, perm, &page)? {
+        Page::At(head) => head,
+        Page::Never => return Err(Error::Runtime(format!("no page called {page:?} on this node"))),
+        Page::Deleted { sequence } => {
+            return Err(Error::Runtime(format!(
+                "{page:?} was deleted at sequence {sequence}; there is no head to walk from"
+            )))
+        }
+    };
 
     // This node's own pages, so this node's own key answers for every author. A revision
     // authored by somebody else — a page copied from a peer — is refused rather than shown
@@ -408,7 +432,24 @@ fn revision_at(store: &Path, perm: &Path, content_id: &str) -> Result<otwono_wik
 /// writing again starts a new chain rather than silently resurrecting the old one. The old
 /// revisions are still content-addressed and reachable to anyone who kept an id, which
 /// ADR-0027 §4 requires be said out loud rather than implied.
-fn current_head(opts: &Options, store: &Path, perm: &Path, page: &str) -> Result<Option<String>, Error> {
+/// What this node's `wiki/<page>` pointer says, in the three states it can be in.
+///
+/// A page that was never written and a page the owner deleted are different facts, and
+/// collapsing them into "no head" is a small lie to the person holding the terminal: one of
+/// them means "you have no such page" and the other means "you had one and removed it".
+/// Deleting is a tombstone — a signed, sequenced record like any other (ADR-0027 §4) — so the
+/// difference is there to be read and there is no reason to throw it away.
+#[derive(Debug)]
+enum Page {
+    /// No pointer under this name at all.
+    Never,
+    /// A tombstone: the owner said this no longer exists.
+    Deleted { sequence: u64 },
+    /// A head revision.
+    At(String),
+}
+
+fn current_head(opts: &Options, store: &Path, perm: &Path, page: &str) -> Result<Page, Error> {
     let _ = opts;
     let out = call(
         store,
@@ -417,15 +458,17 @@ fn current_head(opts: &Options, store: &Path, perm: &Path, page: &str) -> Result
         json!({ "service": SERVICE, "name": page }),
         Some("store.serve"),
     )?;
-    let Some(record) = out.get("record") else {
-        return Ok(None);
+    let Some(record) = out.get("record").filter(|r| !r.is_null()) else {
+        return Ok(Page::Never);
     };
-    if record.is_null() {
-        return Ok(None);
-    }
     let pointer: otwono_pointer::Pointer = serde_json::from_value(record.clone())
         .map_err(|e| Error::Runtime(format!("this node's pointer for {page:?} does not parse: {e}")))?;
-    Ok(pointer.content_id)
+    Ok(match pointer.content_id {
+        Some(head) => Page::At(head),
+        None => Page::Deleted {
+            sequence: pointer.sequence,
+        },
+    })
 }
 
 /// Move the pointer: ask for the next sequence, sign, publish.
@@ -729,4 +772,44 @@ fn fetch(net: &Path, perm: &Path, peer: &str, address: &str, content_id: &str) -
     data_encoding::BASE64
         .decode(data.as_bytes())
         .map_err(|e| Error::Runtime(format!("net.fetch's data is not base64: {e}")))
+}
+
+/// Delete a page: publish a tombstone under its name.
+///
+/// A tombstone is a signed, sequenced record like any other update (ADR-0027 §4) — "this no
+/// longer exists", said by the owner, rather than a pointer that simply stops being served.
+/// A name that goes quiet is indistinguishable from a node that is unreachable, and a reader
+/// deserves to be able to tell those apart.
+///
+/// It does **not** remove anything. The revisions and their bodies are content-addressed and
+/// stay readable to anyone holding an id, and any node that copied the page still has it. The
+/// reply says so rather than letting the word "delete" imply a reach this system does not
+/// have — the same honesty `store.demote` is required to show.
+fn delete_page(opts: &Options, store: &Path, perm: &Path) -> Result<String, Error> {
+    let page = page_of(opts)?;
+    match current_head(opts, store, perm, &page)? {
+        // Nothing to say is gone. Publishing a tombstone for a name nobody used would put a
+        // signed record on the mesh asserting the absence of something that never existed,
+        // and would burn a sequence number doing it.
+        Page::Never => Err(Error::Runtime(format!(
+            "no page called {page:?} on this node, so there is nothing to delete"
+        ))),
+        Page::Deleted { sequence } => Err(Error::Runtime(format!(
+            "{page:?} was already deleted at sequence {sequence}"
+        ))),
+        Page::At(head) => {
+            publish(opts, store, perm, &page, None)?;
+            if opts.json {
+                return Ok(format!(
+                    "{}\n",
+                    serde_json::to_string(&json!({ "page": page, "was": head, "deleted": true }))
+                        .map_err(runtime)?
+                ));
+            }
+            Ok(format!(
+                "{page} deleted\n  was {head}\n  note: the revisions are still readable by id, \
+                 and any node that copied this page still has it\n"
+            ))
+        }
+    }
 }

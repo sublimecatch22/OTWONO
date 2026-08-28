@@ -253,6 +253,26 @@ impl Harness {
             .try_into()
             .unwrap()
     }
+    /// Publish a tombstone under a page's name, as `otwono-wikictl delete` does.
+    fn delete(&self, page: &str) {
+        let author = self.node_id();
+        let next = self.call(
+            &self.store,
+            "pointer.next_sequence",
+            json!({ "service": "wiki", "name": page }),
+            "pointer.read",
+        )["next_sequence"]
+            .as_u64()
+            .unwrap();
+        let mut pointer = otwono_pointer::Pointer::new(&author, "wiki", page, next, None, 1_000);
+        pointer.signature = self.sign(&pointer.payload_for_id_sign().unwrap());
+        self.call(
+            &self.store,
+            "pointer.publish",
+            json!({ "record": pointer }),
+            "pointer.publish",
+        );
+    }
 }
 
 impl Drop for Harness {
@@ -418,6 +438,86 @@ fn a_revision_of_one_page_is_not_a_parent_for_another() {
         matches!(err, otwono_wiki::WikiError::WrongPage { ref found, .. } if found == "Somewhere-Else"),
         "{err}"
     );
+}
+
+#[test]
+fn deleting_a_page_leaves_its_revisions_readable_by_id() {
+    // A tombstone says "this no longer exists"; it does not reach into the store, and it
+    // certainly does not reach other nodes. The word "delete" must not imply otherwise —
+    // the same honesty `store.demote` is required to show.
+    let h = Harness::start("tombstone");
+    let head = h.write("Getting-Started", "words that outlive the name\n");
+    h.delete("Getting-Started");
+
+    assert!(
+        h.head("Getting-Started").is_none(),
+        "the name must stop naming a head"
+    );
+    // The revision and its body are content-addressed and still there.
+    let revision = h.revision(&head);
+    assert_eq!(revision.page, "Getting-Started");
+    assert_eq!(h.body_text(&revision.body), "words that outlive the name\n");
+}
+
+#[test]
+fn a_tombstone_and_a_name_never_used_are_different_answers() {
+    // What `Page::Never` and `Page::Deleted` exist to keep apart. Both leave the pointer
+    // naming no head, and to the person at the terminal one means "you have no such page"
+    // and the other means "you had one and removed it".
+    let h = Harness::start("tombstone-vs-absent");
+    h.write("Existed", "once\n");
+    h.delete("Existed");
+
+    let deleted = h.call(
+        &h.store,
+        "pointer.mine",
+        json!({ "service": "wiki", "name": "Existed" }),
+        "store.serve",
+    );
+    let record: otwono_pointer::Pointer =
+        serde_json::from_value(deleted["record"].clone()).expect("a tombstone is still a record");
+    assert!(record.is_tombstone(), "the record must be a tombstone");
+    assert_eq!(
+        record.sequence, 2,
+        "a delete is an update, so it takes the next sequence"
+    );
+
+    let never = h.call(
+        &h.store,
+        "pointer.mine",
+        json!({ "service": "wiki", "name": "Never-Used" }),
+        "store.serve",
+    );
+    assert!(
+        never["record"].is_null(),
+        "a name never used has no record at all, which is the other answer"
+    );
+}
+
+#[test]
+fn writing_after_a_delete_starts_a_new_chain() {
+    // Reattaching to what came before would make the deletion a thing that never quite
+    // happened. The old revisions stay readable by id; this page's history begins again.
+    let h = Harness::start("rewrite-after-delete");
+    let first = h.write("Getting-Started", "before\n");
+    h.delete("Getting-Started");
+
+    // `write` reads the page's state to choose a parent; after a tombstone there is none.
+    let author = h.node_id();
+    let body = h.call(
+        &h.store,
+        "store.put",
+        json!({ "data": data_encoding::BASE64.encode(b"after\n"), "visibility": "public" }),
+        "store.write",
+    )["content_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut revision = otwono_wiki::Revision::new(&author, "Getting-Started", body, None, 2_000);
+    revision.signature = h.sign(&revision.payload_for_id_sign().unwrap());
+    assert!(revision.is_first(), "a write after a delete must have no parent");
+    // And the pre-deletion revision is still there, just not on this chain.
+    assert_eq!(h.revision(&first).page, "Getting-Started");
 }
 
 #[test]
