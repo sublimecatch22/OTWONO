@@ -43,3 +43,4 @@ Rules:
 | 0026 | Replication is pulled, never pushed, and it is best-effort by construction | accepted |
 | 0027 | Signed mutable pointers: sequence numbers, not timestamps, and rollback is the threat | accepted |
 | 0028 | Addressed messages: the envelope already exists, so store-and-forward is about custody, and it is pulled | accepted |
+| 0029 | **DRAFT, for review** — a compact encoding for the ONM wire: measurements, four candidates, and a recommendation | draft |

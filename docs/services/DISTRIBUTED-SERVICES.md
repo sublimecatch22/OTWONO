@@ -1,14 +1,18 @@
 # Distributed Services
 
-**Status:** `SPECIFIED`, with the first two primitives built and the third's rules written.
+**Status:** `SPECIFIED`, with all three primitives built and two of them verified between
+booted nodes.
 
 Primitive 1 (content-addressed blocks) is `VERIFIED` — `otwono-store`, ADR-0016, exercised
 between booted nodes. Primitive 2 (signed mutable pointers) is `IMPLEMENTED` per ADR-0027:
 the record and its rollback rules in `otwono-pointer`, durable storage in
 `otwono-store::PointerStore`, and `content.pointer` on the wire — a pointer crosses a real
 channel and is verified against the key the Noise handshake proved. Primitive 3 (addressed
-messages) is `SPECIFIED` per ADR-0028 with its custody rules `IMPLEMENTED` in
-`otwono-envelope`; nothing of it has crossed a link. No service in §2 is built.
+messages) is `IMPLEMENTED` per ADR-0028: the custody rules in `otwono-envelope`, a persistent
+carrier's store in `otwono-store::EnvelopeStore`, `content.relayable` and
+`content.addressed_to_me` on the wire, and a carry pass that mirrors replication's. **Whether
+an envelope survives its sender going away has not been shown on booted nodes** — see
+`docs/network/CARRIAGE.md` and the verification log. No service in §2 is built.
 
 **Verified between booted nodes** on 2026-08-27: two VMs each published `wiki/Getting-Started`
 and each resolved the other's, then fetched the object it named. See
@@ -92,8 +96,9 @@ name suggestions from trusted peers; suggestions are never automatic.
 
 ## 3a. Carrying mail for other people
 
-**STATUS: SPECIFIED** (ADR-0028) — the custody rules are `IMPLEMENTED` and unit-tested in
-`otwono-envelope`; nothing has crossed a link.
+**STATUS: IMPLEMENTED** (ADR-0028) — the rules, the store, both wire methods, the carry pass
+and collection all exist and are tested, including over a real Noise channel. The mechanism
+is described in `docs/network/CARRIAGE.md`. **Not yet shown between booted nodes.**
 
 A node that agrees to carry envelopes holds opaque ciphertext addressed to people it may
 never meet, until either it hands the envelope over or the envelope expires. Two things
