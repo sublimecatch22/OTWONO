@@ -2162,3 +2162,88 @@ fn a_brokered_carrier_takes_custody_through_its_own_store_daemon() {
     assert_eq!(entries.len(), 1, "the carrier's own store holds {entries:?}");
     assert_eq!(entries[0]["recipient"], json!(recipient.node_id().to_text()));
 }
+
+/// A node whose broker refuses `envelope.carry` carries nobody's mail and asks nobody.
+///
+/// The carriage counterpart of [`a_node_whose_broker_refuses_replication_asks_nobody`], and
+/// ADR-0028 §2's consent rule made structural: a node that does not carry makes no carriage
+/// traffic. `NotCarrying` is the only outcome reached before the dial, so asserting it is
+/// asserting that nothing went out.
+///
+/// It also pins the direction of the failure. A refusal that arrived *after* the connection
+/// would still look like a pass that took nothing, which is exactly the ambiguity this whole
+/// area has been paying for.
+#[test]
+fn a_node_whose_broker_refuses_carriage_asks_nobody() {
+    let h = Harness::start("carriage-refused");
+
+    let deny_dir = h.dir.join("deny-carry");
+    std::fs::create_dir_all(deny_dir.join("policy.d")).unwrap();
+    std::fs::write(
+        deny_dir.join("policy.d/10-deny.toml"),
+        "[[rule]]\naction = \"envelope.carry\"\ndecision = \"deny\"\n",
+    )
+    .unwrap();
+    let deny_socket = deny_dir.join("perm.sock");
+    let policy = Policy::load_dir(&deny_dir.join("policy.d")).unwrap();
+    policy.validate(&ActionRegistry::builtin()).unwrap();
+    let broker = Arc::new(Broker::new(
+        policy,
+        AuditLog::open(deny_dir.join("audit.jsonl")).unwrap(),
+    ));
+    let s = h.shutdown.clone();
+    let server = Server::bind(&deny_socket).unwrap();
+    std::thread::spawn(move || server.serve(broker, s));
+    Client::connect_waiting(&deny_socket, Duration::from_secs(5)).unwrap();
+
+    let (agreement, _) = AgreementKeystore::new(h.dir.join("agreement-no-carry"))
+        .load_or_generate()
+        .unwrap();
+    let signer = BrokeredSigner::bind(agreement, &h.id_socket, &h.perm_socket).expect("bind");
+    let refused = Arc::new(NetState::new(Arc::new(signer)).with_carrier(Arc::new(
+        otwono_netd::content::BrokeredCarrier::new(&h.store_socket, &deny_socket),
+    )));
+    assert_eq!(
+        refused.carry_from(&h.candidate()).expect("not an error"),
+        otwono_netd::content::CarryPass::NotCarrying
+    );
+}
+
+/// `envelope.take` and `envelope.held` are guarded, and a token for another action is not one.
+///
+/// The bug this pins down cost a three-node run: `otwono-netd` asked `envelope.held` with the
+/// `store.serve` token it had cached for ordinary content, and because an index question
+/// answers an unauthorised caller with an empty page rather than an error (ADR-0020), a
+/// carrier holding the wrong token looked exactly like a carrier holding nothing.
+#[test]
+fn the_carriage_methods_refuse_a_token_minted_for_another_action() {
+    let h = Harness::start("carriage-capability");
+
+    let recipient = NodeIdentity::generate().unwrap();
+    let envelope = otwono_envelope::Envelope::new(
+        &"c".repeat(64),
+        recipient.node_id(),
+        16,
+        otwono_identity::now_unix_ms() + 60_000,
+    );
+    for (method, params) in [
+        ("envelope.take", json!({ "envelope": envelope })),
+        ("envelope.held", json!({})),
+        ("envelope.release", json!({ "envelope_id": "c".repeat(64) })),
+    ] {
+        let refusal = Client::connect(&h.store_socket)
+            .unwrap()
+            .call_with_capability(method, params.clone(), &h.token("store.serve"))
+            .unwrap()
+            .expect_err(&format!("{method} accepted a store.serve token"));
+        assert_eq!(refusal.code, code::UNAUTHORIZED, "{method}: {refusal:?}");
+
+        // And the same call with the right token is not refused, so the assertion above is
+        // about the capability and not about a malformed request.
+        let allowed = Client::connect(&h.store_socket)
+            .unwrap()
+            .call_with_capability(method, params, &h.token("envelope.carry"))
+            .unwrap();
+        assert!(allowed.is_ok(), "{method} with envelope.carry: {allowed:?}");
+    }
+}
