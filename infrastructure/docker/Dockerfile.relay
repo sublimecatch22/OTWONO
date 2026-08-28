@@ -1,0 +1,39 @@
+# The OTWONO relay.
+#
+# A two-stage build: compile in a full toolchain image, run in a slim one that
+# carries only the binary and the certificates it needs. The result runs as an
+# unprivileged user and writes only to its data volume.
+
+FROM rust:1.84-bookworm AS build
+WORKDIR /src
+
+# Copy the workspace and build only the relay. The other crates are needed
+# because the relay shares the workspace's type definitions.
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY packages ./packages
+COPY apps ./apps
+
+RUN cargo build --release --bin otwono-relay
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --system --create-home --uid 10001 otwono
+
+COPY --from=build /src/target/release/otwono-relay /usr/local/bin/otwono-relay
+
+USER otwono
+WORKDIR /home/otwono
+VOLUME ["/home/otwono/data"]
+
+ENV OTWONO_RELAY_DB=/home/otwono/data/otwono-relay.sqlite3 \
+    OTWONO_RELAY_BIND=0.0.0.0:8788 \
+    RUST_LOG=info
+
+EXPOSE 8788
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD ["/usr/local/bin/otwono-relay", "--version"] || exit 1
+
+ENTRYPOINT ["/usr/local/bin/otwono-relay"]

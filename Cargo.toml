@@ -74,6 +74,24 @@ field_reassign_with_default = "allow"
 # parameter objects would add indirection without adding safety.
 too_many_arguments = "allow"
 
+# Password hashing is deliberately expensive. Unoptimised, it makes the test
+# suite crawl without making anything safer, so these crates are compiled with
+# optimisations even in a debug build.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+[profile.dev.package.password-hash]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.aes-gcm]
+opt-level = 3
+[profile.dev.package.rusqlite]
+opt-level = 2
+[profile.dev.package.libsqlite3-sys]
+opt-level = 2
+
 [profile.release]
 opt-level = "s"
 lto = true
