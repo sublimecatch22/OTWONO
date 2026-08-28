@@ -1,18 +1,23 @@
 # Distributed Services
 
-**Status:** `SPECIFIED`, with all three primitives built and two of them verified between
-booted nodes.
+**Status:** `SPECIFIED`, with all three primitives built and **all three verified between
+booted nodes**. No service in §2 is built, which is what still separates this document from
+running software.
 
 Primitive 1 (content-addressed blocks) is `VERIFIED` — `otwono-store`, ADR-0016, exercised
-between booted nodes. Primitive 2 (signed mutable pointers) is `IMPLEMENTED` per ADR-0027:
-the record and its rollback rules in `otwono-pointer`, durable storage in
+between booted nodes. Primitive 2 (signed mutable pointers) is `VERIFIED` per ADR-0027: the
+record and its rollback rules in `otwono-pointer`, durable storage in
 `otwono-store::PointerStore`, and `content.pointer` on the wire — a pointer crosses a real
-channel and is verified against the key the Noise handshake proved. Primitive 3 (addressed
-messages) is `IMPLEMENTED` per ADR-0028: the custody rules in `otwono-envelope`, a persistent
-carrier's store in `otwono-store::EnvelopeStore`, `content.relayable` and
-`content.addressed_to_me` on the wire, and a carry pass that mirrors replication's. **Whether
-an envelope survives its sender going away has not been shown on booted nodes** — see
-`docs/network/CARRIAGE.md` and the verification log. No service in §2 is built.
+channel, is verified against the key the Noise handshake proved, and a rolled-back record is
+refused across a reboot from the reader's own persisted log.
+
+Primitive 3 (addressed messages) is `VERIFIED` per ADR-0028: the custody rules in
+`otwono-envelope`, a persistent carrier's store in `otwono-store::EnvelopeStore`,
+`content.relayable` and `content.addressed_to_me` on the wire, and a carry pass that mirrors
+replication's. An envelope **does** survive its sender going away, shown on booted nodes on
+2026-08-28: sealed by one node, carried unprompted by a second, collected and opened by a
+third with the sender powered off, and the carrier then dropping what it had delivered and
+freeing the bytes it held. See `docs/network/CARRIAGE.md` and the verification log.
 
 **Verified between booted nodes** on 2026-08-27: two VMs each published `wiki/Getting-Started`
 and each resolved the other's, then fetched the object it named. See
@@ -96,9 +101,11 @@ name suggestions from trusted peers; suggestions are never automatic.
 
 ## 3a. Carrying mail for other people
 
-**STATUS: IMPLEMENTED** (ADR-0028) — the rules, the store, both wire methods, the carry pass
-and collection all exist and are tested, including over a real Noise channel. The mechanism
-is described in `docs/network/CARRIAGE.md`. **Not yet shown between booted nodes.**
+**STATUS: VERIFIED** (ADR-0028) — the rules, the store, both wire methods, the carry pass,
+collection and drop on delivery all exist, are tested over a real Noise channel, and were
+shown between three booted nodes on 2026-08-28 with the sender powered off for the whole
+collection. The mechanism is described in `docs/network/CARRIAGE.md`, which also records what
+those runs did *not* show: one hop, nothing expired on a booted node, and no second carrier.
 
 A node that agrees to carry envelopes holds opaque ciphertext addressed to people it may
 never meet, until either it hands the envelope over or the envelope expires. Two things
