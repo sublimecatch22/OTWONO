@@ -144,6 +144,12 @@ pub struct Session {
     /// could serve the wrong one. The cost is the same as every other index here: an
     /// envelope taken into custody *during* a session is not visible to that session.
     addressed_index: Option<Vec<otwono_net::content::CarriedEntry>>,
+    /// Envelope ids this node holds custody of, for the *serving* decision (ADR-0028 §11).
+    ///
+    /// Separate from the two indexes above because it answers a different question — not
+    /// "what may I offer you" but "may I hand you this object at all" — and because it is
+    /// consulted on the manifest path, where the other two never are.
+    carried_custody: Option<std::collections::HashSet<String>>,
 }
 
 impl Session {
@@ -376,6 +382,28 @@ impl ContentResponder {
         Response::Carried(otwono_net::content::CarriedPage { entries })
     }
 
+    /// Whether this node holds custody of an object, for the serving decision.
+    ///
+    /// Cached for the session like every other index here, and for the same reason: producing
+    /// it is a call into another daemon, and a peer that could force one per chunk request
+    /// would have a cheap way to make a small node miserable. The same cost follows — an
+    /// envelope taken into custody *during* a session is not servable within that session —
+    /// and it is the right trade, because the alternative is a store round trip on the
+    /// hottest path in the protocol.
+    fn carries(&self, content_id: &str, session: &mut Session) -> bool {
+        if session.carried_custody.is_none() {
+            let held = self
+                .ask_carried_index(None)
+                .map(|entries| entries.into_iter().map(|e| e.envelope_id).collect())
+                .unwrap_or_default();
+            session.carried_custody = Some(held);
+        }
+        session
+            .carried_custody
+            .as_ref()
+            .is_some_and(|ids| ids.contains(content_id))
+    }
+
     fn ask_carried_index(&self, scope: Option<&NodeId>) -> Option<Vec<otwono_net::content::CarriedEntry>> {
         let params = match scope {
             Some(peer) => json!({ "recipient": peer.to_text() }),
@@ -479,7 +507,20 @@ impl ContentResponder {
         // the decision this daemon can make without that list, and it catches a store that
         // answers a chunk request for an object it never advertised to this peer.
         let allowed = match request {
-            Request::Manifest { .. } => may_go_to_peer(label, sharing.as_ref(), peer),
+            // A shared object goes to the peer it was sealed to — *or* to anyone at all, if
+            // this node is carrying it for somebody (ADR-0028 §11). Carrying is exactly the
+            // act of holding another party's sealed bytes in order to pass them on, and the
+            // ciphertext is opaque to every hop: a carrier that receives it, and the sealed
+            // key it cannot use, learns nothing it did not already know from the descriptor.
+            //
+            // Without this an envelope can never reach a carrier, because ADR-0019's serving
+            // rule admits only the recipient — which makes store-and-forward impossible by
+            // construction. That was found by running it.
+            Request::Manifest { .. } => {
+                may_go_to_peer(label, sharing.as_ref(), peer)
+                    || (label == Some("shared")
+                        && request.content_id().is_some_and(|id| self.carries(id, session)))
+            }
             // A chunk reply carrying an envelope is a reply nobody should be sending.
             Request::Chunk { .. } if sharing.is_some() => false,
             Request::Chunk { .. } if label == Some("shared") => {
