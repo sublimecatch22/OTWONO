@@ -5077,3 +5077,64 @@ before anyone could read it.
   `store.accept_shared` callers into one) landed while the run was in flight and is not in
   what booted.
 
+## 2026-08-28 — both halves of store-and-forward are daemons
+
+**STATUS: VERIFIED.** amd64, QEMU, TCG, no `/dev/kvm`, three VMs at one vCPU each. Image
+built from `30977db`. The run that closes the limitation the previous entry had to record:
+that run's take and its collection were both driven by the CLI, so it showed a carry pass and
+a collect *command* working between booted nodes and said nothing about the daemons.
+
+The carrier took custody unprompted:
+
+```
+otwono-netd: carrying a3871a0220ce6435… (87 bytes) for somebody until 1787911033206,
+             taken from otw1:cw1d-nxgh-v30d-fvqk
+OTWONO-ENVELOPE-CARRIED envelope=a3871a02…26d3
+```
+
+and the recipient, freshly booted with the sender powered off, collected it the same way:
+
+```
+otwono-netd: collected a3871a0220ce6435… (87 bytes) addressed to this node,
+             from otw1:mmca-p6e0-f5sn-nj0j
+OTWONO-ENVELOPE-SWEPT     envelope=a3871a02…26d3
+OTWONO-ENVELOPE-COLLECTED envelope=a3871a02…26d3 bytes=71
+```
+
+`SWEPT` and the fallback are two different markers on purpose. The check waits for the mail to
+appear and only reaches for `otwono-netd --collect` after a minute, printing that it did —
+and this run contains **zero** `collect by hand` lines. `--mail`, which asks what is waiting
+without fetching it, is what makes the two distinguishable at all: without it the recipient
+has no way to name an envelope it has not yet been given, so "the sweep delivered it" and
+"the script delivered it" were the same observation.
+
+`bytes=71` is plaintext again, so the recipient opened what it collected.
+
+### What made a timer safe
+
+A carrier keeps an envelope until it expires even after handing it over (ADR-0028 §7 is not
+built), so the sweep had to learn what it already holds or it would refetch the same message
+every thirty seconds until the sender's expiry ran out. That check is `store.holds`, and it is
+guarded by `store.write` rather than `store.read` because `otwono-netd` is the Z3
+hostile-input daemon and a collection sweep is not a reason to hand it the user's whole store
+— ADR-0030 records the reasoning and
+`asking_whether_an_object_is_here_does_not_need_store_read` keeps it true.
+
+### What this does not show
+
+- **Drop on delivery is still not implemented**, so it is still not verified. The carrier in
+  this run is holding the envelope it delivered, and will until it expires.
+- **One hop, one envelope, 87 bytes**, as before. Nothing about a carrier under budget
+  pressure, many envelopes at once, or a second hop.
+- **Nothing expired**, and all three clocks came from one host, so ADR-0028 §10's skew
+  handling is still only covered by unit tests.
+- **amd64 only**, TCG, one vCPU per guest.
+- **The `store.holds` dedup was not exercised across a restart here.** The recipient collected
+  once and the run ended; nothing re-swept afterwards to show the second pass taking nothing.
+  `an_envelope_reaches_its_recipient_through_a_carrier_that_is_neither_party` asserts it
+  against real daemons, but not on booted nodes.
+- **One node reported `discovered=none` again** — the third run in a row. That is not a
+  failure; the content check has each node seal to one arbitrarily-chosen peer, so on three
+  nodes some node routinely has nothing sealed to it and spends ten minutes proving so. Now
+  commented at the step rather than rediscovered each time.
+

@@ -6,10 +6,12 @@ channel, and on 2026-08-28 a three-node QEMU run showed an envelope sealed by on
 carried by a second, and collected *and opened* by a third with the sender powered off for the
 whole collection.
 
+A second run on 2026-08-28 showed both halves doing it **unprompted**: the carrier's sweep
+took custody and the recipient's sweep collected, with no command run by hand on either.
+
 That does not make every part of this document verified. Drop on delivery is not implemented,
-and on the run that demonstrated delivery both the take and the collection were driven by the
-CLI rather than by the daemons' own sweeps — see §7 and `docs/build/VERIFICATION-LOG.md` for
-what the runs have and have not demonstrated.
+nothing has exercised a second hop, and no envelope has ever expired on a booted node — see
+§7 and `docs/build/VERIFICATION-LOG.md` for what the runs have and have not demonstrated.
 
 This document describes the third of `DISTRIBUTED-SERVICES.md`'s three primitives. The
 decisions are ADR-0028's; this is how they are built.
