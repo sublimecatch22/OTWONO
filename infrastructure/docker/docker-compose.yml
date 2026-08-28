@@ -1,0 +1,65 @@
+# A complete development stack: the OTWONO relay, WordPress, and a database.
+#
+# This is for development. It uses http on localhost and default passwords that
+# are fine for a throwaway stack and unacceptable anywhere else — see the notes
+# in docs/WORDPRESS_SETUP.md before putting any of this on the internet.
+
+name: otwono-dev
+
+services:
+  relay:
+    build:
+      context: ../..
+      dockerfile: infrastructure/docker/Dockerfile.relay
+    environment:
+      OTWONO_RELAY_BIND: 0.0.0.0:8788
+      OTWONO_RELAY_DB: /home/otwono/data/otwono-relay.sqlite3
+      RUST_LOG: info
+    ports:
+      - '127.0.0.1:8788:8788'
+    volumes:
+      - relay-data:/home/otwono/data
+    restart: unless-stopped
+
+  database:
+    image: mariadb:11
+    environment:
+      MARIADB_DATABASE: wordpress
+      MARIADB_USER: wordpress
+      MARIADB_PASSWORD: development-only-password
+      MARIADB_ROOT_PASSWORD: development-only-root-password
+    volumes:
+      - database-data:/var/lib/mysql
+    healthcheck:
+      test: ['CMD', 'healthcheck.sh', '--connect', '--innodb_initialized']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  wordpress:
+    image: wordpress:6-php8.3-apache
+    depends_on:
+      database:
+        condition: service_healthy
+    environment:
+      WORDPRESS_DB_HOST: database
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: development-only-password
+      WORDPRESS_DEBUG: 1
+      WORDPRESS_CONFIG_EXTRA: |
+        define( 'WP_DEBUG_LOG', true );
+        define( 'WP_DEBUG_DISPLAY', false );
+        define( 'DISALLOW_FILE_EDIT', true );
+    ports:
+      - '127.0.0.1:8080:80'
+    volumes:
+      - wordpress-data:/var/www/html
+      # The plugin is mounted live, so an edit is visible on the next request.
+      - ../../wordpress/otwono-ai-connector:/var/www/html/wp-content/plugins/otwono-ai-connector
+    restart: unless-stopped
+
+volumes:
+  relay-data:
+  database-data:
+  wordpress-data:

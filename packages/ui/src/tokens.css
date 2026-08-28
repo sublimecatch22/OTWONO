@@ -1,0 +1,306 @@
+/*
+ * OTWONO AI design tokens.
+ *
+ * Every colour, size and motion value the interface uses is defined here as a
+ * custom property. Screens never hard-code a colour, which is what makes
+ * theming, high contrast and density switching work everywhere at once rather
+ * than in the places somebody remembered.
+ *
+ * The palette is deliberately restrained: dark neutral surfaces, one accent
+ * used sparingly for state and action, and semantic colours that carry meaning
+ * rather than decoration.
+ */
+
+:root {
+  /* ---- Typography ------------------------------------------------------ */
+  --font-sans: 'Inter', 'Segoe UI Variable', 'Segoe UI', system-ui, -apple-system, 'Helvetica Neue',
+    sans-serif;
+  --font-serif: 'Iowan Old Style', 'Palatino Linotype', Palatino, Georgia, serif;
+  --font-mono: 'JetBrains Mono', 'Cascadia Mono', 'SF Mono', Menlo, Consolas, monospace;
+  --font-humanist: 'Verdana', 'Tahoma', 'DejaVu Sans', sans-serif;
+
+  --font-body: var(--font-sans);
+  --font-size-base: 15px;
+
+  --font-size-xs: calc(var(--font-size-base) * 0.75);
+  --font-size-sm: calc(var(--font-size-base) * 0.867);
+  --font-size-md: var(--font-size-base);
+  --font-size-lg: calc(var(--font-size-base) * 1.2);
+  --font-size-xl: calc(var(--font-size-base) * 1.47);
+  --font-size-2xl: calc(var(--font-size-base) * 1.87);
+
+  --line-tight: 1.25;
+  --line-body: 1.6;
+
+  --weight-regular: 400;
+  --weight-medium: 520;
+  --weight-strong: 640;
+
+  /* ---- Spacing --------------------------------------------------------- */
+  --density-scale: 1;
+  --space-1: calc(4px * var(--density-scale));
+  --space-2: calc(8px * var(--density-scale));
+  --space-3: calc(12px * var(--density-scale));
+  --space-4: calc(16px * var(--density-scale));
+  --space-5: calc(24px * var(--density-scale));
+  --space-6: calc(32px * var(--density-scale));
+  --space-7: calc(48px * var(--density-scale));
+
+  --radius-sm: 5px;
+  --radius-md: 9px;
+  --radius-lg: 14px;
+  --radius-pill: 999px;
+
+  --control-height: calc(34px * var(--density-scale));
+  --control-height-sm: calc(28px * var(--density-scale));
+
+  /* ---- Layout ---------------------------------------------------------- */
+  --sidebar-width: 280px;
+  --inspector-width: 320px;
+  --chat-max-width: 820px;
+  --topbar-height: 52px;
+
+  /* ---- Motion ---------------------------------------------------------- */
+  --motion-fast: 120ms;
+  --motion-medium: 220ms;
+  --motion-ease: cubic-bezier(0.2, 0, 0.15, 1);
+
+  /* ---- Accents --------------------------------------------------------- */
+  /* Each accent ships a base, a hover, a low-alpha wash and a readable
+     foreground for text placed on the base. */
+  --accent-signal: #4f8cff;
+  --accent-signal-hover: #6b9dff;
+  --accent-signal-wash: rgba(79, 140, 255, 0.14);
+  --accent-signal-on: #06121f;
+
+  --accent-ember: #ff8a4c;
+  --accent-ember-hover: #ff9d69;
+  --accent-ember-wash: rgba(255, 138, 76, 0.14);
+  --accent-ember-on: #1f0c02;
+
+  --accent-verdant: #43c69a;
+  --accent-verdant-hover: #5ed3ac;
+  --accent-verdant-wash: rgba(67, 198, 154, 0.14);
+  --accent-verdant-on: #04160f;
+
+  --accent-violet: #a583ff;
+  --accent-violet-hover: #b799ff;
+  --accent-violet-wash: rgba(165, 131, 255, 0.16);
+  --accent-violet-on: #0f0620;
+
+  --accent-slate: #93a4bd;
+  --accent-slate-hover: #a8b7cc;
+  --accent-slate-wash: rgba(147, 164, 189, 0.16);
+  --accent-slate-on: #0a1018;
+
+  /* The active accent, repointed by [data-accent]. */
+  --accent: var(--accent-signal);
+  --accent-hover: var(--accent-signal-hover);
+  --accent-wash: var(--accent-signal-wash);
+  --accent-on: var(--accent-signal-on);
+}
+
+[data-accent='ember'] {
+  --accent: var(--accent-ember);
+  --accent-hover: var(--accent-ember-hover);
+  --accent-wash: var(--accent-ember-wash);
+  --accent-on: var(--accent-ember-on);
+}
+[data-accent='verdant'] {
+  --accent: var(--accent-verdant);
+  --accent-hover: var(--accent-verdant-hover);
+  --accent-wash: var(--accent-verdant-wash);
+  --accent-on: var(--accent-verdant-on);
+}
+[data-accent='violet'] {
+  --accent: var(--accent-violet);
+  --accent-hover: var(--accent-violet-hover);
+  --accent-wash: var(--accent-violet-wash);
+  --accent-on: var(--accent-violet-on);
+}
+[data-accent='slate'] {
+  --accent: var(--accent-slate);
+  --accent-hover: var(--accent-slate-hover);
+  --accent-wash: var(--accent-slate-wash);
+  --accent-on: var(--accent-slate-on);
+}
+
+/* ---- Dark: the default surface ---------------------------------------- */
+:root,
+[data-theme='dark'] {
+  color-scheme: dark;
+
+  --surface-base: #0c0f14;
+  --surface-raised: #131820;
+  --surface-overlay: #1a2029;
+  --surface-sunken: #080b0f;
+  --surface-input: #10151c;
+
+  --border-subtle: #1f2731;
+  --border-strong: #2c3743;
+  --border-focus: var(--accent);
+
+  --text-primary: #e8edf4;
+  --text-secondary: #a3b0c0;
+  --text-muted: #74828f;
+  --text-inverse: #0c0f14;
+
+  --state-positive: #4ec38c;
+  --state-positive-wash: rgba(78, 195, 140, 0.14);
+  --state-caution: #e5b45c;
+  --state-caution-wash: rgba(229, 180, 92, 0.14);
+  --state-negative: #f0736a;
+  --state-negative-wash: rgba(240, 115, 106, 0.14);
+  --state-info: #6aa8f0;
+  --state-info-wash: rgba(106, 168, 240, 0.14);
+  --state-running: var(--accent);
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.5);
+  --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.45);
+  --shadow-lg: 0 24px 60px rgba(0, 0, 0, 0.55);
+
+  /* Depth is a single, still gradient — not an animated background. */
+  --backdrop: radial-gradient(1100px 620px at 12% -12%, rgba(79, 140, 255, 0.09), transparent 62%),
+    radial-gradient(900px 560px at 100% 0%, rgba(165, 131, 255, 0.06), transparent 60%);
+}
+
+/* ---- Light ------------------------------------------------------------- */
+[data-theme='light'] {
+  color-scheme: light;
+
+  --surface-base: #f6f8fb;
+  --surface-raised: #ffffff;
+  --surface-overlay: #ffffff;
+  --surface-sunken: #eef1f6;
+  --surface-input: #ffffff;
+
+  --border-subtle: #dfe4ec;
+  --border-strong: #c3cbd8;
+  --border-focus: var(--accent);
+
+  --text-primary: #131920;
+  --text-secondary: #4a5768;
+  --text-muted: #6b7889;
+  --text-inverse: #ffffff;
+
+  --accent-signal: #1f63d6;
+  --accent-signal-hover: #1a55b8;
+  --accent-signal-wash: rgba(31, 99, 214, 0.1);
+  --accent-signal-on: #ffffff;
+  --accent-ember: #c2521c;
+  --accent-ember-hover: #a8461708;
+  --accent-ember-wash: rgba(194, 82, 28, 0.1);
+  --accent-ember-on: #ffffff;
+  --accent-verdant: #14795a;
+  --accent-verdant-hover: #106349;
+  --accent-verdant-wash: rgba(20, 121, 90, 0.1);
+  --accent-verdant-on: #ffffff;
+  --accent-violet: #6742c4;
+  --accent-violet-hover: #5836a8;
+  --accent-violet-wash: rgba(103, 66, 196, 0.1);
+  --accent-violet-on: #ffffff;
+  --accent-slate: #4c5c72;
+  --accent-slate-hover: #3f4d60;
+  --accent-slate-wash: rgba(76, 92, 114, 0.1);
+  --accent-slate-on: #ffffff;
+
+  --state-positive: #10744f;
+  --state-positive-wash: rgba(16, 116, 79, 0.1);
+  --state-caution: #8a5d09;
+  --state-caution-wash: rgba(138, 93, 9, 0.1);
+  --state-negative: #b3271e;
+  --state-negative-wash: rgba(179, 39, 30, 0.1);
+  --state-info: #1f63d6;
+  --state-info-wash: rgba(31, 99, 214, 0.1);
+
+  --shadow-sm: 0 1px 2px rgba(19, 25, 32, 0.08);
+  --shadow-md: 0 8px 24px rgba(19, 25, 32, 0.1);
+  --shadow-lg: 0 24px 60px rgba(19, 25, 32, 0.14);
+
+  --backdrop: none;
+}
+
+/* ---- High contrast ------------------------------------------------------
+ * Not "dark with brighter text": borders become solid and always visible,
+ * washes become opaque, and every pairing is at or above 7:1.
+ */
+[data-theme='high-contrast'] {
+  color-scheme: dark;
+
+  --surface-base: #000000;
+  --surface-raised: #0a0a0a;
+  --surface-overlay: #101010;
+  --surface-sunken: #000000;
+  --surface-input: #000000;
+
+  --border-subtle: #7d7d7d;
+  --border-strong: #ffffff;
+  --border-focus: #ffe14d;
+
+  --text-primary: #ffffff;
+  --text-secondary: #e6e6e6;
+  --text-muted: #c9c9c9;
+  --text-inverse: #000000;
+
+  --accent: #ffe14d;
+  --accent-hover: #fff07f;
+  --accent-wash: #3a3100;
+  --accent-on: #000000;
+
+  --state-positive: #6bff9e;
+  --state-positive-wash: #00340f;
+  --state-caution: #ffd24d;
+  --state-caution-wash: #3a2a00;
+  --state-negative: #ff8f85;
+  --state-negative-wash: #3d0d09;
+  --state-info: #86c5ff;
+  --state-info-wash: #002444;
+
+  --shadow-sm: none;
+  --shadow-md: none;
+  --shadow-lg: none;
+  --backdrop: none;
+}
+
+/* ---- Density ----------------------------------------------------------- */
+[data-density='cosy'] {
+  --density-scale: 0.88;
+}
+[data-density='compact'] {
+  --density-scale: 0.76;
+}
+
+/* ---- Font family ------------------------------------------------------- */
+[data-font='serif'] {
+  --font-body: var(--font-serif);
+}
+[data-font='mono'] {
+  --font-body: var(--font-mono);
+}
+[data-font='humanist'] {
+  --font-body: var(--font-humanist);
+}
+
+/* ---- Background treatment ---------------------------------------------- */
+[data-background='flat'] {
+  --backdrop: none;
+}
+[data-background='grid'] {
+  --backdrop: linear-gradient(var(--border-subtle) 1px, transparent 1px),
+    linear-gradient(90deg, var(--border-subtle) 1px, transparent 1px);
+  --backdrop-size: 48px 48px;
+}
+
+/* ---- Reduced motion ----------------------------------------------------
+ * Honoured both from the user's preference and from the app's own setting.
+ */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --motion-fast: 0ms;
+    --motion-medium: 0ms;
+  }
+}
+[data-reduced-motion='true'] {
+  --motion-fast: 0ms;
+  --motion-medium: 0ms;
+}

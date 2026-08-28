@@ -1,0 +1,63 @@
+[package]
+name = "otwono-local-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The OTWONO AI local application service: a loopback-only HTTP API."
+
+[lints]
+workspace = true
+
+[lib]
+name = "otwono_local_service"
+path = "src/lib.rs"
+
+[[bin]]
+name = "otwono-local-service"
+path = "src/main.rs"
+
+[dependencies]
+otwono-types.workspace = true
+otwono-store.workspace = true
+otwono-permissions.workspace = true
+otwono-providers.workspace = true
+otwono-knowledge.workspace = true
+otwono-agent-core.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rand.workspace = true
+base64.workspace = true
+sha2.workspace = true
+url.workspace = true
+reqwest.workspace = true
+uuid.workspace = true
+rusqlite.workspace = true
+directories.workspace = true
+async-trait = "0.1"
+
+[features]
+# Exposes in-memory constructors so the API can be tested end to end.
+test-support = ["otwono-agent-core/test-support"]
+
+[dev-dependencies]
+otwono-local-service = { path = ".", features = ["test-support"] }
+otwono-agent-core = { path = "../../packages/agent-core", features = ["test-support"] }
+# The relay is a dev dependency only: the desktop service links nothing of it
+# at run time and reaches it over HTTP like any other remote service.
+otwono-relay = { path = "../relay-api", features = ["test-support"] }
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
+axum = { workspace = true }
+reqwest = { workspace = true }

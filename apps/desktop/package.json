@@ -1,0 +1,17 @@
+{
+  "name": "@otwono/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "build:debug": "tauri build --debug",
+    "build:linux": "tauri build --bundles deb",
+    "build:windows": "tauri build --bundles nsis,msi",
+    "build:macos": "tauri build --bundles dmg"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.2.2"
+  }
+}

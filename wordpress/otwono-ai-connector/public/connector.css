@@ -1,0 +1,173 @@
+/*
+ * The connector's styles.
+ *
+ * Deliberately restrained: it inherits the theme's typography and colours
+ * wherever it can, so it looks like part of the site rather than a plugin
+ * bolted on. Contrast is checked against both light and dark themes.
+ */
+
+.otwono {
+	margin: 1.5rem 0;
+	font-size: 1rem;
+	line-height: 1.6;
+}
+
+.otwono--card {
+	padding: 1.25rem 1.5rem;
+	border: 1px solid rgba(128, 128, 128, 0.35);
+	border-radius: 10px;
+}
+
+.otwono--info,
+.otwono--caution {
+	padding: 0.75rem 1rem;
+	border-left: 3px solid currentColor;
+	border-radius: 6px;
+	background: rgba(128, 128, 128, 0.08);
+}
+
+.otwono--caution {
+	border-left-color: #b8860b;
+}
+
+.otwono h3 {
+	margin-top: 0;
+}
+
+.otwono__form .otwono__field {
+	display: flex;
+	flex-direction: column;
+	gap: 0.35rem;
+	margin-bottom: 1rem;
+}
+
+.otwono__form label {
+	font-weight: 600;
+}
+
+.otwono__form input[type='text'],
+.otwono__form input[type='email'],
+.otwono__form input[type='password'],
+.otwono__form textarea {
+	width: 100%;
+	padding: 0.5rem 0.65rem;
+	border: 1px solid rgba(128, 128, 128, 0.5);
+	border-radius: 6px;
+	font: inherit;
+}
+
+.otwono__check {
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
+	font-weight: 400;
+}
+
+.otwono__button {
+	display: inline-flex;
+	align-items: center;
+	gap: 0.4rem;
+	min-height: 44px;
+	padding: 0.5rem 1rem;
+	border: 1px solid currentColor;
+	border-radius: 6px;
+	background: transparent;
+	color: inherit;
+	font: inherit;
+	cursor: pointer;
+	text-decoration: none;
+}
+
+.otwono__button:hover,
+.otwono__button:focus-visible {
+	background: rgba(128, 128, 128, 0.12);
+}
+
+.otwono__button--primary {
+	background: currentColor;
+	border-color: currentColor;
+}
+
+.otwono__button--primary > * {
+	color: Canvas;
+}
+
+.otwono__button:focus-visible,
+.otwono__form :focus-visible {
+	outline: 2px solid currentColor;
+	outline-offset: 2px;
+}
+
+.otwono__muted {
+	opacity: 0.75;
+	font-size: 0.9em;
+}
+
+.otwono__list {
+	list-style: none;
+	margin: 1rem 0 0;
+	padding: 0;
+}
+
+.otwono__list li {
+	padding: 0.75rem 0;
+	border-bottom: 1px solid rgba(128, 128, 128, 0.25);
+}
+
+.otwono__status {
+	list-style: none;
+	margin: 0.5rem 0;
+	padding: 0;
+}
+
+.otwono__status li {
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
+	padding: 0.25rem 0;
+}
+
+.otwono__dot {
+	width: 10px;
+	height: 10px;
+	border-radius: 50%;
+	border: 1px solid currentColor;
+}
+
+.otwono__dot--on {
+	background: #2e7d5b;
+}
+
+.otwono__dot--off {
+	background: transparent;
+}
+
+.otwono__badge {
+	display: inline-block;
+	padding: 0.1rem 0.5rem;
+	border: 1px solid rgba(128, 128, 128, 0.5);
+	border-radius: 999px;
+	font-size: 0.8em;
+}
+
+.otwono__message {
+	min-height: 1.5em;
+	margin: 0.5rem 0 0;
+}
+
+.otwono__message--error {
+	color: #a3231b;
+}
+
+.otwono__message--success {
+	color: #1d6b4c;
+}
+
+@media (prefers-color-scheme: dark) {
+	.otwono__message--error {
+		color: #ff8f85;
+	}
+	.otwono__message--success {
+		color: #6bd8a5;
+	}
+}
