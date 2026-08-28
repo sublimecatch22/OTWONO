@@ -265,6 +265,41 @@ pub trait Carrier {
         -> Result<(), String>;
 }
 
+/// Where a node puts mail addressed to itself (ADR-0028 §9).
+///
+/// The receiving counterpart of [`Carrier`], and separate from it because the two are
+/// different decisions. A carrier agrees to hold *other people's* sealed bytes and can
+/// reasonably decline; a recipient is collecting its own, and the only question is whether it
+/// can write them down.
+///
+/// Injected the way `Carrier` is, so a collection sweep cannot tell an in-process store from
+/// one behind the control plane.
+pub trait Inbox {
+    /// Whether this node will accept mail at all right now.
+    ///
+    /// Checked **before** anything reaches the wire, the same structural consent
+    /// [`Carrier::carriage_room`] gives carriage: a node that cannot write what it collects
+    /// asks nobody, rather than fetching an envelope and discovering it has nowhere to put
+    /// it. `false` covers a broker that denies the capability and a store that is down —
+    /// both mean "not today", and the operator learns which from the log rather than from
+    /// the network.
+    fn accepting(&self) -> bool;
+
+    /// Whether this node already holds `content_id`.
+    ///
+    /// The reason a sweep can run on a timer at all. A carrier keeps an envelope until it
+    /// expires even after handing it over — drop on delivery is not implemented (ADR-0028
+    /// §7) — so without this a recipient would re-download the same mail on every pass,
+    /// for ever.
+    fn holds(&self, content_id: &str) -> bool;
+
+    /// Keep a collected envelope where its recipient can open it.
+    ///
+    /// The ciphertext and the one key that came with it, unchanged. Re-sealing would produce
+    /// a different object under a key the sender never issued.
+    fn keep(&self, content_id: &str, bytes: &[u8], sharing: &crate::object::Sharing) -> Result<(), String>;
+}
+
 /// What a carrier has room for, and what it is already holding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CarriageRoom {

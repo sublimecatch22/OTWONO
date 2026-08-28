@@ -1198,6 +1198,96 @@ pub(crate) fn keep_sealed(
     }
 }
 
+/// The daemon's [`otwono_store::Inbox`]: mail addressed to this node, kept by `otwono-stored`.
+///
+/// Everything here goes through `store.write` and nothing needs `store.read`. That is not
+/// incidental — this daemon is the Z3 hostile-input process, and a collection sweep is not a
+/// reason to hand it the authority to read the user's whole store.
+pub struct BrokeredInbox {
+    store_socket: PathBuf,
+    perm_socket: PathBuf,
+    /// Whether the "not accepting" line has already been printed, so a node whose broker
+    /// denies the capability says so once rather than every thirty seconds for ever.
+    quiet: std::sync::atomic::AtomicBool,
+}
+
+impl std::fmt::Debug for BrokeredInbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrokeredInbox")
+            .field("store", &self.store_socket)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BrokeredInbox {
+    pub fn new(store_socket: impl AsRef<Path>, perm_socket: impl AsRef<Path>) -> Self {
+        BrokeredInbox {
+            store_socket: store_socket.as_ref().to_path_buf(),
+            perm_socket: perm_socket.as_ref().to_path_buf(),
+            quiet: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn call(&self, method: &str, params: Value, reason: &str) -> Result<Value, String> {
+        let token = request_token(&self.perm_socket, otwono_stored::CAPABILITY_WRITE, reason)?;
+        let mut client = Client::connect(&self.store_socket)
+            .map_err(|e| format!("{}: {e}", self.store_socket.display()))?;
+        client
+            .call_with_capability(method, params, &token)
+            .map_err(|e| format!("{method}: {e}"))?
+            .map_err(|e| e.message)
+    }
+}
+
+impl otwono_store::Inbox for BrokeredInbox {
+    fn accepting(&self) -> bool {
+        match request_token(
+            &self.perm_socket,
+            otwono_stored::CAPABILITY_WRITE,
+            "otwono-netd is checking whether it may keep mail addressed to this node",
+        ) {
+            Ok(_) => true,
+            Err(e) => {
+                if !self.quiet.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("otwono-netd: not collecting mail: {e}");
+                }
+                false
+            }
+        }
+    }
+
+    /// A store that cannot be asked answers `false`, and the fetch happens.
+    ///
+    /// The safe direction: a wasted download costs bandwidth, while a wrong `true` would skip
+    /// an envelope this node does not actually have and lose the message.
+    fn holds(&self, content_id: &str) -> bool {
+        self.call(
+            "store.holds",
+            json!({ "content_id": content_id }),
+            "otwono-netd is checking whether mail it was offered is already here",
+        )
+        .ok()
+        .and_then(|r| r.get("holds").and_then(Value::as_bool))
+        .unwrap_or(false)
+    }
+
+    fn keep(
+        &self,
+        content_id: &str,
+        bytes: &[u8],
+        sharing: &otwono_store::object::Sharing,
+    ) -> Result<(), String> {
+        keep_sealed(
+            &self.store_socket,
+            &self.perm_socket,
+            content_id,
+            bytes,
+            sharing,
+            "otwono-netd is storing an envelope collected for this node",
+        )
+    }
+}
+
 pub(crate) fn request_token(perm_socket: &Path, action: &str, reason: &str) -> Result<String, String> {
     let mut broker = Client::connect(perm_socket).map_err(|e| format!("{}: {e}", perm_socket.display()))?;
     let value = broker
@@ -1458,7 +1548,7 @@ pub fn replication_pass<L: LinkAdapter, H: otwono_store::ReplicaHolder + ?Sized>
 /// holds and may pass on — and `true` asks `content.addressed_to_me`, which returns only what
 /// is addressed to this node. Bounded by the same page count as the replication offer, and
 /// for the same reason: this runs on the discovery thread.
-fn fetch_carried_index<L: LinkAdapter>(
+pub(crate) fn fetch_carried_index<L: LinkAdapter>(
     channel: &mut SecureChannel<L>,
     link: &LinkProperties,
     scoped: bool,
@@ -1663,6 +1753,13 @@ pub fn carry_pass<L: LinkAdapter, C: otwono_store::Carrier + ?Sized>(
     }
 }
 
+/// How many envelopes one collection pass will fetch.
+///
+/// One, for the reason the other passes take one: the sweep runs inline on the thread that
+/// finds peers. A carrier that claimed to hold a thousand envelopes for this node would
+/// otherwise own that thread for as long as the fetches took.
+pub const MAX_COLLECTED_PER_PASS: usize = 1;
+
 /// Ask a peer what it is holding for *this* node, and fetch it (ADR-0028 §9).
 ///
 /// The collection half. Uses the scoped question, so this node never receives a list of who
@@ -1674,6 +1771,7 @@ pub fn carry_pass<L: LinkAdapter, C: otwono_store::Carrier + ?Sized>(
 pub fn collect_addressed<L: LinkAdapter>(
     channel: &mut SecureChannel<L>,
     link: &LinkProperties,
+    inbox: &(dyn otwono_store::Inbox + Send + Sync),
 ) -> Result<Vec<FetchedObject>, ProtocolError> {
     let mut collected = Vec::new();
     for entry in fetch_carried_index(channel, link, true)? {
@@ -1684,6 +1782,13 @@ pub fn collect_addressed<L: LinkAdapter>(
                 "a carrier offered mail addressed to somebody else".into(),
             ));
         }
+        // Already open on this node's disk. A carrier holds an envelope until it expires even
+        // after handing it over, because drop on delivery is not implemented (ADR-0028 §7),
+        // so a sweep that did not check this would re-download the same message every pass
+        // for as long as the sender's expiry allowed.
+        if inbox.holds(&entry.envelope_id) {
+            continue;
+        }
         let fetched = fetch_object(channel, &entry.envelope_id, link)?;
         if fetched.visibility != "shared" {
             return Err(ProtocolError::Mismatched(format!(
@@ -1692,6 +1797,14 @@ pub fn collect_addressed<L: LinkAdapter>(
             )));
         }
         collected.push(fetched);
+        // One per pass, as replication and carriage take one. Their reason is a budget; this
+        // one's is the thread. The pass runs inline on the loop that finds peers, so "how
+        // long can one carrier make this take" is a question about the whole node's ability
+        // to mesh — and a node that has mail waiting meets that carrier again in thirty
+        // seconds, so nothing is lost but latency.
+        if collected.len() >= MAX_COLLECTED_PER_PASS {
+            break;
+        }
     }
     Ok(collected)
 }

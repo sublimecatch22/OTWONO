@@ -37,6 +37,9 @@ OPTIONS:
     --peer-ids             Print connected peers' full NodeIDs, one per line, for scripts
     --carry                Take at most one envelope into custody from each connected peer
     --collect              Collect what connected peers are holding for this node, then exit
+    --mail                 Ask what is waiting for this node without fetching any of it.
+                           The daemon collects on its own; this is for looking, and for
+                           telling apart mail that arrived from mail that was fetched by hand
                            something can seal to it (ADR-0019). Exits non-zero if no
                            connected peer has published one.
     --shared-with-me       Ask every connected peer what it has sealed to this node
@@ -109,6 +112,7 @@ fn run(args: &[String]) -> Result<String, Error> {
     let mut peer_ids = false;
     let mut carry = false;
     let mut collect = false;
+    let mut mail = false;
     let mut fetch_id: Option<String> = None;
     let mut fetch_to_file = false;
     let mut fetch_cache = false;
@@ -135,6 +139,7 @@ fn run(args: &[String]) -> Result<String, Error> {
             "--peer-ids" => peer_ids = true,
             "--carry" => carry = true,
             "--collect" => collect = true,
+            "--mail" => mail = true,
             "--fetch" => fetch_id = Some(next(&mut it, "--fetch")?),
             "--to-file" => fetch_to_file = true,
             "--cache" => fetch_cache = true,
@@ -212,8 +217,14 @@ fn run(args: &[String]) -> Result<String, Error> {
         let perm_socket = perm_socket.unwrap_or_else(|| otwono_proto::socket_path("perm"));
         return connected_peer_ids(&socket, &perm_socket);
     }
-    if carry || collect {
-        let method = if carry { "net.carry" } else { "net.collect" };
+    if carry || collect || mail {
+        let method = if carry {
+            "net.carry"
+        } else if collect {
+            "net.collect"
+        } else {
+            "net.mail"
+        };
         let socket = socket.unwrap_or_else(|| otwono_proto::socket_path("net"));
         let perm_socket = perm_socket.unwrap_or_else(|| otwono_proto::socket_path("perm"));
         return carriage_report(&socket, &perm_socket, method);
@@ -275,6 +286,16 @@ fn run(args: &[String]) -> Result<String, Error> {
     let mut state = NetState::new(Arc::new(signer))
         .with_handoff(handoff)
         .with_pointer_memory(Arc::new(otwono_netd::content::BrokeredPointers::new(
+            &store_socket,
+            &perm_socket,
+        )))
+        // Collecting mail addressed to this node is not behind `--no-serve-content` either,
+        // and for the reason above: it is not a service offered to peers. It is this node
+        // receiving what was sent to it, and a node that has chosen not to answer other
+        // people's requests has not thereby chosen to stop getting its own messages.
+        // `store.write` in the broker is the control, and a node without it collects nothing
+        // and says so once.
+        .with_inbox(Arc::new(otwono_netd::content::BrokeredInbox::new(
             &store_socket,
             &perm_socket,
         )));
@@ -707,6 +728,15 @@ fn carriage_report(
                 } else if let Some(list) = v.get("collected").and_then(|c| c.as_array()) {
                     for id in list.iter().filter_map(|i| i.as_str()) {
                         out.push_str(&format!("{node_id} collected {id}\n"));
+                    }
+                } else if let Some(list) = v.get("waiting").and_then(|w| w.as_array()) {
+                    if list.is_empty() {
+                        out.push_str(&format!("{node_id} holds nothing for this node\n"));
+                    }
+                    for e in list {
+                        let id = e.get("envelope_id").and_then(|i| i.as_str()).unwrap_or("?");
+                        let size = e.get("size_bytes").and_then(|b| b.as_u64()).unwrap_or(0);
+                        out.push_str(&format!("{node_id} waiting {id} {size}\n"));
                     }
                 } else if v.get("carrying").and_then(|c| c.as_bool()) == Some(false) {
                     out.push_str(&format!("{node_id} this node carries no mail\n"));

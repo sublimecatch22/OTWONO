@@ -213,17 +213,44 @@ case "$node_ordinal" in
     attempts=240
     [ "$was_here" -eq 0 ] && attempts=12
 
-    step "collecting what a carrier is holding for this node"
+    # Nothing here drives the collection on purpose for the first while, for the reason the
+    # carrier branch does not drive the carry pass: `otwono-netd` collects mail addressed to
+    # this node unprompted now, and a check that reached for `--collect` first would never
+    # find out whether it does. The previous run reached its recipient only because this
+    # script fetched the mail itself, which proves a command works and says nothing about
+    # the daemon.
+    #
+    # `--mail` is the read-only question: what is waiting, without fetching it. So the
+    # envelope id comes from the carrier, and whether it is *here* is a local fact — which
+    # makes "the sweep delivered it" and "this script delivered it" two different observable
+    # outcomes rather than one.
+    step "waiting for the collection sweep to bring this node its mail"
     collected=""
     out=""
     i=0
     while [ "$i" -lt "$attempts" ]; do
-        out=$(otwono-netd --collect --socket /run/otwono/net.sock 2>&1)
-        collected=$(echo "$out" | awk '$2 == "collected" { print $3; exit }')
-        [ -n "$collected" ] && break
+        waiting=$(otwono-netd --mail --socket /run/otwono/net.sock 2>&1 \
+            | awk '$2 == "waiting" { print $3; exit }')
+        if [ -n "$waiting" ]; then
+            if otwono-storectl open "$waiting" --out "$WORK/opened" >/dev/null 2>&1; then
+                collected="$waiting"
+                echo "OTWONO-ENVELOPE-SWEPT envelope=$collected"
+                break
+            fi
+            # After the first minute, ask by hand as well, and say so. If the sweep is what
+            # delivered it the marker above is already printed; if it is not, this is the
+            # line that says the daemon did not do its job.
+            if [ "$i" -gt 12 ] && [ $(( i % 12 )) -eq 0 ]; then
+                out=$(otwono-netd --collect --socket /run/otwono/net.sock 2>&1)
+                echo "OTWONO-ENVELOPE-STEP collect by hand: $(echo "$out" | tr '\n' ';')"
+                collected=$(echo "$out" | awk '$2 == "collected" { print $3; exit }')
+                [ -n "$collected" ] && break
+            fi
+        fi
         i=$((i + 1))
         sleep 5
     done
+
     if [ -z "$collected" ]; then
         [ "$was_here" -eq 0 ] && {
             echo "OTWONO-ENVELOPE-SKIP nothing held for this node yet; the sender seals once this node is away"

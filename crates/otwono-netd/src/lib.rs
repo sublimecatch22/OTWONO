@@ -100,6 +100,10 @@ pub struct NetState {
     /// mail for anyone, and it makes no carriage traffic at all rather than asking and
     /// discarding — the same structural consent `holder` gives replication.
     pub carrier: Option<Arc<dyn otwono_store::Carrier + Send + Sync>>,
+    /// Where mail addressed to *this* node goes (ADR-0028 §9). `None` is a node that never
+    /// asks a carrier whether anything is waiting for it, and makes no collection traffic at
+    /// all — the same structural consent `carrier` gives carriage.
+    pub inbox: Option<Arc<dyn otwono_store::Inbox + Send + Sync>>,
     /// Whatever can sign for this node. In the daemon it is a [`BrokeredSigner`]; in a
     /// test it is usually a whole `NodeIdentity`, which signs locally.
     pub signer: Arc<dyn SessionSigner>,
@@ -117,6 +121,7 @@ impl NetState {
             holder: None,
             pointer_memory: Arc::new(otwono_pointer::NoMemory),
             carrier: None,
+            inbox: None,
             signer,
             node_id,
             peers: Mutex::new(PeerTable::new()),
@@ -169,6 +174,16 @@ impl NetState {
         self
     }
 
+    /// Give this node somewhere to put mail addressed to itself.
+    ///
+    /// Without one it never asks. Collection used to be a command a person ran — the
+    /// carriage half swept unprompted while the receiving half waited to be told — so a
+    /// message "arriving" meant a message becoming fetchable by a node that thought to look.
+    pub fn with_inbox(mut self, inbox: Arc<dyn otwono_store::Inbox + Send + Sync>) -> Self {
+        self.inbox = Some(inbox);
+        self
+    }
+
     /// Take at most one envelope into custody from one peer (ADR-0028 §2).
     ///
     /// A fresh channel, for the reason [`Self::replicate_from`] opens one, and the consent
@@ -189,17 +204,70 @@ impl NetState {
         content::carry_pass(&mut channel, &link, carrier.as_ref(), self.now()).map_err(|e| e.to_string())
     }
 
+    /// Ask one peer what it is holding for this node, and fetch nothing.
+    ///
+    /// The scoped index question on its own. Answers "is anything waiting for me?" without
+    /// paying for it, and without being the thing that collects — which is what makes it
+    /// usable for watching whether the *sweep* is doing its job. A person asking after their
+    /// mail gets the same answer.
+    ///
+    /// Needs no inbox: nothing is kept, so there is nothing to consent to beyond the
+    /// `net.content` the caller already holds.
+    pub fn mail_at(&self, candidate: &Candidate) -> Result<Vec<otwono_net::content::CarriedEntry>, String> {
+        let source = self.open_content_channel(candidate)?;
+        let content::PeerSource {
+            mut channel, link, ..
+        } = source;
+        let me = channel.local().to_text();
+        let entries = content::fetch_carried_index(&mut channel, &link, true).map_err(|e| e.to_string())?;
+        // The same refusal `collect_addressed` makes, for the same reason: a carrier
+        // answering the scoped question with somebody else's mail is confused or probing.
+        if entries.iter().any(|e| e.recipient != me) {
+            return Err("a carrier offered mail addressed to somebody else".into());
+        }
+        Ok(entries)
+    }
+
     /// Ask one peer what it is holding for this node, and fetch it (ADR-0028 §9).
     ///
     /// The scoped question, so this node never learns who else the carrier serves. Returns
     /// the sealed objects; putting them where the recipient can open them is the caller's
     /// decision and carries its own capability.
     pub fn collect_from(&self, candidate: &Candidate) -> Result<Vec<content::FetchedObject>, String> {
+        let Some(inbox) = self.inbox.clone() else {
+            return Ok(Vec::new());
+        };
+        // Before the connect, as carriage checks its budget before the connect: a node that
+        // dialled and then found it could not keep what it collected would still have told a
+        // carrier it was interested, and would have learned nothing it could act on.
+        if !inbox.accepting() {
+            return Ok(Vec::new());
+        }
         let source = self.open_content_channel(candidate)?;
         let content::PeerSource {
             mut channel, link, ..
         } = source;
-        content::collect_addressed(&mut channel, &link).map_err(|e| e.to_string())
+        let collected =
+            content::collect_addressed(&mut channel, &link, inbox.as_ref()).map_err(|e| e.to_string())?;
+        // Kept here rather than handed back unkept. A collection that returned objects and
+        // left storing them to the caller is what made this a command instead of a daemon.
+        for object in &collected {
+            let sharing = object
+                .sharing
+                .as_ref()
+                .ok_or("an envelope arrived without the key to open it")?;
+            inbox.keep(
+                &object.content_id,
+                &object.bytes,
+                &otwono_store::object::Sharing {
+                    encryption: sharing.encryption.clone(),
+                    nonce_prefix: sharing.nonce_prefix.clone(),
+                    plaintext_size_bytes: sharing.plaintext_size_bytes,
+                    sealed_keys: vec![sharing.sealed_key.clone()],
+                },
+            )?;
+        }
+        Ok(collected)
     }
 
     pub fn node_id(&self) -> &NodeId {
@@ -805,6 +873,57 @@ fn carriage_sweep(state: &Arc<NetState>, turn: &mut usize, last: &mut std::time:
     }
 }
 
+/// Ask one peer whether it is holding anything for this node (ADR-0028 §9).
+///
+/// The receiving half made a daemon. Carriage has swept unprompted since it was written,
+/// while collection was a command somebody ran, so a message "arriving" meant a message
+/// becoming fetchable by a node that thought to look. A three-node run reached its recipient
+/// only because the test harness invoked `otwono-netd --collect`.
+///
+/// One peer per turn, like the other two sweeps, and for the same reason: this runs inline on
+/// the loop that finds peers.
+fn collection_sweep(state: &Arc<NetState>, turn: &mut usize, last: &mut std::time::Instant) {
+    if state.inbox.is_none() {
+        return;
+    }
+    if last.elapsed() < DISCOVERY_SWEEP {
+        return;
+    }
+    *last = std::time::Instant::now();
+    let connected = state.peers.lock().unwrap().connected();
+    if connected.is_empty() {
+        return;
+    }
+    let peer = &connected[*turn % connected.len()];
+    *turn = turn.wrapping_add(1);
+    let Some(address) = peer.addresses.first().and_then(|a| a.parse().ok()) else {
+        return;
+    };
+    let candidate = Candidate {
+        claimed_node_id: peer.node_id,
+        address,
+    };
+    match state.collect_from(&candidate) {
+        // Silence when there is nothing, which is almost every pass. A node with no mail
+        // waiting must not fill its console every thirty seconds saying so.
+        Ok(collected) if collected.is_empty() => {}
+        Ok(collected) => {
+            for object in &collected {
+                eprintln!(
+                    "otwono-netd: collected {}… ({} bytes) addressed to this node, from {}",
+                    &object.content_id[..object.content_id.len().min(16)],
+                    object.bytes.len(),
+                    candidate.claimed_node_id.fingerprint()
+                );
+            }
+        }
+        Err(e) => eprintln!(
+            "otwono-netd: collection pass with {} failed: {e}",
+            candidate.claimed_node_id.fingerprint()
+        ),
+    }
+}
+
 /// Discovery loop: browse the LAN, dial whoever we are supposed to dial, and keep trying.
 ///
 /// The retry sweep is not optional. mDNS delivers `ServiceResolved` once per resolution,
@@ -815,19 +934,23 @@ pub fn run_discovery(state: Arc<NetState>, discovery: otwono_net::Discovery) {
     let local = *state.node_id();
     let mut turn = 0usize;
     let mut carriage_turn = 0usize;
+    let mut collection_turn = 0usize;
     // Starts one interval in the past so the first sweep does not wait for one: a node that
     // has just met its peers is a node with the most to ask them.
     let mut last_sweep = std::time::Instant::now() - DISCOVERY_SWEEP;
     let mut last_carriage = std::time::Instant::now() - DISCOVERY_SWEEP;
+    let mut last_collection = std::time::Instant::now() - DISCOVERY_SWEEP;
     loop {
         let Some(candidate) = discovery.next_candidate(DISCOVERY_SWEEP) else {
             retry_known_peers(&state, &local);
             replication_sweep(&state, &mut turn, &mut last_sweep);
             carriage_sweep(&state, &mut carriage_turn, &mut last_carriage);
+            collection_sweep(&state, &mut collection_turn, &mut last_collection);
             continue;
         };
         replication_sweep(&state, &mut turn, &mut last_sweep);
         carriage_sweep(&state, &mut carriage_turn, &mut last_carriage);
+        collection_sweep(&state, &mut collection_turn, &mut last_collection);
         if candidate.claimed_node_id == local {
             continue; // our own advertisement
         }
@@ -905,32 +1028,6 @@ pub struct NetService {
 }
 
 impl NetService {
-    /// Put a collected envelope where its recipient can open it (ADR-0019).
-    ///
-    /// Ciphertext stays ciphertext and only the key that came with it is kept, so this node's
-    /// record names exactly one recipient — itself. Re-sealing would produce a different
-    /// object under a key the sender never issued.
-    fn accept_collected(&self, object: &content::FetchedObject) -> Result<String, String> {
-        let sharing = object
-            .sharing
-            .as_ref()
-            .ok_or("an envelope arrived without the key to open it")?;
-        content::keep_sealed(
-            &self.store_socket,
-            &self.perm_socket,
-            &object.content_id,
-            &object.bytes,
-            &otwono_store::object::Sharing {
-                encryption: sharing.encryption.clone(),
-                nonce_prefix: sharing.nonce_prefix.clone(),
-                plaintext_size_bytes: sharing.plaintext_size_bytes,
-                sealed_keys: vec![sharing.sealed_key.clone()],
-            },
-            "otwono-netd is storing an envelope collected for this node",
-        )?;
-        Ok(object.content_id.clone())
-    }
-
     /// The store socket defaults to the well-known path, which is what a daemon uses.
     /// [`NetService::with_store_socket`] is for a caller that has its own — a test, or a
     /// second store on one machine — because a hardcoded path here meant the one step that
@@ -1026,6 +1123,11 @@ impl Service for NetService {
                     CAPABILITY_CONTENT,
                 ),
                 MethodDescription::guarded(
+                    "net.mail",
+                    "Ask one peer what it is holding for this node, without fetching any of it",
+                    CAPABILITY_CONTENT,
+                ),
+                MethodDescription::guarded(
                     "net.pointer",
                     "Ask one peer what one of its names points at (ADR-0027)",
                     CAPABILITY_CONTENT,
@@ -1104,25 +1206,27 @@ impl Service for NetService {
             "net.collect" => {
                 self.authorize(ctx, CAPABILITY_CONTENT)?;
                 let candidate = Self::candidate(&params)?;
+                // The storing happens inside `collect_from`, with the inbox the sweep uses.
+                // This method used to do it here instead, which meant the command and the
+                // daemon kept mail by two different paths — and only one of them was the one
+                // a node runs unattended.
                 let collected = self.state.collect_from(&candidate).map_err(RpcError::internal)?;
-                // Handed to the store as ciphertext with the key that came with it, so this
-                // node's record names one recipient — itself (ADR-0019). Sealing it again
-                // would produce an object the sender could not recognise.
-                let mut accepted = Vec::new();
-                for object in &collected {
-                    match self.accept_collected(object) {
-                        Ok(id) => accepted.push(id),
-                        // One envelope this node cannot store must not lose the others: a
-                        // carrier may be holding several and the rest are still deliverable.
-                        Err(e) => eprintln!(
-                            "otwono-netd: collected {} but could not store it: {e}",
-                            &object.content_id[..object.content_id.len().min(16)]
-                        ),
-                    }
-                }
                 Ok(json!({
                     "schema_version": DESCRIBE_SCHEMA_VERSION,
-                    "collected": accepted,
+                    "collected": collected.iter().map(|o| o.content_id.clone()).collect::<Vec<_>>(),
+                }))
+            }
+            "net.mail" => {
+                self.authorize(ctx, CAPABILITY_CONTENT)?;
+                let candidate = Self::candidate(&params)?;
+                let waiting = self.state.mail_at(&candidate).map_err(RpcError::internal)?;
+                Ok(json!({
+                    "schema_version": DESCRIBE_SCHEMA_VERSION,
+                    "waiting": waiting.iter().map(|e| json!({
+                        "envelope_id": e.envelope_id,
+                        "size_bytes": e.size_bytes,
+                        "expires_at_ms": e.expires_at_ms,
+                    })).collect::<Vec<_>>(),
                 }))
             }
             "net.pointer" => {

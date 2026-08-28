@@ -993,6 +993,42 @@ impl StoreService {
         Ok(out)
     }
 
+    /// Whether this node already holds one named object, and nothing else about it.
+    ///
+    /// Guarded by `store.write` rather than `store.read`, which looks backwards until you ask
+    /// who needs it. `otwono-netd` collects mail addressed to this node on a timer, and a
+    /// carrier keeps an envelope until it expires even after handing it over (ADR-0028 §7),
+    /// so without this the daemon would re-download the same message every sweep for as long
+    /// as the sender's expiry allowed. The authority it needs for that is the authority to
+    /// avoid a redundant write — not the authority to read the user's store.
+    ///
+    /// That distinction is load-bearing. `otwono-netd` is the Z3 hostile-input daemon and
+    /// does not hold `store.read`; `the_serving_node_serves_without_ever_holding_store_read`
+    /// exists to keep it that way, and this method must not be the thing that quietly
+    /// changes it.
+    ///
+    /// The reply is a bool. No size, no label, no chunk list — a caller that wants any of
+    /// that is asking to read the object and can go and hold `store.read`. The caller must
+    /// already name an exact content id, so this tells a writer whether its write would be
+    /// redundant and does not let anyone enumerate anything.
+    fn handle_holds(&self, params: Value) -> Result<Value, RpcError> {
+        let p: IdParams = serde_json::from_value(params)
+            .map_err(|e| RpcError::invalid_params(format!("store.holds: {e}")))?;
+        let id = Self::parse_id(&p.content_id)?;
+        // Complete, not merely recorded. A half-transferred object is one this node cannot
+        // serve or open, so answering "yes" for it would strand the very fetch that would
+        // finish it.
+        let holds = self
+            .store
+            .get_object(&id)
+            .map(|o| self.store.is_complete(&o))
+            .unwrap_or(false);
+        Ok(json!({
+            "schema_version": DESCRIBE_SCHEMA_VERSION,
+            "holds": holds,
+        }))
+    }
+
     /// Make an object more restrictive.
     ///
     /// Only ever more restrictive. Widening is `label.promote`, which always confirms, and
@@ -1982,6 +2018,11 @@ impl Service for StoreService {
                     CAPABILITY_WRITE,
                 ),
                 MethodDescription::guarded(
+                    "store.holds",
+                    "Whether one named object is already here and complete, and nothing else about it",
+                    CAPABILITY_WRITE,
+                ),
+                MethodDescription::guarded(
                     "cache.purge",
                     "Empty the cluster cache; the node's own store is untouched",
                     CAPABILITY_CACHE_WRITE,
@@ -1995,6 +2036,10 @@ impl Service for StoreService {
             "store.put" => {
                 self.authorize(ctx, CAPABILITY_WRITE)?;
                 self.handle_put(params)
+            }
+            "store.holds" => {
+                self.authorize(ctx, CAPABILITY_WRITE)?;
+                self.handle_holds(params)
             }
             "store.get" => {
                 self.authorize(ctx, CAPABILITY_READ)?;

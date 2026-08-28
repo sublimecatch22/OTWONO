@@ -2126,16 +2126,34 @@ fn an_envelope_reaches_its_recipient_through_a_carrier_that_is_neither_party() {
     );
     std::thread::spawn(move || otwono_netd::run_listener(serving, listener));
 
+    // The recipient's own store, stood up before the collector so the collector can be given
+    // an inbox pointed at it. Collecting and keeping are one step now: a `collect_from` that
+    // handed objects back unkept is what made this half a command rather than a daemon.
+    let inbox_dir = h.dir.join("recipient-store");
+    let inbox_socket = h.dir.join("recipient-store.sock");
+    let inbox = otwono_store::Store::encrypted(inbox_dir.join("store"), otwono_store::StorageKey::generate());
+    inbox.ensure_layout().unwrap();
+    let inbox_service = Arc::new(
+        otwono_stored::StoreService::new(inbox, h.perm_socket.clone()).with_identity(h.id_socket.clone()),
+    );
+    let sd = h.shutdown.clone();
+    let inbox_server = Server::bind(&inbox_socket).unwrap();
+    std::thread::spawn(move || inbox_server.serve(inbox_service, sd));
+    Client::connect_waiting(&inbox_socket, Duration::from_secs(5)).expect("the inbox never came up");
+
     let recipient_node = Arc::new(otwono_identity::NodeIdentity::from_parts(
         recipient_signing,
         otwono_identity::AgreementKey::generate().unwrap(),
     ));
-    let collector = NetState::new(recipient_node);
+    let collector = NetState::new(recipient_node).with_inbox(Arc::new(
+        otwono_netd::content::BrokeredInbox::new(&inbox_socket, &h.perm_socket),
+    ));
+    let carrier_candidate = Candidate {
+        claimed_node_id: carrier_node,
+        address: carrier_addr,
+    };
     let collected = collector
-        .collect_from(&Candidate {
-            claimed_node_id: carrier_node,
-            address: carrier_addr,
-        })
+        .collect_from(&carrier_candidate)
         .expect("collecting from the carrier");
 
     assert_eq!(
@@ -2157,47 +2175,22 @@ fn an_envelope_reaches_its_recipient_through_a_carrier_that_is_neither_party() {
     );
     assert_eq!(collected[0].bytes.len() as u64, size_bytes);
 
-    // And `net.collect` puts it on the recipient's disk, which is the step that makes the
-    // envelope openable rather than merely fetched. It was hardcoded to the well-known store
-    // socket until now, so this was the one part of the chain that could only run on a
-    // booted node.
-    let inbox_dir = h.dir.join("recipient-store");
-    let inbox_socket = h.dir.join("recipient-store.sock");
-    let inbox = otwono_store::Store::encrypted(inbox_dir.join("store"), otwono_store::StorageKey::generate());
-    inbox.ensure_layout().unwrap();
-    let inbox_service = Arc::new(
-        otwono_stored::StoreService::new(inbox, h.perm_socket.clone()).with_identity(h.id_socket.clone()),
-    );
-    let sd = h.shutdown.clone();
-    let inbox_server = Server::bind(&inbox_socket).unwrap();
-    std::thread::spawn(move || inbox_server.serve(inbox_service, sd));
-    Client::connect_waiting(&inbox_socket, Duration::from_secs(5)).expect("the inbox never came up");
-
-    let net_socket = h.dir.join("recipient-net.sock");
-    let collecting_service = Arc::new(
-        otwono_netd::NetService::new(Arc::new(collector), h.perm_socket.clone())
-            .with_store_socket(inbox_socket.clone()),
-    );
-    let sd = h.shutdown.clone();
-    let net_server = Server::bind(&net_socket).unwrap();
-    std::thread::spawn(move || net_server.serve(collecting_service, sd));
-    Client::connect_waiting(&net_socket, Duration::from_secs(5)).expect("the collector never came up");
-
-    let reply = Client::connect(&net_socket)
-        .unwrap()
-        .call_with_capability(
-            "net.collect",
-            json!({ "node_id": carrier_node.to_text(), "address": carrier_addr.to_string() }),
-            &h.token("net.content"),
-        )
-        .unwrap()
-        .expect("net.collect");
-    assert_eq!(
-        reply["collected"],
-        json!([sealed_id]),
-        "net.collect did not report storing the envelope: {reply}"
+    // A second pass takes nothing. This is what makes running the collection on a timer safe
+    // rather than wasteful: the carrier still holds the envelope — drop on delivery is not
+    // implemented (ADR-0028 §7) — so without the `holds` check this node would re-download
+    // the same message every thirty seconds until the sender's expiry ran out.
+    let again = collector
+        .collect_from(&carrier_candidate)
+        .expect("a second pass is not an error");
+    assert!(
+        again.is_empty(),
+        "collected the same envelope twice: {:?}",
+        again.iter().map(|o| &o.content_id).collect::<Vec<_>>()
     );
 
+    // On the recipient's own disk, with the key that opens it — the step that makes an
+    // envelope openable rather than merely fetched, asserted by asking that store to serve
+    // the manifest back.
     let on_disk = Client::connect(&inbox_socket)
         .unwrap()
         .call_with_capability(
@@ -2491,5 +2484,71 @@ fn a_peer_that_stops_answering_stops_being_connected() {
         h.client.peers.lock().unwrap().retry_candidates().len(),
         1,
         "a failed peer must be redialled, or the mesh never heals"
+    );
+}
+
+/// A node with no inbox asks nobody whether it has mail.
+///
+/// The collection counterpart of [`a_node_whose_broker_refuses_carriage_asks_nobody`]. A node
+/// that cannot keep what it collects must not dial for it: it would learn a carrier is
+/// holding something for it and then have nowhere to put it, having told that carrier it was
+/// interested for nothing.
+#[test]
+fn a_node_with_nowhere_to_put_mail_does_not_go_looking_for_it() {
+    let h = Harness::start("no-inbox");
+    let collected = Arc::clone(&h.client)
+        .collect_from(&h.candidate())
+        .expect("not an error");
+    assert!(
+        collected.is_empty(),
+        "a node with no inbox collected {collected:?}"
+    );
+}
+
+/// `store.holds` answers a caller that holds `store.write` and not `store.read`.
+///
+/// This is the point of the method existing at all. `otwono-netd` is the Z3 hostile-input
+/// daemon; `the_serving_node_serves_without_ever_holding_store_read` exists to keep it away
+/// from the user's store, and the collection sweep must not be the thing that quietly hands
+/// it that authority. So the sweep's "do I already have this?" is guarded by the authority to
+/// avoid a redundant write, not by the authority to read.
+#[test]
+fn asking_whether_an_object_is_here_does_not_need_store_read() {
+    let h = Harness::start("holds-without-read");
+
+    let refused = Client::connect(&h.perm_socket)
+        .unwrap()
+        .call(
+            "perm.request",
+            json!({ "action": "store.read", "reason": "prove the policy denies it" }),
+        )
+        .unwrap();
+    assert!(refused.is_err(), "the test policy must deny store.read");
+
+    let id = h.put(b"something this node holds", "public");
+    let write = h.token("store.write");
+
+    let here = Client::connect(&h.store_socket)
+        .unwrap()
+        .call_with_capability("store.holds", json!({ "content_id": id }), &write)
+        .unwrap()
+        .expect("store.holds with store.write");
+    assert_eq!(here["holds"], json!(true), "{here}");
+
+    // And an object nobody put there. `false` rather than an error, because "not here" is a
+    // true answer and the caller's next move is to fetch it.
+    let absent = Client::connect(&h.store_socket)
+        .unwrap()
+        .call_with_capability("store.holds", json!({ "content_id": "a".repeat(64) }), &write)
+        .unwrap()
+        .expect("store.holds for something absent");
+    assert_eq!(absent["holds"], json!(false), "{absent}");
+
+    // Nothing but the bool. A caller wanting size or label is asking to read the object.
+    let keys: Vec<&String> = here.as_object().unwrap().keys().collect();
+    assert_eq!(
+        keys.len(),
+        2,
+        "store.holds leaked more than a schema version and a bool: {keys:?}"
     );
 }
