@@ -163,10 +163,16 @@ impl std::fmt::Display for Declined {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Declined::Expired => write!(f, "expired"),
-            Declined::TooLarge { size_bytes, ceiling_bytes } => {
+            Declined::TooLarge {
+                size_bytes,
+                ceiling_bytes,
+            } => {
                 write!(f, "too_large: {size_bytes} bytes, ceiling {ceiling_bytes}")
             }
-            Declined::NoRoom { size_bytes, room_bytes } => {
+            Declined::NoRoom {
+                size_bytes,
+                room_bytes,
+            } => {
                 write!(f, "no_room: {size_bytes} bytes, {room_bytes} free")
             }
             Declined::Malformed(why) => write!(f, "malformed: {why}"),

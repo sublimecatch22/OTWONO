@@ -1031,9 +1031,7 @@ impl StoreService {
                 .map(|o| (o, Source::Cached))
         });
         found
-            .filter(|(o, source)| {
-                Self::may_go_to(o, *source, peer, || self.carried_for(id).is_some())
-            })
+            .filter(|(o, source)| Self::may_go_to(o, *source, peer, || self.carried_for(id).is_some()))
             .ok_or_else(|| not_available(id))
     }
 
@@ -1091,12 +1089,7 @@ impl StoreService {
     /// A closure rather than a bool because it reads the custody store from disk, and the
     /// overwhelmingly common case — a public object, or a peer that is on the list — must
     /// not pay for it.
-    fn may_go_to(
-        object: &Object,
-        source: Source,
-        peer: Option<&str>,
-        carried: impl Fn() -> bool,
-    ) -> bool {
+    fn may_go_to(object: &Object, source: Source, peer: Option<&str>, carried: impl Fn() -> bool) -> bool {
         if object.visibility.may_leave_the_node_unattended() {
             return true;
         }
@@ -1198,8 +1191,7 @@ impl StoreService {
         // without a key would be undeliverable when the recipient finally collected it.
         let carried = self.carried_for(&id);
         let key_for = carried.as_deref().or(p.peer.as_deref());
-        if let (Visibility::Shared, Some(sharing), Some(peer)) =
-            (object.visibility, &object.sharing, key_for)
+        if let (Visibility::Shared, Some(sharing), Some(peer)) = (object.visibility, &object.sharing, key_for)
         {
             if let Some(copy) = sharing.copy_for(peer) {
                 out["sharing"] = json!({

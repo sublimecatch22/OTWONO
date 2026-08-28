@@ -289,8 +289,20 @@ fn a_skewed_clock_still_drops_the_envelope_eventually() {
 fn a_refusal_names_both_a_code_and_the_numbers_behind_it() {
     let cases = [
         (Declined::Expired, "expired"),
-        (Declined::TooLarge { size_bytes: 9, ceiling_bytes: 4 }, "too_large"),
-        (Declined::NoRoom { size_bytes: 9, room_bytes: 4 }, "no_room"),
+        (
+            Declined::TooLarge {
+                size_bytes: 9,
+                ceiling_bytes: 4,
+            },
+            "too_large",
+        ),
+        (
+            Declined::NoRoom {
+                size_bytes: 9,
+                room_bytes: 4,
+            },
+            "no_room",
+        ),
         (Declined::Malformed("bad id".into()), "malformed"),
     ];
     for (declined, code) in cases {
@@ -301,7 +313,11 @@ fn a_refusal_names_both_a_code_and_the_numbers_behind_it() {
         );
     }
     assert_eq!(
-        Declined::NoRoom { size_bytes: 9, room_bytes: 4 }.to_string(),
+        Declined::NoRoom {
+            size_bytes: 9,
+            room_bytes: 4
+        }
+        .to_string(),
         "no_room: 9 bytes, 4 free",
         "the numbers are the reason this exists"
     );

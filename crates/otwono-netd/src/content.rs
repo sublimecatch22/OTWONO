@@ -1392,9 +1392,7 @@ pub fn replication_pass<L: LinkAdapter, H: otwono_store::ReplicaHolder + ?Sized>
     let Some(pick) = offers.first().cloned() else {
         return Ok(ReplicationPass::NothingTaken {
             offered,
-            why: format!(
-                "nothing left after filtering: {unfit} over a size limit, {dupes} already held"
-            ),
+            why: format!("nothing left after filtering: {unfit} over a size limit, {dupes} already held"),
         });
     };
 

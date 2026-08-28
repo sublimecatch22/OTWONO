@@ -2040,10 +2040,8 @@ fn an_envelope_reaches_its_recipient_through_a_carrier_that_is_neither_party() {
     // the real one; different directories, so it starts out holding nothing.
     let carrier_dir = h.dir.join("carrier-store");
     let carrier_socket = h.dir.join("carrier-store.sock");
-    let store = otwono_store::Store::encrypted(
-        carrier_dir.join("store"),
-        otwono_store::StorageKey::generate(),
-    );
+    let store =
+        otwono_store::Store::encrypted(carrier_dir.join("store"), otwono_store::StorageKey::generate());
     store.ensure_layout().unwrap();
     let service = std::sync::Arc::new(
         otwono_stored::StoreService::new(store, h.perm_socket.clone())

@@ -261,12 +261,8 @@ pub trait Carrier {
     ///
     /// `sharing` is the envelope the *sender* served, carrying the content key sealed to the
     /// recipient. It is stored as it arrived: a carrier cannot open it and does not try.
-    fn keep(
-        &self,
-        envelope: &Envelope,
-        bytes: &[u8],
-        sharing: &crate::object::Sharing,
-    ) -> Result<(), String>;
+    fn keep(&self, envelope: &Envelope, bytes: &[u8], sharing: &crate::object::Sharing)
+        -> Result<(), String>;
 }
 
 /// What a carrier has room for, and what it is already holding.
