@@ -195,6 +195,56 @@ impl CarryPolicy {
     }
 }
 
+/// One envelope a carrier has taken custody of.
+///
+/// The difference between this and an [`Envelope`] is `until_ms`, and it is the whole of
+/// ADR-0028 §10. The sender's `expires_at_ms` is a wall-clock instant on *the sender's* clock;
+/// this mesh has no NTP guarantee, so comparing it to a carrier's clock later is comparing two
+/// numbers that disagree for reasons nobody can see.
+///
+/// `until_ms` is the deadline the carrier **committed to at the moment it took custody**, and
+/// it is what the sweep evaluates. The sender's expiry is a ceiling inside it and is never
+/// exceeded (§3); the second term is measured from this carrier's own custody moment, so a
+/// carrier with a skewed clock still drops the envelope in bounded time rather than holding
+/// it for ever.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Custody {
+    pub schema_version: String,
+    pub envelope: Envelope,
+    /// When this carrier took it, on this carrier's clock.
+    pub took_at_ms: u64,
+    /// When this carrier will drop it, on this carrier's clock. Never later than the
+    /// sender's `expires_at_ms`.
+    pub until_ms: u64,
+}
+
+impl Custody {
+    /// Record what a carrier committed to when it accepted an envelope.
+    ///
+    /// Takes the accepted deadline rather than recomputing it, so there is exactly one place
+    /// the min-rule lives ([`CarryPolicy::decide`]) and no second path that could disagree
+    /// with the decision that was actually made.
+    pub fn taken(envelope: &Envelope, took_at_ms: u64, until_ms: u64) -> Custody {
+        Custody {
+            schema_version: SCHEMA_VERSION.to_string(),
+            envelope: envelope.clone(),
+            took_at_ms,
+            // Belt and braces against a caller that computed its own deadline: the sender's
+            // ceiling is re-applied here, so no code path can lengthen an envelope's life by
+            // constructing a Custody directly.
+            until_ms: until_ms.min(envelope.expires_at_ms),
+        }
+    }
+
+    /// Whether this carrier should drop it now, on this carrier's clock.
+    ///
+    /// Evaluated against the committed deadline, never against the sender's field re-read
+    /// later. That is the point of §10.
+    pub fn is_due(&self, now_ms: u64) -> bool {
+        now_ms >= self.until_ms
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvelopeError {
     Malformed(String),

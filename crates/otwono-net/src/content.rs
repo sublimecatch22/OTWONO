@@ -112,6 +112,37 @@ pub enum Request {
         /// How many entries the requester can receive in one reply.
         max_entries: u32,
     },
+    /// What are you carrying that I could take custody of? (ADR-0028 §9)
+    ///
+    /// The **broad** question, and the same answer for every asker — a carrier is deciding
+    /// about envelopes addressed to people it has never met, so it needs the whole bag.
+    /// ADR-0028 §7 accepts the cost: every hop is another party that learns recipients.
+    ///
+    /// A recipient collecting its own mail must **not** use this. `AddressedToMe` exists so
+    /// that the path every ordinary recipient takes is not an enumeration oracle.
+    #[serde(rename = "content.relayable")]
+    Relayable {
+        /// Continue after this envelope id. Absent starts at the beginning.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+        max_entries: u32,
+    },
+    /// What are you holding for *me*? (ADR-0028 §9)
+    ///
+    /// Scoped to the NodeID the Noise handshake authenticated, exactly as ADR-0020's
+    /// `SharedWithMe` is. There is no recipient field for the same reason there is no owner
+    /// field on `Pointer`: the only recipient a peer will answer about is the one it just
+    /// authenticated, so there is nothing to spoof and nothing to filter wrongly.
+    ///
+    /// An empty reply from a carrier holding nothing for the asker is identical to an empty
+    /// reply from a node that carries nothing at all. Asking must not be a way to find out
+    /// whether a node carries.
+    #[serde(rename = "content.addressed_to_me")]
+    AddressedToMe {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+        max_entries: u32,
+    },
     /// What does this name point at right now? (ADR-0027)
     ///
     /// The second primitive on the wire. There is no `node_id` field, and that is the
@@ -233,6 +264,38 @@ pub struct PointerReply {
     pub record: serde_json::Value,
 }
 
+/// A page of envelopes a carrier is holding (ADR-0028 §9).
+///
+/// The same type answers both questions — `content.relayable` returns every envelope the
+/// carrier holds and may pass on, `content.addressed_to_me` returns only those addressed to
+/// the asker. One type because the *entry* is the same fact either way; two methods because
+/// the two questions have different answers and conflating them leaks (ADR-0028 §9).
+///
+/// Ordered by envelope id, so paging is stable and needs no timestamp — custody time is
+/// metadata neither asker has asked for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CarriedPage {
+    pub entries: Vec<CarriedEntry>,
+}
+
+/// One envelope a carrier is holding, as another node sees it.
+///
+/// Deliberately **not** the carrier's [`Custody`](otwono_envelope::Custody) record: `until_ms`
+/// and `took_at_ms` are this carrier's private commitments on its own clock (ADR-0028 §10) and
+/// mean nothing to anyone else. What crosses the wire is the sender's descriptor, so the next
+/// carrier makes its own commitment from its own custody moment rather than inheriting one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CarriedEntry {
+    /// The content id of the sealed ciphertext.
+    pub envelope_id: String,
+    /// The NodeID it is for.
+    pub recipient: String,
+    pub size_bytes: u64,
+    /// The sender's absolute expiry. A ceiling on any carrier's own deadline, never a
+    /// replacement for it.
+    pub expires_at_ms: u64,
+}
+
 /// A page of what one node is willing to have copied (ADR-0026 §7).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplicablePage {
@@ -324,6 +387,10 @@ pub enum Response {
     /// noun, and the schema is where the inconsistency showed up.
     #[serde(rename = "replicable")]
     Replicable(ReplicablePage),
+    /// A page of envelopes a carrier holds. Answers both `content.relayable` and
+    /// `content.addressed_to_me` — the method decides *which* envelopes, not their shape.
+    #[serde(rename = "carried")]
+    Carried(CarriedPage),
     /// The signed record itself, passed through unexamined by the transport.
     ///
     /// Deliberately opaque here: `otwono-net` moves bytes and must not become a second place
@@ -450,7 +517,13 @@ impl Request {
             Request::Manifest { content_id, .. } | Request::Chunk { content_id, .. } => Some(content_id),
             // A pointer request names no content id either — it asks what a *name* points
             // at, and the id is the answer rather than the question.
-            Request::SharedWithMe { .. } | Request::Replicable { .. } | Request::Pointer { .. } => None,
+            // Neither carriage question names a content id: both ask *which* envelopes, and
+            // the ids are the answer rather than the question.
+            Request::SharedWithMe { .. }
+            | Request::Replicable { .. }
+            | Request::Relayable { .. }
+            | Request::AddressedToMe { .. }
+            | Request::Pointer { .. } => None,
         }
     }
 
@@ -514,7 +587,10 @@ impl Request {
                     });
                 }
             }
-            Request::SharedWithMe { after, max_entries } | Request::Replicable { after, max_entries } => {
+            Request::SharedWithMe { after, max_entries }
+            | Request::Replicable { after, max_entries }
+            | Request::Relayable { after, max_entries }
+            | Request::AddressedToMe { after, max_entries } => {
                 if let Some(after) = after {
                     if !is_hex_digest(after) {
                         return Err(ProtocolError::NotHex { field: "after" });

@@ -431,3 +431,141 @@ fn the_schema_bounds_an_offer_request_the_way_the_code_does() {
         .is_err());
     }
 }
+
+// --- Carriage (ADR-0028 §9) ---------------------------------------------------------------
+
+fn carried(byte: u8) -> content::CarriedEntry {
+    content::CarriedEntry {
+        envelope_id: id(byte),
+        recipient: otwono_identity::NodeIdentity::from_seeds(&[byte; 32], &[byte; 32], 1)
+            .node_id()
+            .to_text(),
+        size_bytes: 4096,
+        expires_at_ms: 1_700_000_000_000,
+    }
+}
+
+/// Both carriage requests and their shared reply are what the schema says they are.
+#[test]
+fn the_carriage_messages_match_their_schema() {
+    for request in [
+        Request::Relayable {
+            after: None,
+            max_entries: 8,
+        },
+        Request::Relayable {
+            after: Some(id(3)),
+            max_entries: 256,
+        },
+        Request::AddressedToMe {
+            after: None,
+            max_entries: 1,
+        },
+        Request::AddressedToMe {
+            after: Some(id(4)),
+            max_entries: 64,
+        },
+    ] {
+        assert_valid(&encoded(&request));
+        request.validate().expect("a bounded carriage request is valid");
+    }
+
+    assert_valid(&encoded(&Response::Carried(content::CarriedPage {
+        entries: Vec::new(),
+    })));
+    assert_valid(&encoded(&Response::Carried(content::CarriedPage {
+        entries: vec![carried(1), carried(2)],
+    })));
+}
+
+/// The reply is tagged `carried`, not with either method name.
+///
+/// ADR-0026 §7 records getting exactly this wrong once — the reply was tagged with the
+/// request's method name, and it was the schema that caught it rather than any test. With
+/// *two* methods sharing one reply the mistake is easier to make and worse: tagging by method
+/// would mean two incompatible replies for one shape.
+#[test]
+fn the_carriage_reply_is_a_bare_noun_and_not_a_method_name() {
+    let page = encoded(&Response::Carried(content::CarriedPage { entries: Vec::new() }));
+    assert_eq!(page["reply"], serde_json::json!("carried"));
+    for wrong in [
+        "content.relayable",
+        "content.addressed_to_me",
+        "relayable",
+        "addressed_to_me",
+    ] {
+        let mut mistagged = page.clone();
+        mistagged["reply"] = serde_json::json!(wrong);
+        assert_invalid(&mistagged, &format!("a reply tagged {wrong}"));
+    }
+}
+
+/// A carried entry names no sender, and the schema refuses one.
+///
+/// ADR-0028 §4: a carrier has no use for the sender and it belongs inside the ciphertext.
+/// Asserted against the *schema* as well as the struct, because the schema is what a second
+/// implementation reads — one that added a sender "for debugging" would hand every relay a
+/// social graph, and nothing in the Rust types would stop it.
+#[test]
+fn the_schema_refuses_a_sender_on_a_carried_entry() {
+    let mut page = encoded(&Response::Carried(content::CarriedPage {
+        entries: vec![carried(5)],
+    }));
+    for leak in ["sender", "from", "origin", "reply_to"] {
+        let mut leaky = page.clone();
+        leaky["entries"][0][leak] = serde_json::json!("otw1whoever");
+        assert_invalid(&leaky, &format!("a carried entry carrying {leak}"));
+    }
+    // Nor the carrier's own private commitments, which mean nothing to anyone else (§10).
+    for private in ["took_at_ms", "until_ms"] {
+        page["entries"][0][private] = serde_json::json!(1_700_000_000_000u64);
+        assert_invalid(
+            &page,
+            &format!("a carried entry carrying the carrier's {private}"),
+        );
+        page = encoded(&Response::Carried(content::CarriedPage {
+            entries: vec![carried(5)],
+        }));
+    }
+}
+
+/// A recipient must be a full NodeID, never a fingerprint.
+#[test]
+fn the_schema_refuses_a_truncated_recipient() {
+    let mut page = encoded(&Response::Carried(content::CarriedPage {
+        entries: vec![carried(6)],
+    }));
+    for wrong in ["otw1:mpkj-f7bw-jpc3-vzs1", "", "otw1", "not-a-node-id"] {
+        page["entries"][0]["recipient"] = serde_json::json!(wrong);
+        assert_invalid(&page, &format!("a recipient of {wrong:?}"));
+    }
+}
+
+/// The schema bounds the carriage requests exactly where the code does.
+#[test]
+fn the_schema_bounds_a_carriage_request_the_way_the_code_does() {
+    for entries in [0u32, 257] {
+        for request in [
+            Request::Relayable {
+                after: None,
+                max_entries: entries,
+            },
+            Request::AddressedToMe {
+                after: None,
+                max_entries: entries,
+            },
+        ] {
+            let mut encoded_request = encoded(&Request::Relayable {
+                after: None,
+                max_entries: 8,
+            });
+            encoded_request["method"] = encoded(&request)["method"].clone();
+            encoded_request["max_entries"] = serde_json::json!(entries);
+            assert_invalid(&encoded_request, &format!("max_entries {entries}"));
+            assert!(
+                request.validate().is_err(),
+                "the code accepted max_entries {entries} where the schema refuses it"
+            );
+        }
+    }
+}

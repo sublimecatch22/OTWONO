@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://otwono.org/schemas/onm-content-1.3.0.json",
+  "$id": "https://otwono.org/schemas/onm-content-1.4.0.json",
   "title": "OTWONO ONM Content-Fetch Protocol",
-  "description": "The messages two nodes exchange to move content over an authenticated ONM channel (ADR-0017). Every message travels inside one Noise transport frame after the Hello exchange, so every one is bounded: a requester asks for a range, a responder may answer with less, and the requester loops. There is exactly one error shape \u2014 absent, private, shared, damaged, and not-part-of-that-object all produce not_available, because any finer answer tells a stranger what this node holds. A chunk request names the object the chunk belongs to; a bare digest would be a probe against a content-addressed store.",
+  "description": "The messages two nodes exchange to move content over an authenticated ONM channel (ADR-0017). Every message travels inside one Noise transport frame after the Hello exchange, so every one is bounded: a requester asks for a range, a responder may answer with less, and the requester loops. There is exactly one error shape — absent, private, shared, damaged, and not-part-of-that-object all produce not_available, because any finer answer tells a stranger what this node holds. A chunk request names the object the chunk belongs to; a bare digest would be a probe against a content-addressed store.",
   "oneOf": [
     {
       "$ref": "#/$defs/request"
@@ -34,6 +34,12 @@
         },
         {
           "$ref": "#/$defs/replicable_request"
+        },
+        {
+          "$ref": "#/$defs/relayable_request"
+        },
+        {
+          "$ref": "#/$defs/addressed_to_me_request"
         }
       ]
     },
@@ -123,6 +129,9 @@
         },
         {
           "$ref": "#/$defs/replicable_response"
+        },
+        {
+          "$ref": "#/$defs/carried_response"
         }
       ]
     },
@@ -156,7 +165,7 @@
           "minLength": 1
         },
         "visibility": {
-          "description": "public, replicated, or shared. Nothing else may leave a node, so nothing else can appear here. A receiver needs this to know whether it may re-serve what it caches \u2014 and shared is exactly the case where it may not, because a shared object is addressed to named recipients and is not cacheable at all.",
+          "description": "public, replicated, or shared. Nothing else may leave a node, so nothing else can appear here. A receiver needs this to know whether it may re-serve what it caches — and shared is exactly the case where it may not, because a shared object is addressed to named recipients and is not cacheable at all.",
           "enum": [
             "public",
             "replicated",
@@ -262,7 +271,7 @@
     },
     "shared_envelope": {
       "type": "object",
-      "description": "Present when and only when visibility is shared (ADR-0019 \u00a74): what the asking peer needs to open the ciphertext it is about to download. ONLY THAT PEER'S OWN COPY of the content key travels \u2014 the serving node's object record holds the whole recipient list, and sending it would tell a recipient who else this node shares with. That is a partial answer to OQ-28, and the part that is cheap. A receiver must check the sealed key is addressed to itself before asking for a single chunk; a manifest labelled shared with no envelope, or an envelope on an object labelled anything else, is refused rather than reconciled.",
+      "description": "Present when and only when visibility is shared (ADR-0019 §4): what the asking peer needs to open the ciphertext it is about to download. ONLY THAT PEER'S OWN COPY of the content key travels — the serving node's object record holds the whole recipient list, and sending it would tell a recipient who else this node shares with. That is a partial answer to OQ-28, and the part that is cheap. A receiver must check the sealed key is addressed to itself before asking for a single chunk; a manifest labelled shared with no envelope, or an envelope on an object labelled anything else, is refused rather than reconciled.",
       "required": [
         "encryption",
         "nonce_prefix",
@@ -335,7 +344,7 @@
     },
     "replicable_response": {
       "type": "object",
-      "description": "A page of what this node offers for replication. A node that replicates nothing and a node that refuses to say both return an empty page, so asking cannot distinguish them. Nothing here obliges the asker: the holder decides what, if anything, to take (ADR-0026 \u00a71).",
+      "description": "A page of what this node offers for replication. A node that replicates nothing and a node that refuses to say both return an empty page, so asking cannot distinguish them. Nothing here obliges the asker: the holder decides what, if anything, to take (ADR-0026 §1).",
       "required": [
         "reply",
         "entries"
@@ -356,7 +365,7 @@
     },
     "replicable_entry": {
       "type": "object",
-      "description": "One offer: an object, its size, and the terms its owner asks of whoever holds a copy. target_replicas is deliberately NOT here \u2014 a holder holds one copy and cannot count the others, so a number it could not act on would only invite it to try (ADR-0026 \u00a72, \u00a73).",
+      "description": "One offer: an object, its size, and the terms its owner asks of whoever holds a copy. target_replicas is deliberately NOT here — a holder holds one copy and cannot count the others, so a number it could not act on would only invite it to try (ADR-0026 §2, §3).",
       "required": [
         "content_id",
         "size_bytes",
@@ -386,7 +395,7 @@
         },
         "allow_rereplication": {
           "type": "boolean",
-          "description": "A request, not a control (ADR-0026 \u00a75). A holder that ignores it is running modified software and already has the bytes."
+          "description": "A request, not a control (ADR-0026 §5). A holder that ignores it is running modified software and already has the bytes."
         }
       }
     },
@@ -404,7 +413,7 @@
         },
         "after": {
           "$ref": "#/$defs/digest",
-          "description": "Continue strictly after this content id. Absent starts at the beginning. Entries are ordered by content id, which is deterministic and needs no timestamp \u2014 sharing time is metadata this system does not record and a recipient has not asked for."
+          "description": "Continue strictly after this content id. Absent starts at the beginning. Entries are ordered by content id, which is deterministic and needs no timestamp — sharing time is metadata this system does not record and a recipient has not asked for."
         },
         "max_entries": {
           "type": "integer",
@@ -415,7 +424,7 @@
     },
     "shared_index_response": {
       "type": "object",
-      "description": "A page of what this node has sealed to the asking peer. An empty page from a node that has sealed nothing to this peer is identical to an empty page from a node that shares with nobody, and identical to a refusal \u2014 deliberately, so that asking is not a way to find out whether a node shares at all. Every id here is one the asker could already fetch, with a key it can already open, so the page reveals no id it was not already entitled to.",
+      "description": "A page of what this node has sealed to the asking peer. An empty page from a node that has sealed nothing to this peer is identical to an empty page from a node that shares with nobody, and identical to a refusal — deliberately, so that asking is not a way to find out whether a node shares at all. Every id here is one the asker could already fetch, with a key it can already open, so the page reveals no id it was not already entitled to.",
       "required": [
         "reply",
         "entries"
@@ -449,6 +458,105 @@
           "type": "integer",
           "minimum": 0,
           "description": "What the object becomes once opened, so a recipient can decide whether to fetch now. The manifest's size_bytes measures ciphertext and is a larger, different number."
+        }
+      }
+    },
+    "relayable_request": {
+      "type": "object",
+      "description": "What are you carrying that I could take custody of? (ADR-0028 §9). The BROAD carriage question, answered the same for every asker, because a prospective carrier is deciding about envelopes addressed to people it has never met and needs the whole bag. ADR-0028 §7 accepts the cost that every hop learns recipients. A recipient collecting its own mail must NOT use this — content.addressed_to_me exists so the path every ordinary recipient takes is not an enumeration oracle.",
+      "required": [
+        "method",
+        "max_entries"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "method": {
+          "const": "content.relayable"
+        },
+        "after": {
+          "$ref": "#/$defs/digest",
+          "description": "Continue strictly after this envelope id. Absent starts at the beginning. Ordered by envelope id, deterministic and needing no timestamp — custody time is metadata no asker has asked for."
+        },
+        "max_entries": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256
+        }
+      }
+    },
+    "addressed_to_me_request": {
+      "type": "object",
+      "description": "What are you holding for ME? (ADR-0028 §9). Scoped to the NodeID the Noise handshake authenticated. There is NO RECIPIENT FIELD, for the same reason content.pointer has no owner field: the only recipient a peer will answer about is the one it just authenticated, so there is nothing to spoof and nothing for a filter to get wrong. An empty reply from a carrier holding nothing for the asker is identical to an empty reply from a node that carries nothing at all — asking must not reveal whether a node carries.",
+      "required": [
+        "method",
+        "max_entries"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "method": {
+          "const": "content.addressed_to_me"
+        },
+        "after": {
+          "$ref": "#/$defs/digest",
+          "description": "Continue strictly after this envelope id. Absent starts at the beginning."
+        },
+        "max_entries": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256
+        }
+      }
+    },
+    "carried_response": {
+      "type": "object",
+      "description": "A page of envelopes this carrier holds. Answers BOTH carriage requests — the method decides which envelopes are listed, not their shape. A node that carries nothing and a node that refuses to say both return an empty page.",
+      "required": [
+        "reply",
+        "entries"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "reply": {
+          "const": "carried"
+        },
+        "entries": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/carried_entry"
+          }
+        }
+      }
+    },
+    "carried_entry": {
+      "type": "object",
+      "description": "One envelope in custody, as another node sees it. Deliberately NOT the carrier's own custody record: took_at_ms and until_ms are private commitments on this carrier's clock (ADR-0028 §10) and mean nothing to anyone else, so what crosses the wire is the sender's descriptor and the next carrier makes its own commitment from its own custody moment. There is NO SENDER FIELD — a carrier has no use for one and the sender lives inside the ciphertext where only the recipient can read it (ADR-0028 §4).",
+      "required": [
+        "envelope_id",
+        "recipient",
+        "size_bytes",
+        "expires_at_ms"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "envelope_id": {
+          "$ref": "#/$defs/digest",
+          "description": "The content id of the sealed ciphertext."
+        },
+        "recipient": {
+          "type": "string",
+          "description": "The NodeID this is for, in full otw1 text form — never the truncated fingerprint, which is for people to read aloud and is documented as never being what a decision is made against.",
+          "pattern": "^otw1[0-9abcdefghjkmnpqrstvwxyz]{55}$"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Ciphertext size, so a carrier can decide before fetching."
+        },
+        "expires_at_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The sender's absolute expiry. A CEILING on any carrier's own deadline and never a replacement for it: a carrier commits to min(this, its own custody moment + its max hold) and sweeps on that (ADR-0028 §10)."
         }
       }
     }

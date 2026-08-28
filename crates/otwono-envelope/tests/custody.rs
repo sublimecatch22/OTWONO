@@ -212,3 +212,70 @@ fn nothing_a_relay_receives_names_the_sender() {
         assert!(json.contains(expected), "the descriptor lost {expected:?}");
     }
 }
+
+/// A carrier's committed deadline is its own, and the sender's expiry is a ceiling on it.
+///
+/// ADR-0028 §10. The mesh has no NTP guarantee, so a sender's wall-clock instant compared
+/// against a carrier's clock later is two numbers disagreeing for invisible reasons. What the
+/// carrier sweeps on is what it committed to when it took custody.
+#[test]
+fn a_carrier_sweeps_on_the_deadline_it_committed_to() {
+    use otwono_envelope::Custody;
+    let p = policy();
+    let envelope = offered(NOW + 3 * 60 * 60 * 1000);
+
+    let Carry::Accept { until_ms } = p.decide(&envelope, NOW) else {
+        panic!("a well-formed envelope inside budget must be accepted");
+    };
+    let held = Custody::taken(&envelope, NOW, until_ms);
+    assert_eq!(
+        held.until_ms,
+        NOW + 3 * 60 * 60 * 1000,
+        "the sender asked for less than the ceiling"
+    );
+    assert!(!held.is_due(NOW));
+    assert!(!held.is_due(held.until_ms - 1));
+    assert!(held.is_due(held.until_ms), "the committed deadline did not fire");
+}
+
+/// Constructing custody directly cannot lengthen an envelope's life.
+///
+/// The min-rule lives in `CarryPolicy::decide`, and this is the second door: a caller that
+/// computed its own deadline, or a record read back off a disk somebody edited, still cannot
+/// push the deadline past what the sender signed for.
+#[test]
+fn custody_cannot_outlive_what_the_sender_asked_for() {
+    use otwono_envelope::Custody;
+    let envelope = offered(NOW + 1000);
+    let greedy = Custody::taken(&envelope, NOW, NOW + 999_999_999);
+    assert_eq!(
+        greedy.until_ms,
+        NOW + 1000,
+        "custody was constructed with a deadline past the sender's expiry"
+    );
+}
+
+/// A carrier whose clock runs fast still drops it in bounded time.
+///
+/// The failure §10 exists to bound: with the deadline measured from the carrier's own custody
+/// moment, a wrong clock shifts *when* the envelope is dropped, not *whether* it ever is.
+#[test]
+fn a_skewed_clock_still_drops_the_envelope_eventually() {
+    use otwono_envelope::Custody;
+    let p = policy();
+    // A sender asking for a year; this carrier holds for a day at most.
+    let envelope = offered(NOW + 365 * 24 * 60 * 60 * 1000);
+
+    // A carrier whose clock reads a week ahead of the sender's.
+    let skewed_now = NOW + 7 * 24 * 60 * 60 * 1000;
+    let Carry::Accept { until_ms } = p.decide(&envelope, skewed_now) else {
+        panic!("an envelope well inside its expiry must be accepted despite the skew");
+    };
+    let held = Custody::taken(&envelope, skewed_now, until_ms);
+    assert_eq!(
+        held.until_ms,
+        skewed_now + p.max_hold_ms,
+        "the deadline must come from this carrier's custody moment, not from clock arithmetic"
+    );
+    assert!(held.is_due(skewed_now + p.max_hold_ms));
+}

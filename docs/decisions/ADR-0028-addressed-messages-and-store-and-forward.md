@@ -208,6 +208,75 @@ and zeroed on a storage-constrained machine by the same rule. The gate and the c
 answer different questions and both must pass — the gate says what this machine can afford,
 the broker says what its operator permits.
 
+### 9. Two wire methods, because a carrier and a collector ask different questions
+
+**Settled 2026-08-27**, on building the wire and finding that one method would have leaked.
+
+The obvious shape is a single `content.relayable` — "what are you holding?" — serving both the
+carrier taking custody and the recipient collecting. It conflates two genuinely different
+questions, and the conflation is a metadata surface §4 did not price in.
+
+- **A carrier** asking what it might take custody of needs the *whole bag*, because it is
+  deciding about envelopes addressed to people it has never met. §7 accepts that cost: every
+  hop is another party that learns recipients.
+- **A recipient** collecting needs only what is addressed to *it*, and has no business
+  learning who else the carrier serves.
+
+One unscoped method would give every peer that can complete a handshake the ability to
+enumerate every recipient a carrier holds mail for — **without carrying anything**. §4 says a
+relay learns the recipients *of what it carries*; an open enumeration endpoint is strictly
+broader, and it follows from §7's own reasoning that nothing distinguishes a genuine carrier
+from somebody reading the mailbag.
+
+So:
+
+- **`content.relayable`** — the custody-transfer question, answered the same for every asker,
+  paged like `content.replicable` and taken once per session for the same reason (ADR-0026 §7).
+  This is the broad path, and it is the one §7 reasoned about.
+- **`content.addressed_to_me`** — the collection question, scoped to the authenticated asker,
+  mirroring ADR-0020's `content.shared_with_me` exactly. A node that only wants its own mail
+  never sees anyone else's.
+
+This does **not** close the enumeration hole on the carrier path, and cannot while §7 stands:
+re-relay requires exposing recipients to prospective carriers. What it does is stop the
+*collection* path — the one every ordinary recipient uses — from being an enumeration oracle,
+and make the broad path explicitly the one the ADR reasoned about rather than an accident of
+having written one method instead of two.
+
+An empty reply from a carrier holding nothing for the asker is identical to an empty reply
+from a node that carries nothing at all, per ADR-0020's rule: asking must not be a way to find
+out whether a node carries.
+
+### 10. Expiry is evaluated on the carrier's clock, from the moment it took custody
+
+**Settled 2026-08-27.** §3 made expiry an absolute wall-clock timestamp and said nothing about
+whose clock. ADR-0027 §2 had already rejected wall clocks for *ordering* on the grounds that
+"on a mesh with no NTP guarantee that is not a rare edge case", and the same absence of NTP
+applies here.
+
+Unaddressed, a carrier whose clock is badly wrong either refuses every envelope on receipt or
+holds past every expiry, and **nothing detects either** — a node that silently discards all
+mail looks identical from outside to one nobody is sending to.
+
+So a carrier commits to a deadline of its own at the moment it accepts custody:
+
+```
+until_ms = min(sender's expires_at_ms, took_at_ms + carrier's max_hold_ms)
+```
+
+and **sweeps against that stored value**, not against the sender's field re-read later. Two
+consequences worth stating:
+
+- The sender's expiry remains a ceiling and is never exceeded (§3 is unchanged).
+- A carrier with a skewed clock still drops the envelope in bounded time, because the second
+  term is measured from *its own* custody moment rather than from a comparison between two
+  clocks that disagree.
+
+What this does not fix: a carrier whose clock is far *ahead* still refuses on receipt, because
+the sender's expiry looks already past. That is the gross-skew case, it is recorded in
+`OPEN-QUESTIONS.md`, and treating it needs something that can detect skew rather than merely
+tolerate it.
+
 ## Consequences
 
 **Good.** No new cryptography and no second envelope format — this composes ADR-0019's
