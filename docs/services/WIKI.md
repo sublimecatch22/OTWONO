@@ -1,14 +1,17 @@
 # Wiki
 
-**Status:** `IMPLEMENTED`. The record and its rules are in `crates/otwono-wiki`; the schema is
+**Status:** `VERIFIED`. The record and its rules are in `crates/otwono-wiki`; the schema is
 `schemas/wiki-revision.schema.json`; the decisions are ADR-0032. `otwono-wikictl` writes,
-reads and walks the history of a page over the real control plane, and a page written through
-the daemons reads back as its text with its signature verifying against the node that made it.
+reads, lists, deletes and walks the history of a page over the real control plane, and the
+binary itself is exercised by `crates/otwono-wikictl/tests/cli.rs`.
 
-A page also **crosses a link**: a reading node resolves the peer's `wiki/<page>` pointer,
-fetches the revision and then the body, and verifies the revision against the key the
-*handshake* proved. Shown between two nodes over a real Noise channel;
-**not yet between booted nodes**, which is what Phase 6's first exit clause needs — see §6.
+A page **crosses a link**: a reading node resolves the peer's `wiki/<page>` pointer, fetches
+the revision and then the body, and verifies the revision against the key the *handshake*
+proved. On 2026-08-28 all three nodes of a QEMU run did exactly that — each reader's
+`their_revision` matching a different node's `wrote`, so genuine cross-reads — which is
+**Phase 6's first exit criterion clause**.
+
+§6 says what that leaves out, and the list is longer than the claim.
 
 The first service composed from the three primitives rather than a fourth one.
 
@@ -121,11 +124,16 @@ is the whole history" from "this is as much of it as I have":
   The pointer moves **last**, and that order is not incidental: it is what anyone else reads,
   so a pointer advanced before its revision was stored would name an id this node cannot
   serve, and a reader would see a page that exists and cannot be opened.
-- **No page has crossed a link between *booted* nodes.** It crosses one in
-  `a_wiki_page_is_readable_from_another_node`, over a real Noise channel with real daemons.
-  What the three-node QEMU harness has shown is two nodes resolving `wiki/Getting-Started` as
-  a *pointer to an opaque blob* — the primitive, not this service. Phase 6's first exit clause
-  needs a revision and its body to make that trip.
+- **One page each, and one revision.** A page crosses between booted nodes — all three did on
+  2026-08-28, which is Phase 6's first exit clause — but each was a single revision of 69
+  bytes. No page with a long history has made the trip, and nothing has been read while its
+  author was editing it.
+- **`read --from` and `history --from` are not in the CLI tests.** Both need two nodes and a
+  link between them, which `crates/otwono-wikictl/tests/cli.rs` does not stand up: it runs one
+  node's daemons. The control-plane tests drive `NetState` directly and the boot check runs
+  the binary, so between them the path is covered — but not by anything that would catch an
+  argument-handling mistake in those two subcommands specifically. `read --from` shipped once
+  with a `net.fetch` call that omitted the peer, and it was a booted run that found it.
 - **No rendering, no links between pages, no `onm://` in a browser.** That is §3's local
   resolver.
 - **No multi-writer merge**, per §2 above.
