@@ -204,7 +204,15 @@ pub struct CarryPolicy {
 /// what counts as a message does not, and a per-tier answer would mean a T0 node refusing
 /// mail that a T3 node would carry, which makes delivery depend on which carrier you happen
 /// to meet.
-pub const MAX_ENVELOPE_BYTES: u64 = 1024 * 1024;
+///
+/// **It must stay under `otwono_stored::MAX_INLINE_BYTES`**, which is what one
+/// `store.accept_shared` call can carry, because that is how a carrier keeps what it takes.
+/// At the previous value of 1 MiB an envelope between 640 KiB and 1 MiB passed every check
+/// in this crate and then failed at the store, and it would have failed identically on every
+/// carrier and every retry — an envelope accepted by the policy and undeliverable by
+/// construction. `the_envelope_ceiling_fits_what_a_carrier_can_actually_keep` in the
+/// control-plane suite fails if either constant moves past the other.
+pub const MAX_ENVELOPE_BYTES: u64 = 512 * 1024;
 
 /// The furthest ahead any carrier will commit to holding an envelope.
 ///

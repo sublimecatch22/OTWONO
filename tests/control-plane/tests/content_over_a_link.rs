@@ -2307,3 +2307,22 @@ fn taking_custody_of_a_private_objects_id_does_not_make_it_servable() {
         "custody of a PRIVATE object's id made it servable: {refused:?}"
     );
 }
+
+/// The largest envelope a carrier will accept must be one it can actually keep.
+///
+/// A carrier stores what it takes through `store.accept_shared`, which is an inline
+/// control-plane call with its own ceiling. When the envelope ceiling was the larger of the
+/// two, an envelope between them passed `CarryPolicy::decide`, passed the fetch, and failed
+/// at the store — on every carrier and every retry, because nothing about it would ever
+/// change. Accepted by policy and undeliverable by construction.
+///
+/// Two constants in two crates that nothing linked, so this is the link.
+#[test]
+fn the_envelope_ceiling_fits_what_a_carrier_can_actually_keep() {
+    assert!(
+        otwono_envelope::MAX_ENVELOPE_BYTES <= otwono_stored::MAX_INLINE_BYTES as u64,
+        "a carrier will accept {} bytes and can only keep {}",
+        otwono_envelope::MAX_ENVELOPE_BYTES,
+        otwono_stored::MAX_INLINE_BYTES
+    );
+}
