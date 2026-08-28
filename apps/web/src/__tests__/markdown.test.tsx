@@ -6,7 +6,9 @@ import { Markdown } from '../components/Markdown';
 describe('Markdown', () => {
   it('renders headings, lists and code', () => {
     const { container } = render(
-      <Markdown source={'# Title\n\nSome **bold** text.\n\n- one\n- two\n\n```js\nconst a = 1;\n```'} />,
+      <Markdown
+        source={'# Title\n\nSome **bold** text.\n\n- one\n- two\n\n```js\nconst a = 1;\n```'}
+      />,
     );
 
     expect(screen.getByRole('heading', { name: 'Title' })).toBeInTheDocument();
@@ -29,7 +31,9 @@ describe('Markdown', () => {
   it('renders http links but refuses other schemes', () => {
     const { container } = render(
       <Markdown
-        source={'[safe](https://example.com) [unsafe](javascript:alert(1)) [file](file:///etc/passwd)'}
+        source={
+          '[safe](https://example.com) [unsafe](javascript:alert(1)) [file](file:///etc/passwd)'
+        }
       />,
     );
 

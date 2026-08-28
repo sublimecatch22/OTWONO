@@ -49,13 +49,7 @@ export function Spinner({ size = 16, label }: { size?: number; label?: string })
   );
 }
 
-export function Badge({
-  tone = 'neutral',
-  children,
-}: {
-  tone?: Tone;
-  children: ReactNode;
-}) {
+export function Badge({ tone = 'neutral', children }: { tone?: Tone; children: ReactNode }) {
   return <span className={`badge badge--${tone}`}>{children}</span>;
 }
 
@@ -200,7 +194,11 @@ export function TimeAgo({ value }: { value: string }) {
           ? `${Math.floor(seconds / 3600)} h ago`
           : `${Math.floor(seconds / 86400)} d ago`;
 
-  return <time dateTime={value} title={date.toLocaleString()}>{label}</time>;
+  return (
+    <time dateTime={value} title={date.toLocaleString()}>
+      {label}
+    </time>
+  );
 }
 
 /** Money, always labelled as simulated by the caller's surrounding copy. */

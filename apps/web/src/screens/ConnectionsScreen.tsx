@@ -172,11 +172,7 @@ export function ConnectionsScreen() {
                 <Button size="sm" busy={test.isPending} onClick={() => test.mutate(connection.id)}>
                   Test
                 </Button>
-                <Button
-                  size="sm"
-                  variant="danger"
-                  onClick={() => remove.mutate(connection.id)}
-                >
+                <Button size="sm" variant="danger" onClick={() => remove.mutate(connection.id)}>
                   Remove
                 </Button>
               </>
@@ -259,9 +255,7 @@ export function ConnectionsScreen() {
             {connection.kind === 'openai_compatible' && (
               <ApiKeyField
                 connection={connection}
-                onSave={(key) =>
-                  update.mutate({ id: connection.id, patch: { api_key: key } })
-                }
+                onSave={(key) => update.mutate({ id: connection.id, patch: { api_key: key } })}
               />
             )}
 
@@ -394,7 +388,9 @@ function ModelTable({ models }: { models: ModelInfo[] }) {
                         : 'caution'
                   }
                 >
-                  {model.capability_source === 'inferred' ? 'guessed from the name' : model.capability_source}
+                  {model.capability_source === 'inferred'
+                    ? 'guessed from the name'
+                    : model.capability_source}
                 </Badge>
               </td>
             </tr>
@@ -413,7 +409,11 @@ function ModelTable({ models }: { models: ModelInfo[] }) {
 const MANUAL_KINDS = [
   { id: 'ollama', name: 'Ollama', endpoint: 'http://127.0.0.1:11434' },
   { id: 'lmstudio', name: 'LM Studio', endpoint: 'http://127.0.0.1:1234' },
-  { id: 'openai_compatible', name: 'OpenAI-compatible endpoint', endpoint: 'http://127.0.0.1:8080' },
+  {
+    id: 'openai_compatible',
+    name: 'OpenAI-compatible endpoint',
+    endpoint: 'http://127.0.0.1:8080',
+  },
 ] as const;
 
 function ManualConnectionForm() {
@@ -446,8 +446,7 @@ function ManualConnectionForm() {
       setApiKey('');
       setError(null);
     },
-    onError: (caught) =>
-      setError(caught instanceof ApiError ? caught.message : String(caught)),
+    onError: (caught) => setError(caught instanceof ApiError ? caught.message : String(caught)),
   });
 
   return (

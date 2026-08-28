@@ -91,9 +91,7 @@ export function TasksScreen() {
                 <span className="muted">
                   {projectTitle} · updated <TimeAgo value={task.updated_at} />
                 </span>
-                {task.failure_reason && (
-                  <span className="muted">Needs: {task.failure_reason}</span>
-                )}
+                {task.failure_reason && <span className="muted">Needs: {task.failure_reason}</span>}
               </button>
             </li>
           ))}

@@ -251,7 +251,12 @@ export function ProjectDetailScreen() {
     onSuccess: invalidate,
   });
 
-  if (project.isLoading) return <div className="screen"><Spinner label="Loading the project" /></div>;
+  if (project.isLoading)
+    return (
+      <div className="screen">
+        <Spinner label="Loading the project" />
+      </div>
+    );
   if (!project.data)
     return (
       <div className="screen">
@@ -328,9 +333,8 @@ export function ProjectDetailScreen() {
 
       {lastRun && (
         <Notice tone={lastRun.tasks_failed > 0 ? 'caution' : 'info'} title="Last run">
-          {lastRun.stopped_because} — {lastRun.steps_used} step(s),{' '}
-          {lastRun.tasks_completed} completed, {lastRun.tasks_reworked} reworked,{' '}
-          {lastRun.tasks_failed} failed.
+          {lastRun.stopped_because} — {lastRun.steps_used} step(s), {lastRun.tasks_completed}{' '}
+          completed, {lastRun.tasks_reworked} reworked, {lastRun.tasks_failed} failed.
         </Notice>
       )}
 

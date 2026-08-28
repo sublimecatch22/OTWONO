@@ -72,7 +72,10 @@ export function applyPreferences(preferences: Preferences, root: HTMLElement): v
   const size = clamp(preferences.font_size_px, 12, 24);
   root.style.setProperty('--font-size-base', `${size}px`);
   root.style.setProperty('--sidebar-width', `${clamp(preferences.sidebar_width_px, 200, 520)}px`);
-  root.style.setProperty('--chat-max-width', `${clamp(preferences.chat_max_width_px, 560, 1600)}px`);
+  root.style.setProperty(
+    '--chat-max-width',
+    `${clamp(preferences.chat_max_width_px, 560, 1600)}px`,
+  );
 }
 
 export function clamp(value: number, low: number, high: number): number {

@@ -13,11 +13,11 @@
 
 :root {
   /* ---- Typography ------------------------------------------------------ */
-  --font-sans: "Inter", "Segoe UI Variable", "Segoe UI", system-ui, -apple-system,
-    "Helvetica Neue", sans-serif;
-  --font-serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
-  --font-mono: "JetBrains Mono", "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
-  --font-humanist: "Verdana", "Tahoma", "DejaVu Sans", sans-serif;
+  --font-sans: 'Inter', 'Segoe UI Variable', 'Segoe UI', system-ui, -apple-system, 'Helvetica Neue',
+    sans-serif;
+  --font-serif: 'Iowan Old Style', 'Palatino Linotype', Palatino, Georgia, serif;
+  --font-mono: 'JetBrains Mono', 'Cascadia Mono', 'SF Mono', Menlo, Consolas, monospace;
+  --font-humanist: 'Verdana', 'Tahoma', 'DejaVu Sans', sans-serif;
 
   --font-body: var(--font-sans);
   --font-size-base: 15px;
@@ -160,11 +160,7 @@
   --shadow-lg: 0 24px 60px rgba(0, 0, 0, 0.55);
 
   /* Depth is a single, still gradient — not an animated background. */
-  --backdrop: radial-gradient(
-      1100px 620px at 12% -12%,
-      rgba(79, 140, 255, 0.09),
-      transparent 62%
-    ),
+  --backdrop: radial-gradient(1100px 620px at 12% -12%, rgba(79, 140, 255, 0.09), transparent 62%),
     radial-gradient(900px 560px at 100% 0%, rgba(165, 131, 255, 0.06), transparent 60%);
 }
 

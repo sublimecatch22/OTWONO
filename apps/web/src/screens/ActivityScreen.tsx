@@ -111,9 +111,7 @@ export function ActivityScreen() {
                   {entry.outcome}
                 </Badge>
                 <code>{entry.action}</code>
-                <span className="muted">
-                  {entry.actor_name ?? entry.actor_type}
-                </span>
+                <span className="muted">{entry.actor_name ?? entry.actor_type}</span>
                 {Object.keys(entry.detail ?? {}).length > 0 && (
                   <details>
                     <summary>Detail</summary>

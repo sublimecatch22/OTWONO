@@ -159,9 +159,7 @@ export function ChatScreen() {
                 at,
                 label: 'Finished',
                 detail:
-                  event.finish_reason === 'stop'
-                    ? 'Complete'
-                    : `Stopped: ${event.finish_reason}`,
+                  event.finish_reason === 'stop' ? 'Complete' : `Stopped: ${event.finish_reason}`,
                 tone: event.finish_reason === 'stop' ? 'positive' : 'caution',
               });
               break;
@@ -335,9 +333,7 @@ export function ChatScreen() {
                     }}
                   />
                   <span>{source.label}</span>
-                  {source.embedding_is_fallback && (
-                    <Badge tone="caution">word match only</Badge>
-                  )}
+                  {source.embedding_is_fallback && <Badge tone="caution">word match only</Badge>}
                 </label>
               ))}
           </fieldset>

@@ -22,14 +22,16 @@ describe('streamEvents', () => {
   it('reads frames in order', async () => {
     vi.stubGlobal(
       'fetch',
-      vi.fn().mockResolvedValue(
-        sseResponse([
-          'data: {"type":"start","message_id":"m1","model":"llama","provider":"Ollama"}\n\n',
-          'data: {"type":"delta","text":"Hello"}\n\n',
-          'data: {"type":"delta","text":", world"}\n\n',
-          'data: {"type":"done","message_id":"m1","finish_reason":"stop","token_estimate":9}\n\n',
-        ]),
-      ),
+      vi
+        .fn()
+        .mockResolvedValue(
+          sseResponse([
+            'data: {"type":"start","message_id":"m1","model":"llama","provider":"Ollama"}\n\n',
+            'data: {"type":"delta","text":"Hello"}\n\n',
+            'data: {"type":"delta","text":", world"}\n\n',
+            'data: {"type":"done","message_id":"m1","finish_reason":"stop","token_estimate":9}\n\n',
+          ]),
+        ),
     );
 
     const events: StreamEvent[] = [];
@@ -46,9 +48,7 @@ describe('streamEvents', () => {
   it('reassembles a frame split across network reads', async () => {
     vi.stubGlobal(
       'fetch',
-      vi.fn().mockResolvedValue(
-        sseResponse(['data: {"type":"del', 'ta","text":"split"}', '\n\n']),
-      ),
+      vi.fn().mockResolvedValue(sseResponse(['data: {"type":"del', 'ta","text":"split"}', '\n\n'])),
     );
 
     const events: StreamEvent[] = [];
@@ -60,13 +60,15 @@ describe('streamEvents', () => {
   it('ignores keep-alive comments and unreadable frames without ending the stream', async () => {
     vi.stubGlobal(
       'fetch',
-      vi.fn().mockResolvedValue(
-        sseResponse([
-          ': keep-alive\n\n',
-          'data: {not json}\n\n',
-          'data: {"type":"delta","text":"survived"}\n\n',
-        ]),
-      ),
+      vi
+        .fn()
+        .mockResolvedValue(
+          sseResponse([
+            ': keep-alive\n\n',
+            'data: {not json}\n\n',
+            'data: {"type":"delta","text":"survived"}\n\n',
+          ]),
+        ),
     );
 
     const events: StreamEvent[] = [];

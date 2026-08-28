@@ -46,7 +46,9 @@ export function MarketplaceScreen() {
         <div className="segmented" role="group" aria-label="Choose your path">
           <button
             type="button"
-            className={path === 'creator' ? 'segmented__item segmented__item--active' : 'segmented__item'}
+            className={
+              path === 'creator' ? 'segmented__item segmented__item--active' : 'segmented__item'
+            }
             aria-pressed={path === 'creator'}
             onClick={() => setPath('creator')}
           >
@@ -54,7 +56,9 @@ export function MarketplaceScreen() {
           </button>
           <button
             type="button"
-            className={path === 'worker' ? 'segmented__item segmented__item--active' : 'segmented__item'}
+            className={
+              path === 'worker' ? 'segmented__item segmented__item--active' : 'segmented__item'
+            }
             aria-pressed={path === 'worker'}
             onClick={() => setPath('worker')}
           >
@@ -64,8 +68,8 @@ export function MarketplaceScreen() {
       </header>
 
       <Notice tone="caution" title="Payments here are simulated">
-        No money moves and no worker is really paid. Every amount below is a record of intent,
-        kept so the flow can be tested end to end.
+        No money moves and no worker is really paid. Every amount below is a record of intent, kept
+        so the flow can be tested end to end.
       </Notice>
 
       {path === 'creator' ? <CreatorPath /> : <WorkerPath />}
@@ -98,9 +102,9 @@ function CreatorPath() {
   const listings = useQuery({
     queryKey: ['marketplace', 'mine'],
     queryFn: () =>
-      api.get<{ listings: (Listing & { moderation_findings: ModerationFinding[]; applications: number })[] }>(
-        '/api/marketplace/my-listings',
-      ),
+      api.get<{
+        listings: (Listing & { moderation_findings: ModerationFinding[]; applications: number })[];
+      }>('/api/marketplace/my-listings'),
   });
 
   const create = useMutation({
@@ -271,7 +275,12 @@ function CreatorPath() {
             </Notice>
           )}
 
-          <Button type="submit" variant="primary" busy={create.isPending} disabled={!draft.title.trim()}>
+          <Button
+            type="submit"
+            variant="primary"
+            busy={create.isPending}
+            disabled={!draft.title.trim()}
+          >
             Save as a draft
           </Button>
         </form>

@@ -146,9 +146,7 @@ export function KnowledgeScreen() {
                   </Button>
                   <Button
                     size="sm"
-                    onClick={() =>
-                      setAuthorisation.mutate({ id: source.id, authorised: false })
-                    }
+                    onClick={() => setAuthorisation.mutate({ id: source.id, authorised: false })}
                   >
                     Revoke access
                   </Button>
@@ -228,7 +226,12 @@ export function KnowledgeScreen() {
               placeholder="What does the handbook say about leave?"
               onChange={(event) => setQuery(event.target.value)}
             />
-            <Button type="submit" variant="primary" busy={search.isPending} disabled={!query.trim()}>
+            <Button
+              type="submit"
+              variant="primary"
+              busy={search.isPending}
+              disabled={!query.trim()}
+            >
               Search
             </Button>
           </form>
@@ -344,7 +347,11 @@ function FolderPicker({ onChoose }: { onChoose: (path: string) => void }) {
             {listing.data.entries.map((entry) => (
               <li key={entry.path}>
                 {entry.is_directory ? (
-                  <button type="button" className="filelist__dir" onClick={() => setPath(entry.path)}>
+                  <button
+                    type="button"
+                    className="filelist__dir"
+                    onClick={() => setPath(entry.path)}
+                  >
                     📁 {entry.name}
                   </button>
                 ) : (

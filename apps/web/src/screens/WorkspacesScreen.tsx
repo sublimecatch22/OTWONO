@@ -15,15 +15,7 @@ import type {
   WorkspaceSummary,
 } from '../api/types';
 import { Markdown } from '../components/Markdown';
-import {
-  Badge,
-  Button,
-  Card,
-  EmptyState,
-  Field,
-  Notice,
-  Spinner,
-} from '../components/primitives';
+import { Badge, Button, Card, EmptyState, Field, Notice, Spinner } from '../components/primitives';
 import { useUi } from '../state/ui';
 
 export function WorkspacesScreen() {
@@ -178,7 +170,8 @@ export function WorkspaceDetailScreen() {
     onSuccess: invalidate,
   });
   const createSession = useMutation({
-    mutationFn: () => api.post<SessionDetail>(`/api/workspaces/${workspaceId}/sessions`, { question }),
+    mutationFn: () =>
+      api.post<SessionDetail>(`/api/workspaces/${workspaceId}/sessions`, { question }),
     onSuccess: (session) => {
       invalidate();
       setQuestion('');
@@ -207,7 +200,11 @@ export function WorkspaceDetailScreen() {
   });
 
   if (workspace.isLoading)
-    return <div className="screen"><Spinner label="Loading the workspace" /></div>;
+    return (
+      <div className="screen">
+        <Spinner label="Loading the workspace" />
+      </div>
+    );
   if (!workspace.data)
     return (
       <div className="screen">
@@ -254,7 +251,12 @@ export function WorkspaceDetailScreen() {
                 <div>
                   <strong>{member.agent.name}</strong>
                   <span className="muted"> · {member.job_role}</span>
-                  {member.is_coordinator && <> <Badge tone="accent">coordinator</Badge></>}
+                  {member.is_coordinator && (
+                    <>
+                      {' '}
+                      <Badge tone="accent">coordinator</Badge>
+                    </>
+                  )}
                 </div>
                 <div className="row row--tight">
                   {!member.is_coordinator && (
@@ -267,7 +269,11 @@ export function WorkspaceDetailScreen() {
                       Make coordinator
                     </Button>
                   )}
-                  <Button size="sm" variant="danger" onClick={() => removeMember.mutate(member.agent.id)}>
+                  <Button
+                    size="sm"
+                    variant="danger"
+                    onClick={() => removeMember.mutate(member.agent.id)}
+                  >
                     Remove
                   </Button>
                 </div>
@@ -325,7 +331,9 @@ export function WorkspaceDetailScreen() {
               className="input"
               value={question}
               placeholder={
-                data.kind === 'boardroom' ? 'Should we ship on Friday?' : 'What should we research next?'
+                data.kind === 'boardroom'
+                  ? 'Should we ship on Friday?'
+                  : 'What should we research next?'
               }
               onChange={(event) => setQuestion(event.target.value)}
             />
@@ -383,8 +391,7 @@ export function WorkspaceDetailScreen() {
 function SessionView({ workspaceId, sessionId }: { workspaceId: string; sessionId: string }) {
   const session = useQuery({
     queryKey: ['session', sessionId],
-    queryFn: () =>
-      api.get<SessionDetail>(`/api/workspaces/${workspaceId}/sessions/${sessionId}`),
+    queryFn: () => api.get<SessionDetail>(`/api/workspaces/${workspaceId}/sessions/${sessionId}`),
   });
 
   if (session.isLoading) return <Spinner label="Loading the session" />;

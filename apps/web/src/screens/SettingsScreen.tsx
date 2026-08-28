@@ -12,21 +12,9 @@ import type {
   PermissionsResponse,
   SyncResult,
 } from '../api/types';
-import {
-  Badge,
-  Button,
-  Card,
-  DetailList,
-  Field,
-  Notice,
-  Spinner,
-} from '../components/primitives';
+import { Badge, Button, Card, DetailList, Field, Notice, Spinner } from '../components/primitives';
 import { ALL_TABS } from '../components/AppShell';
-import {
-  usePreferences,
-  useResetPreferences,
-  useSavePreferences,
-} from '../state/preferences';
+import { usePreferences, useResetPreferences, useSavePreferences } from '../state/preferences';
 import { useSystemStatus } from '../state/system';
 import { useUi } from '../state/ui';
 
@@ -111,19 +99,15 @@ function AppearanceSettings() {
                 } catch (error) {
                   toast({
                     tone: 'negative',
-                    body: error instanceof ApiError ? error.message : 'That file could not be read.',
+                    body:
+                      error instanceof ApiError ? error.message : 'That file could not be read.',
                   });
                 }
                 event.target.value = '';
               }}
             />
           </label>
-          <Button
-            size="sm"
-            variant="danger"
-            busy={reset.isPending}
-            onClick={() => reset.mutate()}
-          >
+          <Button size="sm" variant="danger" busy={reset.isPending} onClick={() => reset.mutate()}>
             Reset to default
           </Button>
         </>
@@ -300,9 +284,7 @@ function AppearanceSettings() {
 
       <fieldset className="fieldset">
         <legend>Visible tabs</legend>
-        <p className="muted">
-          Chat and Settings always stay, so you cannot hide the way back.
-        </p>
+        <p className="muted">Chat and Settings always stay, so you cannot hide the way back.</p>
         {ALL_TABS.map((tab) => {
           const required = options.required_tabs.includes(tab.key);
           return (
@@ -320,7 +302,12 @@ function AppearanceSettings() {
               />
               <span>
                 {tab.label}
-                {required && <> <Badge tone="neutral">always shown</Badge></>}
+                {required && (
+                  <>
+                    {' '}
+                    <Badge tone="neutral">always shown</Badge>
+                  </>
+                )}
               </span>
             </label>
           );
@@ -358,7 +345,12 @@ function PermissionSettings() {
       description="OTWONO refuses anything it has not been given permission for. Nothing is granted until you say so."
       actions={
         (permissions.data?.grants.length ?? 0) > 0 && (
-          <Button size="sm" variant="danger" busy={revokeAll.isPending} onClick={() => revokeAll.mutate()}>
+          <Button
+            size="sm"
+            variant="danger"
+            busy={revokeAll.isPending}
+            onClick={() => revokeAll.mutate()}
+          >
             Revoke everything
           </Button>
         )
@@ -418,11 +410,7 @@ function PermissionSettings() {
                     ? 'Everywhere'
                     : grant.scopes
                         .map((scope) =>
-                          'path' in scope
-                            ? scope.path
-                            : 'host' in scope
-                              ? scope.host
-                              : scope.type,
+                          'path' in scope ? scope.path : 'host' in scope ? scope.host : scope.type,
                         )
                         .join(', ')}
                   {grant.expires_at && ` · expires ${new Date(grant.expires_at).toLocaleString()}`}
@@ -441,8 +429,14 @@ function PermissionSettings() {
         <ul className="stack">
           {(permissions.data?.capabilities ?? []).map((capability) => (
             <li key={capability.capability}>
-              <strong>{capability.capability.replace(/_/g, ' ')}</strong> — {capability.human_request}
-              {capability.leaves_device && <> <Badge tone="caution">can leave this device</Badge></>}
+              <strong>{capability.capability.replace(/_/g, ' ')}</strong> —{' '}
+              {capability.human_request}
+              {capability.leaves_device && (
+                <>
+                  {' '}
+                  <Badge tone="caution">can leave this device</Badge>
+                </>
+              )}
             </li>
           ))}
         </ul>

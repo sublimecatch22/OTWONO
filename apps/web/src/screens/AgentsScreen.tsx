@@ -11,15 +11,7 @@ import type {
   ConnectionsResponse,
   SourcesResponse,
 } from '../api/types';
-import {
-  Badge,
-  Button,
-  Card,
-  EmptyState,
-  Field,
-  Notice,
-  Spinner,
-} from '../components/primitives';
+import { Badge, Button, Card, EmptyState, Field, Notice, Spinner } from '../components/primitives';
 import { useUi } from '../state/ui';
 
 const CAPABILITY_LABELS: Record<Capability, string> = {
@@ -94,8 +86,8 @@ export function AgentsScreen() {
         <div>
           <h1>Agents</h1>
           <p className="screen__lede">
-            An agent is a set of instructions, a model, and a narrow list of things it is allowed
-            to do. Editing one records a version you can go back to.
+            An agent is a set of instructions, a model, and a narrow list of things it is allowed to
+            do. Editing one records a version you can go back to.
           </p>
         </div>
         <div className="row row--tight">
@@ -361,9 +353,7 @@ function AgentEditor({ agentId, onDeleted }: { agentId: string; onDeleted: () =>
                 id={id}
                 className="select"
                 value={current.provider_connection_id ?? ''}
-                onChange={(event) =>
-                  change({ provider_connection_id: event.target.value || null })
-                }
+                onChange={(event) => change({ provider_connection_id: event.target.value || null })}
               >
                 <option value="">Not chosen</option>
                 {(connections.data?.connections ?? []).map((connection) => (
@@ -462,7 +452,10 @@ function AgentEditor({ agentId, onDeleted }: { agentId: string; onDeleted: () =>
               <span>
                 {CAPABILITY_LABELS[capability]}
                 {OFF_DEVICE.includes(capability) && (
-                  <> <Badge tone="caution">can leave this device</Badge></>
+                  <>
+                    {' '}
+                    <Badge tone="caution">can leave this device</Badge>
+                  </>
                 )}
               </span>
             </label>
